@@ -411,9 +411,11 @@ export class BeachRoom extends Room {
 
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 4),
-      from_plaza: new THREE.Vector3(10.5, 0, 2.2),
+      from_plaza: new THREE.Vector3(6.5, 0, 2), // open sand, unoccluded from the room camera
     };
-    this.cameraHint = { offset: new THREE.Vector3(9, 13.5, 15), lookHeight: 1.1 };
+    // gentle east bias: keeps the cove and dock in frame even at the eastern
+    // from_plaza spawn (a stronger offset framed mostly open sea there)
+    this.cameraHint = { offset: new THREE.Vector3(3.5, 13, 16), lookHeight: 1.1 };
 
     scene.updateMatrixWorld(true); // ground raycasts happen before the first render
   }

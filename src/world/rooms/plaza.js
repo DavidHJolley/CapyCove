@@ -964,9 +964,12 @@ export class PlazaRoom extends Room {
 
     // neon sign on a bracket above the arch
     put(g, new THREE.BoxGeometry(0.12, 0.9, 0.12), makeToon(C.iron), 0, 3.3, 0.05, { cast: false });
-    put(g, new THREE.BoxGeometry(3.5, 1.25, 0.18), makeToon(0x2b2038), 0, 3.9, -0.05);
+    put(g, new THREE.BoxGeometry(3.5, 1.25, 0.18), makeToon(0x4a4060), 0, 3.9, -0.05);
+    // neon on BOTH faces so the sign reads from every camera angle
     put(g, new THREE.PlaneGeometry(3.32, 1.14), glowMap(neonTex('GROOVE GROTTO')), 0, 3.9, -0.16,
       { rot: [0, Math.PI, 0], cast: false });
+    put(g, new THREE.PlaneGeometry(3.32, 1.14), glowMap(neonTex('GROOVE GROTTO')), 0, 3.9, 0.06,
+      { cast: false });
 
     const pl = new THREE.PointLight(C.clubGlow, 24, 13, 2);
     pl.position.set(0, 1.4, 0.4);

@@ -45,6 +45,18 @@ app.get('/api/me', (req, res) => {
 });
 app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size }));
 
+// dev-only: lets automated playtests save canvas captures to disk
+if (process.env.NODE_ENV !== 'production') {
+  app.post('/api/debug/shot/:name', express.text({ limit: '10mb', type: '*/*' }), (req, res) => {
+    const name = String(req.params.name).replace(/[^\w-]/g, '');
+    const b64 = String(req.body).replace(/^data:image\/\w+;base64,/, '');
+    const dir = path.join(ROOT, 'data', 'shots');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${name}.jpg`), Buffer.from(b64, 'base64'));
+    res.json({ ok: true });
+  });
+}
+
 // serve the built client in production
 const DIST = path.join(ROOT, 'dist');
 if (fs.existsSync(DIST)) {
