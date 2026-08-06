@@ -4,4 +4,9 @@ export const GAMES = {
   fishing: () => import('./games/fishing.js').then((m) => m.FishingGame),
   sled: () => import('./games/sled.js').then((m) => m.SledGame),
   smoothie: () => import('./games/smoothie.js').then((m) => m.SmoothieGame),
+  pong: () => import('./games/pong.js').then((m) => m.PongGame),
+  shuffle: () => import('./games/shuffle.js').then((m) => m.ShuffleGame),
+  chess: () => import('./games/chess.js').then((m) => m.ChessGame),
+  connect4: () => import('./games/connect4.js').then((m) => m.Connect4Game),
+  cards: () => import('./games/cards.js').then((m) => m.CardsGame),
 };

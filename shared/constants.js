@@ -2,7 +2,7 @@
 
 export const GAME_NAME = 'Capy Cove';
 
-export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club'];
+export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge'];
 export const DEFAULT_ROOM = 'plaza';
 
 export const ROOM_INFO = {
@@ -11,6 +11,7 @@ export const ROOM_INFO = {
   peak: { name: 'Frosty Peak', desc: 'Snow, sleds and cocoa' },
   cafe: { name: 'The Smoothie Shack', desc: 'Blend it like you mean it' },
   club: { name: 'Groove Grotto', desc: 'Underground dance cave' },
+  lounge: { name: 'The Game Den', desc: 'Tables, trophies and tussles' },
 };
 
 // Minigames: id -> reward formula. Server clamps client-reported scores with these.
@@ -18,6 +19,11 @@ export const MINIGAMES = {
   fishing: { name: 'Reel Rush', room: 'beach', maxCoinsPerRun: 120 },
   sled: { name: 'Summit Sprint', room: 'peak', maxCoinsPerRun: 150 },
   smoothie: { name: 'Smoothie Scramble', room: 'cafe', maxCoinsPerRun: 130 },
+  pong: { name: 'Paddle Panic', room: 'lounge', maxCoinsPerRun: 60 },
+  shuffle: { name: 'Shuffle Showdown', room: 'lounge', maxCoinsPerRun: 70 },
+  chess: { name: 'Grand Capy Chess', room: 'lounge', maxCoinsPerRun: 100 },
+  connect4: { name: 'Four in a Row', room: 'lounge', maxCoinsPerRun: 60 },
+  cards: { name: 'Capy Clash', room: 'lounge', maxCoinsPerRun: 100 },
 };
 
 // Hat catalog. Client renders these procedurally (src/player/hats.js must have a
@@ -49,6 +55,7 @@ export const BOT_ZONES = {
   peak: { x: 0, z: 5, r: 4.5 },
   cafe: { x: 0, z: 2, r: 4 },
   club: { x: 0, z: 2, r: 4.5 },
+  lounge: { x: 0, z: 2, r: 4 },
 };
 
 export const CHAT_MAX_LEN = 120;

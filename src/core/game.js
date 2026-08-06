@@ -109,6 +109,9 @@ class Game {
     this.setBest(id, score);
     if (this.net?.connected) {
       this.net.send({ t: 'score', game: id, score, coins: payout });
+      // the server pays one score per announced run; re-arm immediately so a
+      // "Play again" run inside the same mount is paid too
+      if (this.activeMinigame === id) this.net.send({ t: 'mgstart', game: id });
     } else {
       this.grantCoins(payout, id);
     }

@@ -47,11 +47,13 @@ One file = one owner per work wave. Never edit outside your assignment.
 Source of truth is `server/index.js` (message handlers) + `src/net/client.js`
 (client handling). Current families: hello/welcome/denied, join/room/pjoin/
 pleave/state, move, chat, emote, custom, score/best, buy/shop, coins, toast.
-In progress (wave 1): inspect/profile, friend-add/friend-remove/friends,
+Shipped wave 1: inspect/profile, friend-add/friend-remove/friends,
 lobby-join/lobby-leave/lobby, race-start/race-progress/race-state/race-done/
-race-end. Adding a message: implement server handler (validated, rate-limited,
-inside the try/catch), client handler that re-emits via `game.events`, and add
-it to this list.
+race-end, plus mgstart run tokens for score. Planned wave 3 (houses):
+house-config/house-invite/house-uninvite/house-save/house-info, buy-furn.
+Adding a message: implement server handler (validated, rate-limited, inside
+the try/catch), client handler that re-emits via `game.events`, and add it to
+this list.
 
 ## Working rules
 
@@ -71,9 +73,10 @@ it to this list.
 ## Current roadmap state (2026-08-06)
 
 Shipped: 5 rooms, 3 minigames, accounts + guest play, chat/emotes/shop sync,
-server bots, security hardening pass, playtest fixes (beach camera, grotto
-sign). In flight, in order: wave 1 playtester feedback (multiplayer sled
-racing, friends/profiles, menu, chat history, minigame fixes); wave 2 Game Den
-(pong, shuffleboard, chess, connect 4, Capy Clash per docs/CARDGAME.md);
-wave 3 player houses (furniture, placement editor, open/friends/invite access).
-The session task list is the live source of truth for wave status.
+server bots, security hardening pass, wave 1 (3-player seeded sled racing with
+gate lobby, friends + profile cards with medals, game menu, chat history,
+walk-through exits, chairlift/bench/quit/ramp/fishing-lives fixes). In flight:
+wave 2 Game Den ('lounge' room: pong, shuffle, chess, connect4, cards per
+docs/CARDGAME.md). Next: wave 3 player houses (dynamic 'house:<owner>' rooms,
+furniture catalog + placement editor, open/friends/invite access). The session
+task list is the live source of truth for wave status.

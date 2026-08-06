@@ -16,6 +16,7 @@ const CHAT = {
   peak: ['race you down the hill!', 'brrr cozy though', 'the view up here!!'],
   cafe: ['smoothies on me', 'try the mango one', 'it smells amazing in here'],
   club: ['DANCE PARTY', 'dj turn it up', 'these lights tho'],
+  lounge: ['anyone for chess?', 'best of three at pong??', 'the fireplace is so warm', 'i almost beat Grandmaster Pebble once'],
 };
 
 let nextBotId = 1;

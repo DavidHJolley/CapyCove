@@ -95,6 +95,26 @@ function inst(parent, geo, mat, mats, cast = true, recv = false) {
   return im;
 }
 
+/** Colour-per-instance batch: a pile of small props of one primitive in a
+ *  single draw call. three r178 defines USE_COLOR in the fragment prefix
+ *  whenever instanceColor is present, so no vertexColors flag is needed.
+ *  Rows are [color, matrix]. */
+function cinst(parent, geo, rows, cast = true, recv = false) {
+  if (!rows.length) return null;
+  const im = new THREE.InstancedMesh(geo, makeToon(0xffffff, { unique: true }), rows.length);
+  const c = new THREE.Color();
+  for (let i = 0; i < rows.length; i++) {
+    im.setMatrixAt(i, rows[i][1]);
+    im.setColorAt(i, c.set(rows[i][0]));
+  }
+  im.instanceMatrix.needsUpdate = true;
+  im.instanceColor.needsUpdate = true;
+  im.castShadow = cast;
+  im.receiveShadow = recv;
+  parent.add(im);
+  return im;
+}
+
 function put(parent, geo, mat, x, y, z, opt = {}) {
   const m = new THREE.Mesh(geo, mat);
   m.position.set(x, y, z);
@@ -303,6 +323,184 @@ function noticeTex() {
   });
 }
 
+// --- game den lodge (south-west exit) textures ---
+function denSignTex() {
+  const w = 512, h = 160;
+  return canvasTexture(w, h, (ctx) => {
+    ctx.fillStyle = '#f6e3bb';
+    rrect(ctx, 6, 6, w - 12, h - 12, 22);
+    ctx.fill();
+    ctx.strokeStyle = '#8a5a2c';
+    ctx.lineWidth = 10;
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(120,80,36,0.10)';
+    ctx.lineWidth = 3;
+    for (let i = 0; i < 5; i++) {
+      const y = 26 + i * 26;
+      ctx.beginPath();
+      ctx.moveTo(18, y);
+      ctx.bezierCurveTo(w * 0.4, y - 6, w * 0.6, y + 6, w - 18, y);
+      ctx.stroke();
+    }
+    // dice pips book-ending the name
+    for (const cx of [58, w - 58]) {
+      ctx.fillStyle = '#e8657a';
+      rrect(ctx, cx - 26, h / 2 - 26, 52, 52, 12);
+      ctx.fill();
+      ctx.fillStyle = '#fff6e3';
+      for (const [px, py] of [[-13, -13], [13, -13], [0, 0], [-13, 13], [13, 13]]) {
+        ctx.beginPath();
+        ctx.arc(cx + px, h / 2 + py, 5.5, 0, 7);
+        ctx.fill();
+      }
+    }
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    fitFont(ctx, 'GAME DEN', 300, 78, '900');
+    ctx.fillStyle = 'rgba(90,58,30,0.28)';
+    ctx.fillText('GAME DEN', w / 2 + 3, h * 0.47 + 3);
+    ctx.fillStyle = '#5b3a1e';
+    ctx.fillText('GAME DEN', w / 2, h * 0.47);
+    ctx.fillStyle = '#a8763f';
+    fitFont(ctx, 'five ways to lose gracefully', 280, 24, 'normal');
+    ctx.fillText('five ways to lose gracefully', w / 2, h * 0.82);
+  });
+}
+
+function denWindowTex() {
+  const S = 128;
+  return canvasTexture(S, S, (ctx) => {
+    const g = ctx.createLinearGradient(0, 0, 0, S);
+    g.addColorStop(0, '#ffe6b0');
+    g.addColorStop(0.55, '#ffc978');
+    g.addColorStop(1, '#f0a659');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, S, S);
+    // shelf + mug silhouettes so the pane reads as an inhabited room
+    ctx.fillStyle = 'rgba(120,64,24,0.4)';
+    ctx.fillRect(10, 74, S - 20, 6);
+    for (let i = 0; i < 4; i++) ctx.fillRect(18 + i * 24, 56, 14, 18);
+    ctx.fillStyle = 'rgba(120,64,24,0.28)';
+    ctx.beginPath();
+    ctx.arc(S * 0.7, S * 0.9, 22, 0, 7);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.16)';
+    ctx.beginPath();
+    ctx.moveTo(0, S); ctx.lineTo(S * 0.55, 0); ctx.lineTo(S * 0.85, 0); ctx.lineTo(S * 0.3, S);
+    ctx.fill();
+    ctx.strokeStyle = '#6d4526';
+    ctx.lineWidth = 9;
+    ctx.beginPath();
+    ctx.moveTo(S / 2, 0); ctx.lineTo(S / 2, S);
+    ctx.moveTo(0, S / 2); ctx.lineTo(S, S / 2);
+    ctx.stroke();
+    ctx.lineWidth = 14;
+    ctx.strokeRect(7, 7, S - 14, S - 14);
+  });
+}
+
+function denDoorTex() {
+  const w = 256, h = 288;
+  return canvasTexture(w, h, (ctx) => {
+    // Kept deliberately deep: an unlit basic material renders this at full
+    // brightness, and a pale interior card reads as a hole punched in the wall
+    // rather than a room with a fire in it.
+    const g = ctx.createRadialGradient(w / 2, h * 0.62, 8, w / 2, h * 0.62, h * 0.72);
+    g.addColorStop(0, '#ffbe63');
+    g.addColorStop(0.5, '#b4712f');
+    g.addColorStop(1, '#3f2210');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+    // hearth arch at the far end
+    ctx.fillStyle = '#ff9c3c';
+    ctx.beginPath();
+    ctx.moveTo(w * 0.34, h * 0.72);
+    ctx.lineTo(w * 0.34, h * 0.46);
+    ctx.quadraticCurveTo(w / 2, h * 0.3, w * 0.66, h * 0.46);
+    ctx.lineTo(w * 0.66, h * 0.72);
+    ctx.fill();
+    ctx.fillStyle = '#ffe3a0';
+    ctx.beginPath();
+    ctx.ellipse(w / 2, h * 0.66, 22, 30, 0, 0, 7);
+    ctx.fill();
+    // two capys hunched over a table
+    ctx.fillStyle = 'rgba(46,24,9,0.72)';
+    for (const cx of [w * 0.26, w * 0.74]) {
+      ctx.beginPath();
+      ctx.ellipse(cx, h * 0.74, 26, 22, 0, 0, 7);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(cx + (cx < w / 2 ? 12 : -12), h * 0.62, 17, 15, 0, 0, 7);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(50,26,10,0.72)';
+    ctx.fillRect(w * 0.34, h * 0.76, w * 0.32, 10);
+    // hanging lamp
+    ctx.strokeStyle = 'rgba(50,26,10,0.7)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h * 0.2);
+    ctx.stroke();
+    ctx.fillStyle = '#ffe9b8';
+    ctx.beginPath();
+    ctx.moveTo(w / 2 - 26, h * 0.28);
+    ctx.lineTo(w / 2 + 26, h * 0.28);
+    ctx.lineTo(w / 2 + 14, h * 0.19);
+    ctx.lineTo(w / 2 - 14, h * 0.19);
+    ctx.fill();
+    // warm vignette so the opening does not read as a flat card
+    const v = ctx.createRadialGradient(w / 2, h / 2, h * 0.3, w / 2, h / 2, h * 0.72);
+    v.addColorStop(0, 'rgba(0,0,0,0)');
+    v.addColorStop(1, 'rgba(60,30,12,0.55)');
+    ctx.fillStyle = v;
+    ctx.fillRect(0, 0, w, h);
+  });
+}
+
+function denCrestTex() {
+  const S = 192;
+  return canvasTexture(S, S, (ctx) => {
+    ctx.fillStyle = '#f3e2bc';
+    ctx.beginPath();
+    ctx.arc(S / 2, S / 2, 88, 0, 7);
+    ctx.fill();
+    ctx.lineWidth = 10;
+    ctx.strokeStyle = '#8a5a2c';
+    ctx.stroke();
+    // capy head badge
+    ctx.fillStyle = '#b08a5a';
+    rrect(ctx, 58, 62, 76, 62, 26);
+    ctx.fill();
+    ctx.strokeStyle = '#2d2417';
+    ctx.lineWidth = 5;
+    ctx.stroke();
+    for (const ex of [66, 126]) {
+      ctx.beginPath();
+      ctx.ellipse(ex, 66, 12, 10, 0, 0, 7);
+      ctx.fillStyle = '#8a6642';
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#c9a06b';
+    rrect(ctx, 74, 96, 44, 30, 13);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#2d2417';
+    for (const ex of [80, 112]) {
+      ctx.beginPath();
+      ctx.ellipse(ex, 84, 5.5, 6.5, 0, 0, 7);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#f2b64a';
+    ctx.beginPath();
+    ctx.arc(S / 2, 146, 13, 0, 7);
+    ctx.fill();
+    ctx.strokeStyle = '#2d2417';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+  });
+}
+
 function neonTex(text) {
   const w = 512, h = 192;
   return canvasTexture(w, h, (ctx) => {
@@ -425,6 +623,7 @@ export class PlazaRoom extends Room {
     this._buildShop(scene);
     this._buildGates(scene);
     this._buildClubEntrance(scene);
+    this._buildDenEntrance(scene);
     this._buildScatter(scene, rand);
     this._buildCritters(scene, rand);
 
@@ -436,6 +635,10 @@ export class PlazaRoom extends Room {
       from_peak: new THREE.Vector3(0, 0, -9.5),
       from_cafe: new THREE.Vector3(9.44, 0, 1.45),
       from_club: new THREE.Vector3(6.72, 0, 8.21),
+      // on the den's cobble stub, 4.31 out from the mouth: clear of the topiary
+      // (1.44) and the lawn bench (1.98), and the lodge stands north-west of it
+      // so the arrival frame shows the player, the path and the plaza beyond
+      from_lounge: new THREE.Vector3(-5.0, 0, 9.4),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 15, 20), lookHeight: 1.2 };
   }
@@ -458,6 +661,7 @@ export class PlazaRoom extends Room {
     const cob = cobbleTex(rand);
     cob.wrapS = cob.wrapT = THREE.RepeatWrapping;
     cob.repeat.set(7, 7);
+    this._cob = cob; // the den's path stub clones this so both cobbles match
     const plaza = put(scene, new THREE.CircleGeometry(PLAZA_R, 60), toonMap(0xffffff, cob),
       0, Y_PLAZA, 0, { rot: [-Math.PI / 2, 0, 0], cast: false, recv: true });
 
@@ -1007,6 +1211,256 @@ export class PlazaRoom extends Room {
     this.anim.club = { pl, moteMesh, moteData };
   }
 
+  // --------------------------------------------------- game den entrance --
+  // South-west counterpart to the grotto: a timber games lodge, warm where the
+  // club is neon, so the two southern exits read as a pair without twinning.
+  //
+  // The lodge sits NORTH-WEST of its mouth and its porch faces south-east, into
+  // the follow camera (which always trails the player by ~20 units of +z). That
+  // is the whole reason for the odd angle: a lodge facing the plaza would show
+  // the camera its back wall and, worse, would stand between the camera and a
+  // player at the door. Here every solid piece is behind the player.
+  //
+  // Route audit, spawn (0,0,4) -> mouth (-9,0,11). The straight line grazes the
+  // topiary (0.25 off its rim), so walkers slide north of it and thread the
+  // topiary/lawn-bench gap: centres 5.96 apart, radii 1.70 + 1.05, so 3.21 of
+  // free width. Past the topiary the bench-to-east-post gap is 2.78 and the
+  // porch mouth between the two post colliders is 3.25; the doorway between the
+  // facade colliders is 1.80. The tightest thing a route touches is 1.20 (east
+  // post) and 1.24 (facade, right of the door). The nook between the east post
+  // and the topiary is a deliberate dead corner (0.77): the exit auto-fires 2.4
+  // out from the mouth, which the walk line reaches 0.61 before the east post's
+  // closest approach, so nobody is ever funnelled into it.
+  _buildDenEntrance(scene) {
+    const ex = -9, ez = 11;        // the mouth (hotspot), on the cobble stub
+    const dx = 0.633, dz = 0.774;  // out of the lodge, toward plaza and camera
+    // 1.6 back from the mouth, plus 0.8 along the facade: without that lateral
+    // nudge the east corner lands inside the topiary planter. The door is set
+    // 0.5 off centre to compensate, so the mouth still sits in the doorway.
+    const GX = ex - dx * 1.6 - 0.8 * dz, GZ = ez - dz * 1.6 + 0.8 * dx;
+    const g = new THREE.Group();
+    g.position.set(GX, 0, GZ);
+    g.rotation.y = Math.atan2(dx, dz); // local +Z out of the porch
+    scene.add(g);
+    // local (x, z) -> world, for colliders
+    const W = (lx, lz) => ({ x: GX + lx * dz + lz * dx, z: GZ - lx * dx + lz * dz });
+
+    const LOG = 0xa87548, ROOF = 0x6b4a33, TRIM = 0xd9a15f;
+
+    const HW = 2.6, DEEP = -3.3;         // facade half width, body depth
+    const DL = -0.7, DR = 1.7;           // door opening in local x
+    const DOOR_TOP = 2.6;
+    const WIN_LO = 1.56, WIN_HI = 2.6;   // window band, punched out of the logs
+    const ROWS = [0.26, 0.78, 1.3, 1.82, 2.34, 2.86, 3.38];
+    const RIDGE = 4.5, EAVE = 3.35, OVER = 2.9; // roof ridge/eave height, half span
+    const slope = Math.hypot(OVER, RIDGE - EAVE);
+    const pitch = Math.atan2(RIDGE - EAVE, OVER);
+
+    // The plaza already sits at the ~120 draw call budget without this exit, so
+    // every solid here goes into one of two colour-per-instance batches: all
+    // the boxwork in one call, all the turnery (logs, posts, chains, firewood)
+    // in another. Only the canvas-mapped faces get meshes of their own.
+    const BOX = [], TURN = [], BLOOM = [];
+    const bx = (color, p, r, s) => BOX.push([color, T(p, r, s)]);
+    const cy = (color, p, r, s) => TURN.push([color, T(p, r, s)]);
+
+    // ---- log walls ---------------------------------------------------------
+    const LOGD = 0.52; // log diameter
+    const alongX = (x0, x1, y, z) => cy(LOG, [(x0 + x1) / 2, y, z], [0, 0, Math.PI / 2], [LOGD, x1 - x0, LOGD]);
+    const alongZ = (z0, z1, y, x) => cy(LOG, [x, y, (z0 + z1) / 2], [Math.PI / 2, 0, 0], [LOGD, z1 - z0, LOGD]);
+
+    for (const y of ROWS) {
+      const band = y > WIN_LO && y < WIN_HI;
+      // facade: door gap in the middle, window punched out of the left panel
+      if (y > DOOR_TOP) alongX(-HW, HW, y, 0);
+      else {
+        if (!band) alongX(-HW, DL, y, 0);
+        alongX(DR, HW, y, 0);
+      }
+      alongX(-HW, HW, y, DEEP);   // back wall
+      alongZ(DEEP, 0, y, HW);     // east flank (turned away from the camera)
+      // west flank faces the camera: two lit bays punched into the log band
+      if (band) {
+        alongZ(DEEP, -2.95, y, -HW);
+        alongZ(-1.75, -1.55, y, -HW);
+        alongZ(-0.35, 0, y, -HW);
+      } else alongZ(DEEP, 0, y, -HW);
+    }
+    // corner posts hide the log ends
+    for (const cx of [-HW, HW]) {
+      for (const cz of [0, DEEP]) cy(C.woodDark, [cx, 1.85, cz], null, [0.64, 3.7, 0.64]);
+    }
+
+    // ---- roof: two slabs, a ridge cap, bargeboards, two gable ends ---------
+    for (const s of [1, -1]) {
+      bx(ROOF, [s * OVER / 2, (RIDGE + EAVE) / 2, -1.2], [0, 0, -s * pitch], [slope, 0.2, 4.9]);
+      bx(TRIM, [s * OVER / 2, (RIDGE + EAVE) / 2 - 0.16, 1.22], [0, 0, -s * pitch], [slope, 0.2, 0.16]);
+    }
+    bx(0x8b5f3c, [0, RIDGE + 0.09, -1.2], null, [0.36, 0.3, 5.0]);
+
+    const gable = new THREE.Shape();
+    gable.moveTo(-HW - 0.08, EAVE - 0.5);
+    gable.lineTo(HW + 0.08, EAVE - 0.5);
+    gable.lineTo(0, RIDGE - 0.06);
+    gable.closePath();
+    inst(g, new THREE.ShapeGeometry(gable), makeToon(0xc08a55),
+      [T([0, 0, 0.03]), T([0, 0, DEEP - 0.03], [0, Math.PI, 0])], false, false);
+    // carved crest in the gable peak, facing the plaza
+    put(g, new THREE.CircleGeometry(0.44, 20), glowMap(denCrestTex()), 0, 3.66, 0.09, { cast: false });
+
+    // ---- porch: deck, step, posts, beam ------------------------------------
+    bx(C.stone, [0.5, 0.08, 0.62], null, [5.4, 0.16, 1.5]);
+    bx(C.stoneDark, [0.5, 0.05, 1.62], null, [4.6, 0.1, 0.7]);
+    for (const px of [-1.6, 2.6]) {
+      const h = RIDGE - (Math.abs(px) / OVER) * (RIDGE - EAVE) - 0.14;
+      cy(C.woodDark, [px, h / 2, 1.25], null, [0.42, h, 0.42]);
+      cy(C.stoneDark, [px, 0.08, 1.25], null, [0.62, 0.16, 0.62]);
+      bx(TRIM, [px, h - 0.02, 1.25], null, [0.42, 0.16, 0.42]);
+      bx(C.iron, [px, 2.86, 1.25], null, [0.44, 0.16, 0.44]); // lantern hood
+    }
+    bx(C.woodDark, [0.5, 3.2, 1.25], null, [4.9, 0.28, 0.3]);
+    bx(TRIM, [-1.25, 2.9, 1.25], [0, 0, -0.7], [0.7, 0.14, 0.14]);
+    bx(TRIM, [2.25, 2.9, 1.25], [0, 0, 0.7], [0.7, 0.14, 0.14]);
+
+    // ---- doorway: recess, lit interior card, swung-open leaf ---------------
+    bx(0x3a2617, [0.5, 1.3, -0.62], null, [2.5, DOOR_TOP + 0.1, 1.3]);
+    put(g, new THREE.PlaneGeometry(2.32, 2.46), glowMap(denDoorTex()), 0.5, 1.26, 0.04, { cast: false });
+    for (const jx of [DL - 0.05, DR + 0.05]) {
+      bx(C.woodDark, [jx, (DOOR_TOP + 0.3) / 2, 0.06], null, [0.26, DOOR_TOP + 0.3, 0.34]);
+    }
+    bx(C.woodDark, [0.5, DOOR_TOP + 0.18, 0.06], null, [2.9, 0.3, 0.36]);
+    bx(C.wood, [-0.28, 1.25, 0.52], [0, -0.95, 0], [0.12, 2.5, 1.15]); // door, swung open
+
+    // ---- windows: facade pane plus two on the camera-facing flank ----------
+    const planeGeo = new THREE.PlaneGeometry(1, 1);
+    const winMat = glowMap(denWindowTex());
+    const panes = [T([-1.65, 2.08, 0.05], null, [1.5, 1.0, 1])];
+    bx(C.woodDark, [-1.65, 2.08, -0.02], null, [1.76, 1.26, 0.18]);
+    for (const wz of [-0.95, -2.35]) {
+      panes.push(T([-HW - 0.05, 2.08, wz], [0, -Math.PI / 2, 0], [1.1, 1.0, 1]));
+      bx(C.woodDark, [-HW + 0.02, 2.08, wz], null, [0.18, 1.26, 1.36]);
+      bx(TRIM, [-HW - 0.12, 1.42, wz], null, [0.26, 0.24, 1.5]);
+    }
+    inst(g, planeGeo, winMat, panes, false, false);
+
+    // ---- hanging sign, both faces painted (the grotto rule) ----------------
+    cy(C.iron, [0.5, 3.36, 1.42], null, [0.1, 0.4, 0.1]);
+    cy(C.iron, [-0.75, 3.15, 1.5], null, [0.06, 0.46, 0.06]);
+    cy(C.iron, [1.75, 3.15, 1.5], null, [0.06, 0.46, 0.06]);
+    bx(C.woodDark, [0.5, 2.9, 1.5], null, [3.1, 1.0, 0.12]);
+    inst(g, planeGeo, glowMap(denSignTex()), [
+      T([0.5, 2.9, 1.57], null, [2.96, 0.92, 1]),
+      T([0.5, 2.9, 1.43], [0, Math.PI, 0], [2.96, 0.92, 1]),
+    ], false, false);
+
+    // ---- lanterns, chimney, firewood, planter ------------------------------
+    const lantern = inst(g, new THREE.SphereGeometry(0.17, 10, 8), makeGlow(0xffdca0),
+      [T([-1.6, 2.62, 1.25]), T([2.6, 2.62, 1.25]), T([-0.62, 1.3, 0.96], null, 0.42)], false, false);
+
+    bx(C.stoneDark, [-1.85, 4.2, -2.25], null, [0.86, 2.7, 0.86]);
+    bx(C.stone, [-1.85, 5.62, -2.25], null, [1.08, 0.22, 1.08]);
+
+    for (let r = 0; r < 3; r++) {
+      for (let i = 0; i < 3 - (r % 2 ? 1 : 0); i++) {
+        cy(C.wood, [2.02 + (r % 2 ? 0.14 : 0) + i * 0.28, 0.31 + r * 0.26, 0.52],
+          [Math.PI / 2, 0, 0], [0.26, 0.9, 0.26]);
+      }
+    }
+
+    bx(C.wood, [-1.9, 0.3, 1.42], null, [1.5, 0.44, 0.56]);
+    for (let i = 0; i < 5; i++) BLOOM.push([C.coral, T([-2.5 + i * 0.3, 0.58, 1.42], null, 0.16)]);
+    // Greenery stays inside the footprint: the west flank already sits on the
+    // last 0.5 of grass, and the east flank is the walking approach, so a bush
+    // on either side would be in the sea or in the way. Window boxes instead.
+    for (const wz of [-0.95, -2.35]) {
+      for (let i = 0; i < 4; i++) {
+        BLOOM.push([C.gold, T([-HW - 0.16, 1.62, wz - 0.45 + i * 0.3], null, 0.15)]);
+      }
+    }
+
+    cinst(g, new THREE.BoxGeometry(1, 1, 1), BOX, true, true);
+    cinst(g, new THREE.CylinderGeometry(0.5, 0.5, 1, 8), TURN, true, true);
+    cinst(g, new THREE.IcosahedronGeometry(1, 0), BLOOM, false, false);
+
+    const pl = new THREE.PointLight(0xffb968, 20, 13, 2);
+    pl.position.set(0.5, 1.9, 0.9);
+    g.add(pl);
+    // pool of doorway light on the grass, the part of the porch the camera sees
+    put(g, new THREE.CircleGeometry(2.1, 24), glowFade(0xffce8a, 0.2), 0.5, 0.03, 1.9,
+      { rot: [-Math.PI / 2, 0, 0], scale: [1, 0.72, 1], cast: false });
+
+    // chimney smoke
+    const smokeData = [], smoke = [];
+    for (let i = 0; i < 10; i++) {
+      smokeData.push({ t: i / 10, sp: 0.2 + (i % 3) * 0.035, ph: i * 1.7 });
+      smoke.push(T([0, -9, 0]));
+    }
+    const smokeMesh = inst(g, new THREE.SphereGeometry(0.3, 8, 6), glowFade(0xf2e4d2, 0.34),
+      smoke, false, false);
+
+    // ---- cobble stub: plaza rim, round the topiary, up to the porch --------
+    this._buildDenPath(scene);
+
+    this.obstacles.push(
+      // 0.38, not the post's visual 0.22: big enough to feel solid, small
+      // enough that the spawn -> mouth walk line clears its rim (0.01) instead
+      // of nudging walkers toward the dead corner behind it
+      { ...W(2.6, 1.25), r: 0.38 },                    // east porch post
+      { ...W(-1.6, 1.25), r: 0.5 },                    // west porch post
+      { ...W(2.15, 0), r: 0.85 },                      // facade, right of the door
+      { ...W(-1.65, 0), r: 1.15 },                     // facade, left of the door
+      { ...W(2.3, -1.8), r: 1.5 },
+      { ...W(-2.3, -1.8), r: 1.5 },
+      { ...W(0, -3.3), r: 1.7 },
+    );
+    this.hotspots.push({
+      id: 'exit-lounge',
+      position: new THREE.Vector3(ex, 0, ez),
+      radius: 3,
+      label: 'Into The Game Den',
+      action: (gm) => gm.goToRoom('lounge', 'plaza'),
+    });
+    this.anim.den = { lantern, smoke: smokeMesh, smokeData, pl };
+  }
+
+  /** Cobble stub from the plaza rim to the den porch, bowed north so it clears
+   *  the topiary planter by 0.08 at its tightest. One ribbon mesh: overlapping
+   *  quads at a single Y would z-fight. */
+  _buildDenPath(scene) {
+    const curve = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(-3.85, 0, 8.3),
+      new THREE.Vector3(-6.6, 0, 11.1),
+      new THREE.Vector3(-9.4, 0, 10.5),
+    );
+    const N = 14, HALFW = 1.5;
+    const pos = [], uvs = [], idx = [];
+    let u = 0, prev = null;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const p = curve.getPoint(t);
+      const d = curve.getTangent(t);
+      if (prev) u += Math.hypot(p.x - prev.x, p.z - prev.z) / 2.6;
+      prev = p;
+      pos.push(p.x + d.z * HALFW, Y_PATH, p.z - d.x * HALFW);
+      pos.push(p.x - d.z * HALFW, Y_PATH, p.z + d.x * HALFW);
+      uvs.push(0, u, 1.15, u);
+    }
+    for (let i = 0; i < N; i++) {
+      const a = i * 2;
+      idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    const tex = this._cob.clone();
+    tex.needsUpdate = true;
+    tex.repeat.set(1, 1);
+    const mesh = put(scene, geo, toonMap(0xffffff, tex), 0, 0, 0, { cast: false, recv: true });
+    this.groundMeshes.push(mesh);
+  }
+
   // ------------------------------------------------------------- scatter --
   _buildScatter(scene, rand) {
     const keep = [
@@ -1017,9 +1471,11 @@ export class PlazaRoom extends Room {
       { x: -6.9, z: 6.9, r: 3.0 }, { x: -9.9, z: 4.4, r: 3.0 },
       { x: -9.4, z: 6.6, r: 2.4 }, { x: 9.6, z: 5.6, r: 2.4 },
       { x: -4.6, z: 12.4, r: 2.2 }, // clearing around the lawn bench
+      { x: -11.2, z: 9.4, r: 5.6 }, // the game den lodge and its porch
     ];
     const segs = [
       [-8, 0, -16, 0], [0, -8, 0, -16], [8, 1.2, 16, 2.5], [5.2, 6.4, 10.2, 12.4],
+      [-4.6, 8.0, -10.4, 10.4], // the den's cobble stub
     ];
     const okSpot = (x, z, pad) => {
       for (const k of keep) if (Math.hypot(x - k.x, z - k.z) < k.r + pad) return false;
@@ -1231,6 +1687,37 @@ export class PlazaRoom extends Room {
       a.club.moteMesh.instanceMatrix.needsUpdate = true;
     }
 
+    // den lanterns + chimney smoke
+    if (a.den) {
+      const lp = 1 + Math.sin(t * 2.4) * 0.07;
+      for (let i = 0; i < 2; i++) {
+        _o2.position.set(i ? 2.6 : -1.6, 2.62, 1.25);
+        _o2.rotation.set(0, 0, 0);
+        _o2.scale.setScalar(lp + i * 0.03);
+        _o2.updateMatrix();
+        a.den.lantern.setMatrixAt(i, _o2.matrix);
+      }
+      a.den.lantern.instanceMatrix.needsUpdate = true;
+      a.den.pl.intensity = 18 + Math.sin(t * 1.9) * 4;
+      const sd = a.den.smokeData;
+      for (let i = 0; i < sd.length; i++) {
+        const s = sd[i];
+        s.t += dt * s.sp;
+        if (s.t > 1) s.t -= 1;
+        const f = s.t;
+        _o2.position.set(
+          -1.85 + Math.sin(f * 3.2 + s.ph) * (0.2 + f * 0.9),
+          5.75 + f * 3.6,
+          -2.25 + Math.cos(f * 2.4 + s.ph) * (0.15 + f * 0.5),
+        );
+        _o2.rotation.set(0, f * 2.4, 0);
+        _o2.scale.setScalar((0.35 + f * 1.9) * Math.max(0, 1 - f * 0.9));
+        _o2.updateMatrix();
+        a.den.smoke.setMatrixAt(i, _o2.matrix);
+      }
+      a.den.smoke.instanceMatrix.needsUpdate = true;
+    }
+
     // butterflies
     if (a.flies) {
       for (const f of a.flies.flies) {
@@ -1282,6 +1769,7 @@ export class PlazaRoom extends Room {
 
   dispose() {
     this.anim = null;
+    this._cob = null;
     this.groundMeshes = [];
     this.hotspots = [];
     this.obstacles = [];

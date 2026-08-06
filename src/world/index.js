@@ -7,4 +7,5 @@ export const ROOMS = {
   peak: () => import('./rooms/peak.js').then((m) => m.PeakRoom),
   cafe: () => import('./rooms/cafe.js').then((m) => m.CafeRoom),
   club: () => import('./rooms/club.js').then((m) => m.ClubRoom),
+  lounge: () => import('./rooms/lounge.js').then((m) => m.LoungeRoom),
 };

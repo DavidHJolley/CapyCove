@@ -10,7 +10,7 @@ practice (note deviations in code comments).
 
 - Two capybaras duel: the player vs a named AI capybara (PvP later).
 - Each starts at **25 HP**. Reduce the opponent to 0 to win.
-- Same 20-card starter deck for both sides (shuffled independently) in v1;
+- Same 24-card starter deck for both sides (shuffled independently) in v1;
   collectible cards and deck-building are future work.
 - A duel lasts 5-10 minutes. Coins: **win 70 + (your remaining HP)/2, loss 10
   consolation if you got the opponent under 10 HP, else 5** (server cap via
@@ -55,7 +55,7 @@ practice (note deviations in code comments).
 - **Splashproof**: cannot be targeted by spells (yours or theirs).
 - **Last Splash: <effect>**: triggers when this critter dies.
 
-## 6. Card pool v1 (starter deck = the 20 cards marked x1/x2)
+## 6. Card pool v1 (starter deck = the 24 cards marked x1/x2 below)
 
 Critters: "cost | element | atk/hp | keywords" (name flavor: cozy, silly).
 
