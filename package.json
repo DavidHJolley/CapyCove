@@ -1,0 +1,22 @@
+{
+  "name": "capy-cove",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Capy Cove: a cozy multiplayer hangout world with minigames",
+  "scripts": {
+    "dev": "vite --port 5199",
+    "dev:server": "node server/index.js",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "three": "^0.178.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}
