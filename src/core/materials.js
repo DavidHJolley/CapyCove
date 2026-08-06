@@ -54,6 +54,11 @@ export function canvasTexture(w, h, draw) {
 export function disposeObject(root) {
   root.traverse((o) => {
     o.geometry?.dispose?.();
+    // A shadow map is a WebGLRenderTarget hanging off the light, not off any
+    // material, so the material sweep below never reaches it. Rooms are rebuilt
+    // on every visit, so without this each visit leaks one GPU texture per
+    // shadow-casting light.
+    if (o.isLight) o.shadow?.dispose?.();
     const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
     for (const m of mats) {
       if (m.userData?.shared) continue; // cached/shared, keep

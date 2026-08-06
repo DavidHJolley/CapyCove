@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: capy-cove
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: node server/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+    disk:
+      name: capy-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
