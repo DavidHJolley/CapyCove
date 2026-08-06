@@ -8,15 +8,19 @@ import { MINIGAMES } from '../../../shared/constants.js';
  * is flat toon shapes with dark outlines, which reads far cleaner in 2D than as
  * low-poly meshes. Everything is procedural: fish, kelp, coral, boat, capybara.
  *
- * Run: 90 seconds. Mouse Y (or arrow keys) sets the hook depth, touch a fish to
- * reel it in. Jellyfish stun, boots cost points, sharks sweep the lanes.
+ * Run: 90 seconds OR three hearts, whichever runs out first. Mouse Y (or arrow
+ * keys) sets the hook depth, touch a fish to reel it in. Hooking anything that
+ * is NOT a fish (jellyfish, boot, shark) costs a heart and grants brief
+ * invulnerability frames.
  */
 
 const TAU = Math.PI * 2;
 const RUN_SECONDS = 90;
 const COMBO_NEEDED = 5;
 const COMBO_TIME = 10;
-const STUN_TIME = 1.5;
+const MAX_HEARTS = 3;
+const INVULN_TIME = 1.5;   // i-frames after a hazard hit
+const HIT_STUN = 0.5;      // short control lock inside those i-frames
 const SHARK_EVERY = 20;
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -34,6 +38,21 @@ const KINDS = {
   golden: { points: 10, r: 10, speed: 0.5, body: '#f2b64a', fin: '#ffdd7a', belly: '#fff4cd', flap: 22, label: 'Golden Minnow', hint: 'rare! tiny + fast' },
 };
 
+// Everything in the water that is NOT a fish. All of them cost one heart.
+const HAZARDS = {
+  jelly: { label: 'Jellyfish', hint: 'zaps your line', hit: 'ZAP!' },
+  boot: { label: 'Old Boot', hint: 'not dinner', hit: 'CLUNK!' },
+  shark: { label: 'Shark', hint: 'sweeps the cove', hit: 'CHOMP!' },
+};
+
+// Flavour for the "ran out of hearts" results card, keyed by whatever got you.
+const WIPEOUT = {
+  jelly: 'The jellyfish are already writing a song about it.',
+  boot: 'Beaten by footwear. Somewhere out there, a boot is gloating.',
+  shark: 'The shark would like to thank you for the snack.',
+};
+
+const HEART = '♥';
 const OUTLINE = 'rgba(8,34,56,0.55)';
 
 function spawnTable(p) {
@@ -507,7 +526,7 @@ const CSS = `
 .mg-fishing-ui { position:absolute; inset:0; pointer-events:none; color:#fff6e3; }
 
 .mg-fishing-hud { position:absolute; top:0; left:0; right:0; display:flex; align-items:center;
-  gap:12px; padding:14px 16px; }
+  flex-wrap:wrap; gap:10px 12px; padding:14px 16px; }
 .mg-fishing-hud[hidden] { display:none; }
 .mg-fishing-pill { display:flex; align-items:center; gap:9px; padding:7px 15px; border-radius:999px;
   background:rgba(9,36,58,0.6); border:2px solid rgba(255,255,255,0.32);
@@ -518,6 +537,25 @@ const CSS = `
   font-variant-numeric:tabular-nums; }
 .mg-fishing-v.mg-fishing-bump { animation:mg-fishing-bump 0.28s ease; }
 @keyframes mg-fishing-bump { 0%{ transform:scale(1);} 40%{ transform:scale(1.35); color:#fff6e3;} 100%{ transform:scale(1);} }
+
+.mg-fishing-lives { display:flex; align-items:center; gap:9px; padding:7px 15px; border-radius:999px;
+  background:rgba(9,36,58,0.6); border:2px solid rgba(255,255,255,0.32);
+  box-shadow:0 5px 16px rgba(0,0,0,0.3); backdrop-filter:blur(4px);
+  transition:border-color 0.2s ease; }
+.mg-fishing-hrow { display:flex; gap:5px; }
+.mg-fishing-heart { display:block; font-size:20px; line-height:1; color:#e8657a;
+  text-shadow:0 2px 0 rgba(9,36,58,0.45); transition:color 0.2s ease, transform 0.2s ease; }
+.mg-fishing-heart.mg-fishing-gone { color:rgba(255,246,227,0.2); transform:scale(0.78); text-shadow:none; }
+.mg-fishing-heart.mg-fishing-break { animation:mg-fishing-break 0.55s ease both; }
+@keyframes mg-fishing-break { 0%{ transform:scale(1.6); color:#fff6e3; }
+  35%{ transform:scale(1.12) rotate(-14deg); color:#e8657a; }
+  100%{ transform:scale(0.78) rotate(0deg); color:rgba(255,246,227,0.2); } }
+.mg-fishing-lives.mg-fishing-hurt .mg-fishing-hrow { animation:mg-fishing-hurt 0.45s ease; }
+@keyframes mg-fishing-hurt { 0%,100%{ transform:translateX(0);} 18%{ transform:translateX(-6px);}
+  42%{ transform:translateX(5px);} 68%{ transform:translateX(-3px);} }
+.mg-fishing-lives.mg-fishing-danger { border-color:rgba(232,101,122,0.9);
+  animation:mg-fishing-lastheart 0.9s ease-in-out infinite; }
+@keyframes mg-fishing-lastheart { 50% { box-shadow:0 0 22px rgba(232,101,122,0.7); } }
 
 .mg-fishing-timer { flex:1; max-width:340px; display:flex; flex-direction:column; gap:4px;
   padding:7px 14px 9px; border-radius:16px; background:rgba(9,36,58,0.6);
@@ -568,6 +606,7 @@ const CSS = `
 .mg-fishing-title { font-size:clamp(30px,5.2vw,46px); font-weight:900; letter-spacing:0.02em; color:#e8657a;
   text-shadow:0 3px 0 #fff, 0 5px 0 rgba(45,36,23,0.12); line-height:1.05; }
 .mg-fishing-sub { font-size:14px; font-weight:700; color:#8a7a5a; margin-top:2px; }
+.mg-fishing-flavor { margin-top:7px; font-size:14.5px; font-weight:800; color:#b4525f; line-height:1.35; }
 .mg-fishing-legend { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:6px 12px;
   margin:14px 0 12px; text-align:left; }
 .mg-fishing-le { display:flex; align-items:center; gap:9px; background:rgba(79,179,232,0.14);
@@ -624,6 +663,8 @@ export class FishingGame extends Minigame {
     this.last = 0;
     this.score = 0;
     this.timeLeft = RUN_SECONDS;
+    this.hearts = MAX_HEARTS;
+    this.lastHazard = null;
     this.entities = [];
     this.particles = [];
     this.popups = [];
@@ -660,6 +701,10 @@ export class FishingGame extends Minigame {
             <span class="mg-fishing-k">Score</span>
             <span class="mg-fishing-v" data-el="score">0</span>
           </div>
+          <div class="mg-fishing-lives" data-el="lives">
+            <span class="mg-fishing-k">Lives</span>
+            <div class="mg-fishing-hrow" data-el="hearts"></div>
+          </div>
           <div class="mg-fishing-timer" data-el="timer">
             <div class="mg-fishing-timer-row">
               <span class="mg-fishing-k">Time left</span>
@@ -693,6 +738,14 @@ export class FishingGame extends Minigame {
     }
     this.dotEls = [...dots.children];
 
+    for (let i = 0; i < MAX_HEARTS; i++) {
+      const heart = document.createElement('span');
+      heart.className = 'mg-fishing-heart';
+      heart.innerHTML = '&#9829;';
+      this.el.hearts.appendChild(heart);
+    }
+    this.heartEls = [...this.el.hearts.children];
+
     this._buildSplash();
     this._layout();
     this._resetScene();
@@ -710,13 +763,12 @@ export class FishingGame extends Minigame {
       ['medium', `+${KINDS.medium.points}`, false],
       ['big', `+${KINDS.big.points}`, false],
       ['golden', `+${KINDS.golden.points}`, false],
-      ['jelly', 'Stun!', true],
-      ['boot', '-2', true],
+      ['jelly', '-1 &#9829;', true],
+      ['boot', '-1 &#9829;', true],
+      ['shark', '-1 &#9829;', true],
     ];
     const rows = legend.map(([kind, pts, bad]) => {
-      const meta = KINDS[kind] || (kind === 'jelly'
-        ? { label: 'Jellyfish', hint: 'zaps your line' }
-        : { label: 'Old Boot', hint: 'not dinner' });
+      const meta = KINDS[kind] || HAZARDS[kind];
       return `<div class="mg-fishing-le">
         <canvas data-icon="${kind}" width="128" height="88"></canvas>
         <span><b>${meta.label}</b><i>${meta.hint}</i></span>
@@ -727,12 +779,14 @@ export class FishingGame extends Minigame {
     this.el.splash.innerHTML = `
       <div class="mg-fishing-card">
         <div class="mg-fishing-title">Reel Rush</div>
-        <div class="mg-fishing-sub">Driftwood Beach &middot; 90 seconds of fishing</div>
+        <div class="mg-fishing-sub">Driftwood Beach &middot; 90 seconds &middot; 3 hearts</div>
         <div class="mg-fishing-legend">${rows}</div>
         <p class="mg-fishing-tip">
           Move the <b>mouse</b> (or <b>&uarr; &darr;</b>) to set your hook depth, <b>&larr; &rarr;</b> to lean.
-          Touch a fish to reel it in. Land <b>5 catches</b> in a row without a hazard for <b>double points</b>.
-          Watch out: a <b>shark</b> sweeps the cove every 20 seconds.
+          Touch a fish to reel it in.
+          <b>Hook anything that is not a fish and it costs a heart</b>: three hearts gone and the run
+          ends there, even with time on the clock.
+          Land <b>5 catches</b> in a row without a hazard for <b>double points</b>.
         </p>
         <div class="mg-fishing-best">Your best catch: <b>${best}</b> points</div>
         <div class="mg-fishing-row">
@@ -754,6 +808,8 @@ export class FishingGame extends Minigame {
         drawJellyArt(g, 9, 0.35, 0);
       } else if (kind === 'boot') {
         drawBootArt(g, 11, 0.2);
+      } else if (kind === 'shark') {
+        drawSharkArt(g, 27, 0.12);
       } else {
         drawFishArt(g, kind, clamp(KINDS[kind].r * 0.7, 7, 17), 0.07, 0.4);
       }
@@ -977,10 +1033,13 @@ export class FishingGame extends Minigame {
       xOff: 0,
       vy: 0,
       stun: 0,
+      inv: 0,
     };
+    this.hearts = MAX_HEARTS;
+    this.lastHazard = null;
     this.spawnIn = 0.6;
     this.bucket = 0;
-    this.stats = { small: 0, medium: 0, big: 0, golden: 0, boot: 0, jelly: 0 };
+    this.stats = { small: 0, medium: 0, big: 0, golden: 0, boot: 0, jelly: 0, shark: 0 };
     this.combo = 0;
     this.bestCombo = 0;
     this.multTimer = 0;
@@ -1005,7 +1064,9 @@ export class FishingGame extends Minigame {
     this._updateHud(true);
   }
 
-  _endRun() {
+  _endRun(reason = 'time') {
+    if (this.phase === 'results') return;
+    const wiped = reason === 'hearts';
     this.phase = 'results';
     this.el.count.hidden = true;
     this.wrap.querySelector('.mg-fishing-hud').hidden = true;
@@ -1019,17 +1080,23 @@ export class FishingGame extends Minigame {
     this.finish(score);
     this._sfx(score >= 60 ? 'success' : 'ding');
 
-    const rank = score >= 150 ? 'Legendary haul!'
+    const rank = wiped ? 'Out of hearts!'
+      : score >= 150 ? 'Legendary haul!'
       : score >= 105 ? 'Master angler!'
       : score >= 70 ? 'Nice haul!'
       : score >= 40 ? 'Solid catch'
       : 'Better luck next cast';
+
+    const flavor = wiped
+      ? `<div class="mg-fishing-flavor">${WIPEOUT[this.lastHazard] || 'The cove wins this round.'}</div>`
+      : '';
 
     const s = this.stats;
     this.el.results.innerHTML = `
       <div class="mg-fishing-card">
         <div class="mg-fishing-ribbon"${isBest ? '' : ' hidden'}>New personal best!</div>
         <div class="mg-fishing-title">${rank}</div>
+        ${flavor}
         <div class="mg-fishing-score-big">${score}</div>
         <div class="mg-fishing-sub">points</div>
         <div><span class="mg-fishing-coins">+${coins} coins</span></div>
@@ -1039,7 +1106,7 @@ export class FishingGame extends Minigame {
           <div class="mg-fishing-stat"><b>${s.big}</b><span>Groupers</span></div>
           <div class="mg-fishing-stat"><b>${s.golden}</b><span>Golden</span></div>
           <div class="mg-fishing-stat"><b>${this.bestCombo}</b><span>Best streak</span></div>
-          <div class="mg-fishing-stat"><b>${s.boot + s.jelly}</b><span>Oopsies</span></div>
+          <div class="mg-fishing-stat"><b>${MAX_HEARTS - this.hearts}</b><span>Hearts lost</span></div>
         </div>
         <div class="mg-fishing-best">Best catch: <b>${Math.max(prevBest, score)}</b> points</div>
         <div class="mg-fishing-row">
@@ -1096,14 +1163,19 @@ export class FishingGame extends Minigame {
     this._updateSpawns(dt, playing);
     this._updateEntities(dt, playing);
     this._updateShark(dt, playing);
-    if (playing) this._collide();
+    this._collide();
     this._updateFx(dt);
 
-    if (this.multTimer > 0 && playing) {
+    // last heart: the cove closes in a little
+    if (this.phase === 'play' && this.hearts === 1) {
+      this.danger = Math.max(this.danger, 0.13 + 0.06 * Math.sin(this.t * 4));
+    }
+
+    if (this.multTimer > 0 && this.phase === 'play') {
       this.multTimer = Math.max(0, this.multTimer - dt);
       if (this.multTimer === 0) this._sfx('pop');
     }
-    if (playing) this._updateHud(false);
+    if (this.phase === 'play') this._updateHud(false);
   }
 
   _updateBoat(dt) {
@@ -1121,6 +1193,15 @@ export class FishingGame extends Minigame {
     const hk = this.hook;
     const speed = 620 * this.S;
 
+    if (hk.inv > 0) {
+      hk.inv = Math.max(0, hk.inv - dt);
+      if (hk.inv === 0 && this.phase === 'play') {
+        // "you're safe again" flourish so the flicker ending is readable
+        this._burst(hk.x, hk.y, 8, '#bfe8ff', 130);
+        this._sfx('pop');
+      }
+    }
+
     if (hk.stun > 0) {
       hk.stun -= dt;
       hk.y = clamp(hk.y + 42 * this.S * dt, this.topLimit, this.botLimit);
@@ -1128,7 +1209,6 @@ export class FishingGame extends Minigame {
       if (hk.stun <= 0) {
         hk.stun = 0;
         if (this.pointer) hk.targetY = this.pointer.y;
-        this._burst(hk.x, hk.y, 8, '#bfe8ff', 130);
       }
     } else {
       if (this.keys.up) hk.targetY -= speed * dt;
@@ -1308,9 +1388,11 @@ export class FishingGame extends Minigame {
       }
     }
 
-    if (this.phase === 'play' && this.hook.stun <= 0) {
+    if (this.phase === 'play' && this.hook.inv <= 0) {
       if (Math.abs(this.hook.x - sh.x) < sh.L * 0.85 && Math.abs(this.hook.y + 6 * this.S - sh.y) < sh.L * 0.38) {
-        this._zap(1.2, 'Shark scare!');
+        this.stats.shark++;
+        this._burst(this.hook.x, this.hook.y, 12, '#d6e4ee', 200);
+        this._damage('shark');
       }
     }
 
@@ -1318,6 +1400,7 @@ export class FishingGame extends Minigame {
   }
 
   _collide() {
+    if (this.phase !== 'play') return;
     const hk = this.hook;
     if (hk.stun > 0) return;
     const hx = hk.x;
@@ -1325,6 +1408,8 @@ export class FishingGame extends Minigame {
 
     for (const e of this.entities) {
       if (e.dead) continue;
+      // i-frames only shrug off hazards; fish are still catchable while flickering
+      if (!KINDS[e.kind] && hk.inv > 0) continue;
       const dx = e.x - hx;
       const dy = e.y - hy;
       const rr = e.hitR + hk.r;
@@ -1357,34 +1442,44 @@ export class FishingGame extends Minigame {
       } else if (e.kind === 'jelly') {
         e.dead = true;
         this.stats.jelly++;
-        this._zap(STUN_TIME, 'ZAP!');
         this._burst(e.x, e.y, 14, '#ff9ee0', 190);
+        this._damage('jelly');
       } else {
         e.dead = true;
         this.stats.boot++;
-        this.score = Math.max(0, this.score - 2);
-        this.combo = 0;
-        this.multTimer = 0;
-        this._popup(e.x, e.y, '-2', '#ff9a9a', 1.2);
-        this._sfx('pop');
-        this.shake = Math.max(this.shake, 5);
+        // the boot still gets reeled in, it just costs a heart instead of points
         this.catches.push({
           kind: 'boot', x0: e.x, y0: e.y, r: e.r, dir: e.dir, t: 0,
           dur: 0.4 + Math.abs(e.y - this.rodTip.y) / (this.h * 3.2), ph: e.ph, spin: rand(-8, 8),
         });
+        this._damage('boot');
       }
       break; // one thing per frame keeps the feedback readable
     }
   }
 
-  _zap(time, text) {
-    this.hook.stun = time;
+  /** One heart gone. Every non-fish in the cove routes through here. */
+  _damage(kind) {
+    const hk = this.hook;
+    if (this.phase !== 'play' || hk.inv > 0) return;
+
+    this.hearts = Math.max(0, this.hearts - 1);
+    this.lastHazard = kind;
+    hk.inv = INVULN_TIME;
+    hk.stun = HIT_STUN;
     this.combo = 0;
     this.multTimer = 0;
-    this.shake = Math.max(this.shake, 12);
-    this.danger = Math.max(this.danger, 0.8);
-    this._popup(this.hook.x, this.hook.y - 18 * this.S, text, '#ffe27a', 1.5);
+    this.shake = Math.max(this.shake, 13);
+    this.danger = Math.max(this.danger, 0.85);
+    this._popup(hk.x, hk.y - 18 * this.S, HAZARDS[kind]?.hit || 'OUCH!', '#ffe27a', 1.5);
+    this._popup(hk.x, hk.y + 16 * this.S, `-1 ${HEART}`, '#ff9a9a', 1.15);
     this._sfx('fail');
+    this._updateHud(false);
+
+    if (this.hearts <= 0) {
+      this.shake = Math.max(this.shake, 18);
+      this._endRun('hearts');
+    }
   }
 
   _popup(x, y, text, col, scale = 1) {
@@ -1485,6 +1580,29 @@ export class FishingGame extends Minigame {
       this.el.score.classList.remove('mg-fishing-bump');
       void this.el.score.offsetWidth;
       this.el.score.classList.add('mg-fishing-bump');
+    }
+    const hearts = this.hearts;
+    if (force || h.hearts !== hearts) {
+      const lost = h.hearts != null && hearts < h.hearts;
+      h.hearts = hearts;
+      for (let i = 0; i < this.heartEls.length; i++) {
+        const el = this.heartEls[i];
+        const gone = i >= hearts;
+        el.classList.toggle('mg-fishing-gone', gone);
+        if (lost && i === hearts) {
+          el.classList.remove('mg-fishing-break');
+          void el.offsetWidth;
+          el.classList.add('mg-fishing-break');
+        } else if (!gone) {
+          el.classList.remove('mg-fishing-break');
+        }
+      }
+      this.el.lives.classList.toggle('mg-fishing-danger', hearts === 1);
+      if (lost) {
+        this.el.lives.classList.remove('mg-fishing-hurt');
+        void this.el.lives.offsetWidth;
+        this.el.lives.classList.add('mg-fishing-hurt');
+      }
     }
     const clock = fmtTime(this.timeLeft);
     if (force || h.clock !== clock) {
@@ -1872,6 +1990,10 @@ export class FishingGame extends Minigame {
     const hk = this.hook;
     const tip = this.rodTip;
 
+    // invulnerability flicker: the whole rig blinks while the i-frames run
+    ctx.save();
+    if (hk.inv > 0) ctx.globalAlpha = 0.3 + 0.45 * (0.5 + 0.5 * Math.sin(this.t * 34));
+
     ctx.strokeStyle = 'rgba(255,255,255,0.55)';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -1892,7 +2014,7 @@ export class FishingGame extends Minigame {
     const pulse = 0.5 + 0.5 * Math.sin(this.t * 3.4);
     ctx.beginPath();
     ctx.arc(0, 6 * this.S, hk.r * (1.25 + pulse * 0.18), 0, TAU);
-    ctx.strokeStyle = hk.stun > 0
+    ctx.strokeStyle = hk.inv > 0
       ? `rgba(255,226,122,${0.5 + pulse * 0.4})`
       : `rgba(190,240,255,${0.22 + pulse * 0.16})`;
     ctx.lineWidth = 2 * this.S;
@@ -1910,13 +2032,13 @@ export class FishingGame extends Minigame {
     ctx.strokeStyle = OUTLINE;
     ctx.stroke();
     ctx.lineWidth = 3.6 * S;
-    ctx.strokeStyle = hk.stun > 0 ? '#ffe27a' : '#e9f2f7';
+    ctx.strokeStyle = hk.inv > 0 ? '#ffe27a' : '#e9f2f7';
     ctx.stroke();
 
     // lure bead
     ctx.beginPath();
     ctx.arc(0, -2 * S, 4.6 * S, 0, TAU);
-    ctx.fillStyle = hk.stun > 0 ? '#ff9a5c' : '#e8657a';
+    ctx.fillStyle = hk.inv > 0 ? '#ff9a5c' : '#e8657a';
     ctx.fill();
     ctx.lineWidth = 1.6 * S;
     ctx.strokeStyle = OUTLINE;
@@ -1939,6 +2061,7 @@ export class FishingGame extends Minigame {
         ctx.stroke();
       }
     }
+    ctx.restore();
     ctx.restore();
   }
 

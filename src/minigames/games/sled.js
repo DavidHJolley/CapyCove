@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Minigame } from '../minigame.js';
 import { makeToon, makeGlow, canvasTexture, disposeObject } from '../../core/materials.js';
+import { buildHat } from '../../player/hats.js';
 import { MINIGAMES } from '../../../shared/constants.js';
 
 /**
@@ -11,6 +12,19 @@ import { MINIGAMES } from '../../../shared/constants.js';
  * to the back of the queue, obstacles/pickups live in InstancedMesh pools, and
  * a single instanced particle system covers snow spray, coin sparkles, impact
  * puffs and boost streaks.
+ *
+ * TRACK LAYOUT IS SEEDED. Everything that decides where a hazard, pickup, ramp
+ * or gap lands is drawn from `this.rngTrack` (mulberry32 from `this.seed`), and
+ * hazard density is a function of *track distance*, never of wall-clock time.
+ * Two clients handed the same seed therefore ride byte-identical layouts even
+ * at wildly different frame rates or speeds. Cosmetic randomness (backdrop
+ * pines, particle jitter, popup offsets) stays on Math.random on purpose: it
+ * never touches the seeded stream, so it cannot desync a race.
+ *
+ * MULTIPLAYER: if `game.__raceCtx` is set at mount time ({seed, players}) the
+ * run becomes a 3-way race. Rivals ride the same track; we place them by the
+ * delta between their reported distance and ours (ahead = up-slope), send our
+ * own progress at 5Hz, and finish on a shared leaderboard.
  */
 
 // ---------------------------------------------------------------- tuning ----
@@ -28,6 +42,10 @@ const DIST_SCALE = 0.35;     // track units -> displayed metres
 const INVULN = 1.6;          // seconds of mercy after a hit
 const BOOST_TIME = 2.3;
 const BOOST_MUL = 1.55;
+const DIFF_RAMP = 2400;      // track units from the gate to peak hazard density
+const RACE_SEND_HZ = 5;      // race-progress messages per second
+const RIVAL_HIDE = 60;       // hide a rival past this |distance delta|
+const RIVAL_HIDE_BACK = 52;  // ...and sooner behind us, where ground runs out
 
 const SKY_TOP = 0x4e9fd6;
 const SKY_MID = 0xa9d8f2;
@@ -64,8 +82,19 @@ function mulberry32(seed) {
 
 const lerp = (a, b, t) => a + (b - a) * t;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
-const rand = (a, b) => a + Math.random() * (b - a);
-const pick = (arr) => arr[(Math.random() * arr.length) | 0];
+const rand = (a, b) => a + Math.random() * (b - a); // cosmetic only: never track layout
+
+const ORD = ['th', 'st', 'nd', 'rd'];
+/** 1 -> "1st". Used by the live race position readout. */
+function ordinal(n) {
+  const v = n % 100;
+  return `${n}${ORD[(v - 20) % 10] || ORD[v] || ORD[0]}`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, (c) => (
+    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&quot;'));
+}
 
 /**
  * Merge a list of primitive parts into one vertex-coloured BufferGeometry so a
@@ -252,10 +281,11 @@ function buildSky() {
 // ------------------------------------------------------------- sled + rider -
 /**
  * Little red sled with a chibi capybara aboard, built from primitives so the
- * minigame stays independent of the player modules. Modelled facing +Z; the
- * caller flips the inner group so it looks down the hill.
+ * minigame keeps its own chunky silhouette. Modelled facing +Z; the caller
+ * flips the inner group so it looks down the hill. The hat comes from the
+ * shared catalog so a rival's cosmetics read exactly as they do in the world.
  */
-function buildSledRig(bodyColor) {
+function buildSledRig(bodyColor, hatId = 'none') {
   const rig = new THREE.Group();
 
   const red = makeToon(0xd8433f);
@@ -410,7 +440,49 @@ function buildSledRig(bodyColor) {
   tail.position.set(0, 0.42, -0.42);
   bob.add(tail);
 
-  return { rig, sled, rider, bob, head, arms, ears, tails, scarf };
+  // hat: same anchor offset the avatar uses, so every catalog hat fits
+  const hatAnchor = new THREE.Group();
+  hatAnchor.position.set(0, 0.36, 0);
+  head.add(hatAnchor);
+  let spin = null;
+  if (hatId && hatId !== 'none') {
+    const h = buildHat(hatId);
+    if (h) {
+      hatAnchor.add(h);
+      spin = h.getObjectByName?.('spin') || null;
+    }
+  }
+
+  return { rig, sled, rider, bob, head, arms, ears, tails, scarf, hatAnchor, spin };
+}
+
+/**
+ * Pose one rider (ours or a rival's): crouch with speed, lean into the turn,
+ * ears and scarf in the wind. Shared so a rival on the same slope is animated
+ * by exactly the same maths as the player.
+ */
+function poseRider(r, lean, spd, air, time, dt) {
+  const buzz = Math.sin(time * 22) * 0.012 * (0.3 + spd);
+  r.bob.position.y = buzz + (air ? 0.05 : 0);
+  r.bob.rotation.z = lean * 0.42;
+  r.bob.rotation.x = -0.12 * spd + (air ? -0.12 : 0);
+  r.head.rotation.y = lean * 0.4;
+  r.head.rotation.z = -lean * 0.18;
+  for (const a of r.arms) {
+    a.rotation.x = -0.1 + (air ? -0.7 : 0) + buzz * 6;
+    a.rotation.z = lean * 0.25;
+  }
+  for (let i = 0; i < r.ears.length; i++) {
+    r.ears[i].rotation.z = Math.sin(time * 17 + i) * 0.12 * (0.4 + spd) - lean * 0.2;
+  }
+  const flap = 0.55 + spd * 0.7;
+  for (const t of r.tails) {
+    t.root.rotation.x = -0.35 - flap * 0.5 + Math.sin(time * 13 + t.side) * 0.18;
+    t.root.rotation.y = lean * 0.9 + Math.sin(time * 9 + t.side * 2) * 0.22;
+    t.tip.rotation.x = Math.sin(time * 15 + t.side * 3) * 0.35;
+    t.tip.rotation.y = Math.sin(time * 11 + t.side) * 0.3;
+  }
+  if (r.spin) r.spin.rotation.y += dt * (7 + spd * 26);
 }
 
 // ------------------------------------------------------------------- css ----
@@ -461,10 +533,17 @@ const CSS = `
 .mg-sled-num.go{color:var(--gold);font-size:104px;}
 @keyframes mg-sled-num{from{opacity:0;scale:2.1}18%{opacity:1;scale:1}to{opacity:0;scale:.72}}
 
+/* The card host spans the whole screen so cards can centre themselves, which
+   means it MUST stay click-through while empty: it sits above the quit button
+   and used to swallow every press on it. */
+.mg-sled-cards{position:absolute;inset:0;z-index:4;pointer-events:none;}
+/* margin:auto instead of justify-content:center so a tall card (race
+   leaderboard on a short window) scrolls instead of hiding its buttons */
 .mg-sled-card{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
-  justify-content:center;gap:13px;padding:22px;text-align:center;
+  gap:13px;padding:22px;text-align:center;pointer-events:auto;overflow-y:auto;
   background:linear-gradient(180deg,rgba(20,32,44,.34),rgba(20,32,44,.72));}
-.mg-sled-card.out{animation:mg-sled-out .28s ease forwards;}
+.mg-sled-card>*{margin:auto 0;}
+.mg-sled-card.out{animation:mg-sled-out .28s ease forwards;pointer-events:none;}
 @keyframes mg-sled-out{to{opacity:0;scale:1.05;pointer-events:none}}
 .mg-sled-box{background:var(--cream);border-radius:28px;padding:26px 32px;width:min(470px,92vw);
   box-shadow:var(--shadow);animation:mg-sled-in .3s ease;}
@@ -501,17 +580,53 @@ const CSS = `
   animation:mg-sled-tag .8s ease-in-out infinite;}
 @keyframes mg-sled-tag{50%{scale:1.12}}
 
-.mg-sled-quit{position:absolute;right:16px;bottom:16px;background:rgba(255,253,246,.9);border:0;
-  font-family:var(--font);font-weight:800;font-size:13px;padding:9px 16px;border-radius:999px;
-  cursor:pointer;box-shadow:var(--shadow);transition:scale .12s ease;}
+/* z-index 6 keeps quit above the card host in every phase: countdown, riding,
+   airborne and the crash tumble. It is the one control that must never miss. */
+.mg-sled-quit{position:absolute;right:16px;bottom:16px;z-index:6;background:rgba(255,253,246,.9);
+  border:0;font-family:var(--font);font-weight:800;font-size:13px;padding:9px 16px;
+  border-radius:999px;cursor:pointer;box-shadow:var(--shadow);transition:scale .12s ease;}
 .mg-sled-quit:hover{scale:1.07;}
+.mg-sled-quit b{font-weight:900;opacity:.5;margin-left:6px;font-size:11px;}
 .mg-sled-tip{position:absolute;left:50%;bottom:18px;translate:-50% 0;background:rgba(45,36,23,.7);
   color:#fff;font-size:12.5px;font-weight:700;padding:7px 16px;border-radius:999px;
   transition:opacity .6s ease;}
+
+/* ---- race: rival name tags, live standing, results leaderboard ---- */
+.mg-sled-tags{position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden;}
+.mg-sled-ntag{position:absolute;left:0;top:0;translate:-50% -100%;display:none;align-items:center;
+  gap:6px;background:rgba(255,253,246,.92);border-radius:999px;padding:3px 10px 3px 5px;
+  font-size:12px;font-weight:800;white-space:nowrap;box-shadow:0 3px 10px rgba(26,52,78,.28);}
+.mg-sled-ntag.on{display:flex;}
+.mg-sled-ntag i{width:13px;height:13px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
+.mg-sled-ntag u{text-decoration:none;font-size:10.5px;color:#8a7a5a;font-weight:900;}
+.mg-sled-race{top:118px;left:16px;min-width:150px;display:none;}
+.mg-sled-race.on{display:block;}
+.mg-sled-place{font-size:23px;line-height:1.05;color:var(--accent);}
+.mg-sled-place span{font-size:12px;color:#9b8a6c;margin-left:4px;}
+.mg-sled-gaps{margin-top:6px;display:flex;flex-direction:column;gap:3px;}
+.mg-sled-gap{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:800;color:#5c5140;}
+.mg-sled-gap i{width:10px;height:10px;border-radius:99px;flex:none;}
+.mg-sled-gap b{margin-left:auto;font-size:11.5px;}
+.mg-sled-gap b.up{color:#3f8f4f;} .mg-sled-gap b.dn{color:#c95c5c;}
+.mg-sled-board{margin:14px 0 4px;display:flex;flex-direction:column;gap:6px;}
+.mg-sled-brow{display:flex;align-items:center;gap:9px;background:var(--card);border-radius:12px;
+  padding:8px 13px;font-weight:800;font-size:14px;}
+.mg-sled-brow .n{width:22px;color:#9b8a6c;font-size:12px;}
+.mg-sled-brow .s{margin-left:auto;font-size:15px;}
+.mg-sled-brow.win{background:var(--gold);}
+.mg-sled-brow.me{outline:3px solid var(--accent);outline-offset:-3px;}
+.mg-sled-crown{width:19px;height:16px;fill:#a5700f;}
+.mg-sled-wait{margin:14px 0 2px;font-size:13px;font-weight:800;color:#8a7a5a;
+  animation:mg-sled-blink 1.5s ease-in-out infinite;}
+.mg-sled-vs{display:flex;flex-direction:column;gap:6px;margin:14px 0 6px;}
+.mg-sled-vsrow{display:flex;align-items:center;gap:9px;background:var(--card);border-radius:12px;
+  padding:7px 13px;font-weight:800;font-size:13.5px;}
+.mg-sled-vsrow i{width:15px;height:15px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
 `;
 
 const HEART = '<svg class="mg-sled-heart" viewBox="0 0 24 22"><path d="M12 20.8S1.6 14 1.6 7.5C1.6 4 4.4 1.4 7.5 1.4c1.9 0 3.6 1 4.5 2.5.9-1.5 2.6-2.5 4.5-2.5 3.1 0 5.9 2.6 5.9 6.1 0 6.5-10.4 13.3-10.4 13.3z"/></svg>';
 const COIN_ICO = '<svg class="mg-sled-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="#e0952f"/><circle cx="12" cy="12" r="7.4" fill="#f2b64a"/><circle cx="12" cy="12" r="3.6" fill="#ffd77a"/></svg>';
+const CROWN = '<svg class="mg-sled-crown" viewBox="0 0 24 20"><path d="M2 6l4.6 3.6L12 2l5.4 7.6L22 6l-2 12H4L2 6z"/></svg>';
 
 // ================================================================== game ====
 export class SledGame extends Minigame {
@@ -526,23 +641,75 @@ export class SledGame extends Minigame {
     this.disposed = false;
     this.geos = [];        // geometries we own outside the scene graph churn
     this.listeners = [];
+    this.subs = [];        // game.events unsubscribers (race wiring)
     this.props = [];
     this.parts = [];       // live particles
     this.keys = new Set();
+    this.race = null;      // set when game.__raceCtx handed us a race
+    this.ctxRef = null;
+    this.boardEl = null;
+    this.boardSfx = false;
+    this.seed = 0;
+    this.rngTrack = mulberry32(1);
+    this.trackStart = 0;
+    this.vw = 1;
+    this.vh = 1;
   }
 
   // -------------------------------------------------------------- lifecycle -
   mount(root) {
     super.mount(root);
+    this.race = this._readRaceCtx();
     this._buildDom(root);
     this._buildScene();
-    this._resetWorld();
+    this._resetWorld(this.race ? this.race.seed : null);
     this._bindInput();
+    this._bindRace();
     this._last = performance.now();
     this.raf = requestAnimationFrame(this._tick);
   }
 
   coinsForScore(score) { return Math.round(score / 20); }
+
+  /**
+   * Read the race handshake the peak room parked on the game object. Anything
+   * malformed (no seed, no roster, we are the only entry) degrades to a solo
+   * run rather than breaking the minigame.
+   */
+  _readRaceCtx() {
+    const ctx = this.game.__raceCtx;
+    this.ctxRef = ctx || null; // only ever clear the handshake we consumed
+    if (!ctx || !Array.isArray(ctx.players) || !Number.isFinite(ctx.seed)) return null;
+    const selfId = this.game.net?.selfId ?? null;
+    let others = ctx.players.filter((p) => p && typeof p === 'object');
+    if (selfId != null) {
+      others = others.filter((p) => p.id !== selfId);
+    } else {
+      // no socket id yet: drop the entry that looks like us so we do not race a ghost
+      const me = others.findIndex((p) => p.name === this.game.state.name);
+      if (me >= 0) others.splice(me, 1);
+    }
+    others = others.slice(0, 4);
+    if (!others.length) return null;
+    return {
+      seed: ctx.seed >>> 0,
+      selfId,
+      rivals: others.map((p, i) => ({
+        id: p.id ?? `rival${i}`,
+        name: String(p.name || 'Capy').slice(0, 16),
+        color: Number.isFinite(p.color) ? p.color : 0xb08a5a,
+        hat: typeof p.hat === 'string' ? p.hat : 'none',
+        d: 0, x: 0, done: false, vd: 0, lastD: 0, lastT: 0,
+        dSm: 0, xSm: 0, xPrev: 0, lean: 0, seen: false,
+        root: null, face: null, rig: null, tag: null,
+      })),
+      standings: null,
+      doneSent: false,
+      sendAcc: 0,
+      intro: 0,
+      ended: false,
+    };
+  }
 
   // ------------------------------------------------------------------- dom -
   _buildDom(root) {
@@ -578,6 +745,11 @@ export class SledGame extends Minigame {
       </div>
       <div class="mg-sled-panel mg-sled-tc" data-f="hearts"></div>
       <div class="mg-sled-panel mg-sled-tr" data-f="coinbox">${COIN_ICO}<b data-f="coins">0</b></div>
+      <div class="mg-sled-panel mg-sled-race" data-f="race">
+        <div class="mg-sled-lbl">Position</div>
+        <div class="mg-sled-place"><b data-f="place">1st</b><span data-f="of">of 3</span></div>
+        <div class="mg-sled-gaps" data-f="gaps"></div>
+      </div>
       <div class="mg-sled-pops" data-f="pops"></div>`;
     wrap.appendChild(hud);
     this.hud = hud;
@@ -585,6 +757,24 @@ export class SledGame extends Minigame {
     hud.querySelectorAll('[data-f]').forEach((el) => { this.f[el.dataset.f] = el; });
     this.f.hearts.innerHTML = HEART + HEART + HEART;
     this.heartEls = [...this.f.hearts.querySelectorAll('.mg-sled-heart')];
+
+    // world-anchored rival name tags (DOM over WebGL, house style)
+    const tags = document.createElement('div');
+    tags.className = 'mg-sled-tags';
+    wrap.appendChild(tags);
+    this.tagHost = tags;
+    if (this.race) {
+      this.f.race.classList.add('on');
+      for (const r of this.race.rivals) {
+        const el = document.createElement('div');
+        el.className = 'mg-sled-ntag';
+        el.innerHTML = `<i style="background:#${(r.color >>> 0).toString(16).padStart(6, '0')}"></i>`
+          + `<span>${esc(r.name)}</span><u data-f="gap"></u>`;
+        tags.appendChild(el);
+        r.tag = el;
+        r.tagGap = el.querySelector('[data-f="gap"]');
+      }
+    }
 
     const tip = document.createElement('div');
     tip.className = 'mg-sled-tip';
@@ -600,13 +790,21 @@ export class SledGame extends Minigame {
 
     const quit = document.createElement('button');
     quit.className = 'mg-sled-quit';
-    quit.textContent = 'Quit run';
-    quit.onclick = () => { this.game.audio?.play?.('click'); this.quit(); };
+    quit.type = 'button';
+    quit.innerHTML = 'Quit run<b>ESC</b>';
+    // pointerdown, not click: a crash tumble or a stray pointer capture must
+    // never be able to eat the press between down and up
+    this._on(quit, 'pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.game.audio?.play?.('click');
+      this.quit();
+    });
     wrap.appendChild(quit);
     this.quitBtn = quit;
 
     this.cardHost = document.createElement('div');
-    this.cardHost.style.cssText = 'position:absolute;inset:0;';
+    this.cardHost.className = 'mg-sled-cards';
     wrap.appendChild(this.cardHost);
 
     this._showSplash();
@@ -614,17 +812,29 @@ export class SledGame extends Minigame {
 
   _showSplash() {
     const best = this.game.state.bests?.sled || 0;
+    const race = this.race;
+    const roster = race ? `
+        <div class="mg-sled-vs">
+          <div class="mg-sled-vsrow"><i style="background:#${
+  ((this.game.state.color ?? 0xb08a5a) >>> 0).toString(16).padStart(6, '0')}"></i>
+            <span>${esc(this.game.state.name)}</span><b style="margin-left:auto">you</b></div>
+          ${race.rivals.map((r) => `<div class="mg-sled-vsrow"><i style="background:#${
+  (r.color >>> 0).toString(16).padStart(6, '0')}"></i><span>${esc(r.name)}</span></div>`).join('')}
+        </div>` : '';
     const card = document.createElement('div');
     card.className = 'mg-sled-card';
     card.innerHTML = `
       <div class="mg-sled-box">
-        <div class="mg-sled-title">Summit Sprint</div>
-        <div class="mg-sled-sub">Point the sled downhill and do not look back</div>
+        <div class="mg-sled-title">${race ? 'Race time' : 'Summit Sprint'}</div>
+        <div class="mg-sled-sub">${race
+    ? `Same slope, same snow, ${race.rivals.length + 1} sleds. Furthest run wins.`
+    : 'Point the sled downhill and do not look back'}</div>
         <div class="mg-sled-keys">
           <span class="mg-sled-key">A</span><span class="mg-sled-key">D</span>
           <span class="mg-sled-key">&#8592;</span><span class="mg-sled-key">&#8594;</span>
           <span class="mg-sled-key">mouse</span><span class="mg-sled-key">space = hop</span>
         </div>
+        ${roster || `
         <div class="mg-sled-rules">
           <div class="mg-sled-rule"><span class="mg-sled-dot" style="background:#f2b64a"></span>
             Snowcoins are worth 10 points each.</div>
@@ -634,20 +844,22 @@ export class SledGame extends Minigame {
             Kickers send you flying. Longer air, bigger bonus.</div>
           <div class="mg-sled-rule"><span class="mg-sled-dot" style="background:#367a48"></span>
             Pines, rocks and ice cost a heart. You have three.</div>
-        </div>
+        </div>`}
         <div class="mg-sled-best">Best run: <b>${best.toLocaleString()}</b></div>
         <div class="mg-sled-btns">
-          <button class="mg-sled-btn" data-a="play">Drop in</button>
-          <button class="mg-sled-btn ghost" data-a="back">Back to the peak</button>
+          ${race ? '' : '<button class="mg-sled-btn" data-a="play">Drop in</button>'}
+          <button class="mg-sled-btn ghost" data-a="back">${
+  race ? 'Bail out' : 'Back to the peak'}</button>
         </div>
-        <div class="mg-sled-blink">or press any key</div>
+        <div class="mg-sled-blink">${race ? 'the gate drops in a moment' : 'or press any key'}</div>
       </div>`;
     this.cardHost.appendChild(card);
     this.card = card;
-    card.querySelector('[data-a="play"]').onclick = () => this._beginCountdown();
+    const play = card.querySelector('[data-a="play"]');
+    if (play) play.onclick = () => this._beginCountdown();
     card.querySelector('[data-a="back"]').onclick = () => {
       this.game.audio?.play?.('click');
-      this.exitToRoom();
+      this.quit();
     };
   }
 
@@ -709,13 +921,15 @@ export class SledGame extends Minigame {
     this.sky = buildSky();
     scene.add(this.sky);
 
+    // MeshToonMaterial has no flatShading flag (three warns and ignores it);
+    // the chunky facets come from the geometry's own normals instead.
     const mg = mountainsGeo();
-    this.mountains = new THREE.Mesh(mg, makeToon(0xffffff, { vertexColors: true, flatShading: true }));
+    this.mountains = new THREE.Mesh(mg, makeToon(0xffffff, { vertexColors: true }));
     this.mountains.frustumCulled = false;
     scene.add(this.mountains);
 
     // ---- ground segments --------------------------------------------------
-    const groundMat = makeToon(0xffffff, { vertexColors: true, flatShading: true });
+    const groundMat = makeToon(0xffffff, { vertexColors: true });
     this.segs = [];
     for (let i = 0; i < SEG_COUNT; i++) {
       const geo = this._segGeo();
@@ -726,7 +940,7 @@ export class SledGame extends Minigame {
     }
 
     // ---- instanced prop pools --------------------------------------------
-    const vcToon = makeToon(0xffffff, { vertexColors: true, flatShading: true });
+    const vcToon = makeToon(0xffffff, { vertexColors: true });
     const vcGlow = makeGlow(0xffffff, { unique: true });
     vcGlow.vertexColors = true;
     this.glowMat = vcGlow;
@@ -804,7 +1018,7 @@ export class SledGame extends Minigame {
     this.rigFace.rotation.y = Math.PI;
     this.rigRoot.add(this.rigFace);
     scene.add(this.rigRoot);
-    this.rig = buildSledRig(this.game.state.color ?? 0xb08a5a);
+    this.rig = buildSledRig(this.game.state.color ?? 0xb08a5a, this.game.state.hat ?? 'none');
     this.rigFace.add(this.rig.rig);
 
     this.shadow = new THREE.Mesh(
@@ -813,6 +1027,37 @@ export class SledGame extends Minigame {
     );
     this.shadow.rotation.x = -Math.PI / 2;
     scene.add(this.shadow);
+
+    this.vw = w;
+    this.vh = h;
+    this._buildRivals();
+  }
+
+  /** One sled rig per rival, hidden until their first race-state lands. */
+  _buildRivals() {
+    if (!this.race) return;
+    for (const r of this.race.rivals) {
+      const root = new THREE.Group();          // world position only
+      const tilt = new THREE.Group();          // lean + slope pitch
+      const face = new THREE.Group();          // model faces downhill
+      face.rotation.y = Math.PI;
+      tilt.add(face);
+      root.add(tilt);
+      const rig = buildSledRig(r.color, r.hat);
+      face.add(rig.rig);
+      const blob = new THREE.Mesh(
+        new THREE.CircleGeometry(0.92, 14),
+        new THREE.MeshBasicMaterial({ color: 0x2c4a68, transparent: true, opacity: 0.2, depthWrite: false }),
+      );
+      blob.rotation.x = -Math.PI / 2;
+      blob.position.y = 0.06;
+      root.add(blob);
+      root.visible = false;
+      this.scene.add(root);
+      r.root = root;
+      r.tilt = tilt;
+      r.rig = rig;
+    }
   }
 
   _segGeo() {
@@ -883,9 +1128,21 @@ export class SledGame extends Minigame {
 
     this._on(window, 'keydown', (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // Escape bails out of any phase: splash, countdown, riding, airborne and
+      // the crash tumble. Checked first so it never doubles as "any key".
+      if (e.key === 'Escape' || e.key === 'Esc') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.game.audio?.play?.('click');
+        this.quit();
+        return;
+      }
       // Swallow our control keys before the world hotkeys (D = dance) see them.
       if (STEER.includes(e.key)) { e.preventDefault(); e.stopPropagation(); }
-      if (this.phase === 'splash' && !e.repeat) { this._beginCountdown(); return; }
+      if (this.phase === 'splash' && !e.repeat) {
+        if (!this.race) this._beginCountdown(); // a race starts on its own clock
+        return;
+      }
       this.keys.add(e.key);
       this.mouseSteer = false;
       if ((e.key === ' ' || e.key === 'Spacebar') && !e.repeat) this._hop();
@@ -905,7 +1162,10 @@ export class SledGame extends Minigame {
 
     this._on(this.wrap, 'pointerdown', (e) => {
       if (e.target !== this.renderer.domElement) return;
-      if (this.phase === 'splash') { this._beginCountdown(); return; }
+      if (this.phase === 'splash') {
+        if (!this.race) this._beginCountdown();
+        return;
+      }
       this._hop();
     });
 
@@ -916,16 +1176,219 @@ export class SledGame extends Minigame {
     if (!this.renderer) return;
     const w = this.wrap.clientWidth || innerWidth;
     const h = this.wrap.clientHeight || innerHeight;
+    this.vw = w;
+    this.vh = h;
     this.renderer.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   }
 
+  // ------------------------------------------------------------------ race -
+  _bindRace() {
+    if (!this.race) return;
+    const ev = this.game.events;
+    if (!ev?.on) return;
+    this.subs.push(ev.on('race-state', (m) => this._onRaceState(m)));
+    this.subs.push(ev.on('race-end', (m) => this._onRaceEnd(m)));
+  }
+
+  /** {t:'race-state', players:[{id,d,x,done}]} (the client may hand us either
+   *  the whole frame or just the array). ~5Hz; we smooth between packets. */
+  _onRaceState(m) {
+    if (!this.race || this.disposed) return;
+    const list = Array.isArray(m) ? m : m?.players;
+    if (!Array.isArray(list)) return;
+    const now = this.time;
+    for (const s of list) {
+      if (!s || s.id === this.race.selfId) continue;
+      const r = this.race.rivals.find((q) => q.id === s.id);
+      if (!r) continue;
+      const d = Number(s.d);
+      if (!Number.isFinite(d)) continue;
+      const gap = clamp(now - r.lastT, 0.05, 1);
+      r.vd = r.seen ? clamp((d - r.lastD) / gap, 0, 70) : 0;
+      r.lastD = d;
+      r.lastT = now;
+      r.d = d;
+      if (Number.isFinite(s.x)) r.x = clamp(s.x, -CLAMP_X, CLAMP_X);
+      r.done = !!s.done;
+      if (r.done) r.vd = 0;
+      if (!r.seen) { r.seen = true; r.dSm = d; r.xSm = r.x; r.xPrev = r.x; }
+    }
+  }
+
+  /** {t:'race-end', standings:[{id,name,score}]}: freeze the board, and if we
+   *  are somehow still riding (server timeout) wrap our run up too. */
+  _onRaceEnd(m) {
+    if (!this.race || this.disposed) return;
+    const st = Array.isArray(m) ? m : m?.standings;
+    if (!Array.isArray(st)) return;
+    this.race.standings = st.filter((s) => s && typeof s === 'object');
+    this.race.ended = true;
+    if (this.phase === 'results') this._renderBoard();
+    else if (this.phase !== 'splash') this._showResults();
+  }
+
+  _sendRaceProgress(dt) {
+    const race = this.race;
+    if (!race || this.phase !== 'run') return;
+    race.sendAcc += dt;
+    if (race.sendAcc < 1 / RACE_SEND_HZ) return;
+    race.sendAcc = 0;
+    this.game.net?.send?.({
+      t: 'race-progress',
+      d: +this.dist.toFixed(2),
+      x: +this.sledX.toFixed(2),
+    });
+  }
+
+  _sendRaceDone(score) {
+    const race = this.race;
+    if (!race || race.doneSent) return;
+    race.doneSent = true;
+    this.game.net?.send?.({ t: 'race-done', score: Math.max(0, Math.round(score) || 0) });
+  }
+
+  /** Live standing: how many rivals are further down the mountain than us. */
+  _racePlace() {
+    let ahead = 0;
+    for (const r of this.race.rivals) if (r.d > this.dist + 0.4) ahead++;
+    return ahead + 1;
+  }
+
+  /**
+   * Rivals share our track, so their world z is simply the distance we have on
+   * them: ahead of us is up-slope (negative z), behind is down-slope.
+   */
+  _updateRivals(dt) {
+    const race = this.race;
+    if (!race) return;
+    // the camera moved this frame; refresh its inverse so the DOM name tags do
+    // not trail the sleds they belong to
+    this.camera.updateMatrixWorld();
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+    const k = Math.min(1, dt * 6);
+    const kx = Math.min(1, dt * 8);
+    for (const r of race.rivals) {
+      const root = r.root;
+      if (!root) continue;
+      if (!r.seen) { root.visible = false; r.tag.classList.remove('on'); continue; }
+      if (!r.done && this.phase === 'run') r.d += r.vd * dt; // extrapolate between packets
+      r.dSm = lerp(r.dSm, r.d, k);
+      r.xPrev = r.xSm;
+      r.xSm = lerp(r.xSm, r.x, kx);
+
+      // anchor to the scrolling world, not to our frozen distance: during the
+      // crash tumble `dist` stops but the mountain keeps sliding past
+      const z = (this.travel - this.runOrigin) - r.dSm;
+      const vis = z > -RIVAL_HIDE && z < RIVAL_HIDE_BACK;
+      root.visible = vis;
+      if (!vis) { r.tag.classList.remove('on'); continue; }
+
+      const s = this.travel - z;
+      const gy = heightAt(r.xSm, s);
+      root.position.set(r.xSm, gy, z);
+
+      const vx = dt > 0 ? (r.xSm - r.xPrev) / dt : 0;
+      r.lean = lerp(r.lean, clamp(vx / STEER_MAX, -1, 1), Math.min(1, dt * 7));
+      const ahead = heightAt(r.xSm, s + 2.5);
+      const behind = heightAt(r.xSm, s - 2.5);
+      r.tilt.rotation.z = -r.lean * 0.55;
+      r.tilt.rotation.y = -r.lean * 0.22;
+      r.tilt.rotation.x = ((ahead - behind) / 5) * 0.9;
+      poseRider(r.rig, r.lean, r.done ? 0.2 : 0.72, false, this.time + r.dSm * 0.01, dt);
+
+      this._placeTag(r, z, gy);
+    }
+    this._refreshRaceHud();
+  }
+
+  /** Project a rival to screen space and park their DOM name tag over them. */
+  _placeTag(r, z, gy) {
+    _v.set(r.xSm, gy + 2.5, z).project(this.camera);
+    if (_v.z > 1 || Math.abs(_v.x) > 1.35 || Math.abs(_v.y) > 1.35) {
+      r.tag.classList.remove('on');
+      return;
+    }
+    const gap = Math.round((r.d - this.dist) * DIST_SCALE);
+    r.tag.classList.add('on');
+    r.tag.style.left = `${(_v.x * 0.5 + 0.5) * this.vw}px`;
+    r.tag.style.top = `${(-_v.y * 0.5 + 0.5) * this.vh}px`;
+    if (r.tagGapV !== gap) {
+      r.tagGapV = gap;
+      r.tagGap.textContent = gap > 0 ? `+${gap}m` : gap < 0 ? `${gap}m` : 'level';
+    }
+  }
+
+  _refreshRaceHud() {
+    const race = this.race;
+    if (!race || this.phase === 'splash') return;
+    const c = this._hudCache || (this._hudCache = {});
+    // frozen once we are out of the race, so the results screen keeps the
+    // standing we actually finished with
+    const live = this.phase === 'run' || this.phase === 'countdown';
+    const place = live ? this._racePlace() : (c.place || 1);
+    const total = race.rivals.length + 1;
+    if (place !== c.place || total !== c.total) {
+      c.place = place;
+      c.total = total;
+      this.f.place.textContent = ordinal(place);
+      this.f.of.textContent = ` of ${total}`;
+    }
+    const sorted = [...race.rivals].sort((a, b) => b.d - a.d);
+    let sig = '';
+    for (const r of sorted) sig += `${r.id}:${Math.round((r.d - this.dist) * DIST_SCALE)}|`;
+    if (sig === c.gaps) return;
+    c.gaps = sig;
+    this.f.gaps.innerHTML = sorted.map((r) => {
+      const g = Math.round((r.d - this.dist) * DIST_SCALE);
+      const cls = g > 0 ? 'up' : g < 0 ? 'dn' : '';
+      const txt = r.done ? 'done' : g > 0 ? `+${g}m` : `${g}m`;
+      return `<div class="mg-sled-gap"><i style="background:#${
+        (r.color >>> 0).toString(16).padStart(6, '0')}"></i>`
+        + `<span>${esc(r.name)}</span><b class="${cls}">${txt}</b></div>`;
+    }).join('');
+  }
+
+  /** Drop out of race mode but keep sledding (results screen "Sled again"). */
+  _leaveRace() {
+    const race = this.race;
+    if (!race) return;
+    for (const off of this.subs) { try { off(); } catch {} }
+    this.subs.length = 0;
+    for (const r of race.rivals) {
+      if (r.root) {
+        this.scene?.remove(r.root);
+        disposeObject(r.root);
+      }
+      r.tag?.remove();
+      r.root = null;
+      r.rig = null;
+    }
+    this.race = null;
+    this._clearCtx();
+    this.f.race.classList.remove('on');
+  }
+
+  /** Drop the handshake we consumed, without stomping a newer one. */
+  _clearCtx() {
+    if (this.ctxRef && this.game.__raceCtx === this.ctxRef) this.game.__raceCtx = null;
+    this.ctxRef = null;
+  }
+
   // ------------------------------------------------------------ run control -
-  _resetWorld() {
+  /**
+   * @param {number|null} seed track seed; solo runs roll a fresh one from the
+   * clock, a race uses the seed the server dealt so everyone rides one track.
+   */
+  _resetWorld(seed = null) {
+    this.seed = (Number.isFinite(seed) ? seed : Date.now()) >>> 0;
+    this.rngTrack = mulberry32(this.seed);
+    this.trackStart = 0;
     this.travel = 0;
     this.prevTravel = 0;
     this.dist = 0;
+    this.runOrigin = 0;
     this.speed = 5;
     this.runTime = 0;
     this.sledX = 0;
@@ -974,6 +1437,9 @@ export class SledGame extends Minigame {
     this.countT = 0;
     this.countStep = -1;
     this.spawnS = this.travel + 78; // hazards stream in as the flag drops
+    // the gate: every seeded chunk measures its difficulty from here, so the
+    // layout is identical for anyone riding this seed
+    this.trackStart = this.spawnS;
     this.hud.classList.add('on');
     this.tip.style.opacity = '1';
     this._done = false; // each replay reports its own run
@@ -983,6 +1449,7 @@ export class SledGame extends Minigame {
     this.phase = 'run';
     this.runTime = 0;
     this.dist = 0;
+    this.runOrigin = this.travel; // track position that rival distances measure from
     this.game.audio?.play?.('whoosh');
   }
 
@@ -995,6 +1462,11 @@ export class SledGame extends Minigame {
   }
 
   // ----------------------------------------------------------- prop spawning -
+  /**
+   * `rot` is the yaw. Trees, rocks and moguls take a random one (they read as
+   * scattered nature); anything directional (ramps) passes rot: 0 and an
+   * explicit rotX so it always faces the incoming sled.
+   */
   _addProp(type, s, x, opts = {}) {
     const h = opts.h || 0;
     this.props.push({
@@ -1004,6 +1476,7 @@ export class SledGame extends Minigame {
       h,
       y: heightAt(x, s) + h,
       rot: opts.rot ?? Math.random() * Math.PI * 2,
+      rotX: opts.rotX ?? 0,
       sc: opts.sc ?? 1,
       phase: Math.random() * 6.283,
       taken: false,
@@ -1011,16 +1484,27 @@ export class SledGame extends Minigame {
     });
   }
 
-  get difficulty() { return clamp(this.runTime / 78, 0, 1); }
+  // ---- seeded draws: every call below shapes the TRACK, so it must come off
+  // the seeded stream and never off Math.random.
+  _rnd() { return this.rngTrack(); }
+  _rand(a, b) { return a + this.rngTrack() * (b - a); }
+  _pick(arr) { return arr[(this.rngTrack() * arr.length) | 0]; }
+
+  /**
+   * Hazard density as a function of DISTANCE down the track, not of elapsed
+   * time: two racers who reach the same gate at different moments must still
+   * meet the same wall of pines.
+   */
+  _diffAt(s) { return clamp((s - this.trackStart) / DIFF_RAMP, 0, 1); }
 
   _spawnAhead() {
     const horizon = this.travel + VIEW_AHEAD;
-    const d = this.difficulty;
 
     // The splash sits on a clean groomed run: scenery only, no hazards.
     while (this.phase !== 'splash' && this.spawnS < horizon) {
+      const d = this._diffAt(this.spawnS);
       this._spawnChunk(this.spawnS, d);
-      this.spawnS += lerp(32, 17, d) * rand(0.85, 1.15);
+      this.spawnS += lerp(32, 17, d) * this._rand(0.85, 1.15);
     }
     while (this.flagS < horizon) {
       const key = ((this.flagS / 34) | 0) % 2 === 0 ? 'flagA' : 'flagB';
@@ -1028,6 +1512,9 @@ export class SledGame extends Minigame {
       this._addProp(key, this.flagS, 10.4, { rot: Math.PI - 0.35, deco: true });
       this.flagS += 34;
     }
+    // Backdrop pines live outside the play corridor and hit nothing, so they
+    // stay on Math.random: keeping them off the seeded stream means a race can
+    // never desync just because two clients dressed the treeline differently.
     while (this.sceneS < horizon) {
       const n = 2 + ((Math.random() * 2) | 0);
       for (let i = 0; i < n; i++) {
@@ -1040,56 +1527,66 @@ export class SledGame extends Minigame {
   }
 
   _spawnChunk(s, d) {
-    const r = Math.random();
+    const r = this._rnd();
     if (r < 0.36 + d * 0.10) this._spawnObstacles(s, d);
     else if (r < 0.61) this._spawnCoins(s, d);
     else if (r < 0.78) this._spawnRamp(s);
-    else if (r < 0.87) this._addProp('boost', s, pick([-7.5, -3.8, 0, 3.8, 7.5]));
+    else if (r < 0.87) this._addProp('boost', s, this._pick([-7.5, -3.8, 0, 3.8, 7.5]));
     else { this._spawnObstacles(s, d * 0.5); this._spawnCoins(s + 14, d); }
   }
 
   _spawnObstacles(s, d) {
     const lanes = [-8.4, -4.2, 0, 4.2, 8.4];
     for (let i = lanes.length - 1; i > 0; i--) {
-      const j = (Math.random() * (i + 1)) | 0;
+      const j = (this._rnd() * (i + 1)) | 0;
       [lanes[i], lanes[j]] = [lanes[j], lanes[i]];
     }
-    const n = Math.min(3, 1 + ((Math.random() * (0.7 + d * 2.4)) | 0));
+    const n = Math.min(3, 1 + ((this._rnd() * (0.7 + d * 2.4)) | 0));
     for (let i = 0; i < n; i++) {
-      const roll = Math.random();
+      const roll = this._rnd();
       const type = roll < 0.42 ? 'pine' : roll < 0.75 ? 'rock' : 'bump';
-      this._addProp(type, s + rand(-5, 5), clamp(lanes[i] + rand(-0.9, 0.9), -PLAY_HALF, PLAY_HALF), {
-        sc: type === 'pine' ? rand(0.85, 1.15) : rand(0.85, 1.25),
-      });
+      this._addProp(type, s + this._rand(-5, 5),
+        clamp(lanes[i] + this._rand(-0.9, 0.9), -PLAY_HALF, PLAY_HALF), {
+          sc: type === 'pine' ? this._rand(0.85, 1.15) : this._rand(0.85, 1.25),
+        });
     }
   }
 
   _spawnCoins(s, d) {
-    const style = Math.random();
+    const style = this._rnd();
     if (style < 0.4) {
-      const x = clamp(rand(-7.5, 7.5), -PLAY_HALF, PLAY_HALF);
+      const x = clamp(this._rand(-7.5, 7.5), -PLAY_HALF, PLAY_HALF);
       for (let i = 0; i < 5; i++) this._addProp('coin', s + i * 3.4, x, { h: 1.0 });
     } else if (style < 0.78) {
-      const x0 = rand(-6, 6);
-      const amp = rand(3, 5.5) * (Math.random() < 0.5 ? -1 : 1);
+      const x0 = this._rand(-6, 6);
+      const amp = this._rand(3, 5.5) * (this._rnd() < 0.5 ? -1 : 1);
       for (let i = 0; i < 7; i++) {
         const t = i / 6;
         this._addProp('coin', s + i * 3.2, clamp(x0 + Math.sin(t * Math.PI) * amp, -PLAY_HALF, PLAY_HALF), { h: 1.0 });
       }
     } else {
-      const x = clamp(rand(-6, 6), -PLAY_HALF, PLAY_HALF);
+      const x = clamp(this._rand(-6, 6), -PLAY_HALF, PLAY_HALF);
       for (let i = 0; i < 4; i++) {
         for (let k = -1; k <= 1; k += 2) {
           this._addProp('coin', s + i * 3.4, clamp(x + k * 1.5, -PLAY_HALF, PLAY_HALF), { h: 1.0 });
         }
       }
     }
-    if (d > 0.35 && Math.random() < 0.35) this._spawnObstacles(s + 22, d * 0.6);
+    if (d > 0.35 && this._rnd() < 0.35) this._spawnObstacles(s + 22, d * 0.6);
   }
 
+  /**
+   * Kickers are the one directional prop on the hill. The model is authored
+   * with its low mouth at +z and its lip at -z, which is exactly how the sled
+   * meets it (props travel from -z toward the camera), so the yaw is pinned to
+   * 0 instead of being rolled like a tree. The pitch is matched to the slope
+   * under it, so the take-off lip always points down-track and launches the
+   * sled forward rather than into the hillside.
+   */
   _spawnRamp(s) {
-    const x = clamp(rand(-6.5, 6.5), -PLAY_HALF, PLAY_HALF);
-    this._addProp('ramp', s, x);
+    const x = clamp(this._rand(-6.5, 6.5), -PLAY_HALF, PLAY_HALF);
+    const slope = (heightAt(x, s + 2.2) - heightAt(x, s - 2.2)) / 4.4;
+    this._addProp('ramp', s, x, { rot: 0, rotX: Math.atan(slope) });
     // Coin arc traced along the launch parabola so a clean kicker pays out.
     for (let i = 0; i < 6; i++) {
       this._addProp('coin', s + 9 + i * 3.6, x, { h: 1.3 + Math.sin(((i + 0.7) / 6.8) * Math.PI) * 3.9 });
@@ -1171,6 +1668,12 @@ export class SledGame extends Minigame {
 
   _step(dt) {
     // ---- phase timing ----------------------------------------------------
+    if (this.phase === 'splash' && this.race) {
+      // a race drops the gate on its own clock: no key press, no early start,
+      // so all three sleds leave within a frame or two of each other
+      this.race.intro += dt;
+      if (this.race.intro > 1.6) this._beginCountdown();
+    }
     if (this.phase === 'countdown') {
       this.countT += dt;
       const step = Math.floor(this.countT / 0.9);
@@ -1249,8 +1752,10 @@ export class SledGame extends Minigame {
     this._updateParticles(dt);
     this._animateRig(dt);
     this._updateCamera(dt);
+    this._updateRivals(dt);
     this._updateSnowfall(dt);
     this._refreshHud(false);
+    this._sendRaceProgress(dt);
 
     if (this.invuln > 0) {
       this.invuln -= dt;
@@ -1401,6 +1906,7 @@ export class SledGame extends Minigame {
       let y = p.y;
       let rotY = p.rot;
       let sc = p.sc;
+      let rotX = p.rotX;
       if (p.type === 'coin') {
         rotY = this.time * 3.4 + p.phase;
         y = p.y + Math.sin(this.time * 2.4 + p.phase) * 0.09;
@@ -1410,9 +1916,12 @@ export class SledGame extends Minigame {
         sc = p.sc * (1 + Math.sin(this.time * 6 + p.phase) * 0.05);
       } else if (p.type === 'flagA' || p.type === 'flagB') {
         rotY = p.rot + Math.sin(this.time * 5 + p.phase) * 0.28;
+      } else if (p.type === 'ramp') {
+        rotY = 0;                              // never let a kicker face away
+        rotX = p.rotX;                         // lip pitched down-track
       }
 
-      _e.set(0, rotY, 0);
+      _e.set(rotX, rotY, 0);
       _q.setFromEuler(_e);
       _v2.set(p.x, y, z);
       _sc.set(sc, sc, sc);
@@ -1480,28 +1989,8 @@ export class SledGame extends Minigame {
 
     // rider: crouch with speed, lean into the turn, ears and scarf in the wind
     const r = this.rig;
-    const spd = clamp(this.speed / 55, 0, 1);
-    const buzz = Math.sin(this.time * 22) * 0.012 * (0.3 + spd);
-    r.bob.position.y = buzz + (this.airY > 0.05 ? 0.05 : 0);
-    r.bob.rotation.z = lean * 0.42;
-    r.bob.rotation.x = -0.12 * spd + (this.airY > 0.05 ? -0.12 : 0);
-    r.head.rotation.y = lean * 0.4;
-    r.head.rotation.z = -lean * 0.18;
+    poseRider(r, lean, clamp(this.speed / 55, 0, 1), this.airY > 0.05, this.time, dt);
     r.head.rotation.x = clamp(-this.airVY * 0.02, -0.25, 0.25);
-    for (const a of r.arms) {
-      a.rotation.x = -0.1 + (this.airY > 0.05 ? -0.7 : 0) + buzz * 6;
-      a.rotation.z = lean * 0.25;
-    }
-    for (let i = 0; i < r.ears.length; i++) {
-      r.ears[i].rotation.z = Math.sin(this.time * 17 + i) * 0.12 * (0.4 + spd) - lean * 0.2;
-    }
-    const flap = 0.55 + spd * 0.7;
-    for (const t of r.tails) {
-      t.root.rotation.x = -0.35 - flap * 0.5 + Math.sin(this.time * 13 + t.side) * 0.18;
-      t.root.rotation.y = lean * 0.9 + Math.sin(this.time * 9 + t.side * 2) * 0.22;
-      t.tip.rotation.x = Math.sin(this.time * 15 + t.side * 3) * 0.35;
-      t.tip.rotation.y = Math.sin(this.time * 11 + t.side) * 0.3;
-    }
 
     // blob shadow
     this.shadow.position.set(this.sledX, this.groundY + 0.06, 0);
@@ -1573,11 +2062,16 @@ export class SledGame extends Minigame {
   }
 
   // --------------------------------------------------------------- results -
+  _runScore() {
+    return Math.floor(this.dist * DIST_SCALE) + this.coins * 10 + this.airBonus;
+  }
+
   _showResults() {
     if (this.phase === 'results') return;
     this.phase = 'results';
     this.hud.classList.remove('on');
     this.quitBtn.style.display = 'none';
+    for (const r of this.race?.rivals || []) r.tag?.classList.remove('on');
 
     const metres = Math.floor(this.dist * DIST_SCALE);
     const coinPts = this.coins * 10;
@@ -1587,8 +2081,10 @@ export class SledGame extends Minigame {
     const payout = Math.min(this.coinsForScore(score), MINIGAMES.sled.maxCoinsPerRun);
 
     this.finish(score);
+    this._sendRaceDone(score);
     this.game.audio?.play?.(isBest ? 'success' : 'ding');
 
+    const racing = !!this.race;
     const title = score > 2200 ? 'Powder legend'
       : score > 1400 ? 'Clean lines'
         : score > 700 ? 'Nice carve'
@@ -1599,7 +2095,9 @@ export class SledGame extends Minigame {
     card.innerHTML = `
       <div class="mg-sled-box">
         <div class="mg-sled-title">${title}</div>
-        <div class="mg-sled-sub">You wiped out at the bottom of the run</div>
+        <div class="mg-sled-sub">${racing
+    ? 'One slope, one seed. Here is how it shook out.'
+    : 'You wiped out at the bottom of the run'}</div>
         <div class="mg-sled-rows">
           <div class="mg-sled-row"><span>Distance</span><b>${metres.toLocaleString()} m</b></div>
           <div class="mg-sled-row"><span>Snowcoins &times; 10</span><b>${this.coins} &rarr; ${coinPts}</b></div>
@@ -1607,18 +2105,23 @@ export class SledGame extends Minigame {
           <div class="mg-sled-row total"><span>Score</span><b>${score.toLocaleString()}</b></div>
           <div class="mg-sled-row pay"><span>Coins earned</span><b>+${payout}</b></div>
         </div>
+        ${racing ? '<div data-a="board"></div>' : ''}
         <div class="mg-sled-best">Best run: <b>${Math.max(prevBest, score).toLocaleString()}</b>${
   isBest ? '<span class="mg-sled-tag">NEW BEST</span>' : ''}</div>
         <div class="mg-sled-btns">
-          <button class="mg-sled-btn" data-a="again">Play again</button>
+          <button class="mg-sled-btn" data-a="again">${racing ? 'Sled again' : 'Play again'}</button>
           <button class="mg-sled-btn alt" data-a="back">Back to the peak</button>
         </div>
       </div>`;
     this.cardHost.appendChild(card);
     this.card = card;
+    this.boardEl = card.querySelector('[data-a="board"]');
+    if (racing) this._renderBoard();
     card.querySelector('[data-a="again"]').onclick = () => {
       this.game.audio?.play?.('click');
       this._clearCard();
+      this.boardEl = null;
+      this._leaveRace();      // a replay is a solo run: the race is over
       this.phase = 'splash';
       this.quitBtn.style.display = '';
       this._resetWorld();
@@ -1630,7 +2133,45 @@ export class SledGame extends Minigame {
     };
   }
 
+  /** Final standings from the server, winner crowned and our row highlighted. */
+  _renderBoard() {
+    const el = this.boardEl;
+    if (!el || !this.race) return;
+    const st = this.race.standings;
+    if (!st || !st.length) {
+      el.innerHTML = '<div class="mg-sled-wait">waiting for the others to finish...</div>';
+      return;
+    }
+    const selfId = this.race.selfId;
+    const myName = this.game.state.name;
+    const isMe = (s) => (selfId != null ? s.id === selfId : s.name === myName);
+    const rows = [...st].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
+    el.innerHTML = `<div class="mg-sled-board">${rows.map((s, i) => {
+      const me = isMe(s);
+      const cls = `mg-sled-brow${i === 0 ? ' win' : ''}${me ? ' me' : ''}`;
+      return `<div class="${cls}"><span class="n">${ordinal(i + 1)}</span>`
+        + `${i === 0 ? CROWN : ''}<span>${esc(s.name || 'Capy')}${me ? ' (you)' : ''}</span>`
+        + `<span class="s">${(Number(s.score) || 0).toLocaleString()}</span></div>`;
+    }).join('')}</div>`;
+    if (this.boardSfx) return;
+    this.boardSfx = true;
+    const won = rows[0] && isMe(rows[0]);
+    this.game.audio?.play?.(won ? 'success' : 'ding');
+    if (won) this.game.toast?.('You won the sled race!');
+  }
+
   // --------------------------------------------------------------- teardown -
+  /**
+   * Bail out of the run from any phase (quit button, Escape, splash back).
+   * A race gets a final race-done first so the server is not left waiting on a
+   * sled that has already left the mountain.
+   */
+  quit() {
+    if (this.disposed) return;
+    this._sendRaceDone(this.phase === 'splash' ? 0 : this._runScore());
+    super.quit();
+  }
+
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
@@ -1640,6 +2181,12 @@ export class SledGame extends Minigame {
       target.removeEventListener(type, fn, opts);
     }
     this.listeners.length = 0;
+    for (const off of this.subs) { try { off(); } catch {} }
+    this.subs.length = 0;
+    for (const r of this.race?.rivals || []) { r.tag?.remove(); r.root = null; r.rig = null; }
+    this.race = null;
+    this._clearCtx(); // the race is over: never leak into the next run
+    this.boardEl = null;
     this.keys.clear();
 
     if (this.scene) {

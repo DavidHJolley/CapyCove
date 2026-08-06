@@ -1,11 +1,14 @@
 import { ROOM_INFO, GAME_NAME } from '../../shared/constants.js';
 
-/** In-world HUD: coins, room name, chat, emotes, map, mute, shop. */
+/** Chat lines kept for the scrollback card above the chat box. */
+const HISTORY_MAX = 150;
+
+/** In-world HUD: coins, room name, chat, emotes, map, mute, shop, menu. */
 export function initHud(game) {
   const root = document.getElementById('hud-root');
   root.innerHTML = `
     <div class="hud-top-left">
-      <div class="logo-chip">${GAME_NAME}</div>
+      <button class="logo-chip" id="btn-menu" type="button" title="Menu, how to play, sound" aria-haspopup="dialog">${GAME_NAME}</button>
       <div class="room-chip"><span id="room-name">...</span><span id="pop-count"></span></div>
       <div class="net-dot" id="net-dot" role="img" aria-label="Connection status">
         <span class="net-tip" id="net-tip">Paddling out to the cove...</span>
@@ -28,6 +31,11 @@ export function initHud(game) {
       <button class="hud-btn wide" id="btn-map">&#128506; Map</button>
     </div>
     <div class="chat-log" id="chat-log"></div>
+    <div class="chat-history hidden" id="chat-history">
+      <div class="chat-history-head">Chat history<span class="chat-history-hint">Esc to close</span></div>
+      <div class="chat-history-scroll" id="chat-history-scroll"></div>
+      <div class="chat-history-empty" id="chat-history-empty">The cove is quiet. Say hello!</div>
+    </div>
     <div class="toasts" id="toasts"></div>
     <div class="map-overlay hidden" id="map-overlay"></div>
   `;
@@ -84,35 +92,115 @@ export function initHud(game) {
     game.say(text);
     game.engine?.showBubble(game.engine.playerAvatar.group, text.trim().slice(0, 120));
   });
-  game.events.on('chat', ({ name, text, self }) => {
-    const log = $('chat-log');
+
+  // The log at the bottom left only ever shows the last few lines and fades
+  // them out. The full history (last HISTORY_MAX lines) lives in a scrollable
+  // card that takes its place while the chat box has focus.
+  const chatInput = $('chat-input');
+  const historyPanel = $('chat-history');
+  const historyScroll = $('chat-history-scroll');
+  const historyEmpty = $('chat-history-empty');
+  let historyOpen = false;
+  let overHistory = false; // scrolling/selecting inside the card must not close it
+
+  const scrollHistoryDown = () => { historyScroll.scrollTop = historyScroll.scrollHeight; };
+
+  function makeLine(name, text, self) {
     const line = document.createElement('div');
     line.className = `chat-line${self ? ' self' : ''}`;
     const who = document.createElement('b');
     who.textContent = name;
     line.appendChild(who);
     line.appendChild(document.createTextNode(` ${text}`));
+    return line;
+  }
+
+  function openHistory() {
+    if (historyOpen) return;
+    historyOpen = true;
+    historyPanel.classList.remove('hidden');
+    $('chat-log').classList.add('is-tucked');
+    scrollHistoryDown(); // reading scrollHeight flushes layout, so this lands
+  }
+
+  function closeHistory() {
+    if (!historyOpen) return;
+    historyOpen = false;
+    historyPanel.classList.add('hidden');
+    $('chat-log').classList.remove('is-tucked');
+  }
+
+  game.events.on('chat', ({ name, text, self }) => {
+    const log = $('chat-log');
+    const line = makeLine(name, text, self);
     log.appendChild(line);
     while (log.children.length > 6) log.firstChild.remove();
     setTimeout(() => { line.classList.add('fade-out'); setTimeout(() => line.remove(), 900); }, 9000);
+
+    // stay pinned to the newest line unless the player scrolled up to read
+    const atBottom = historyScroll.scrollHeight - historyScroll.scrollTop
+      - historyScroll.clientHeight < 56;
+    const kept = makeLine(name, text, self);
+    kept.classList.add('chat-history-line');
+    historyScroll.appendChild(kept);
+    while (historyScroll.children.length > HISTORY_MAX) historyScroll.firstChild.remove();
+    historyEmpty.classList.add('hidden');
+    if (historyOpen && atBottom) scrollHistoryDown();
+  });
+
+  chatInput.addEventListener('focus', openHistory);
+  chatInput.addEventListener('blur', () => { if (!overHistory) closeHistory(); });
+  historyPanel.addEventListener('pointerenter', () => { overHistory = true; });
+  historyPanel.addEventListener('pointerleave', () => {
+    overHistory = false;
+    if (document.activeElement !== chatInput) closeHistory();
   });
   // don't let game hotkeys eat chat typing
-  $('chat-input').addEventListener('keydown', (e) => e.stopPropagation());
+  chatInput.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      overHistory = false;
+      closeHistory();
+      chatInput.blur();
+    }
+  });
+  // Escape with the pointer parked on the card (input already blurred)
+  addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && historyOpen && document.activeElement !== chatInput) {
+      overHistory = false;
+      closeHistory();
+    }
+  });
+  // a minigame covers the HUD: never leave the card hanging underneath it
+  game.events.on('minigame', (id) => { if (id) { overHistory = false; closeHistory(); } });
 
   // emotes
   $('btn-wave').onclick = () => game.emote('wave');
   $('btn-dance').onclick = () => game.emote('dance');
 
-  // mute
+  // mute (the menu can flip this too, so the icon follows a 'mute' event)
+  const setMuteIcon = (m) => {
+    $('btn-mute').innerHTML = m ? '&#128263;' : '&#128266;';
+    $('btn-mute').setAttribute('aria-pressed', m ? 'true' : 'false');
+  };
+  setMuteIcon(!!game.audio?.muted);
   $('btn-mute').onclick = () => {
     const m = game.audio.toggleMute();
-    $('btn-mute').innerHTML = m ? '&#128263;' : '&#128266;';
+    setMuteIcon(m);
+    game.events.emit('mute', m);
   };
+  game.events.on('mute', (m) => setMuteIcon(!!m));
 
   // shop (loaded on demand, like the plaza hotspot, so it stays out of the entry chunk)
   $('btn-shop').onclick = () => import('./shop.js')
     .then((m) => m.openShop(game))
     .catch((e) => { console.error('[hud] shop failed to load:', e); game.toast('The shop is not answering, try again'); });
+
+  // menu (same on-demand load: pause card, how to play, sound, log out)
+  $('btn-menu').onclick = () => import('./menu.js')
+    .then((m) => m.openMenu(game))
+    .catch((e) => { console.error('[hud] menu failed to load:', e); game.toast('The menu is stuck in the sand, try again'); });
 
   // toasts
   game.events.on('toast', (msg, ms = 2600) => {

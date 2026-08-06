@@ -612,8 +612,10 @@ export class PlazaRoom extends Room {
 
   // --------------------------------------------------------------- lamps --
   _buildLamps(scene) {
+    // The east lamp sits at z 5.1, not 4.2: the walk line from spawn (0,4) to the
+    // cafe gate (13,2) passes under it, and 4.2 left only 0.8 of clearance.
     const pts = [
-      [7.27, 4.2], [-7.27, 4.2], [-4.2, -7.27], [4.2, -7.27], [5.99, -2.2], [-5.99, -2.2],
+      [7.27, 5.1], [-7.27, 4.2], [-4.2, -7.27], [4.2, -7.27], [5.99, -2.2], [-5.99, -2.2],
     ];
     const base = [], post = [], cap = [], globe = [], halo = [];
     for (const [x, z] of pts) {
@@ -663,7 +665,10 @@ export class PlazaRoom extends Room {
 
   // ------------------------------------------------------------- benches --
   _buildBenches(scene) {
-    const spots = [[4.9, -3.4], [-4.9, -3.4], [-2.6, -7.6], [2.6, -7.6], [7.0, 1.4]];
+    // Four flank the fountain; the fifth is a lawn seat on the south-west grass,
+    // well outside every gate route (it used to sit at (7.0, 1.4) and squeezed
+    // the walk to the cafe gate down to a 1.26-wide gap against the east lamp).
+    const spots = [[4.9, -3.4], [-4.9, -3.4], [-2.6, -7.6], [2.6, -7.6], [-4.6, 12.4]];
     const seat = [], back = [], legs = [], arms = [];
     for (const [x, z] of spots) {
       const bm = T([x, 0, z], [0, Math.atan2(FX - x, FZ - z), 0]); // face the fountain
@@ -743,7 +748,10 @@ export class PlazaRoom extends Room {
 
   // -------------------------------------------------------- notice board --
   _buildNoticeBoard(scene) {
-    const x = -8.6, z = 3.0;
+    // Set back on the west lawn: at (-8.6, 3.0) its collider reached to within
+    // 0.47 of the spawn -> beach-gate walk line. Its hotspot still overlaps the
+    // route, so passers-by are offered the read without being herded into it.
+    const x = -9.9, z = 4.4;
     const g = new THREE.Group();
     g.position.set(x, 0, z);
     g.rotation.y = Math.atan2(-x, 1 - z);
@@ -1006,8 +1014,9 @@ export class PlazaRoom extends Room {
       { x: 0, z: 0, r: 10.6 },
       { x: -13, z: 0, r: 4.2 }, { x: 0, z: -13, r: 4.2 }, { x: 13, z: 2, r: 4.2 },
       { x: 10.6, z: -4.8, r: 6.6 }, { x: 10.9, z: 13.2, r: 7.0 },
-      { x: -6.9, z: 6.9, r: 3.0 }, { x: -8.6, z: 3.0, r: 3.0 },
+      { x: -6.9, z: 6.9, r: 3.0 }, { x: -9.9, z: 4.4, r: 3.0 },
       { x: -9.4, z: 6.6, r: 2.4 }, { x: 9.6, z: 5.6, r: 2.4 },
+      { x: -4.6, z: 12.4, r: 2.2 }, // clearing around the lawn bench
     ];
     const segs = [
       [-8, 0, -16, 0], [0, -8, 0, -16], [8, 1.2, 16, 2.5], [5.2, 6.4, 10.2, 12.4],

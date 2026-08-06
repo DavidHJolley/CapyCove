@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { users, saveSoon } from './db.js';
+import { users, saveSoon, ensureFriends, FRIEND_CAP } from './db.js';
 import { signup, login, verifyToken, publicProfile } from './auth.js';
 import { BotManager } from './bots.js';
 import {
@@ -21,6 +21,16 @@ const MAX_COINS_PER_HOUR = 12_000; // rolling backstop, far above honest play
 const JOIN_COOLDOWN_MS = 400;
 const MSG_BURST_LIMIT = 80; // messages per second before we drop the socket
 const HEARTBEAT_MS = 30_000;
+const SOCIAL_BURST_LIMIT = 5; // per second, for profile/friends/lobby chatter
+
+const SLED_ROOM = 'peak';
+const SLED_LOBBY_MAX = 3;
+const RACE_COUNTDOWN_MS = 1_500; // lobby fills -> everyone reads the roster -> go
+const RACE_STATE_MS = 200; // ghost relay cadence (~5Hz)
+const RACE_MAX_MS = 150_000; // hard stop, so one rage-quit cannot hang a race
+const RACE_WIN_COINS = 30;
+
+const USERNAME_RE = new RegExp(`^[a-zA-Z0-9_]{${NAME_MIN_LEN},${NAME_MAX_LEN}}$`);
 
 const PORT = process.env.PORT || 3001;
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -119,6 +129,9 @@ function roomSnapshot(roomId) {
 function joinRoom(p, roomId) {
   if (!world.rooms.has(roomId)) return;
   if (p.room === roomId) return; // already here: re-joining would churn pleave/pjoin on everyone
+  // walking away from the mountain gives up your spot on the sled queue (and
+  // forfeits a run in progress); the lobby must never list someone who left
+  if (p.room === SLED_ROOM) exitSled(p);
   if (p.room) {
     world.rooms.get(p.room)?.delete(p.id);
     broadcastToRoom(p.room, { t: 'pleave', id: p.id });
@@ -127,9 +140,13 @@ function joinRoom(p, roomId) {
   world.rooms.get(roomId).add(p.id);
   sendTo(p, { t: 'room', room: roomId, players: roomSnapshot(roomId) });
   broadcastToRoom(roomId, { t: 'pjoin', p: snapshotFor(p) }, p.id);
+  // the lobby only broadcasts on change, so a late arrival would stare at an
+  // empty sign-up board until someone else joined or left
+  if (roomId === SLED_ROOM) sendTo(p, lobbyPayload());
 }
 
 function leaveWorld(p) {
+  exitSled(p);
   if (p.room) {
     world.rooms.get(p.room)?.delete(p.id);
     broadcastToRoom(p.room, { t: 'pleave', id: p.id });
@@ -162,6 +179,223 @@ function persist(p) {
 
 const cleanName = (s) => String(s || '').replace(/[^\w \-]/g, '').trim().slice(0, NAME_MAX_LEN);
 
+/**
+ * The one road coins travel: rolling hourly backstop, record-first balance
+ * (a second session must not roll back the active one), persist, notify.
+ * Returns the amount actually paid.
+ */
+function grantCoins(p, amount, reason) {
+  const now = Date.now();
+  const payout = Math.max(0, Math.floor(Number(amount) || 0));
+  if (payout <= 0) return 0;
+  p.earned = p.earned.filter((e) => now - e.t < 3_600_000);
+  if (p.earned.reduce((a, e) => a + e.n, 0) + payout > MAX_COINS_PER_HOUR) return 0;
+  p.earned.push({ t: now, n: payout });
+  const rec = recordFor(p);
+  const bal = rec ? rec.coins : p.coins;
+  const next = Math.max(0, Math.min(9_999_999, (Number.isFinite(bal) ? bal : 0) + payout));
+  if (rec) rec.coins = next;
+  p.coins = next;
+  persist(p);
+  sendTo(p, { t: 'coins', coins: p.coins, delta: payout, reason });
+  return payout;
+}
+
+/**
+ * Budget for the social messages (cards, friends, lobby): each one either fans
+ * out to other sockets or writes a stored record, so the 80/sec socket-wide
+ * flood guard is far too generous for them. A human clicks about once a second.
+ */
+function socialLimited(p, now) {
+  if (now - p.socialWindow > 1000) { p.socialWindow = now; p.socialCount = 0; }
+  return ++p.socialCount > SOCIAL_BURST_LIMIT;
+}
+
+// ---------- player cards + friends ----------
+
+/** A connected player or wandering bot, for 'inspect'. */
+function findEntity(id) {
+  if (typeof id !== 'string' || !id) return null;
+  const p = world.players.get(id);
+  if (p) return p;
+  if (bots.bots instanceof Map) return bots.bots.get(id) || null;
+  for (const roomId of ROOM_IDS) {
+    const b = bots.inRoom(roomId).find((x) => x.id === id);
+    if (b) return b;
+  }
+  return null;
+}
+
+/** Every live session for an account: one player may have several tabs open. */
+function sessionsFor(usernameKey) {
+  const out = [];
+  for (const p of world.players.values()) {
+    if (p.username && p.username.toLowerCase() === usernameKey) out.push(p);
+  }
+  return out;
+}
+
+/** Client-supplied name -> a users.js key, or null if it could never be one. */
+function friendKey(name) {
+  const s = String(name ?? '').trim();
+  return USERNAME_RE.test(s) ? s.toLowerCase() : null;
+}
+
+/**
+ * friend-add/remove target. The player card sends the connection id of whoever
+ * it is showing (that is all a client knows about a stranger); the friends list
+ * and any scripted client send a username. Accept both, resolve to a users key.
+ */
+function friendTarget(m) {
+  const byName = friendKey(m?.name);
+  if (byName) return byName;
+  const other = typeof m?.id === 'string' ? world.players.get(m.id) : null;
+  return other?.username ? other.username.toLowerCase() : null;
+}
+
+function friendsPayload(rec) {
+  const friends = ensureFriends(rec).map((key) => {
+    const other = users.get(key);
+    const online = sessionsFor(key)[0] || null;
+    // the live connection id (when they are on) is what the player card is keyed
+    // on, so the list can open a card; offline friends simply have none
+    return { id: online?.id || null, name: other?.username || key, online: !!online, room: online?.room || null };
+  });
+  // online first, then alphabetical: the useful half of the list stays on top
+  friends.sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name));
+  return { t: 'friends', friends };
+}
+
+function sendFriends(p) {
+  const rec = recordFor(p);
+  sendTo(p, rec ? friendsPayload(rec) : { t: 'friends', friends: [] });
+}
+
+// ---------- sled race lobby ----------
+// One global queue, tied to the peak room. Three capys sign the board, the
+// server picks the seed so everyone rides the same mountain, and relays each
+// rider's progress so the others see ghosts.
+
+const sledLobby = []; // player ids, in sign-up order
+let lobbyStartTimer = null;
+
+function lobbyPayload(starting = false) {
+  const players = [];
+  for (const id of sledLobby) {
+    const p = world.players.get(id);
+    if (p) players.push({ id: p.id, name: p.name });
+  }
+  return { t: 'lobby', players, starting };
+}
+
+function broadcastLobby(starting = false) {
+  broadcastToRoom(SLED_ROOM, lobbyPayload(starting));
+}
+
+function removeFromLobby(p) {
+  const i = sledLobby.indexOf(p.id);
+  if (i < 0) return false;
+  sledLobby.splice(i, 1);
+  // a rider who backs out during the countdown cancels it: the race only ever
+  // starts with a full board, otherwise the last one in gets a solo run
+  if (lobbyStartTimer) { clearTimeout(lobbyStartTimer); lobbyStartTimer = null; }
+  broadcastLobby(false);
+  return true;
+}
+
+function joinLobby(p) {
+  if (p.room !== SLED_ROOM || p.race) return;
+  if (sledLobby.includes(p.id) || sledLobby.length >= SLED_LOBBY_MAX) return;
+  sledLobby.push(p.id);
+  if (sledLobby.length >= SLED_LOBBY_MAX) {
+    broadcastLobby(true);
+    if (lobbyStartTimer) clearTimeout(lobbyStartTimer);
+    lobbyStartTimer = setTimeout(() => { try { startRace(); } catch (e) { console.error('[race] start failed:', e?.message || e); } }, RACE_COUNTDOWN_MS);
+  } else {
+    broadcastLobby(false);
+  }
+}
+
+function startRace() {
+  lobbyStartTimer = null;
+  const members = sledLobby
+    .map((id) => world.players.get(id))
+    .filter((p) => p && p.room === SLED_ROOM && !p.race);
+  if (members.length < 2) {
+    // everyone bailed; drop ids that no longer resolve so a stale entry can
+    // never wedge the board at "full" and lock the queue for good
+    for (let i = sledLobby.length - 1; i >= 0; i--) {
+      const p = world.players.get(sledLobby[i]);
+      if (!p || p.room !== SLED_ROOM || p.race) sledLobby.splice(i, 1);
+    }
+    broadcastLobby(false);
+    return;
+  }
+  sledLobby.length = 0;
+
+  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
+  const race = { seed, ended: false, racers: new Map(), tick: null, timer: null };
+  const roster = members.map((p) => ({ id: p.id, name: p.name, color: p.color, hat: p.hat }));
+  for (const p of members) {
+    p.race = race;
+    race.racers.set(p.id, { id: p.id, name: p.name, d: 0, x: 0, done: false, score: 0 });
+  }
+  for (const p of members) sendTo(p, { t: 'race-start', seed, players: roster });
+  broadcastLobby(false); // the board is empty again for everyone still in the room
+
+  race.tick = setInterval(() => {
+    try { broadcastRaceState(race); } catch (e) { console.error('[race] relay failed:', e?.message || e); }
+  }, RACE_STATE_MS);
+  race.timer = setTimeout(() => {
+    try { endRace(race); } catch (e) { console.error('[race] end failed:', e?.message || e); }
+  }, RACE_MAX_MS);
+}
+
+function broadcastRaceState(race) {
+  if (race.ended) return;
+  const players = [...race.racers.values()].map(({ id, d, x, done }) => ({ id, d, x, done }));
+  const raw = JSON.stringify({ t: 'race-state', players });
+  for (const id of race.racers.keys()) {
+    const p = world.players.get(id);
+    if (p && p.race === race && p.ws?.readyState === 1) p.ws.send(raw);
+  }
+}
+
+function endRace(race) {
+  if (race.ended) return;
+  race.ended = true;
+  clearInterval(race.tick);
+  clearTimeout(race.timer);
+
+  const standings = [...race.racers.values()]
+    .map(({ id, name, score }) => ({ id, name, score }))
+    .sort((a, b) => b.score - a.score);
+  const finalists = [];
+  for (const id of race.racers.keys()) {
+    const p = world.players.get(id);
+    if (p && p.race === race) { p.race = null; finalists.push(p); }
+  }
+  for (const p of finalists) sendTo(p, { t: 'race-end', standings });
+  // a real head-to-head pays out; a race that emptied out does not. Paid after
+  // the standings so the coin pop lands on top of the results screen.
+  const champ = standings[0];
+  if (race.racers.size >= 2 && champ && champ.score > 0) {
+    const winner = finalists.find((p) => p.id === champ.id);
+    if (winner) grantCoins(winner, RACE_WIN_COINS, 'race win');
+  }
+}
+
+/** Give up a lobby spot and/or a run in progress (leaving the peak, or the world). */
+function exitSled(p) {
+  removeFromLobby(p);
+  const race = p.race;
+  if (!race) return;
+  p.race = null;
+  const r = race.racers.get(p.id);
+  if (r && !r.done) { r.done = true; } // keeps whatever they last reported (0 if nothing)
+  if ([...race.racers.values()].every((x) => x.done)) endRace(race);
+}
+
 // ---------- websocket ----------
 // maxPayload: nothing the protocol carries comes close; the ws default is 100MiB.
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
@@ -181,6 +415,9 @@ wss.on('connection', (ws) => {
 
     let m;
     try { m = JSON.parse(raw); } catch { return; }
+    // "null", "5" and "[]" all parse fine; reading m.t off them throws outside
+    // the try below, which would surface as an uncaughtException per bad frame
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return;
     if (!p && m.t !== 'hello') return;
 
     // One bad frame must never take the process down with it.
@@ -224,6 +461,7 @@ wss.on('connection', (ws) => {
             coins: profile.coins, color: profile.color, hat: profile.hat,
             ownedHats: profile.ownedHats, bests: profile.bests,
             lastChat: 0, joinWindow: 0, joinCount: 0, run: null, earned: [],
+            socialWindow: 0, socialCount: 0, race: null,
           };
           world.players.set(p.id, p);
           sendTo(p, { t: 'welcome', id: p.id, profile: { ...profile, registered: p.registered } });
@@ -243,7 +481,7 @@ wss.on('connection', (ws) => {
           p.x = Math.max(-100, Math.min(100, Number(m.x) || 0));
           p.z = Math.max(-100, Math.min(100, Number(m.z) || 0));
           p.rot = Number(m.rot) || 0;
-          if (['idle', 'walk', 'dance'].includes(m.anim)) p.anim = m.anim;
+          if (['idle', 'walk', 'dance', 'sit'].includes(m.anim)) p.anim = m.anim;
           break;
         }
         case 'chat': {
@@ -278,18 +516,7 @@ wss.on('connection', (ws) => {
           p.run = null; // single use
           if (!run || run.game !== m.game) break;
           if (t0 - run.startedAt < MIN_RUN_MS) break;
-          const payout = clampCoinsForGame(m.game, Number(m.coins) || 0);
-          if (payout <= 0) break;
-          p.earned = p.earned.filter((e) => t0 - e.t < 3_600_000);
-          if (p.earned.reduce((a, e) => a + e.n, 0) + payout > MAX_COINS_PER_HOUR) break;
-          p.earned.push({ t: t0, n: payout });
-          const rec = recordFor(p);
-          const bal = rec ? rec.coins : p.coins;
-          const next = Math.max(0, Math.min(9_999_999, (Number.isFinite(bal) ? bal : 0) + payout));
-          if (rec) rec.coins = next;
-          p.coins = next;
-          persist(p);
-          sendTo(p, { t: 'coins', coins: p.coins, delta: payout, reason: m.game });
+          grantCoins(p, clampCoinsForGame(m.game, Number(m.coins) || 0), m.game);
           break;
         }
         case 'best': {
@@ -317,6 +544,105 @@ wss.on('connection', (ws) => {
           p.ownedHats.push(m.hat);
           persist(p);
           sendTo(p, { t: 'shop', ok: true, coins: p.coins, delta: -hat.price, ownedHats: p.ownedHats, bought: m.hat });
+          break;
+        }
+
+        // ---- player cards + friends ----------------------------------------
+        // These fan out to other sockets and touch stored records, so they get
+        // a tighter budget than the movement stream: a human clicks, it does not
+        // stream. Everything past the guard treats bad input as a no-op.
+        case 'inspect': {
+          if (socialLimited(p, t0)) break;
+          const target = findEntity(m.id);
+          if (!target) break;
+          const rec = target.bot ? null : recordFor(target);
+          sendTo(p, {
+            t: 'profile',
+            id: target.id,
+            name: target.name,
+            bot: !!target.bot,
+            color: target.color,
+            hat: target.hat,
+            bests: target.bot ? {} : { ...(rec?.bests || target.bests || {}) },
+            registered: !target.bot && !!target.registered,
+          });
+          break;
+        }
+        case 'friends': {
+          if (socialLimited(p, t0)) break;
+          sendFriends(p);
+          break;
+        }
+        case 'friend-add':
+        case 'friend-remove': {
+          if (socialLimited(p, t0)) break;
+          const rec = recordFor(p);
+          if (!rec) { sendTo(p, { t: 'toast', msg: 'Make an account to keep friends' }); break; }
+          const key = friendTarget(m);
+          if (!key) break; // could never be a username: say nothing
+          const meKey = p.username.toLowerCase();
+          if (key === meKey) { sendTo(p, { t: 'toast', msg: 'You are already your own best friend' }); break; }
+          const other = users.get(key);
+          // guests have no record to write to, so friendship is accounts-only
+          if (!other) { sendTo(p, { t: 'toast', msg: 'No capy signed up under that name' }); sendFriends(p); break; }
+          const mine = ensureFriends(rec);
+          const theirs = ensureFriends(other);
+
+          if (m.t === 'friend-add') {
+            if (!mine.includes(key) && (mine.length >= FRIEND_CAP || theirs.length >= FRIEND_CAP)) {
+              sendTo(p, { t: 'toast', msg: 'That friends list is full' });
+              sendFriends(p);
+              break;
+            }
+            // both sides always move together: a one-way entry would show up as
+            // a friend who never sees you online
+            if (!mine.includes(key)) mine.push(key);
+            if (!theirs.includes(meKey)) theirs.push(meKey);
+          } else {
+            const i = mine.indexOf(key);
+            if (i >= 0) mine.splice(i, 1);
+            const j = theirs.indexOf(meKey);
+            if (j >= 0) theirs.splice(j, 1);
+          }
+          saveSoon();
+          // every open tab on both accounts, or the second one keeps showing a
+          // list that no longer exists
+          const minePayload = friendsPayload(rec);
+          sendTo(p, minePayload);
+          for (const session of sessionsFor(meKey)) if (session !== p) sendTo(session, minePayload);
+          const theirPayload = friendsPayload(other);
+          for (const session of sessionsFor(key)) {
+            sendTo(session, theirPayload);
+            if (m.t === 'friend-add') sendTo(session, { t: 'toast', msg: `${p.name} added you as a friend!` });
+          }
+          break;
+        }
+
+        // ---- sled race lobby -----------------------------------------------
+        case 'lobby-join':
+          if (socialLimited(p, t0)) break;
+          joinLobby(p);
+          break;
+        case 'lobby-leave':
+          if (socialLimited(p, t0)) break;
+          removeFromLobby(p);
+          break;
+        case 'race-progress': {
+          // hot path: no broadcast here, the relay tick reads the latest values
+          const r = p.race?.racers.get(p.id);
+          if (!r || r.done) break;
+          r.d = Math.max(0, Math.min(100_000, Number(m.d) || 0));
+          r.x = Math.max(-20, Math.min(20, Number(m.x) || 0));
+          break;
+        }
+        case 'race-done': {
+          const race = p.race;
+          const r = race?.racers.get(p.id);
+          if (!r || r.done) break; // one score per racer, no re-reporting
+          r.score = Math.max(0, Math.min(10_000_000, Math.floor(Number(m.score) || 0)));
+          r.done = true;
+          broadcastRaceState(race); // the others see them cross immediately
+          if ([...race.racers.values()].every((x) => x.done)) endRace(race);
           break;
         }
       }

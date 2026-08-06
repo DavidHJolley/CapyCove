@@ -1,6 +1,12 @@
 import { createAvatar } from '../player/avatar.js';
 import { NET_TICK_MS } from '../../shared/constants.js';
 
+// Poses a remote avatar is allowed into. 'sit' rides sleds/benches; anything
+// unknown (older server, rogue frame) falls back to idle so nobody gets wedged
+// in a pose the rig never animates out of.
+const REMOTE_ANIMS = new Set(['idle', 'walk', 'dance', 'sit']);
+const safeAnim = (a) => (REMOTE_ANIMS.has(a) ? a : 'idle');
+
 /**
  * WebSocket client. Owns remote-player entities (avatar + interpolation +
  * name tag + chat bubbles). The engine renders whatever is in
@@ -71,6 +77,9 @@ export class NetClient {
     this.ws.onclose = () => {
       this.connected = false;
       this._clearRemotes();
+      // the server drops us from the sled lobby on disconnect, so clear the
+      // lobby UI too rather than leaving a frozen roster of ghosts on the sign
+      this.game.events.emit('lobby', { t: 'lobby', players: [], starting: false });
       // emit even when we never got as far as 'welcome': a first connection that
       // simply fails must not leave the HUD saying "paddling out" forever
       this.game.events.emit('net', 'offline');
@@ -146,7 +155,8 @@ export class NetClient {
           const r = this.remotes.get(s.id);
           if (!r) continue;
           r.target = s;
-          if (s.anim !== r.anim) { r.anim = s.anim; r.avatar.setAnim(s.anim); }
+          const anim = safeAnim(s.anim);
+          if (anim !== r.anim) { r.anim = anim; r.avatar.setAnim(anim); }
         }
         break;
       case 'chat': {
@@ -186,6 +196,30 @@ export class NetClient {
       case 'toast':
         game.toast(m.msg);
         break;
+      // ---- player cards / friends ------------------------------------------
+      // Re-emitted raw: the UI owns the shape (see server/index.js). Named
+      // '*-data' so they never collide with the local 'profile' state event.
+      case 'profile':
+        game.events.emit('profile-data', m);
+        break;
+      case 'friends':
+        game.events.emit('friends-data', m);
+        break;
+      // ---- sled race lobby + race relay ------------------------------------
+      // The peak room owns the lobby UI and sets game.__raceCtx on 'race-start';
+      // the sled minigame reads that ctx and listens for state/end itself.
+      case 'lobby':
+        game.events.emit('lobby', m);
+        break;
+      case 'race-start':
+        game.events.emit('race-start', m);
+        break;
+      case 'race-state':
+        game.events.emit('race-state', m);
+        break;
+      case 'race-end':
+        game.events.emit('race-end', m);
+        break;
     }
   }
 
@@ -194,10 +228,14 @@ export class NetClient {
     const avatar = createAvatar({ color: p.color, hat: p.hat });
     avatar.group.position.set(p.x, 0, p.z);
     avatar.group.rotation.y = p.rot || 0;
+    // adopt the pose from the snapshot: someone already sitting or dancing when
+    // we walk in should not pop from idle on their next state frame
+    const anim = safeAnim(p.anim);
+    avatar.setAnim(anim);
     this.engine.remoteGroup.add(avatar.group);
     const tag = this.engine.attachNameTag(avatar.group, p.name, p.bot);
     this.remotes.set(p.id, {
-      p, avatar, tag, target: { x: p.x, z: p.z, rot: p.rot || 0 }, anim: 'idle',
+      p, avatar, tag, target: { x: p.x, z: p.z, rot: p.rot || 0 }, anim,
       // last position we raycast the ground for; Infinity so the first snap runs
       snapX: Infinity, snapZ: Infinity,
     });

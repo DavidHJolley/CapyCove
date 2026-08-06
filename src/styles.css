@@ -20,7 +20,16 @@
 html, body { height: 100%; overflow: hidden; }
 body { font-family: var(--font); color: var(--ink); background: #1c2733; }
 
-#app { position: fixed; inset: 0; }
+/* The world is a game, not a document: double clicking a prop or a label used
+   to paint it blue. Selection comes back only where text is meant to be read
+   and copied (the inputs and the chat history card). */
+#app {
+  position: fixed; inset: 0;
+  -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+}
+#app input, #app textarea, .chat-history-line {
+  -webkit-user-select: text; user-select: text;
+}
 #game-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 
 /* soft vignette over the world so the HUD always reads (never eats clicks) */
@@ -97,6 +106,10 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
 /* ---------- HUD ---------- */
 #hud-root { position: absolute; inset: 0; pointer-events: none; z-index: 30; }
 #hud-root > * { pointer-events: auto; }
+/* ...except the read-only layers. An id selector beats the bare class on
+   .chat-log/.toasts, so without this the chat lines and toasts sit on top of
+   the world and swallow ground clicks (invisibly, once they have faded). */
+#hud-root > .chat-log, #hud-root > .toasts { pointer-events: none; }
 
 .hud-top-left {
   position: absolute; top: 14px; left: 14px; display: flex; gap: 10px; align-items: center;
@@ -108,7 +121,24 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
   box-shadow: 0 4px 0 rgba(150, 55, 72, 0.35), var(--shadow);
   text-shadow: 0 2px 0 rgba(150, 55, 72, 0.35);
   animation: hud-drop 0.5s var(--spring) backwards;
+  /* it is a button now: the menu lives behind it */
+  border: 0; font-family: var(--font); cursor: pointer; display: flex; align-items: center;
+  transition: scale 0.12s ease, translate 0.12s ease, box-shadow 0.18s ease, filter 0.18s ease;
 }
+.logo-chip::after {
+  content: '\2630'; margin-left: 9px; font-size: 12px; opacity: 0.72;
+  text-shadow: none; translate: 0 -1px;
+}
+.logo-chip:hover {
+  scale: 1.06; translate: 0 -2px; filter: brightness(1.05);
+  box-shadow: 0 6px 0 rgba(150, 55, 72, 0.35), 0 12px 26px rgba(45, 36, 23, 0.32);
+}
+.logo-chip:hover::after { opacity: 1; }
+.logo-chip:active {
+  scale: 0.96; translate: 0 2px;
+  box-shadow: 0 1px 0 rgba(150, 55, 72, 0.35), 0 4px 12px rgba(45, 36, 23, 0.26);
+}
+.logo-chip:focus-visible { outline: 3px solid var(--accent2); outline-offset: 3px; }
 .room-chip {
   background: var(--card); font-weight: 700; font-size: 14px;
   padding: 8px 14px; border-radius: 999px; box-shadow: var(--lift), var(--shadow);
@@ -220,7 +250,7 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
 
 .chat-log {
   position: absolute; bottom: 74px; left: 14px; display: flex; flex-direction: column;
-  gap: 4px; max-width: 320px; pointer-events: none;
+  gap: 4px; max-width: 320px; pointer-events: none; transition: opacity 0.18s ease;
 }
 .chat-line {
   background: rgba(255, 253, 246, 0.9); font-size: 13px; padding: 5px 12px;
@@ -231,10 +261,41 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
 .chat-line.self b { color: var(--accent); }
 .chat-line b { color: var(--accent2); margin-right: 2px; }
 .chat-line.fade-out { opacity: 0; }
+.chat-log.is-tucked { opacity: 0; }
 @keyframes chat-in {
   0% { opacity: 0; translate: -14px 0; scale: 0.9; }
   60% { opacity: 1; scale: 1.03; }
   100% { opacity: 1; translate: 0 0; scale: 1; }
+}
+
+/* ---------- chat history (opens while the chat box has focus) ---------- */
+.chat-history {
+  position: absolute; bottom: 74px; left: 14px; z-index: 2;
+  display: flex; flex-direction: column;
+  width: min(360px, 52vw); max-height: min(340px, 44vh);
+  background: var(--cream); border: 3px solid #fff; border-radius: 20px;
+  padding: 11px 11px 9px;
+  box-shadow: var(--shadow), 0 0 0 3px rgba(45, 36, 23, 0.07);
+  animation: history-in 0.26s var(--spring);
+}
+@keyframes history-in { from { opacity: 0; translate: 0 14px; scale: 0.94; } }
+.chat-history-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 0 5px 7px; font-size: 10.5px; font-weight: 900; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--muted);
+}
+.chat-history-hint { font-size: 10px; letter-spacing: 0.05em; text-transform: none; opacity: 0.85; }
+.chat-history-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  display: flex; flex-direction: column; gap: 4px; padding: 1px 4px 1px 2px;
+}
+.chat-history-line {
+  align-self: flex-start; max-width: 100%; background: var(--card);
+  box-shadow: 0 2px 0 rgba(45, 36, 23, 0.06); cursor: text;
+  overflow-wrap: anywhere;
+}
+.chat-history-empty {
+  padding: 4px 6px 6px; font-size: 12.5px; font-weight: 700; color: var(--muted);
 }
 
 .toasts {
@@ -372,6 +433,80 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
   display: flex; justify-content: space-between; align-items: center;
   background: var(--card); border-radius: 14px; padding: 10px 14px; font-weight: 700;
 }
+
+/* ---------- menu (behind the logo chip) ---------- */
+.menu-overlay {
+  position: absolute; inset: 0; background: rgba(20, 32, 44, 0.58);
+  display: flex; align-items: center; justify-content: center; z-index: 42;
+  backdrop-filter: blur(7px) saturate(1.15);
+  animation: overlay-in 0.2s ease;
+}
+.menu-overlay.is-closing { opacity: 0; transition: opacity 0.15s ease; pointer-events: none; }
+.menu-card {
+  position: relative; background: var(--cream); border-radius: 26px; border: 4px solid #fff;
+  padding: 24px 24px 18px; width: min(430px, 92vw); max-height: 92vh; overflow-y: auto;
+  text-align: center; box-shadow: var(--shadow), 0 0 0 3px rgba(45, 36, 23, 0.08);
+  animation: card-in 0.34s var(--spring);
+}
+.menu-card:focus { outline: none; }
+.menu-card h2 {
+  color: var(--accent); font-size: 26px; letter-spacing: 0.03em;
+  text-shadow: 0 2px 0 rgba(45, 36, 23, 0.1);
+}
+.menu-sub { font-size: 12.5px; font-weight: 700; color: var(--muted); margin: 3px 0 15px; }
+.menu-x { position: absolute; top: 14px; right: 14px; }
+
+.menu-list { display: flex; flex-direction: column; gap: 9px; }
+.menu-item {
+  display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%;
+  border: 0; font-family: var(--font); font-weight: 900; font-size: 15px; color: var(--ink);
+  background: var(--card); padding: 12px 18px; border-radius: 999px; cursor: pointer;
+  box-shadow: 0 4px 0 rgba(45, 36, 23, 0.12), 0 8px 18px rgba(45, 36, 23, 0.14);
+  transition: scale 0.12s ease, translate 0.12s ease, background 0.18s ease, filter 0.18s ease;
+}
+.menu-item:hover { scale: 1.03; translate: 0 -2px; background: #fffaef; filter: brightness(1.02); }
+.menu-item:active {
+  scale: 0.97; translate: 0 2px;
+  box-shadow: 0 1px 0 rgba(45, 36, 23, 0.14), 0 4px 12px rgba(45, 36, 23, 0.2);
+}
+.menu-item:focus-visible { outline: 3px solid var(--accent2); outline-offset: 3px; }
+.menu-item.is-primary {
+  background: linear-gradient(180deg, #f07f90 0%, var(--accent) 100%);
+  color: #fff; border: 3px solid #fff; font-size: 17px;
+  box-shadow: 0 5px 0 rgba(150, 55, 72, 0.35), var(--shadow);
+}
+.menu-item.is-primary:hover { background: linear-gradient(180deg, #f48b9b 0%, var(--accent) 100%); }
+.menu-item.is-danger {
+  background: linear-gradient(180deg, #ffd98a 0%, var(--gold) 100%);
+  border: 3px solid #fff; font-size: 13.5px;
+}
+.menu-item.is-danger:hover { background: linear-gradient(180deg, #ffe1a2 0%, var(--gold) 100%); }
+.menu-item.is-quiet {
+  background: transparent; box-shadow: none; color: var(--muted); font-size: 13.5px; padding: 9px 16px;
+}
+.menu-item.is-quiet:hover { background: rgba(45, 36, 23, 0.07); color: var(--ink); }
+.menu-ico { font-size: 15px; line-height: 1; }
+.menu-item.is-off { color: var(--muted); }
+
+.menu-how {
+  text-align: left; background: var(--card); border-radius: 18px; padding: 13px 15px;
+  margin: 15px 0; box-shadow: inset 0 0 0 2px rgba(45, 36, 23, 0.05);
+}
+.menu-how h3 {
+  font-size: 10.5px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 9px;
+}
+.menu-how ul { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.menu-how li {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12.5px; font-weight: 700; line-height: 1.3;
+}
+.menu-key {
+  flex: none; min-width: 30px; text-align: center; font-size: 11px; font-weight: 900;
+  padding: 5px 8px; border-radius: 9px; background: #fff; color: var(--ink);
+  border: 2px solid #f0e2c4; box-shadow: 0 2px 0 rgba(45, 36, 23, 0.16);
+}
+.menu-foot { margin-top: 13px; font-size: 11.5px; font-weight: 700; color: var(--muted); }
 
 /* ---------- title screen ---------- */
 .title-screen {
@@ -517,5 +652,6 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
   .logo-chip, .room-chip, .net-dot, .coins-pill, .hud-bottom {
     animation: none;
   }
-  .chat-bubble, .toast, .chat-line, .map-card, .title-card { animation-duration: 0.01ms; }
+  .chat-bubble, .toast, .chat-line, .map-card, .title-card,
+  .menu-card, .chat-history { animation-duration: 0.01ms; }
 }

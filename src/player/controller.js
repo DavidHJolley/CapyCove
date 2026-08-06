@@ -45,13 +45,26 @@ export class WalkController {
         const step = Math.min(this.speed * dt, dist);
         const next = g.position.clone().addScaledVector(to, step);
 
-        // circle-obstacle slide
+        // Circle-obstacle slide: push out to the rim, then carry the blocked
+        // part of the step along it. Pushing out alone is not a slide: walking
+        // due north at something due north of you (the plaza fountain sits on
+        // the spawn -> peak-gate line) put the player back on the same radius
+        // every frame and parked them against it forever.
         for (const o of room.obstacles) {
           const dx = next.x - o.x, dz = next.z - o.z;
           const d = Math.hypot(dx, dz);
           if (d < o.r && d > 1e-4) {
-            next.x = o.x + (dx / d) * o.r;
-            next.z = o.z + (dz / d) * o.r;
+            const nx = dx / d, nz = dz / d; // outward normal
+            next.x = o.x + nx * o.r;
+            next.z = o.z + nz * o.r;
+            if (to.x * nx + to.z * nz < 0) { // still heading into it: skirt the rim
+              let tx = -nz, tz = nx;
+              let td = to.x * tx + to.z * tz;
+              if (td < 0) { tx = -tx; tz = -tz; td = -td; } // the side nearer the target
+              if (td < 1e-3) td = 1; // dead-on: commit to a side, the next frame agrees
+              next.x += tx * step * td;
+              next.z += tz * step * td;
+            }
           }
         }
 

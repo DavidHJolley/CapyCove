@@ -6,6 +6,7 @@ import { audio } from './core/audio.js';
 import { ROOMS } from './world/index.js';
 import { GAMES } from './minigames/index.js';
 import { initHud } from './ui/hud.js';
+import { initFriendsButton } from './ui/friends.js';
 import { showTitle } from './ui/title.js';
 import { DEFAULT_ROOM } from '../shared/constants.js';
 
@@ -77,6 +78,10 @@ function enterWorld(auth) {
   audio.init();
   engine.createPlayer();
   initHud(game);
+  // after initHud: the button docks into the HUD cluster the line above builds,
+  // and this is also where the world-wide 'avatar-click' -> player card wiring
+  // is installed (once per session)
+  initFriendsButton(game);
   net.connect(auth);
   engine.start();
   game.goToRoom(DEFAULT_ROOM, null);

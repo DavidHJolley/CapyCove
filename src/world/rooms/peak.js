@@ -1,12 +1,21 @@
 import * as THREE from 'three';
 import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
+import { createAvatar } from '../../player/avatar.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
 
 /* ---------------------------------------------------------------------------
  * Frosty Peak: a snowy mountaintop clearing above a sea of clouds.
  * Snowbank rim, pine ring, ski lodge, chairlift, frozen pond, snow-capybara.
  * Everything procedural: geometry + canvas textures only.
+ *
+ * This room also owns the Summit Sprint race lobby: three parked sleds behind
+ * the start gate, one per lobby slot, a live RIDERS n/3 sign, and the hotspots
+ * that join/leave the lobby. Protocol (server <-> src/net/client.js):
+ *   out  {t:'lobby-join'} {t:'lobby-leave'}
+ *   in   'lobby' {players:[{id,name}], starting}   'race-start' {seed, players}
+ * On 'race-start' we stash game.__raceCtx and launch the sled minigame; solo
+ * runs launch with game.__raceCtx = null.
  * ------------------------------------------------------------------------- */
 
 const TAU = Math.PI * 2;
@@ -49,6 +58,30 @@ const GROUND_HALF = 20;
 const GROUND_SEGS = 58;
 const SUN_DIR = new THREE.Vector3(-34, 10, -44); // where the pale sun sits
 const COCOA = { x: 6.2, z: 5.4 }; // barrel table outside the lodge
+
+const GATE_Z = -9; // the start gate group sits here; the chute runs to -Z
+
+/**
+ * The three race lobby seats, in protocol order: lobby.players[i] rides slot i.
+ * They sit on the start line under the gate, on the flat apron (terrainH is 0
+ * inside r=3.4 of the gate) and inside the join hotspot's radius so the "Hop
+ * out" prompt stays reachable while seated. They carry NO obstacle circles: a
+ * collider here would shove the local player straight back out of their seat.
+ */
+const RACE_SLOTS = [
+  { x: -1.75, z: -9.3 },
+  { x: 0, z: -9.3 },
+  { x: 1.75, z: -9.3 },
+];
+const SLOT_YAW = Math.PI; // sled + rider face -Z, down the chute
+const SLED_SCALE = 1.4; // rack sleds are props; a race sled has to fit a capybara
+const SLED_DZ = -0.35; // sled sits a nose ahead of the seat, backrest at the rider's back
+// Deck top is 0.25 * SLED_SCALE. Sitting this high tucks the narrow bottom of
+// the capybara inside the bed while its wide middle clears the sides, so nothing
+// clips through the sled walls.
+const SEAT_LIFT = 0.38;
+const SLOT_COLORS = [0xe8657a, 0x4fb3e8, 0xf2b64a];
+const DEFAULT_FUR = 0xb08a5a; // lobby payload is id+name only; brown until we know better
 
 /* --- tiny math helpers ---------------------------------------------------- */
 
@@ -493,6 +526,66 @@ function liftPlateTexture() {
   });
 }
 
+/**
+ * The live lobby board above the start gate. Redrawn into the SAME canvas every
+ * time the roster changes (see _paintRiders), so the room only ever owns one
+ * texture no matter how many capybaras hop in and out.
+ */
+function drawRidersSign(c, w, h, n, starting) {
+  c.clearRect(0, 0, w, h);
+  // cream card with a coral header band
+  c.fillStyle = '#fff6e3';
+  c.beginPath();
+  c.roundRect(6, 6, w - 12, h - 12, 26);
+  c.fill();
+  c.fillStyle = starting ? '#7ac74f' : '#e8657a';
+  c.beginPath();
+  c.roundRect(6, 6, w - 12, 52, [26, 26, 0, 0]);
+  c.fill();
+  c.strokeStyle = '#ffffff';
+  c.lineWidth = 7;
+  c.beginPath();
+  c.roundRect(6, 6, w - 12, h - 12, 26);
+  c.stroke();
+
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  c.fillStyle = '#fffaf0';
+  c.font = '800 30px system-ui, "Segoe UI", Verdana, sans-serif';
+  c.fillText(starting ? 'LAUNCHING!' : 'RIDERS', w / 2, 33);
+
+  // big count
+  c.fillStyle = '#2d2417';
+  c.font = '900 52px system-ui, "Segoe UI", Verdana, sans-serif';
+  c.fillText(`${n}/3`, w / 2 - 74, 92);
+
+  // three seat pips, filled left to right
+  for (let i = 0; i < 3; i++) {
+    const cx = w / 2 + 6 + i * 52;
+    c.beginPath();
+    c.arc(cx, 92, 20, 0, TAU);
+    c.fillStyle = i < n ? (starting ? '#7ac74f' : '#f2b64a') : '#e6dcc4';
+    c.fill();
+    c.lineWidth = 4;
+    c.strokeStyle = '#2d2417';
+    c.stroke();
+    if (i < n) {
+      // a little seated capy blob so the pip reads as an occupied sled
+      c.fillStyle = '#6b4f35';
+      c.beginPath();
+      c.arc(cx, 96, 9, 0, TAU);
+      c.fill();
+      c.beginPath();
+      c.arc(cx, 84, 6, 0, TAU);
+      c.fill();
+    }
+  }
+}
+
+function ridersSignTexture() {
+  return canvasTexture(512, 128, (c, w, h) => drawRidersSign(c, w, h, 0, false));
+}
+
 /* --- prop builders (module scope: no per-instance state) ------------------- */
 
 function makeTreeGeo(tall) {
@@ -534,15 +627,51 @@ function makeSledGeo() {
   return mergeParts(p);
 }
 
+/**
+ * One chairlift bench, hung from the cable at the geometry origin (y = 0).
+ *
+ * Read top-to-bottom it must say "bench": grip on the cable -> vertical hanger
+ * bar -> snow-capped shoulder rail -> backrest panel standing UP behind the
+ * seat -> horizontal seat -> armrests, lap bar and a footrest out front.
+ * Local +Z is the direction of travel (the instance is yawed to the cable
+ * heading), so the rider faces forward and the backrest is behind them at -Z;
+ * the two cables run opposite ways so their chairs end up back-to-back.
+ * The old version hung its backrest BELOW the seat, which is what made the
+ * whole lift read upside down from the play camera.
+ */
 function makeChairGeo() {
   const p = [];
-  part(p, new THREE.CylinderGeometry(0.045, 0.045, 1.5, 6), C.steel, { y: -0.75 });
-  part(p, new THREE.BoxGeometry(1.25, 0.11, 0.14), C.steel, { y: -1.5 });
-  part(p, new THREE.BoxGeometry(1.2, 0.12, 0.62), C.coral, { y: -1.6, z: 0.08 });
-  part(p, new THREE.BoxGeometry(1.2, 0.66, 0.11), C.coralDark, { y: -1.9, z: -0.24 });
-  part(p, new THREE.BoxGeometry(1.24, 0.1, 0.1), C.steel, { y: -2.16, z: -0.22 });
-  part(p, new THREE.BoxGeometry(1.05, 0.07, 0.3), C.steelDark, { y: -2.06, z: 0.5, rx: 0.28 });
-  part(p, new THREE.SphereGeometry(0.12, 8, 6), C.steelDark, { y: -0.02 });
+  const BACK_Z = -0.28; // hanger + backrest plane, behind the seat
+  const RAIL_Y = -1.02; // shoulder rail: the top of the backrest
+  const SEAT_Y = -1.91; // seat cushion centre
+  const ARM_Y = -1.42;
+
+  // cable grip, clamp and the hanger bar dropping straight down
+  part(p, new THREE.SphereGeometry(0.13, 8, 6), C.steelDark, { y: -0.03 });
+  part(p, new THREE.BoxGeometry(0.26, 0.16, 0.4), C.steel, { y: -0.18, z: BACK_Z * 0.5 });
+  part(p, new THREE.CylinderGeometry(0.055, 0.06, 0.96, 6), C.steel, { y: -0.54, z: BACK_Z });
+
+  // shoulder rail with a crust of snow on top: the strongest "this way up" cue
+  part(p, new THREE.BoxGeometry(1.34, 0.12, 0.2), C.steel, { y: RAIL_Y, z: BACK_Z });
+  part(p, new THREE.BoxGeometry(1.32, 0.07, 0.23), C.snowLit, { y: RAIL_Y + 0.09, z: BACK_Z });
+
+  // backrest panel: a chunky slab standing up off the back edge of the seat
+  part(p, new THREE.BoxGeometry(1.22, 0.82, 0.14), C.coralDark, { y: RAIL_Y - 0.44, z: BACK_Z });
+
+  // seat: cushion on a steel frame, extending forward into +Z
+  part(p, new THREE.BoxGeometry(1.22, 0.15, 0.7), C.coral, { y: SEAT_Y, z: 0.04 });
+  part(p, new THREE.BoxGeometry(1.28, 0.09, 0.76), C.steel, { y: SEAT_Y - 0.11, z: 0.04 });
+
+  // armrests down each side + the lap bar closing them off at the front
+  for (const s of [-1, 1]) {
+    part(p, new THREE.BoxGeometry(0.09, 0.09, 0.82), C.steel, { x: s * 0.63, y: ARM_Y, z: 0.03 });
+    part(p, new THREE.BoxGeometry(0.08, 0.42, 0.08), C.steel, { x: s * 0.63, y: -1.63, z: 0.4 });
+    link(p, [s * 0.46, SEAT_Y - 0.15, 0.34], [s * 0.46, -2.26, 0.52], 0.032, C.steelDark);
+  }
+  part(p, new THREE.BoxGeometry(1.34, 0.085, 0.085), C.steel, { y: ARM_Y, z: 0.42 });
+
+  // footrest bar, tilted slightly so boots sit on it
+  part(p, new THREE.BoxGeometry(1.08, 0.08, 0.28), C.steelDark, { rx: 0.18, y: -2.28, z: 0.54 });
   return mergeParts(p);
 }
 
@@ -584,6 +713,17 @@ export class PeakRoom extends Room {
     this._dummy.rotation.order = 'YXZ';
     this._v = new THREE.Vector3();
     this._rng = mulberry32(0x5f0757);
+    this._game = game;
+
+    // race lobby state (see the header note for the wire protocol)
+    this._riders = new Map(); // playerId -> { avatar, slot, tag, hidden }
+    this._lobbyCount = 0;
+    this._lobbyStarting = false;
+    this._localSlot = null;
+    this._offLobby = null;
+    this._offRaceStart = null;
+    this._wasOnline = !!game?.net?.connected;
+    this._reconcileT = 0;
 
     scene.background = new THREE.Color(0xc3dcf1);
     scene.fog = new THREE.Fog(0xd9e9f7, 26, 82);
@@ -602,6 +742,7 @@ export class PeakRoom extends Room {
     this._snowCapybara(scene);
     this._sledRack(scene);
     this._startGate(scene);
+    this._raceLobby(scene);
     this._trailSign(scene);
     this._trailFence(scene);
     this._snowfall(scene);
@@ -614,13 +755,35 @@ export class PeakRoom extends Room {
       from_plaza: new THREE.Vector3(0, 0, 8.5), // exit-plaza is (0,12) r=3
     };
 
+    // The gate offers the multiplayer lobby; the sled rack a few steps east is
+    // the "just let me ride" door. Two props, two prompts: they never overlap
+    // on screen the way two prompts on one spot would.
+    this._joinSpot = {
+      id: 'race-join',
+      position: new THREE.Vector3(0, 0, -7.6),
+      radius: 3.0,
+      label: this._joinLabel(),
+      action: (g) => {
+        if (g.net?.connected) {
+          g.net.send({ t: this._localSlot === null ? 'lobby-join' : 'lobby-leave' });
+        } else {
+          // offline: no lobby to join, so the gate just starts a solo run
+          g.__raceCtx = null;
+          g.startMinigame('sled');
+        }
+      },
+    };
     this.hotspots.push(
+      this._joinSpot,
       {
         id: 'play-sled',
-        position: new THREE.Vector3(0, 0, -8.6),
-        radius: 3.2,
-        label: 'Play Summit Sprint',
-        action: (g) => g.startMinigame('sled'),
+        position: new THREE.Vector3(4.6, 0, -4.6),
+        radius: 2.6,
+        label: 'Sled alone',
+        action: (g) => {
+          g.__raceCtx = null;
+          g.startMinigame('sled');
+        },
       },
       {
         id: 'exit-plaza',
@@ -642,6 +805,240 @@ export class PeakRoom extends Room {
     );
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11.5, 20), lookHeight: 1.8 };
+
+    // Live only while this room is: both handles are dropped in dispose().
+    if (game?.events?.on) {
+      this._offLobby = game.events.on('lobby', (m) => this._onLobby(m));
+      this._offRaceStart = game.events.on('race-start', (m) => this._onRaceStart(m));
+    }
+  }
+
+  /* --- race lobby --------------------------------------------------------- */
+
+  _joinLabel() {
+    if (!this._game?.net?.connected) return 'Sled down the chute';
+    if (this._localSlot !== null) return 'Hop out';
+    return `Join the race (${this._lobbyCount}/3)`;
+  }
+
+  /** Three parked sleds in their launch grooves, plus the floating tally sign. */
+  _raceLobby(scene) {
+    // packed-snow launch grooves so an empty slot still reads as "your lane".
+    // Kept clear of the gate's start-line stripes at z = GATE_Z + 0.45.
+    const pads = [];
+    for (const s of RACE_SLOTS) {
+      part(pads, new THREE.BoxGeometry(1.36, 0.08, 1.6), C.packed, { x: s.x, y: 0, z: s.z - 0.45 });
+      for (const sx of [-1, 1]) {
+        part(pads, new THREE.BoxGeometry(0.12, 0.16, 1.6), C.snowLit, { x: s.x + sx * 0.68, y: 0.04, z: s.z - 0.45 });
+      }
+    }
+    scene.add(solidMesh(pads, { shadow: false }));
+
+    const sleds = new THREE.InstancedMesh(makeSledGeo(), makeToon(0xffffff, VC), RACE_SLOTS.length);
+    sleds.castShadow = true;
+    sleds.receiveShadow = true;
+    const d = this._dummy;
+    const col = new THREE.Color();
+    for (let i = 0; i < RACE_SLOTS.length; i++) {
+      const s = RACE_SLOTS[i];
+      d.position.set(s.x, 0, s.z + SLED_DZ);
+      d.rotation.set(0, SLOT_YAW, 0);
+      d.scale.setScalar(SLED_SCALE);
+      d.updateMatrix();
+      sleds.setMatrixAt(i, d.matrix);
+      sleds.setColorAt(i, col.set(SLOT_COLORS[i]));
+    }
+    sleds.instanceMatrix.needsUpdate = true;
+    if (sleds.instanceColor) sleds.instanceColor.needsUpdate = true;
+    sleds.computeBoundingSphere();
+    scene.add(sleds);
+    d.rotation.set(0, 0, 0);
+    d.scale.setScalar(1);
+
+    // riders get their own group so dispose() can empty it without hunting
+    this._riderGroup = new THREE.Group();
+    scene.add(this._riderGroup);
+
+    // floating RIDERS n/3 board, hanging over the gate facing the play camera
+    const sign = new THREE.Group();
+    sign.position.set(0, 5.3, GATE_Z - 0.02);
+    scene.add(sign);
+    const backing = [];
+    part(backing, new THREE.BoxGeometry(3.16, 0.94, 0.14), C.coralDark, {});
+    part(backing, new THREE.SphereGeometry(0.14, 8, 6), C.gold, { x: -1.5, z: 0.02 });
+    part(backing, new THREE.SphereGeometry(0.14, 8, 6), C.gold, { x: 1.5, z: 0.02 });
+    sign.add(solidMesh(backing, { shadow: false }));
+    this._ridersTex = ridersSignTexture();
+    const face = new THREE.Mesh(new THREE.PlaneGeometry(3.0, 0.78), texMat(this._ridersTex));
+    face.position.z = 0.09;
+    sign.add(face);
+    this._ridersSign = sign;
+    this._signBaseY = 5.3;
+  }
+
+  /** Repaint the tally board in place (one canvas, one texture, forever). */
+  _paintRiders() {
+    const tex = this._ridersTex;
+    const cv = tex?.image;
+    if (!cv?.getContext) return;
+    drawRidersSign(cv.getContext('2d'), cv.width, cv.height, this._lobbyCount, this._lobbyStarting);
+    tex.needsUpdate = true;
+  }
+
+  /** Server->client 'lobby': {players:[{id,name}], starting}. */
+  _onLobby(m) {
+    const game = this._game;
+    const players = Array.isArray(m?.players) ? m.players.slice(0, RACE_SLOTS.length) : [];
+    const selfId = game?.net?.selfId ?? null;
+    const seen = new Set();
+    let localSlot = null;
+
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      if (!p || p.id === undefined || p.id === null) continue;
+      if (selfId !== null && p.id === selfId) { localSlot = i; continue; }
+      seen.add(p.id);
+      this._addRider(p.id, p.name, i);
+    }
+    for (const id of [...this._riders.keys()]) if (!seen.has(id)) this._removeRider(id);
+
+    this._lobbyCount = players.length;
+    this._lobbyStarting = !!m?.starting;
+    this._setLocalSlot(localSlot);
+    this._paintRiders();
+    this._refreshJoinLabel();
+  }
+
+  /** Seat a remote lobby member in their sled. */
+  _addRider(id, name, slot) {
+    const existing = this._riders.get(id);
+    if (existing) {
+      if (existing.slot === slot) return;
+      this._removeRider(id);
+    }
+    const s = RACE_SLOTS[slot];
+    if (!s || !this._riderGroup) return;
+    const game = this._game;
+    const remote = game?.net?.remotes?.get?.(id) || null;
+    const avatar = createAvatar({
+      color: remote?.p?.color ?? DEFAULT_FUR,
+      hat: remote?.p?.hat ?? 'none',
+    });
+    avatar.setAnim('sit');
+    avatar.group.position.set(s.x, SEAT_LIFT, s.z);
+    avatar.group.rotation.y = SLOT_YAW;
+    this._riderGroup.add(avatar.group);
+
+    // The same capybara is also drawn by the net client wherever they happen to
+    // be standing. Park their networked body offscreen while they are seated
+    // here so the room never shows the same player twice; _restoreRemote puts
+    // it (and its name tag, which hides itself once unparented) straight back.
+    let hidden = null;
+    if (remote?.avatar?.group?.parent) {
+      hidden = remote.avatar.group;
+      hidden.parent.remove(hidden);
+    }
+    const tag = game?.engine?.attachNameTag?.(avatar.group, name || 'Capybara') || null;
+    this._riders.set(id, { avatar, slot, tag, hidden });
+    game?.audio?.play?.('pop');
+  }
+
+  _removeRider(id) {
+    const r = this._riders.get(id);
+    if (!r) return;
+    this._riders.delete(id);
+    r.tag?.remove?.();
+    this._riderGroup?.remove(r.avatar.group);
+    r.avatar.dispose();
+    this._restoreRemote(id, r.hidden);
+  }
+
+  /** Late-bind riders to their networked record: real fur, real hat, no double. */
+  _reconcileRiders() {
+    const remotes = this._game?.net?.remotes;
+    if (!remotes?.get) return;
+    for (const [id, r] of this._riders) {
+      if (r.hidden) continue;
+      const remote = remotes.get(id);
+      const g = remote?.avatar?.group;
+      if (!g?.parent) continue;
+      r.hidden = g;
+      g.parent.remove(g);
+      if (typeof remote.p?.color === 'number') r.avatar.setColor(remote.p.color);
+      if (remote.p?.hat) r.avatar.setHat(remote.p.hat);
+    }
+  }
+
+  /** Re-parent a networked avatar we hid, but only if it is still that player's. */
+  _restoreRemote(id, group) {
+    if (!group) return;
+    const remote = this._game?.net?.remotes?.get?.(id);
+    const remoteGroup = this._game?.engine?.remoteGroup;
+    if (!remoteGroup || remote?.avatar?.group !== group) return; // they left; net client owns it now
+    if (!group.parent) remoteGroup.add(group);
+  }
+
+  /** Walk the local capybara into (or out of) their seat. */
+  _setLocalSlot(slot) {
+    if (slot === this._localSlot) return;
+    const game = this._game;
+    const engine = game?.engine;
+    const avatar = engine?.playerAvatar;
+    if (slot !== null) {
+      const s = RACE_SLOTS[slot];
+      if (s && engine?.controller) engine.controller.setTarget(this._v.set(s.x, 0, s.z));
+      game?.audio?.play?.('whoosh');
+      game?.toast?.('You are in the lineup! Hop out any time.');
+    } else if (avatar) {
+      if (avatar.state.anim === 'sit') avatar.setAnim('idle');
+      engine?.snapY?.(avatar.group.position, this);
+      game?.audio?.play?.('click');
+    }
+    this._localSlot = slot;
+  }
+
+  /** Server->client 'race-start': stash the ctx, then launch the sled game. */
+  _onRaceStart(m) {
+    const game = this._game;
+    if (!game || !m) return;
+    // The server started the race either way, so the board is empty now.
+    this._clearLobby();
+    // Already inside a minigame (a solo run started from the rack while the
+    // lobby filled): startMinigame would no-op and the ctx would sit there
+    // waiting to turn some later solo run into a phantom race. Bow out loudly
+    // instead, so the other two are not left waiting on the 150s timeout.
+    if (game.activeMinigame) {
+      game.net?.send?.({ t: 'race-done', score: 0 });
+      game.toast?.('The race left without you: you were already on the slope!');
+      return;
+    }
+    game.__raceCtx = { seed: Number(m.seed) || 0, players: Array.isArray(m.players) ? m.players : [] };
+    game.toast?.('Three, two, one... GO!');
+    game.startMinigame('sled');
+  }
+
+  /** Empty every seat (race launched, or the room is going away). */
+  _clearLobby() {
+    for (const id of [...this._riders.keys()]) this._removeRider(id);
+    this._lobbyCount = 0;
+    this._lobbyStarting = false;
+    this._setLocalSlot(null);
+    this._paintRiders();
+    this._refreshJoinLabel();
+  }
+
+  /**
+   * Push the label onto the prompt. The engine writes textContent once, when it
+   * spawns the button, so a live label has to patch the element in place.
+   */
+  _refreshJoinLabel() {
+    const spot = this._joinSpot;
+    if (!spot) return;
+    const label = this._joinLabel();
+    if (label === spot.label) return;
+    spot.label = label;
+    const el = this._game?.engine?.hotspotEls?.get?.(spot);
+    if (el) el.textContent = label;
   }
 
   /* --- lighting ----------------------------------------------------------- */
@@ -1580,8 +1977,9 @@ export class PeakRoom extends Room {
 
   /* --- per-frame ---------------------------------------------------------- */
 
-  update(dt) {
+  update(dt, game) {
     const t = (this._t += dt);
+    if (game) this._game = game;
 
     // falling snow
     const snow = this._snow;
@@ -1720,9 +2118,79 @@ export class PeakRoom extends Room {
       const s = 1 + Math.sin(t * 0.5) * 0.03;
       this._halo.scale.set(s, s, s);
     }
+
+    this._updateLobby(dt, t);
+  }
+
+  /* --- race lobby, per frame ---------------------------------------------- */
+
+  _updateLobby(dt, t) {
+    // seated riders keep breathing (nothing organic is ever perfectly still)
+    for (const r of this._riders.values()) r.avatar.update(dt);
+
+    // A 'lobby' frame can beat the 'pjoin' that introduces the same capybara,
+    // so a rider may start out brown and un-deduplicated. Catch up twice a
+    // second: cheap, and it means the seat always ends up wearing their hat.
+    this._reconcileT += dt;
+    if (this._reconcileT > 0.5) {
+      this._reconcileT = 0;
+      if (this._riders.size) this._reconcileRiders();
+    }
+
+    // the board bobs, and pulses once two of the three seats are taken
+    const sign = this._ridersSign;
+    if (sign) {
+      sign.position.y = this._signBaseY + Math.sin(t * 1.3) * 0.09;
+      sign.rotation.z = Math.sin(t * 0.9) * 0.015;
+      const eager = this._lobbyCount === 2 || this._lobbyStarting;
+      const s = eager ? 1 + Math.abs(Math.sin(t * 4.2)) * 0.09 : 1;
+      sign.scale.set(s, s, s);
+    }
+
+    // keep the local capybara settled in their sled while they wait
+    const engine = this._game?.engine;
+    const avatar = engine?.playerAvatar;
+    if (this._localSlot !== null && avatar) {
+      const slot = RACE_SLOTS[this._localSlot];
+      const g = avatar.group;
+      const walking = !!engine.controller?.target;
+      if (slot && !walking && Math.hypot(g.position.x - slot.x, g.position.z - slot.z) < 0.55) {
+        if (avatar.state.anim !== 'sit') avatar.setAnim('sit');
+        g.position.y = SEAT_LIFT;
+        const d = ((((SLOT_YAW - g.rotation.y) % TAU) + Math.PI * 3) % TAU) - Math.PI;
+        g.rotation.y += d * Math.min(1, dt * 6);
+      }
+    }
+
+    // the prompt has to follow the connection coming and going
+    const online = !!this._game?.net?.connected;
+    if (online !== this._wasOnline) {
+      this._wasOnline = online;
+      if (!online) this._clearLobby();
+      else this._refreshJoinLabel();
+    }
   }
 
   dispose() {
+    // Walking out of the room while seated must not leave a ghost holding one of
+    // the three slots. Harmless if the server already dropped us on room change.
+    if (this._localSlot !== null && this._game?.net?.connected) {
+      this._game.net.send({ t: 'lobby-leave' });
+    }
+    // riders next: they hold engine-owned name tags and may be sitting on top
+    // of networked avatars we un-parented, which have to go back in the room
+    for (const id of [...this._riders.keys()]) this._removeRider(id);
+    this._riders.clear();
+    this._offLobby?.();
+    this._offRaceStart?.();
+    this._offLobby = null;
+    this._offRaceStart = null;
+    this._localSlot = null;
+    this._riderGroup = null;
+    this._ridersSign = null;
+    this._ridersTex = null; // the sign material is unique; disposeObject frees it
+    this._joinSpot = null;
+    this._game = null;
     this._snow = null;
     this._sparkles = null;
     this._banner = null;
