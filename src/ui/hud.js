@@ -1,5 +1,4 @@
 import { ROOM_INFO, GAME_NAME } from '../../shared/constants.js';
-import { openShop } from './shop.js';
 
 /** In-world HUD: coins, room name, chat, emotes, map, mute, shop. */
 export function initHud(game) {
@@ -53,17 +52,28 @@ export function initHud(game) {
   game.events.on('population', (n) => { $('pop-count').textContent = n > 1 ? ` * ${n} here` : ''; });
 
   // net status
+  let lastNet = null;
+  let deniedMsg = null;
   game.events.on('net', (s) => {
     $('net-dot').className = `net-dot ${s === 'online' ? 'on' : 'off'}`;
     const tip = $('net-tip');
     if (tip) {
       tip.textContent = s === 'online'
         ? 'Online : everyone can see you'
-        : 'Offline : swimming solo, still fun';
+        : `Offline : ${deniedMsg || 'swimming solo, still fun'}`;
     }
     $('net-dot').setAttribute('aria-label', s === 'online' ? 'Online' : 'Offline');
-    if (s === 'offline') game.toast('Connection lost, playing solo until it returns');
+    // only on the transition: the reconnect backoff would otherwise toast forever
+    if (s === 'offline' && lastNet !== 'offline') {
+      game.toast(deniedMsg || 'Connection lost, playing solo until it returns', 4200);
+    }
+    if (s === 'online') deniedMsg = null;
+    lastNet = s;
   });
+  // the server refused us outright (bad name, expired session): this is terminal,
+  // there is no reconnect, so say so instead of sitting on "paddling out..."
+  // (main.js already re-validates any saved token on load, so nothing to clear)
+  game.events.on('net-denied', (msg) => { deniedMsg = msg || 'the cove would not let us in'; });
 
   // chat
   $('chat-form').addEventListener('submit', (e) => {
@@ -99,8 +109,10 @@ export function initHud(game) {
     $('btn-mute').innerHTML = m ? '&#128263;' : '&#128266;';
   };
 
-  // shop
-  $('btn-shop').onclick = () => openShop(game);
+  // shop (loaded on demand, like the plaza hotspot, so it stays out of the entry chunk)
+  $('btn-shop').onclick = () => import('./shop.js')
+    .then((m) => m.openShop(game))
+    .catch((e) => { console.error('[hud] shop failed to load:', e); game.toast('The shop is not answering, try again'); });
 
   // toasts
   game.events.on('toast', (msg, ms = 2600) => {

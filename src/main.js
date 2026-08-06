@@ -24,12 +24,27 @@ game.net = net;
 // minigame lifecycle
 let activeGame = null;
 const mgRoot = document.getElementById('minigame-root');
-game.events.on('minigame', (id) => {
+game.events.on('minigame', async (id) => {
   if (id) {
-    const GameClass = GAMES[id];
-    if (!GameClass) { console.error(`[main] unknown minigame '${id}'`); return; }
-    game.activeMinigame = id;
+    if (activeGame) return;
+    const loader = Object.prototype.hasOwnProperty.call(GAMES, id) ? GAMES[id] : null;
+    if (!loader) { console.error(`[main] unknown minigame '${id}'`); return; }
+    game.activeMinigame = id; // set before awaiting so startMinigame stays guarded
+    let GameClass;
+    try {
+      GameClass = await loader();
+    } catch (e) {
+      console.error(`[main] failed to load minigame '${id}':`, e);
+      game.activeMinigame = null;
+      game.toast('That game could not load, try again');
+      return;
+    }
+    if (game.activeMinigame !== id) return; // quit raced the load
     engine.paused = true;
+    // the map lives under the minigame (z-index 30 vs 45); leaving it open would
+    // run its canvas painter invisibly and reveal it again on the way out
+    document.getElementById('map-overlay')?.classList.add('hidden');
+    document.getElementById('chat-input')?.blur(); // it is under there too, and it eats keys
     mgRoot.classList.remove('hidden');
     mgRoot.innerHTML = '';
     activeGame = new GameClass(game);
@@ -45,9 +60,13 @@ game.events.on('minigame', (id) => {
   }
 });
 
-// keyboard shortcuts (skipped while typing in inputs)
+// keyboard shortcuts (skipped while typing in inputs, and while a minigame owns
+// the screen: Enter used to focus the chat box hidden underneath it, which left
+// the running game with no keyboard at all)
 addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+  if (game.activeMinigame) return;
+  if (e.repeat) return; // held keys must not spam emotes (and net sends)
   if (e.key === 'd' || e.key === 'D') game.emote('dance');
   if (e.key === 'w' || e.key === 'W') game.emote('wave');
   if (e.key === 'm' || e.key === 'M') document.getElementById('map-overlay')?.classList.toggle('hidden');

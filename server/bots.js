@@ -103,7 +103,10 @@ export class BotManager {
             bot.target = { x: zone.x + Math.cos(a) * r, z: zone.z + Math.sin(a) * r };
           }
         }
-        if (bot.anim === 'dance' && bot.room !== 'club' && Math.random() < dt * 0.1) bot.anim = 'idle';
+        // club dancers must be able to stop too (rarely), otherwise dancing is an
+        // absorbing state: every bot ends up parked on the club floor forever
+        // and the other four rooms empty out.
+        if (bot.anim === 'dance' && Math.random() < dt * (bot.room === 'club' ? 0.03 : 0.1)) bot.anim = 'idle';
       }
     }
   }

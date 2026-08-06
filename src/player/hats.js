@@ -147,11 +147,16 @@ const builders = {
 };
 
 export function buildHat(id) {
-  const fn = builders[id] || builders.none;
-  return fn();
+  // own-property only: builders['__proto__'] is Object.prototype (truthy, not
+  // callable) and builders['constructor'] returns a plain object, either of
+  // which would throw inside createAvatar and blank out the whole room.
+  const fn = Object.prototype.hasOwnProperty.call(builders, id) ? builders[id] : builders.none;
+  const h = typeof fn === 'function' ? fn() : null;
+  return h?.isObject3D ? h : null;
 }
 
 /** Register extra hats at runtime (shop agent may extend). */
 export function registerHat(id, builderFn) {
-  builders[id] = builderFn;
+  if (typeof id !== 'string' || typeof builderFn !== 'function') return;
+  Object.defineProperty(builders, id, { value: builderFn, writable: true, enumerable: true, configurable: true });
 }

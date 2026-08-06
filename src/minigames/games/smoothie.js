@@ -1,5 +1,5 @@
 import { Minigame } from '../minigame.js';
-import { BODY_COLORS } from '../../../shared/constants.js';
+import { BODY_COLORS, clampCoinsForGame } from '../../../shared/constants.js';
 
 /**
  * Smoothie Scramble : the Smoothie Shack's order-matching rush.
@@ -769,6 +769,9 @@ export class SmoothieGame extends Minigame {
 
   coinsForScore(score) { return Math.round(score / 3); }
 
+  /** What the player will actually be paid, i.e. what the UI must show. */
+  _payout(score) { return clampCoinsForGame('smoothie', this.coinsForScore(score)); }
+
   _after(ms, fn) {
     const id = setTimeout(() => {
       this._timers.delete(id);
@@ -938,7 +941,7 @@ export class SmoothieGame extends Minigame {
         </div>
         <div class="mg-smoothie-stats">
           <div class="mg-smoothie-stat"><b>${best}</b><span>YOUR BEST</span></div>
-          <div class="mg-smoothie-stat mg-smoothie-gold"><b>${this.coinsForScore(best)}</b><span>COINS THEN</span></div>
+          <div class="mg-smoothie-stat mg-smoothie-gold"><b>${this._payout(best)}</b><span>COINS THEN</span></div>
         </div>
         <div class="mg-smoothie-btns">
           <button class="mg-smoothie-btn" data-a="play">START BLENDING</button>
@@ -981,7 +984,7 @@ export class SmoothieGame extends Minigame {
     const score = Math.round(this.score);
     const prevBest = this.game.state?.bests?.smoothie || 0;
     const isBest = score > prevBest;
-    const coins = this.coinsForScore(score);
+    const coins = this._payout(score); // the cap is what the purse actually gets
     this.finish(score);
     const shown = Math.max(prevBest, score);
     this.game.audio?.play?.(isBest ? 'success' : 'ding');

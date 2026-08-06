@@ -59,7 +59,8 @@ export const NET_TICK_MS = 100; // server broadcast + client send cadence
 export const WALK_SPEED = 5.2; // units/sec, shared so server bots match players
 
 export function clampCoinsForGame(gameId, coins) {
-  const g = MINIGAMES[gameId];
+  // own-property lookup: MINIGAMES['constructor'] is truthy and would yield NaN
+  const g = Object.prototype.hasOwnProperty.call(MINIGAMES, gameId) ? MINIGAMES[gameId] : null;
   if (!g) return 0;
-  return Math.max(0, Math.min(Math.floor(coins), g.maxCoinsPerRun));
+  return Math.max(0, Math.min(Math.floor(Number(coins) || 0), g.maxCoinsPerRun));
 }

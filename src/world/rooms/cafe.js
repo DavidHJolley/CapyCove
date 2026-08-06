@@ -684,9 +684,11 @@ export class CafeRoom extends Room {
     for (const b of this._batches) b.build(scene, b !== boxFlat, true);
 
     // --- navigation ---------------------------------------------------------
+    // both sit clear of the exit-plaza hotspot at (0,7) r=2.2, so arriving (or
+    // jumping here from the map) does not pop the "go back" prompt over you
     this.spawnPoints = {
-      default: new THREE.Vector3(0, 0, 5),
-      from_plaza: new THREE.Vector3(0, 0, 6),
+      default: new THREE.Vector3(0, 0, 4.3),
+      from_plaza: new THREE.Vector3(0, 0, 4.3),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 10, 13), lookHeight: 1 };
     this.hotspots.push(

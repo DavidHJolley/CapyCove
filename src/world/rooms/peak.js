@@ -607,9 +607,11 @@ export class PeakRoom extends Room {
     this._snowfall(scene);
     this._sparkle(scene);
 
+    // arrival spots sit a step BEYOND the exit hotspot's radius, so walking in
+    // from the plaza does not immediately pop the "go back" prompt over you
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 4),
-      from_plaza: new THREE.Vector3(0, 0, 11.2),
+      from_plaza: new THREE.Vector3(0, 0, 8.5), // exit-plaza is (0,12) r=3
     };
 
     this.hotspots.push(

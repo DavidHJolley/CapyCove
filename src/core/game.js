@@ -30,6 +30,19 @@ class Game {
 
   // ---- profile -------------------------------------------------------------
   applyProfile(p) {
+    if (p && p.registered === false) {
+      // Guest progress is client-owned and saveLocal() writes whatever lands
+      // here, so a server profile may only ever grow it. Belt and braces: the
+      // hello frame already ships our coins/hats/bests up.
+      const bests = { ...(this.state.bests || {}) };
+      for (const [g, v] of Object.entries(p.bests || {})) if (v > (bests[g] || 0)) bests[g] = v;
+      p = {
+        ...p,
+        coins: Math.max(this.state.coins || 0, Number(p.coins) || 0),
+        ownedHats: [...new Set([...(this.state.ownedHats || ['none']), ...(p.ownedHats || [])])],
+        bests,
+      };
+    }
     Object.assign(this.state, p);
     this.events.emit('profile', this.state);
     this.events.emit('coins', this.state.coins, 0, 'sync');
@@ -62,10 +75,14 @@ class Game {
     this.state.coins = total;
     this.events.emit('coins', total, delta, reason);
     if (delta > 0) this.audio?.play?.('coin');
+    this.saveLocal(); // guests: otherwise online earnings only survive by accident
   }
 
   // ---- rooms ---------------------------------------------------------------
   goToRoom(id, fromId = this.roomId) {
+    // a double-clicked exit prompt would otherwise queue a second full room
+    // build and make everyone in the room see a spurious leave/join
+    if (id === this.roomId && !this.activeMinigame) return;
     if (this.activeMinigame) this.endMinigame();
     this.engine?.switchRoom(id, fromId);
     this.roomId = id;
@@ -76,6 +93,9 @@ class Game {
   // ---- minigames -----------------------------------------------------------
   startMinigame(id) {
     if (this.activeMinigame) return;
+    // tell the server a run is starting: it pays out at most one 'score' per
+    // announced run, so a flood of score messages can no longer mint coins
+    this.net?.send({ t: 'mgstart', game: id });
     this.events.emit('minigame', id);
   }
 

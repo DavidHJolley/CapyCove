@@ -30,7 +30,10 @@ export function showTitle(game, onEnter) {
   root.appendChild(el);
 
   let mode = 'guest';
+  let entered = false; // finish() must never run twice: it opens a second socket
+  let busy = false;
   let color = BODY_COLORS[Math.floor(Math.random() * BODY_COLORS.length)];
+  const goBtn = el.querySelector('#t-go');
 
   const colorsEl = el.querySelector('#t-colors');
   for (const c of BODY_COLORS) {
@@ -65,9 +68,16 @@ export function showTitle(game, onEnter) {
 
   el.querySelector('#title-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const name = el.querySelector('#t-name').value.trim();
+    if (entered || busy) return; // double click / held Enter
+    const raw = el.querySelector('#t-name').value.trim();
     const pass = el.querySelector('#t-pass').value;
-    if (name.length < NAME_MIN_LEN) return err(`Name needs at least ${NAME_MIN_LEN} characters`);
+    // Match the server's own name cleaning (server/index.js cleanName), which is
+    // ASCII-only: a nickname that survives here but not there gets silently
+    // denied and leaves the player alone in the world with no explanation.
+    const name = raw.replace(/[^\w \-]/g, '').trim();
+    if (name.length < NAME_MIN_LEN) {
+      return err(`Name needs at least ${NAME_MIN_LEN} letters, numbers or _`);
+    }
 
     game.state.color = color;
     if (mode === 'guest') {
@@ -76,6 +86,8 @@ export function showTitle(game, onEnter) {
       return;
     }
     if (pass.length < 6) return err('Password needs at least 6 characters');
+    busy = true;
+    goBtn.disabled = true;
     try {
       const res = await fetch(`/api/${mode}`, {
         method: 'POST',
@@ -89,10 +101,16 @@ export function showTitle(game, onEnter) {
       finish({ token: data.token });
     } catch {
       err('Server unreachable. Try "Play now" for offline mode.');
+    } finally {
+      busy = false;
+      goBtn.disabled = entered; // a failed login can be retried
     }
   });
 
   function finish(auth) {
+    if (entered) return;
+    entered = true;
+    goBtn.disabled = true;
     el.classList.add('fade-out');
     setTimeout(() => el.remove(), 450);
     onEnter(auth);

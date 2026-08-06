@@ -386,7 +386,9 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
   transition: opacity 0.45s ease;
 }
 @keyframes sky-drift { to { background-position: 0 0, 0 100%; } }
-.title-screen.fade-out { opacity: 0; pointer-events: none; }
+/* ID selector so this beats "#overlay-root > * { pointer-events: auto }": the
+   card is transparent but still hit-testable for its whole 450ms fade. */
+#overlay-root > .title-screen.fade-out { opacity: 0; pointer-events: none; }
 
 /* two parallax layers of CSS clouds */
 .title-screen::before, .title-screen::after {

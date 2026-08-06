@@ -4,6 +4,7 @@ import { createAvatar } from '../player/avatar.js';
 import { WalkController } from '../player/controller.js';
 
 const DOWN = new THREE.Vector3(0, -1, 0);
+const _rayOrigin = new THREE.Vector3(); // snapY runs per remote per frame; don't allocate
 
 /**
  * Engine: renderer, camera, main loop, room lifecycle, click-to-move,
@@ -17,9 +18,13 @@ export class Engine {
     this.room = null;
     this.scene = null;
     this.paused = false;
+    this._switchTimer = null; // pending switchRoom fade timer
+    this._pendingRoom = null; // its destination, so re-entrant calls can collapse
+    this._switchSeq = 0;
     this.playerAvatar = null;
     this.controller = null;
     this.remoteGroup = new THREE.Group();
+    this.roomAge = 0; // seconds since the current room finished building
     this.overlays = new Set(); // {obj, el, yOff, until?}
     this.hotspotEls = new Map(); // hotspot -> button el
     this.ray = new THREE.Raycaster();
@@ -61,13 +66,39 @@ export class Engine {
 
   // ---- room lifecycle ------------------------------------------------------
   switchRoom(id, fromId) {
-    const RoomClass = this.rooms[id];
-    if (!RoomClass) { console.error(`[engine] unknown room '${id}'`); return; }
+    const loader = Object.prototype.hasOwnProperty.call(this.rooms, id) ? this.rooms[id] : null;
+    if (!loader) { console.error(`[engine] unknown room '${id}'`); return; }
+
+    // Collapse re-entrant calls (double-clicked exit prompt): the same
+    // destination keeps its original arrival time, a different one wins and
+    // cancels the queued build instead of running both.
+    if (this._pendingRoom !== null) {
+      if (this._pendingRoom === id) return;
+      if (this._switchTimer !== null) { clearTimeout(this._switchTimer); this._switchTimer = null; }
+    }
+    this._pendingRoom = id;
+    const seq = ++this._switchSeq;
+
+    // start the room module download NOW so the fade covers it, not after
+    const pending = (async () => loader())();
+    pending.catch(() => {}); // handled in the timer; this only silences an orphaned reject
 
     const fade = document.getElementById('fade');
     fade.classList.add('on');
 
-    setTimeout(() => {
+    this._switchTimer = setTimeout(async () => {
+      this._switchTimer = null;
+      let RoomClass;
+      try {
+        RoomClass = await pending;
+      } catch (e) {
+        console.error(`[engine] failed to load room '${id}':`, e);
+        if (seq === this._switchSeq) { this._pendingRoom = null; fade.classList.remove('on'); }
+        return;
+      }
+      if (seq !== this._switchSeq) return; // superseded while loading
+      this._pendingRoom = null;
+
       this._teardownRoom();
       this.room = new RoomClass();
       this.scene = new THREE.Scene();
@@ -90,6 +121,7 @@ export class Engine {
       this.camera.position.copy(spawn).add(this.camCfg.offset);
       this.camTarget.copy(spawn);
 
+      this.roomAge = 0;
       this.game.audio?.setRoom?.(id);
       fade.classList.remove('on');
     }, 220);
@@ -110,7 +142,7 @@ export class Engine {
 
   // ---- ground helpers ------------------------------------------------------
   snapY(pos, room) {
-    this.ray.set(new THREE.Vector3(pos.x, pos.y + 8, pos.z), DOWN);
+    this.ray.set(_rayOrigin.set(pos.x, pos.y + 8, pos.z), DOWN);
     const hits = this.ray.intersectObjects(room.groundMeshes, false);
     if (hits.length) pos.y = hits[0].point.y;
     return !!hits.length;
@@ -121,6 +153,24 @@ export class Engine {
     if (this.paused || !this.room || e.button !== 0) return;
     const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
     this.ray.setFromCamera(ndc, this.camera);
+
+    // clicking another capybara opens their profile instead of walking
+    const avatarHits = this.ray.intersectObjects(this.remoteGroup.children, true);
+    if (avatarHits.length) {
+      let root = avatarHits[0].object;
+      while (root.parent && root.parent !== this.remoteGroup) root = root.parent;
+      const remotes = this.game.net?.remotes;
+      if (remotes) {
+        for (const [id, r] of remotes) {
+          if (r.avatar.group === root) {
+            this.game.audio?.play?.('pop');
+            this.game.events.emit('avatar-click', id);
+            return;
+          }
+        }
+      }
+    }
+
     const hits = this.ray.intersectObjects(this.room.groundMeshes, false);
     if (hits.length) {
       this.controller.setTarget(hits[0].point);
@@ -172,7 +222,23 @@ export class Engine {
     const v = new THREE.Vector3();
     for (const h of this.room.hotspots) {
       const d = Math.hypot(p.x - h.position.x, p.z - h.position.z);
-      const near = d <= (h.radius || 2.5);
+      const radius = h.radius || 2.5;
+      const near = d <= radius;
+
+      // exits fire by walking in, no click needed. Armed only once the player
+      // has been clearly outside the radius (prevents an instant bounce-back
+      // when arriving on a spawn near the return exit).
+      if (h.id?.startsWith('exit-') && !h.noAuto) {
+        if (!h.__armed) {
+          if (this.roomAge > 0.4 && d > radius + 0.75) h.__armed = true;
+        } else if (!h.__fired && d <= radius * 0.8 && this.roomAge > 1.2 && !this.game.activeMinigame) {
+          h.__fired = true;
+          this.game.audio?.play?.('whoosh');
+          h.action(this.game);
+          continue;
+        }
+      }
+
       let el = this.hotspotEls.get(h);
       if (near && !el) {
         el = document.createElement('button');
@@ -201,6 +267,7 @@ export class Engine {
   _tick() {
     const dt = Math.min(this.clock.getDelta(), 0.05);
     if (!this.paused && this.room && this.scene) {
+      this.roomAge += dt;
       this.controller.update(dt, this.room);
       this.playerAvatar.update(dt);
       this.room.update(dt, this.game);

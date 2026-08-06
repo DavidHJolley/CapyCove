@@ -23,7 +23,12 @@ export function verifyToken(token) {
   if (parts.length !== 3) return null;
   const [username, exp, sig] = parts;
   const expect = crypto.createHmac('sha256', SECRET).update(`${username}.${exp}`).digest('hex');
-  if (sig.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return null;
+  // Compare BYTE lengths of the buffers we hand to timingSafeEqual: a string
+  // length check passes for multi-byte UTF-8 signatures and timingSafeEqual
+  // then throws RangeError, which would kill the process from the ws handler.
+  const got = Buffer.from(sig);
+  const want = Buffer.from(expect);
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return null;
   if (Number(exp) < Date.now()) return null;
   return users.has(username.toLowerCase()) ? username : null;
 }
@@ -34,8 +39,10 @@ export function publicProfile(rec) {
     coins: rec.coins,
     color: rec.color,
     hat: rec.hat,
-    ownedHats: rec.ownedHats,
-    bests: rec.bests || {},
+    // copies, never the live record arrays/objects: two sessions on one account
+    // used to share a single ownedHats reference (free hats + coin rollback).
+    ownedHats: [...(rec.ownedHats || ['none'])],
+    bests: { ...(rec.bests || {}) },
   };
 }
 
@@ -65,8 +72,9 @@ export function signup({ username, password, color, hat }) {
 export function login({ username, password }) {
   const rec = users.get(String(username || '').toLowerCase());
   if (!rec) return { ok: false, msg: 'Unknown name or wrong password' };
-  const hash = scryptHash(String(password || ''), rec.salt);
-  if (hash.length !== rec.hash.length || !crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(rec.hash))) {
+  const hash = Buffer.from(scryptHash(String(password || ''), rec.salt));
+  const want = Buffer.from(String(rec.hash || ''));
+  if (hash.length !== want.length || !crypto.timingSafeEqual(hash, want)) {
     return { ok: false, msg: 'Unknown name or wrong password' };
   }
   return { ok: true, token: makeToken(rec.username), profile: publicProfile(rec) };

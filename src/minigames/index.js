@@ -1,10 +1,7 @@
 // Minigame registry. Ids must match shared/constants.js MINIGAMES.
-import { FishingGame } from './games/fishing.js';
-import { SledGame } from './games/sled.js';
-import { SmoothieGame } from './games/smoothie.js';
-
+// Code-split: nothing here is downloaded until a player actually starts a run.
 export const GAMES = {
-  fishing: FishingGame,
-  sled: SledGame,
-  smoothie: SmoothieGame,
+  fishing: () => import('./games/fishing.js').then((m) => m.FishingGame),
+  sled: () => import('./games/sled.js').then((m) => m.SledGame),
+  smoothie: () => import('./games/smoothie.js').then((m) => m.SmoothieGame),
 };

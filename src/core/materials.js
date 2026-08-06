@@ -53,7 +53,9 @@ export function canvasTexture(w, h, draw) {
 /** Dispose helper: recursively free geometries + non-cached materials of a subtree. */
 export function disposeObject(root) {
   root.traverse((o) => {
-    o.geometry?.dispose?.();
+    // geometry.userData.shared marks module-level singletons (avatar bodies):
+    // other avatars are still drawing them, so they outlive any one subtree
+    if (o.geometry && !o.geometry.userData?.shared) o.geometry.dispose();
     // A shadow map is a WebGLRenderTarget hanging off the light, not off any
     // material, so the material sweep below never reaches it. Rooms are rebuilt
     // on every visit, so without this each visit leaks one GPU texture per

@@ -228,9 +228,11 @@ export class ClubRoom extends Room {
     this._buildAtmosphere(scene);
     this._buildLights(scene);
 
+    // both sit clear of the exit-plaza hotspot at (0,8) r=3.2, so arriving (or
+    // jumping here from the map) does not pop the "go back" prompt over you
     this.spawnPoints = {
-      default: new THREE.Vector3(0, PODIUM_TOP, 6),
-      from_plaza: new THREE.Vector3(0, PODIUM_TOP, 7),
+      default: new THREE.Vector3(0, PODIUM_TOP, 4.2),
+      from_plaza: new THREE.Vector3(0, PODIUM_TOP, 4.2),
     };
 
     this.hotspots.push({

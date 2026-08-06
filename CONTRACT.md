@@ -1,5 +1,8 @@
 # Capy Cove: module contract
 
+> New here? Read CLAUDE.md first (project scope, file ownership, working
+> rules), then this file for interfaces, then DESIGN.md for style.
+
 Capy Cove is a cozy multiplayer hangout world (Three.js client, Node/ws server).
 Players are chibi capybaras who explore rooms, chat, dance, play minigames for
 coins, and buy hats. This document is the integration contract. Read it fully

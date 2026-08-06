@@ -20,6 +20,13 @@ WebAudio synth).
 - Server-authoritative coin payouts (per-game caps) and chat rate limits
 - Ambient capybara bots so the cove never feels empty
 
+## Documentation
+
+- `CLAUDE.md`: agent/developer onboarding: scope, file ownership, rules
+- `CONTRACT.md`: module interfaces (rooms, minigames, game API, protocol)
+- `DESIGN.md`: art style and game design bible
+- `docs/CARDGAME.md`: Capy Clash card duel spec
+
 ## Development
 ```bash
 npm install
