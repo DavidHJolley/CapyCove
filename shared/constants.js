@@ -60,7 +60,10 @@ export const BOT_ZONES = {
   cafe: { x: 0, z: 2, r: 4 },
   club: { x: 0, z: 2, r: 4.5 },
   lounge: { x: 0, z: 2, r: 4 },
-  mine: { x: 0, z: 3, r: 4 },
+  // south of the Prop Hunt lobby deck: the old (0, 3, 4) circle covered the
+  // deck's northern half, so blind bots wandered onto the join pads and read
+  // as capys who had signed up for a hunt they were not in
+  mine: { x: 1, z: 5.8, r: 3 },
   jungle: { x: 0, z: 3, r: 4.5 },
 };
 

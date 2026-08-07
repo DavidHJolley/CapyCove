@@ -94,6 +94,28 @@ const DEN_RADIUS = 2.2;
 // needs no collider of its own at all.
 const COCOA = { x: 6.6, z: 2.6 };
 
+/**
+ * The Glimmer Mine's front door, cut into the mountainside on the WEST flank of
+ * the clearing. Its group sits at (MINE.x, terrain, MINE.z) yawed MINE_YAW, so
+ * local +Z is the way OUT of the adit: the mouth faces south-east, 35 degrees
+ * off the play camera's axis, which is close enough to square that the opening,
+ * its lit throat and the board above it all read from the clearing (the ski
+ * lodge learned this the hard way with a west-facing door).
+ *
+ * The pocket it lives in is tight: the frozen pond's collider (r 3.85) is to
+ * the north, the snow capybara (r 1.35) to the east and the chairlift's west
+ * tower (r 1.05) to the south-west. The bluff therefore carries ONE collider,
+ * a single circle behind the door face - convex, so the walk controller's
+ * slide can never wedge in a notch - and it clears all three:
+ *   pond 6.58 (needs 6.25) · snow capy 5.26 (3.75) · lift tower 4.29 (3.45)
+ * The exit's fire ring (radius * 0.8 = 1.76 around the threshold) reaches to
+ * 2.54 of the rock, so you always hand over before you touch the mountain.
+ */
+const MINE = { x: -9.0, z: 6.6 };
+const MINE_YAW = 0.62;
+const MINE_DOOR = { x: -8.01, z: 7.98 };  // local (0, 1.7): the threshold
+const MINE_RADIUS = 2.2;
+
 const GATE_Z = -9; // the start gate group sits here; the chute runs to -Z
 
 /**
@@ -596,6 +618,107 @@ function denDoorwayTexture() {
   });
 }
 
+/**
+ * The board bolted to the rock over the mineshaft door. Same job as the den's
+ * gable shingle: the close-range confirmation that this lit hole in the
+ * mountain is a place, not scenery. Big ink on cream, one glyph, one subtitle.
+ */
+function mineSignTexture() {
+  return canvasTexture(512, 232, (c, w, h) => {
+    c.fillStyle = '#fff6e3';
+    c.beginPath();
+    c.roundRect(5, 5, w - 10, h - 10, 22);
+    c.fill();
+    c.fillStyle = '#f2b64a';
+    c.beginPath();
+    c.roundRect(5, 5, w - 10, 54, [22, 22, 0, 0]);
+    c.fill();
+    c.strokeStyle = '#5f3f28';
+    c.lineWidth = 10;
+    c.beginPath();
+    c.roundRect(5, 5, w - 10, h - 10, 22);
+    c.stroke();
+
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillStyle = '#3a2a18';
+    c.font = '800 32px system-ui, "Segoe UI", Verdana, sans-serif';
+    c.fillText('INTO THE MOUNTAIN', w / 2, 31);
+
+    c.fillStyle = 'rgba(90,60,35,0.26)';
+    c.font = '900 78px system-ui, "Segoe UI", Verdana, sans-serif';
+    c.fillText('GLIMMER MINE', w / 2 + 5, 117);
+    c.fillStyle = '#2d2417';
+    c.fillText('GLIMMER MINE', w / 2, 112);
+
+    // a crossed pick and shovel either side of the strapline
+    c.strokeStyle = '#8a6242';
+    c.lineWidth = 9;
+    c.lineCap = 'round';
+    for (const cx of [62, w - 62]) {
+      c.beginPath();
+      c.moveTo(cx - 26, 186);
+      c.lineTo(cx + 26, 146);
+      c.moveTo(cx - 26, 146);
+      c.lineTo(cx + 26, 186);
+      c.stroke();
+    }
+    c.lineCap = 'butt';
+    c.fillStyle = '#8a6242';
+    c.font = '700 29px system-ui, "Segoe UI", Verdana, sans-serif';
+    c.fillText('coins in the walls · warm lanterns', w / 2, 172);
+  });
+}
+
+/** The lit throat you see through the mineshaft frame: rails, lamps, a glint. */
+function mineThroatTexture() {
+  return canvasTexture(256, 256, (c, w, h) => {
+    const g = c.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#3a2415');
+    g.addColorStop(0.42, '#6d431f');
+    g.addColorStop(0.75, '#c07a34');
+    g.addColorStop(1, '#e8a659');
+    c.fillStyle = g;
+    c.fillRect(0, 0, w, h);
+
+    // two receding timber frames, painted so the throat has depth
+    c.strokeStyle = 'rgba(58,36,20,0.85)';
+    for (const [inset, lw] of [[34, 16], [70, 11]]) {
+      c.lineWidth = lw;
+      c.strokeRect(inset, inset * 0.8, w - inset * 2, h - inset * 1.1);
+    }
+    // rails running away into the dark
+    c.strokeStyle = 'rgba(255,214,150,0.5)';
+    c.lineWidth = 7;
+    c.beginPath();
+    c.moveTo(70, h);
+    c.lineTo(112, 128);
+    c.moveTo(w - 70, h);
+    c.lineTo(w - 112, 128);
+    c.stroke();
+    // a hanging lantern and one amber glint in the wall
+    c.fillStyle = 'rgba(255,222,160,0.92)';
+    c.beginPath();
+    c.arc(w / 2, 74, 15, 0, TAU);
+    c.fill();
+    c.fillStyle = 'rgba(255,238,200,0.35)';
+    c.beginPath();
+    c.moveTo(w / 2 - 44, 168);
+    c.lineTo(w / 2 + 44, 168);
+    c.lineTo(w / 2 + 20, 74);
+    c.lineTo(w / 2 - 20, 74);
+    c.closePath();
+    c.fill();
+    c.fillStyle = '#7ce0d4';
+    c.beginPath();
+    c.moveTo(190, 150);
+    c.lineTo(202, 128);
+    c.lineTo(210, 152);
+    c.closePath();
+    c.fill();
+  });
+}
+
 function trailSignTexture() {
   return canvasTexture(512, 160, (c, w, h) => {
     c.fillStyle = '#b98a5c';
@@ -945,6 +1068,7 @@ export class PeakRoom extends Room {
     this._chairlift(scene);
     this._pond(scene);
     this._snowCapybara(scene);
+    this._mineAdit(scene);
     this._sledRack(scene);
     this._startGate(scene);
     this._raceLobby(scene);
@@ -967,6 +1091,11 @@ export class PeakRoom extends Room {
       // It also stays north of z 8: past that the south snowbank crest rises
       // into the camera's sightline and clips the capybara's feet.
       from_lounge: new THREE.Vector3(8.2, 0, 7.7),
+      // Out of the mine and a step down its shovelled path, with the lit adit
+      // behind you and the clearing ahead. 3.40 from 'exit-mine' (arming needs
+      // > 2.95, re-entry fires at 1.76), 7.70 clear of the bluff's collider and
+      // 3.32 clear of the snow capybara, so nothing is in reach on arrival.
+      from_mine: new THREE.Vector3(-6.14, 0, 10.82),
     };
 
     // The gate offers the multiplayer lobby; the sled rack a few steps east is
@@ -1018,6 +1147,14 @@ export class PeakRoom extends Room {
         radius: DEN_RADIUS,
         label: 'Step into the Game Den',
         action: (g) => g.goToRoom('lounge', 'peak'),
+      },
+      {
+        // the mountain is hollow: a timbered adit on the west of the clearing
+        id: 'exit-mine',
+        position: new THREE.Vector3(MINE_DOOR.x, 0, MINE_DOOR.z),
+        radius: MINE_RADIUS,
+        label: 'Duck into the Glimmer Mine',
+        action: (g) => g.goToRoom('mine', 'peak'),
       },
       {
         id: 'exit-plaza',
@@ -1452,6 +1589,13 @@ export class PeakRoom extends Room {
       // the forecourt). Rocks are still allowed through: at 1.0 tall nothing
       // that low can reach the sightline.
       if (x > 5.0 && x < 13.8 && z > 5.0) continue;
+      // The mineshaft door and its viewing corridor, by the same argument: the
+      // camera sits 20 south of anyone on that path, so a pine in this band
+      // stands between it and the lit adit. Excluding candidates only removes
+      // trees from the list (the rng stream is consumed before these tests, so
+      // every other tree keeps its spot).
+      if (Math.hypot(x - MINE.x, z - MINE.z) < 5.6) continue;
+      if (x > -11.6 && x < -6.4 && z > 6.0) continue;
       if (Math.hypot(x + 8.0, z + 1.6) < 5.2) continue; // pond
       if (Math.hypot(x, z + 9) < 5.4) continue; // start gate
       let clash = false;
@@ -1521,6 +1665,7 @@ export class PeakRoom extends Room {
       if (Math.hypot(x - BZ.x, z - BZ.z) < BZ.r + 1.6) continue;
       if (Math.hypot(x - 10.6, z - 1.0) < 5.4) continue;
       if (x > 4.0 && x < 14.4 && z > 5.2 && z < 10.6) continue; // den approach
+      if (Math.hypot(x - MINE.x, z - MINE.z) < 4.2) continue; // mine forecourt
       if (Math.hypot(x + 8.0, z + 1.6) < 4.4) continue;
       const s = 0.55 + rng() * 1.05;
       d.position.set(x, terrainH(x, z) - 0.14, z);
@@ -2320,6 +2465,218 @@ export class PeakRoom extends Room {
     this.obstacles.push({ x, z, r: 1.35 });
   }
 
+  /* --- the mineshaft door ------------------------------------------------- */
+
+  /**
+   * A timbered adit into the mountainside on the west of the clearing: rock
+   * bluff, pierced frame, two burning lanterns, a board over the lintel and a
+   * stub of rail running out of the mouth into the snow. See the MINE constants
+   * for the collider audit; the shovelled path is dressed here too so the
+   * approach reads sign -> lit path -> lit hole, the same grammar as the den.
+   */
+  _mineAdit(scene) {
+    const rng = this._rng;
+    const baseY = terrainH(MINE.x, MINE.z);
+    const g = new THREE.Group();
+    g.position.set(MINE.x, baseY, MINE.z);
+    g.rotation.y = MINE_YAW; // local +Z points out of the mouth
+    scene.add(g);
+
+    const solid = [];
+    const glow = [];
+    const HW = 1.2;   // opening half width
+    const H = 2.75;   // opening height
+
+    // ---- the bluff: lumps of rock heaped around and over the opening -------
+    const lumps = [
+      [-2.6, 0.9, -0.2, 1.6], [-3.4, 1.9, -1.3, 1.9], [-2.2, 2.4, -1.9, 1.5],
+      [2.6, 0.9, -0.2, 1.6], [3.3, 1.8, -1.2, 1.9], [2.2, 2.5, -2.0, 1.5],
+      [0, 3.7, -1.1, 2.0], [-1.3, 4.0, -2.1, 1.7], [1.3, 3.9, -2.2, 1.7],
+      [0, 2.2, -3.7, 2.8], [-2.4, 2.6, -4.0, 2.2], [2.5, 2.5, -4.1, 2.2], [0, 4.5, -3.5, 2.0],
+    ];
+    for (let i = 0; i < lumps.length; i++) {
+      const [lx, ly, lz, r] = lumps[i];
+      const geo = new THREE.IcosahedronGeometry(r, 0);
+      geo.scale(1, 0.86, 1);
+      part(solid, geo, i % 3 ? C.rock : C.rockDark, { ry: rng() * TAU, x: lx, y: ly, z: lz });
+      // snow lying on everything that faces the sky
+      if (ly > 2.0) {
+        part(solid, new THREE.SphereGeometry(r * 0.72, 9, 6, 0, TAU, 0, Math.PI * 0.5), C.snowLit, {
+          sy: 0.42, x: lx, y: ly + r * 0.72, z: lz,
+        });
+      }
+    }
+    // drift banked against the foot of the bluff, outside the doorway
+    part(solid, new THREE.SphereGeometry(1, 10, 7), C.snowLit, { sx: 3.4, sy: 0.42, sz: 0.9, x: 0, y: 0.02, z: 0.85 });
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.SphereGeometry(1, 9, 6), C.snow, { sx: 1.1, sy: 0.34, sz: 0.7, x: s * 2.6, y: 0.02, z: 0.7 });
+    }
+
+    // ---- the throat: two receding frames behind a dark slot ----------------
+    part(solid, new THREE.BoxGeometry(HW * 2 + 0.5, H + 0.4, 0.14), 0x2a1c12, { y: (H + 0.4) / 2, z: -2.55 });
+    const throatMat = makeGlow(0xffffff, { unique: true });
+    throatMat.map = mineThroatTexture();
+    throatMat.needsUpdate = true;
+    const throat = new THREE.Mesh(new THREE.PlaneGeometry(HW * 2 - 0.05, H - 0.05), throatMat);
+    throat.position.set(0, H / 2, -2.42);
+    g.add(throat);
+    for (let i = 1; i <= 2; i++) {
+      const z = -i * 0.95;
+      const hue = i === 1 ? C.woodDark : 0x4a3222;
+      for (const s of [-1, 1]) {
+        part(solid, new THREE.BoxGeometry(0.28, H - i * 0.1, 0.26), hue, { x: s * (HW - 0.06), y: (H - i * 0.1) / 2, z });
+      }
+      part(solid, new THREE.BoxGeometry(HW * 2 + 0.36, 0.3, 0.28), hue, { y: H - i * 0.1 + 0.1, z });
+    }
+
+    // ---- the mouth frame: chunky posts, lintel, snow-capped cap beam -------
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.BoxGeometry(0.36, H, 0.44), s < 0 ? C.wood : C.woodLit, { x: s * HW, y: H / 2, z: 0.02 });
+      part(solid, new THREE.BoxGeometry(0.5, 0.22, 0.56), C.woodDark, { x: s * HW, y: 0.11, z: 0.02 });
+      part(solid, new THREE.SphereGeometry(0.1, 8, 6), C.gold, { x: s * HW, y: H - 0.18, z: 0.26 });
+      // strut wedged between post and rock
+      part(solid, new THREE.BoxGeometry(0.18, 0.9, 0.18), C.woodDark, {
+        rz: s * 0.8, x: s * (HW + 0.42), y: H - 0.5, z: 0.02,
+      });
+    }
+    part(solid, new THREE.BoxGeometry(HW * 2 + 1.0, 0.4, 0.52), C.woodDark, { y: H + 0.2, z: 0.04 });
+    part(solid, new THREE.BoxGeometry(HW * 2 + 1.5, 0.18, 0.78), C.wood, { rx: -0.26, y: H + 0.56, z: 0.3 });
+    part(solid, new THREE.BoxGeometry(HW * 2 + 1.6, 0.12, 0.72), C.snowLit, { rx: -0.26, y: H + 0.7, z: 0.34 });
+
+    // ---- lanterns hung under the cap beam ----------------------------------
+    for (const s of [-1, 1]) {
+      const lx = s * (HW + 0.28);
+      link(solid, [lx, H + 0.36, 0.24], [lx, H - 0.02, 0.24], 0.028, C.steelDark);
+      part(solid, new THREE.ConeGeometry(0.24, 0.2, 4), C.coralDark, { ry: Math.PI / 4, x: lx, y: H - 0.12, z: 0.24 });
+      part(solid, new THREE.SphereGeometry(0.06, 7, 5), C.gold, { x: lx, y: H - 0.02, z: 0.24 });
+      part(glow, new THREE.BoxGeometry(0.2, 0.26, 0.2), C.warm, { x: lx, y: H - 0.34, z: 0.24 });
+    }
+
+    // ---- the board over the lintel -----------------------------------------
+    part(solid, new THREE.BoxGeometry(2.5, 1.14, 0.12), C.woodDark, { y: H + 1.42, z: -0.16 });
+    part(solid, new THREE.BoxGeometry(2.6, 0.12, 0.26), C.snowLit, { y: H + 2.04, z: -0.14 });
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.SphereGeometry(0.09, 8, 6), C.gold, { x: s * 1.08, y: H + 1.42, z: -0.09 });
+    }
+    const board = new THREE.Mesh(new THREE.PlaneGeometry(2.38, 1.08), texMat(mineSignTexture()));
+    board.position.set(0, H + 1.42, -0.09);
+    g.add(board);
+
+    // ---- rails running out of the mouth, ending in the drift ---------------
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.BoxGeometry(0.09, 0.1, 3.6), C.steelDark, { x: s * 0.42, y: 0.08, z: 1.2 });
+    }
+    for (let i = 0; i < 5; i++) {
+      part(solid, new THREE.BoxGeometry(1.24, 0.09, 0.24), C.woodDark, { x: 0, y: 0.04, z: -0.3 + i * 0.78 });
+    }
+    part(solid, new THREE.BoxGeometry(1.16, 0.34, 0.2), C.woodDark, { y: 0.21, z: 2.9 });
+    part(solid, new THREE.BoxGeometry(1.2, 0.12, 0.26), C.coralDark, { y: 0.42, z: 2.9 });
+    // spilled ore beside the rails, still glinting under the snow
+    for (let i = 0; i < 6; i++) {
+      const ox = (rng() - 0.5) * 2.6;
+      const oz = 1.2 + rng() * 1.9;
+      part(solid, new THREE.IcosahedronGeometry(0.13 + rng() * 0.1, 0), i % 3 ? C.rockDark : C.rock, { x: ox, y: 0.08, z: oz });
+      if (i % 2) part(glow, new THREE.OctahedronGeometry(0.09), i % 4 ? C.gold : 0x42d6c8, { x: ox + 0.16, y: 0.1, z: oz + 0.1 });
+    }
+
+    // ---- a lamp post out on the path, west of the mouth --------------------
+    const px = -1.9;
+    const pz = 2.6;
+    part(solid, new THREE.CylinderGeometry(0.3, 0.36, 0.2, 9), C.snowLit, { x: px, y: 0.1, z: pz });
+    part(solid, new THREE.CylinderGeometry(0.1, 0.12, 1.6, 7), C.woodDark, { x: px, y: 0.95, z: pz });
+    part(solid, new THREE.BoxGeometry(0.32, 0.05, 0.32), C.steelDark, { x: px, y: 1.75, z: pz });
+    part(solid, new THREE.ConeGeometry(0.28, 0.22, 4), C.coralDark, { ry: Math.PI / 4, x: px, y: 2.05, z: pz });
+    part(solid, new THREE.SphereGeometry(0.08, 7, 5), C.gold, { x: px, y: 2.19, z: pz });
+    part(glow, new THREE.BoxGeometry(0.24, 0.3, 0.24), C.warm, { x: px, y: 1.9, z: pz });
+
+    g.add(solidMesh(solid));
+    const glowMeshMine = glowMesh(glow);
+    g.add(glowMeshMine);
+    this._mineLampMat = glowMeshMine.userData.mat;
+
+    // hearth light in the mouth: a capybara on the threshold is lit warm
+    this._mineLight = new THREE.PointLight(0xffc07a, 9, 8, 2);
+    this._mineLight.position.set(0, 1.6, 0.1);
+    g.add(this._mineLight);
+
+    // the warm pool the mouth throws onto the snow
+    this._mineGlowMat = makeGlow(0xffcf8a, { unique: true });
+    this._mineGlowMat.transparent = true;
+    this._mineGlowMat.opacity = 0.38;
+    this._mineGlowMat.depthWrite = false;
+    this._mineGlowMat.blending = THREE.AdditiveBlending;
+    this._mineGlowMat.map = glowPoolTexture();
+    this._mineGlowMat.needsUpdate = true;
+    const pool = new THREE.Mesh(new THREE.PlaneGeometry(4.4, 4.4), this._mineGlowMat);
+    pool.rotation.x = -Math.PI / 2;
+    pool.position.set(0, 0.1, 1.9);
+    pool.renderOrder = 1;
+    g.add(pool);
+
+    // ---- world-space bits: the collider and the shovelled path stub --------
+    g.updateMatrixWorld(true);
+    const w = new THREE.Vector3();
+    g.localToWorld(w.set(0, 0, -2.6));
+    this.obstacles.push({ x: w.x, z: w.z, r: 2.4 });
+    g.localToWorld(w.set(px, 0, pz));
+    this.obstacles.push({ x: w.x, z: w.z, r: 0.3 });
+
+    const p = [];
+    const topAt = (cx, cz, hw = 0.9, hz = 1.1) => Math.max(
+      terrainH(cx - hw, cz - hz), terrainH(cx + hw, cz - hz),
+      terrainH(cx - hw, cz + hz), terrainH(cx + hw, cz + hz),
+    ) + 0.06;
+    const NODES = [[-4.7, 6.9], [-5.8, 7.2], [-6.9, 7.6], [-7.9, 8.0]];
+    for (let i = 0; i < NODES.length; i++) {
+      const [nx, nz] = NODES[i];
+      part(p, new THREE.BoxGeometry(1.9, 0.34, 2.2), C.packed, {
+        ry: 0.4 + 0.06 * ((i % 3) - 1), x: nx, y: topAt(nx, nz) - 0.17, z: nz,
+      });
+    }
+    for (let i = 0; i < 8; i++) {
+      const t = i / 7;
+      const fx = -4.5 - t * 3.3;
+      const fz = 6.85 + t * 1.15 + Math.sin(t * 2.6) * 0.16;
+      part(p, new THREE.BoxGeometry(0.46, 0.06, 0.8 + (i % 3) * 0.14), i % 2 ? C.rock : C.snowShade, {
+        ry: 0.5 + 0.1 * ((i % 3) - 1), x: fx, y: topAt(fx, fz) + 0.02, z: fz,
+      });
+    }
+    // shovel spoil banked along the path edges (ankle high: no colliders)
+    for (let i = 0; i < 9; i++) {
+      const t = i / 8;
+      const bx = -4.3 - t * 3.4;
+      const bz = 6.8 + t * 1.2;
+      for (const s of [-1, 1]) {
+        const sx = bx + s * 0.42;
+        const sz = bz + s * -1.3;
+        part(p, new THREE.SphereGeometry(0.32, 8, 6), i % 2 ? C.snowLit : C.snow, {
+          sx: 0.85 + rng() * 0.45, sy: 0.4 + rng() * 0.26, sz: 0.8,
+          x: sx, y: terrainH(sx, sz) + 0.02, z: sz,
+        });
+      }
+    }
+    scene.add(solidMesh(p));
+
+    // the light lying along that path, breathing with the lanterns
+    const pud = [];
+    for (let i = 0; i < NODES.length; i++) {
+      const [nx, nz] = NODES[i];
+      part(pud, new THREE.PlaneGeometry(1.5 + i * 0.24, 1.5 + i * 0.24), 0xffffff, {
+        rx: -Math.PI / 2, x: nx, y: topAt(nx, nz) + 0.03, z: nz,
+      });
+    }
+    this._minePathGlowMat = makeGlow(0xffcf8a, { unique: true });
+    this._minePathGlowMat.map = glowPoolTexture();
+    this._minePathGlowMat.transparent = true;
+    this._minePathGlowMat.opacity = 0.28;
+    this._minePathGlowMat.depthWrite = false;
+    this._minePathGlowMat.blending = THREE.AdditiveBlending;
+    this._minePathGlowMat.needsUpdate = true;
+    const puddles = new THREE.Mesh(mergeParts(pud), this._minePathGlowMat);
+    puddles.renderOrder = 1;
+    scene.add(puddles);
+  }
+
   /* --- sled rack ---------------------------------------------------------- */
 
   _sledRack(scene) {
@@ -2740,6 +3097,15 @@ export class PeakRoom extends Room {
     }
     if (this._denLight) this._denLight.intensity = 5.4 + Math.sin(t * 3.4) * 0.9;
 
+    // the mineshaft: two lanterns burning at the mouth, warm light on the snow
+    if (this._mineLampMat) {
+      const f = 0.87 + 0.13 * Math.sin(t * 4.7 + 0.4);
+      this._mineLampMat.color.setRGB(1 * f, 0.9 * f, 0.7 * f);
+    }
+    if (this._mineLight) this._mineLight.intensity = 8.4 + Math.sin(t * 3.0 + 0.7) * 1.4;
+    if (this._mineGlowMat) this._mineGlowMat.opacity = 0.3 + 0.1 * (0.5 + 0.5 * Math.sin(t * 1.6));
+    if (this._minePathGlowMat) this._minePathGlowMat.opacity = 0.22 + 0.08 * (0.5 + 0.5 * Math.sin(t * 1.6 - 0.8));
+
     this._updateLobby(dt, t);
   }
 
@@ -2829,6 +3195,10 @@ export class PeakRoom extends Room {
     this._trailGlowMat = null;
     this._denLampMat = null;
     this._denLight = null;
+    this._mineLampMat = null;
+    this._mineLight = null;
+    this._mineGlowMat = null;
+    this._minePathGlowMat = null;
     this._halo = null;
   }
 }

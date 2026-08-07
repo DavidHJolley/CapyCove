@@ -277,6 +277,16 @@ function popCoins(pill, delta) {
 
 // Painted landmark centres, in fractions of the island box. The Game Den lives
 // inside the ski lodge, so it sits up on the peak's snowfield, not on the grass.
+// The mine mouth is cut into the peak's west flank; the jungle is the canopy
+// the beach path disappears into, inland of the sand.
+//
+// Deviation from docs/PARTY-GAMES.md, on purpose: the spec puts the jungle
+// "north of the beach", and the north-west headland is where it was first
+// painted. Nothing can label it there. At a 480px viewport the pills tile the
+// west coast in ~11% bands, the band under that headland belongs to the Game
+// Den (nothing else can label the lodge), and the next one down is the dock
+// itself, which a pill would bury. Moving the canopy to the head of the beach
+// path keeps its pill directly underneath it, which is what a map has to do.
 const ART = {
   plaza: [0.500, 0.465],
   beach: [0.170, 0.570],
@@ -284,15 +294,28 @@ const ART = {
   cafe: [0.795, 0.400],
   lounge: [0.362, 0.284],
   club: [0.690, 0.700],
+  mine: [0.458, 0.252],
+  jungle: [0.334, 0.582],
 };
 
 // Label pills sit just under their landmark so the art stays readable.
+//
+// Eight pills is what this island holds at a 480px viewport: the card is
+// 441.6px wide there, so the pill row is only 389.6px and the longest label
+// ("The Smoothie Shack") eats 39.7% of it. Two pills only fit in one band when
+// they sit on opposite coasts, so the labels cascade north to south in bands
+// ~11% apart. Peak, Smoothie Shack, Game Den and Driftwood Beach each shifted
+// to open bands for the mine and the jungle; every pair clears by at least 6px
+// at 480px, and no pill covers a landmark (checked at both 400px and 340px
+// island heights).
 const MAP_SPOTS = [
-  { id: 'plaza', bx: 50, by: 60 },
-  { id: 'beach', bx: 24, by: 68 },
-  { id: 'peak', bx: 50, by: 32.5 },
-  { id: 'cafe', bx: 78, by: 51 },
-  { id: 'lounge', bx: 31.5, by: 41.5 },
+  { id: 'peak', bx: 66, by: 25 },
+  { id: 'mine', bx: 52, by: 36 },
+  { id: 'lounge', bx: 29.5, by: 47 },
+  { id: 'cafe', bx: 79, by: 49.5 },
+  { id: 'plaza', bx: 56, by: 60.5 },
+  { id: 'jungle', bx: 22.5, by: 68 },
+  { id: 'beach', bx: 19, by: 79 },
   { id: 'club', bx: 66, by: 81.5 },
 ];
 
@@ -300,6 +323,12 @@ const MAP_SPOTS = [
 // R() units: the painted layer and the live glow/smoke must agree on them.
 const DEN_WINDOW = [0.018, 0.019];
 const DEN_CHIMNEY = [-0.024, -0.040];
+
+// Same deal for the mine's lantern (flicker) and the jungle's plunge pool
+// (ripples + falling water), as offsets from their landmark centres.
+const MINE_LAMP = [-0.0315, -0.006];
+const JUNGLE_POOL = [-0.030, 0.030];
+const JUNGLE_FALL = [-0.030, 0.004];
 
 const MAP_HINT = 'Pick a spot to waddle over. Press M to close the map.';
 
@@ -346,15 +375,19 @@ const SEA_SPARKS = [
 ];
 
 // The two west-slope pines give the den lodge its clearing; the rest are the
-// peak's usual treeline.
+// peak's usual treeline. Two of them moved for wave 6: one stood exactly where
+// the mine mouth is now cut, one stood inside the jungle canopy, so both went
+// back onto the west slope as a stand running down toward the jungle.
 const PINES = [
   [0.412, 0.232, 0.86], [0.302, 0.348, 0.88], [0.402, 0.348, 0.82], [0.615, 0.292, 1.00],
-  [0.663, 0.338, 0.88], [0.575, 0.352, 0.78], [0.440, 0.248, 0.72], [0.560, 0.244, 0.68],
-  [0.712, 0.400, 0.84], [0.292, 0.420, 0.80], [0.248, 0.318, 0.70], [0.742, 0.320, 0.72],
+  [0.663, 0.338, 0.88], [0.575, 0.352, 0.78], [0.262, 0.232, 0.68], [0.560, 0.244, 0.68],
+  [0.712, 0.400, 0.84], [0.296, 0.262, 0.76], [0.248, 0.318, 0.70], [0.742, 0.320, 0.72],
 ];
 
+// One tree used to stand at [0.330, 0.600]: the jungle canopy took its place
+// (and brings far more foliage than it did).
 const TREES = [
-  [0.330, 0.600, 1.00], [0.402, 0.662, 0.84], [0.600, 0.618, 0.94], [0.548, 0.702, 0.80],
+  [0.402, 0.662, 0.84], [0.600, 0.618, 0.94], [0.548, 0.702, 0.80],
   [0.752, 0.552, 0.90], [0.700, 0.470, 0.74], [0.262, 0.500, 0.80], [0.470, 0.722, 0.88],
   [0.800, 0.620, 0.78], [0.372, 0.512, 0.68], [0.320, 0.716, 0.86], [0.612, 0.762, 0.78],
   [0.532, 0.786, 0.70], [0.268, 0.652, 0.74], [0.678, 0.516, 0.90],
@@ -368,7 +401,7 @@ const ROCKS = [
 const FLOWERS = [
   [0.430, 0.560, C.coral], [0.575, 0.552, C.gold], [0.628, 0.545, C.coral],
   [0.375, 0.560, C.gold], [0.520, 0.620, C.coral], [0.652, 0.610, C.gold],
-  [0.290, 0.560, C.gold], [0.482, 0.352, C.coral], [0.716, 0.520, C.gold],
+  [0.452, 0.664, C.gold], [0.482, 0.352, C.coral], [0.716, 0.520, C.gold],
 ];
 
 // ---- tiny drawing helpers -------------------------------------------------
@@ -437,6 +470,17 @@ function poly(c, pts) {
   c.beginPath();
   c.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+  c.closePath();
+}
+
+/** Round-topped arch (the mine shaft's mouth and the bite of rock around it). */
+function archPath(c, x, top, halfW, bottom) {
+  c.beginPath();
+  c.moveTo(x - halfW, bottom);
+  c.lineTo(x - halfW, top + halfW);
+  c.quadraticCurveTo(x - halfW, top, x, top);
+  c.quadraticCurveTo(x + halfW, top, x + halfW, top + halfW);
+  c.lineTo(x + halfW, bottom);
   c.closePath();
 }
 
@@ -590,6 +634,8 @@ function paintBase(c, w, h) {
   for (const [u, v, s] of ROCKS) rock(c, X(u), Y(v), R(0.026) * s);
   for (const [u, v, s] of PINES) pine(c, X(u), Y(v), R(0.062) * s);
   for (const [u, v, s] of TREES) tree(c, X(u), Y(v), R(0.036) * s);
+  paintMine(c, R, X, Y);
+  paintJungle(c, R, X, Y);
   paintCafe(c, R, X, Y);
   paintLounge(c, R, X, Y);
   paintBeach(c, R, X, Y);
@@ -720,6 +766,230 @@ function paintPeak(c, R, X, Y) {
   c.moveTo(X(0.494), Y(0.170));
   c.bezierCurveTo(X(0.462), Y(0.220), X(0.520), Y(0.246), X(0.478), Y(0.298));
   outline(c, 'rgba(255,255,255,0.85)', R(0.006));
+  c.restore();
+}
+
+/**
+ * The Glimmer Mine: a timbered shaft cut into the peak's west flank, one
+ * lantern burning over the lintel and amber light welling up out of the dark.
+ *
+ * It has to thread a needle up there: the rock's west edge runs diagonally
+ * (nothing may hang past it into the sky), the snow cap sits above, the sled
+ * track dashes down at u ~0.49, and the lodge roof reaches u ~0.42. The mouth
+ * spans u 0.432-0.484, v 0.214-0.269 and the pill bands are kept clear of it.
+ */
+function paintMine(c, R, X, Y) {
+  const x = X(ART.mine[0]);
+  const y = Y(ART.mine[1]);
+  const ow = R(0.0165);     // half width of the opening
+  const ft = R(0.005);      // timber thickness
+  const cw = ow + ft * 2.2; // the bite taken out of the rock
+  const top = y - R(0.020);
+  const bot = y + R(0.019);
+  const lx = x + R(MINE_LAMP[0]);
+  const ly = y + R(MINE_LAMP[1]);
+
+  c.save();
+
+  // lantern light pooled on the rock (the flicker on top is drawn live)
+  const spill = c.createRadialGradient(lx, ly, R(0.003), lx, ly, R(0.05));
+  spill.addColorStop(0, 'rgba(242,182,74,0.40)');
+  spill.addColorStop(1, 'rgba(242,182,74,0)');
+  c.fillStyle = spill;
+  circle(c, lx, ly, R(0.05));
+  c.fill();
+
+  // the bite out of the rock face: a recess in the mountain's own greys, no
+  // heavy ink ring, so the mouth reads as a hole rather than a hut on the slope
+  archPath(c, x, top - R(0.008), cw, bot + R(0.006));
+  fillStroke(c, C.rockDark, 'rgba(58,44,28,0.45)', R(0.004));
+
+  // the dark of the shaft, with amber glow rising from somewhere deeper
+  archPath(c, x, top, ow, bot);
+  fillStroke(c, '#241c14', C.ink, R(0.005));
+  c.save();
+  archPath(c, x, top, ow, bot);
+  c.clip();
+  const deep = c.createLinearGradient(x, bot, x, top - R(0.004));
+  deep.addColorStop(0, 'rgba(242,182,74,0.85)');
+  deep.addColorStop(1, 'rgba(242,182,74,0)');
+  c.fillStyle = deep;
+  c.fillRect(x - ow, top - R(0.006), ow * 2, bot - top + R(0.012));
+  c.strokeStyle = 'rgba(58,44,28,0.7)'; // a rail running off into the dark
+  c.lineWidth = R(0.0026);
+  for (const s of [-1, 1]) {
+    c.beginPath();
+    c.moveTo(x + s * ow * 0.62, bot);
+    c.lineTo(x + s * ow * 0.3, bot - R(0.013));
+    c.stroke();
+  }
+  // a seam of glimmer down there, amber and teal
+  for (const [dx, s, col] of [[-0.006, 1, C.gold], [0.007, 0.75, C.seaShallow]]) {
+    poly(c, [
+      [x + R(dx) - R(0.0035 * s), bot - R(0.002)],
+      [x + R(dx), bot - R(0.002) - R(0.012 * s)],
+      [x + R(dx) + R(0.0035 * s), bot - R(0.002)],
+    ]);
+    c.fillStyle = col;
+    c.fill();
+  }
+  c.restore();
+
+  // timber frame: two posts under a lintel
+  for (const s of [-1, 1]) {
+    roundBox(c, x + s * (ow + ft * 0.5) - ft / 2, top, ft, bot - top + R(0.004), R(0.002));
+    fillStroke(c, C.wood, C.ink, R(0.0042));
+  }
+  roundBox(c, x - ow - ft * 1.3, top - R(0.008), (ow + ft * 1.3) * 2, R(0.0085), R(0.003));
+  fillStroke(c, C.woodDark, C.ink, R(0.0042));
+
+  // the lantern, hung off the west post
+  c.beginPath();
+  c.moveTo(lx, top - R(0.001));
+  c.lineTo(lx, ly - R(0.005));
+  outline(c, C.ink, R(0.0026));
+  circle(c, lx, ly, R(0.0055));
+  fillStroke(c, C.gold, C.ink, R(0.0036));
+  circle(c, lx - R(0.0015), ly - R(0.0015), R(0.0017));
+  c.fillStyle = C.cream;
+  c.fill();
+
+  // spoil heap spilling out of the threshold
+  c.beginPath();
+  c.moveTo(x - ow - ft, bot + R(0.008));
+  c.quadraticCurveTo(x - ow * 0.4, bot - R(0.002), x + ow * 0.9, bot + R(0.008));
+  c.closePath();
+  fillStroke(c, C.rockDark, C.ink, R(0.0045));
+
+  c.restore();
+}
+
+/**
+ * The Tangle Jungle: the canopy the beach path runs into, one bend inland from
+ * Driftwood Beach. Layered lobes of leaf, a plunge pool under a thread of
+ * waterfall, mossy ruin stones with capy glyphs pecked into them, and two
+ * flowers far too big for their own good.
+ */
+function paintJungle(c, R, X, Y) {
+  const x = X(ART.jungle[0]);
+  const y = Y(ART.jungle[1]);
+  const px = x + R(JUNGLE_POOL[0]);
+  const py = y + R(JUNGLE_POOL[1]);
+  const fx = x + R(JUNGLE_FALL[0]);
+  const fy = y + R(JUNGLE_FALL[1]);
+  const LEAF = '#3f8f3d';     // deeper than the island's round trees on purpose
+  const LEAF_HI = '#6fc44f';
+  const LEAF_TOP = '#9ade6a';
+
+  c.save();
+
+  // ground shadow under the canopy
+  c.save();
+  c.translate(x, y + R(0.034));
+  c.scale(1, 0.34);
+  circle(c, 0, 0, R(0.060));
+  c.fillStyle = 'rgba(58,44,28,0.16)';
+  c.fill();
+  c.restore();
+
+  // canopy: five lobes plus three crown spikes in ONE path, stroked and then
+  // filled so only the outer silhouette keeps its ink line (chained arcs would
+  // otherwise draw seams across the middle of the cluster). The spikes are what
+  // stop it reading as three more of the island's round trees.
+  c.beginPath();
+  for (const [dx, dy, r] of [
+    [-0.034, -0.006, 0.027], [-0.006, -0.018, 0.029], [0.026, -0.010, 0.028],
+    [-0.016, 0.014, 0.025], [0.016, 0.018, 0.023],
+  ]) {
+    c.arc(x + R(dx), y + R(dy), R(r), 0, Math.PI * 2);
+  }
+  for (const [dx, dy, w] of [[-0.030, -0.048, 0.011], [-0.004, -0.060, 0.012], [0.024, -0.046, 0.010]]) {
+    c.moveTo(x + R(dx - w), y + R(dy) + R(0.016));
+    c.lineTo(x + R(dx), y + R(dy));
+    c.lineTo(x + R(dx + w), y + R(dy) + R(0.016));
+    c.closePath();
+  }
+  outline(c, C.ink, R(0.018));
+  c.fillStyle = LEAF;
+  c.fill();
+  c.fillStyle = LEAF_HI;
+  for (const [dx, dy, r] of [[-0.030, -0.012, 0.018], [0.010, -0.022, 0.018], [0.026, 0.004, 0.014]]) {
+    circle(c, x + R(dx), y + R(dy), R(r));
+    c.fill();
+  }
+  c.fillStyle = LEAF_TOP;
+  for (const [dx, dy, r] of [[-0.032, -0.018, 0.010], [0.006, -0.028, 0.011]]) {
+    circle(c, x + R(dx), y + R(dy), R(r));
+    c.fill();
+  }
+
+  // a mossy ruin stone leaning at the canopy's edge
+  roundBox(c, x + R(0.030), y + R(0.010), R(0.016), R(0.028), R(0.004));
+  fillStroke(c, '#ded5b7', C.ink, R(0.006));
+  c.fillStyle = '#7ac74f'; // moss on its crown
+  c.beginPath();
+  c.moveTo(x + R(0.030), y + R(0.014));
+  c.quadraticCurveTo(x + R(0.038), y + R(0.006), x + R(0.046), y + R(0.014));
+  c.quadraticCurveTo(x + R(0.038), y + R(0.012), x + R(0.030), y + R(0.014));
+  c.fill();
+
+  // waterfall: white water dropping out from under the leaves into the pool
+  poly(c, [
+    [fx - R(0.005), fy],
+    [fx + R(0.005), fy],
+    [px + R(0.008), py - R(0.002)],
+    [px - R(0.008), py - R(0.002)],
+  ]);
+  fillStroke(c, '#eef8ff', C.ink, R(0.006));
+  c.strokeStyle = 'rgba(99,195,232,0.85)';
+  c.lineWidth = R(0.0022);
+  c.beginPath();
+  c.moveTo(fx - R(0.001), fy + R(0.003));
+  c.lineTo(px - R(0.002), py - R(0.004));
+  c.stroke();
+
+  // the plunge pool
+  c.save();
+  c.translate(px, py);
+  c.scale(1, 0.46);
+  circle(c, 0, 0, R(0.026));
+  c.restore();
+  fillStroke(c, C.water, C.ink, R(0.007));
+  c.save();
+  c.translate(px, py);
+  c.scale(1, 0.46);
+  circle(c, R(0.006), -R(0.004), R(0.015));
+  c.restore();
+  c.fillStyle = 'rgba(255,255,255,0.45)';
+  c.fill();
+
+  // two oversized jungle flowers on the fringe
+  for (const [dx, dy, col] of [[-0.048, 0.010, C.coral], [0.046, -0.016, C.gold]]) {
+    const r = R(0.0085);
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2;
+      circle(c, x + R(dx) + Math.cos(a) * r, y + R(dy) + Math.sin(a) * r, r * 0.8);
+      c.fillStyle = col;
+      c.fill();
+    }
+    circle(c, x + R(dx), y + R(dy), r * 0.6);
+    c.fillStyle = C.cream;
+    c.fill();
+  }
+
+  // hanging vines off the canopy's south edge
+  c.strokeStyle = '#3f7f39';
+  c.lineWidth = R(0.0035);
+  for (const [dx, dy, len] of [[-0.026, 0.016, 0.020], [0.010, 0.026, 0.016]]) {
+    c.beginPath();
+    c.moveTo(x + R(dx), y + R(dy));
+    c.quadraticCurveTo(x + R(dx) - R(0.005), y + R(dy) + R(len) * 0.6, x + R(dx) + R(0.003), y + R(dy) + R(len));
+    c.stroke();
+    circle(c, x + R(dx) + R(0.003), y + R(dy) + R(len), R(0.0035));
+    c.fillStyle = LEAF_HI;
+    c.fill();
+  }
+
   c.restore();
 }
 
@@ -1262,6 +1532,68 @@ function paintLive(c, w, h, t) {
     circle(c, dx + R(DEN_CHIMNEY[0]) + Math.sin(t * 1.1 + i * 2.1) * R(0.009),
       dy + R(DEN_CHIMNEY[1]) - R(0.012) - R(0.072) * p, R(0.006 + 0.008 * p));
     c.fill();
+  }
+  c.restore();
+
+  // the mine: the lantern gutters, warm motes drift up out of the shaft
+  const mx = X(ART.mine[0]);
+  const my = Y(ART.mine[1]);
+  const lamp = 0.62 + 0.38 * Math.sin(t * 2.7) * Math.sin(t * 1.13 + 0.7);
+  c.save();
+  const lg = c.createRadialGradient(
+    mx + R(MINE_LAMP[0]), my + R(MINE_LAMP[1]), R(0.002),
+    mx + R(MINE_LAMP[0]), my + R(MINE_LAMP[1]), R(0.030 + 0.010 * lamp),
+  );
+  lg.addColorStop(0, `rgba(255,214,130,${0.30 + 0.24 * lamp})`);
+  lg.addColorStop(1, 'rgba(242,182,74,0)');
+  c.fillStyle = lg;
+  circle(c, mx + R(MINE_LAMP[0]), my + R(MINE_LAMP[1]), R(0.044));
+  c.fill();
+  c.fillStyle = C.gold;
+  for (let i = 0; i < 3; i++) {
+    const p = (t * 0.42 + i / 3) % 1;
+    c.globalAlpha = 0.75 * (1 - p);
+    circle(c, mx + Math.sin(t * 1.4 + i * 2.3) * R(0.009),
+      my + R(0.017) - R(0.058) * p, R(0.004) * (1 - p * 0.4));
+    c.fill();
+  }
+  c.restore();
+
+  // the jungle: water tumbling into the pool, ripples, two butterflies
+  const jx = X(ART.jungle[0]);
+  const jy = Y(ART.jungle[1]);
+  const jpx = jx + R(JUNGLE_POOL[0]) + R(0.004);
+  const jpy = jy + R(JUNGLE_POOL[1]);
+  c.save();
+  c.fillStyle = '#ffffff';
+  for (let i = 0; i < 3; i++) {
+    const p = (t * 0.9 + i / 3) % 1;
+    c.globalAlpha = 0.85 * (1 - p * 0.7);
+    circle(c, jx + R(JUNGLE_FALL[0]) + Math.sin(p * 5 + i) * R(0.002),
+      jy + R(JUNGLE_FALL[1]) + R(0.026) * p, R(0.0035));
+    c.fill();
+  }
+  for (let i = 0; i < 2; i++) {
+    const p = (t * 0.5 + i * 0.5) % 1;
+    c.globalAlpha = 0.5 * (1 - p);
+    c.save();
+    c.translate(jpx, jpy);
+    c.scale(1, 0.44);
+    circle(c, 0, 0, R(0.004) + R(0.013) * p);
+    c.restore();
+    outline(c, '#ffffff', R(0.0025));
+  }
+  for (let i = 0; i < 2; i++) {
+    const a = t * (0.7 + i * 0.25) + i * 2.4;
+    const bx = jx + R(0.014 + i * 0.010) + Math.cos(a) * R(0.032);
+    const by = jy - R(0.046 + i * 0.012) + Math.sin(a * 1.6) * R(0.010);
+    const flap = 0.3 + 0.7 * Math.abs(Math.sin(t * 9 + i * 2));
+    c.globalAlpha = 0.95;
+    c.fillStyle = i ? C.gold : C.coral;
+    for (const s of [-1, 1]) {
+      circle(c, bx + s * R(0.004) * flap, by - R(0.001) * flap, R(0.0032));
+      c.fill();
+    }
   }
   c.restore();
 

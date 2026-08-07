@@ -17,6 +17,8 @@ const CHAT = {
   cafe: ['smoothies on me', 'try the mango one', 'it smells amazing in here'],
   club: ['DANCE PARTY', 'dj turn it up', 'these lights tho'],
   lounge: ['anyone for chess?', 'best of three at pong??', 'the fireplace is so warm', 'i almost beat Grandmaster Pebble once'],
+  mine: ['just parking here, the walls pay rent', 'found a gem yesterday!!', 'my pickaxe is tiny but mighty', 'shhh i think that barrel moved', 'hunters on the board, who is in?'],
+  jungle: ['my doodles are museum quality', 'is that a toucan or a leaf', 'the waterfall is so loud and so nice', 'i drew a smoothie and nobody guessed it', 'vines make the best swings'],
 };
 
 let nextBotId = 1;

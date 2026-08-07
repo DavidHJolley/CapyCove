@@ -54,10 +54,13 @@ Play-again runs). Shipped wave 3: house-info/house-config/house-invite/
 house-uninvite/house-save/house-guests, buy-furn/furn; dynamic 'house:<owner>'
 room sets, access enforced in houseGate() before any join side effect.
 Known limitation: access changes do not evict players already inside.
-In flight (wave 6, party games): dig-tick (mine AFK prospecting),
-ph-join/ph-leave/ph-lobby/ph-start/ph-msg/ph-state/ph-done/ph-end (Prop
-Hunt), dd-join/dd-leave/dd-lobby/dd-start/dd-words/dd-pick/dd-mask/
-dd-stroke/dd-guess/dd-correct/dd-state/dd-end (Capy Doodles).
+Shipped wave 6 (party games): dig-tick (mine AFK prospecting: pays only
+when the grant paid); ph-join/ph-leave/ph-msg->ph-state{from,id,m}/ph-done/
+ph-lobby/ph-start/ph-end (Prop Hunt; {left:true} relay note on abandon);
+dd-join/dd-leave/dd-pick/dd-stroke/dd-guess -> dd-lobby/dd-start/dd-words
+(drawer only)/dd-mask/dd-stroke{from}/dd-correct/dd-state/dd-end (Capy
+Doodles; server-authoritative words + validation; the private near-miss
+ping rides dd-state as {close:true}: check m.close before m.phase).
 Shipped wave 4 (den PvP): table-join/table-leave/table,
 match-start/match-move/match-done/match-end (2-seat tables per den game,
 agreed-winner +30 bonus, forfeit on leave/disconnect). The Game Den now lives

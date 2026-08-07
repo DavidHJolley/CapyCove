@@ -21,6 +21,8 @@ const HOW_TO = [
   ['Go', 'Walk into an archway or signpost to travel between rooms.'],
   ['Sled', 'Gather 3 capybaras at Frosty Peak for a live sled race.'],
   ['Den', 'The Game Den is inside the ski lodge at Frosty Peak: take a seat at any table to face another player, or the house capybaras.'],
+  ['Mine', 'The Glimmer Mine is through the timbered door on Frosty Peak: standing around down there earns coins on its own, and the round door starts a game of Prop Hunt.'],
+  ['Jungle', 'The Tangle Jungle is up the fern path from Driftwood Beach: gather at the stone easel for Capy Doodles, drawing and guessing.'],
 ];
 
 let openInstance = null;

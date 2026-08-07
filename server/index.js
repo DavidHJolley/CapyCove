@@ -41,6 +41,33 @@ const MATCH_MOVE_LIMIT = 25; // relayed moves per second, per player
 const MATCH_MOVE_MAX = 2_048; // bytes of JSON in one relayed move
 const MATCH_WIN_COINS = 30;
 
+const MINE_ROOM = 'mine';
+const JUNGLE_ROOM = 'jungle';
+const DIG_TICK_MS = 30_000; // passive prospecting cadence
+const DIG_COINS = 2;
+const GEM_COINS = 25;
+const GEM_CHANCE = 0.02; // share of ticks that strike a gem instead
+
+const PARTY_READY_MS = 1_500; // full board -> everyone reads the roster -> go
+const PARTY_FILL_MS = 20_000; // viable board -> wait for stragglers -> go
+
+const PH_MSG_LIMIT = 15; // relayed prop-hunt frames per second, per player
+const PH_MSG_MAX = 4_096; // bytes of JSON in one relayed frame
+const PH_MAX_MS = 240_000; // hard stop, so one AFK hider cannot hang a round
+
+const DD_MOUNT_MS = 1_200; // 'dd-start' -> the doodle chunk is up -> round one
+const DD_PICK_MS = 15_000; // drawer picks a word, or the server picks for them
+const DD_DRAW_MS = 80_000;
+const DD_REVEAL_MS = [40_000, 60_000]; // letters fall out of the mask here
+const DD_GAP_MS = 6_000; // reveal screen between rounds
+const DD_MAX_ROUNDS = 5;
+const DD_STROKE_LIMIT = 20; // relayed stroke frames per second, per player
+const DD_STROKE_MAX = 4_096; // bytes of JSON in one stroke frame
+const DD_GUESS_LIMIT = 4; // guesses per second, per player
+const DD_DRAWER_POINTS = 15; // per capy who guesses your doodle
+const DD_GUESS_POINTS = [100, 85, 75, 65, 55, 45, 40]; // by finishing order
+const DD_PODIUM_COINS = [20, 10, 5];
+
 const USERNAME_RE = new RegExp(`^[a-zA-Z0-9_]{${NAME_MIN_LEN},${NAME_MAX_LEN}}$`);
 
 const PORT = process.env.PORT || 3001;
@@ -169,6 +196,10 @@ function joinRoom(p, roomId) {
   // same deal for the den: leaving the room stands you up from your table, and
   // walking out mid-duel hands the win (and the coins) to whoever stayed
   if (p.room === LOUNGE_ROOM) exitTable(p);
+  // and for the party games: the mine's hunt and the jungle's doodle are both
+  // tied to their room, so walking out drops you from the board and the round
+  if (p.room === MINE_ROOM) exitPropHunt(p);
+  if (p.room === JUNGLE_ROOM) exitDoodle(p);
   if (p.room) leaveRoomSet(p);
   p.room = roomId;
   world.rooms.get(roomId).add(p.id);
@@ -179,11 +210,15 @@ function joinRoom(p, roomId) {
   if (roomId === SLED_ROOM) sendTo(p, lobbyPayload());
   // and the den's five boards, for the same reason
   if (roomId === LOUNGE_ROOM) sendTables(p);
+  // ...and the party boards in the mine and the jungle
+  for (const lob of Object.values(partyLobbies)) if (roomId === lob.room) sendTo(p, partyPayload(lob));
 }
 
 function leaveWorld(p) {
   exitSled(p);
   exitTable(p);
+  exitPropHunt(p);
+  exitDoodle(p);
   if (p.room) leaveRoomSet(p);
   world.players.delete(p.id);
 }
@@ -692,6 +727,482 @@ function exitTable(p) {
   leaveTable(p);
 }
 
+// ---------- the Glimmer Mine: passive prospecting ----------
+// Standing in the mine pays, no clicking required: every 30s each capy in the
+// room chips +2 coins out of the wall (~240/hour, a fraction of active play),
+// and now and then the pickaxe finds a 25-coin gem instead. The payout rides
+// the normal grantCoins road, so the hourly backstop still bounds it.
+
+function digTick() {
+  for (const id of world.rooms.get(MINE_ROOM) || []) {
+    const p = world.players.get(id);
+    if (!p || p.bot) continue;
+    const gem = Math.random() < GEM_CHANCE;
+    // 'dig-tick' is only the cue for the pickaxe swing and the "+2" mote, so it
+    // must not fire when the backstop paid nothing: the animation would lie
+    if (grantCoins(p, gem ? GEM_COINS : DIG_COINS, gem ? 'gem!' : 'mining') > 0) {
+      sendTo(p, { t: 'dig-tick', gem });
+    }
+  }
+}
+
+// ---------- party lobbies (Prop Hunt, Capy Doodles) ----------
+// The sled board's shape, twice over: a room-wide sign-up list, a fill window
+// so latecomers can pile in, and an instant start once it is full. Unlike the
+// sled (which needs exactly three riders) these run at any size in range, so a
+// capy backing out only cancels the countdown when the round stops being
+// viable. Everything is keyed off the room, so leaving it leaves the board.
+
+const partyLobbies = {
+  prophunt: {
+    room: MINE_ROOM, min: 2, max: 6, type: 'ph-lobby',
+    ids: [], timer: null, starting: false, start: (members) => startPropHunt(members),
+  },
+  doodle: {
+    room: JUNGLE_ROOM, min: 2, max: 8, type: 'dd-lobby',
+    ids: [], timer: null, starting: false, start: (members) => startDoodle(members),
+  },
+};
+
+function partyPayload(lob) {
+  const players = [];
+  for (const id of lob.ids) {
+    const p = world.players.get(id);
+    if (p) players.push({ id: p.id, name: p.name });
+  }
+  return { t: lob.type, players, starting: !!lob.starting };
+}
+
+function broadcastParty(lob) {
+  broadcastToRoom(lob.room, partyPayload(lob));
+}
+
+function armParty(lob, ms) {
+  if (lob.timer) clearTimeout(lob.timer);
+  lob.timer = setTimeout(() => {
+    lob.timer = null;
+    try { startParty(lob); } catch (e) { console.error(`[${lob.type}] start failed:`, e?.message || e); }
+  }, ms);
+}
+
+function joinParty(p, lob) {
+  if (!lob || p.room !== lob.room) return;
+  if (p.race || p.match || p.ph || p.dd) return; // already busy elsewhere
+  if (lob.ids.includes(p.id) || lob.ids.length >= lob.max) return;
+  lob.ids.push(p.id);
+  if (lob.ids.length >= lob.max) {
+    // spec says a full board starts "instantly"; it gets the same 1.5s beat the
+    // sled race takes, so the last capy in still sees who they are playing with
+    lob.starting = true;
+    armParty(lob, PARTY_READY_MS);
+  } else if (lob.ids.length >= lob.min && !lob.timer) {
+    // the fill window opens when the board first becomes playable, not on the
+    // first signature: one capy alone would otherwise start a 20s countdown to
+    // nothing, over and over
+    lob.starting = true;
+    armParty(lob, PARTY_FILL_MS);
+  }
+  broadcastParty(lob);
+}
+
+/** Give up a spot on a party board. True if they were on it. */
+function leaveParty(p, lob) {
+  const i = lob.ids.indexOf(p.id);
+  if (i < 0) return false;
+  lob.ids.splice(i, 1);
+  // dropping below the minimum cancels the countdown; 4-of-6 walking back to
+  // 3-of-6 does not, because three is still a perfectly good round
+  if (lob.ids.length < lob.min && lob.timer) {
+    clearTimeout(lob.timer);
+    lob.timer = null;
+    lob.starting = false;
+  }
+  broadcastParty(lob);
+  return true;
+}
+
+function startParty(lob) {
+  lob.timer = null;
+  const members = lob.ids
+    .map((id) => world.players.get(id))
+    .filter((p) => p && p.room === lob.room && !p.ph && !p.dd && !p.race && !p.match);
+  if (members.length < lob.min) {
+    // everyone bailed; drop ids that no longer resolve so a stale entry can
+    // never wedge the board at "full" and lock the game for good
+    for (let i = lob.ids.length - 1; i >= 0; i--) {
+      if (!members.includes(world.players.get(lob.ids[i]))) lob.ids.splice(i, 1);
+    }
+    lob.starting = false;
+    broadcastParty(lob);
+    return;
+  }
+  lob.ids.length = 0;
+  lob.starting = false;
+  lob.start(members.slice(0, lob.max));
+  broadcastParty(lob); // the board is empty again for everyone still in the room
+}
+
+// ---------- Prop Hunt ----------
+// The server owns the roster, the seed and the seeker; everything else (props,
+// possession, clicks) is client simulation relayed blind through 'ph-state',
+// exactly like the den's match-move. Scores are client-reported, so they buy
+// nothing here beyond the standings: coins come from the mgstart/score road,
+// which the per-run cap already bounds. That is also why there is no podium
+// bonus on this side (the doodle has one): the server refereed none of it.
+
+function startPropHunt(members) {
+  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
+  const roster = members.map((p) => ({ id: p.id, name: p.name, color: p.color, hat: p.hat }));
+  // the seed picks the first seeker too, so a client replaying the round from
+  // the seed alone lands on the same capy the server named
+  const seekerId = roster[seed % roster.length].id;
+  const round = { seed, seekerId, ended: false, players: new Map(), timer: null };
+  for (const p of members) {
+    p.ph = round;
+    round.players.set(p.id, { id: p.id, name: p.name, score: 0, done: false });
+  }
+  for (const p of members) sendTo(p, { t: 'ph-start', seed, players: roster, seekerId });
+  round.timer = setTimeout(() => {
+    try { endPropHunt(round); } catch (e) { console.error('[ph] end failed:', e?.message || e); }
+  }, PH_MAX_MS);
+}
+
+/**
+ * Blind relay to the rest of the round: nothing in `data` is read here.
+ * The payload rides in `m` (the field prophunt.js reads) and the sender id is
+ * stamped as both `id` and `from`; an anonymous relay would silently break
+ * every catch and every clock sync, so it is never sent without one.
+ */
+function relayPropHunt(round, fromId, data) {
+  const raw = JSON.stringify({ t: 'ph-state', from: fromId, id: fromId, m: data });
+  for (const id of round.players.keys()) {
+    if (id === fromId) continue;
+    const other = world.players.get(id);
+    if (other && other.ph === round && other.ws?.readyState === 1) other.ws.send(raw);
+  }
+}
+
+function endPropHunt(round) {
+  if (round.ended) return;
+  round.ended = true;
+  clearTimeout(round.timer);
+  const scores = [...round.players.values()]
+    .map(({ id, name, score }) => ({ id, name, score }))
+    .sort((a, b) => b.score - a.score);
+  for (const id of round.players.keys()) {
+    const p = world.players.get(id);
+    if (p && p.ph === round) { p.ph = null; sendTo(p, { t: 'ph-end', scores }); }
+  }
+}
+
+/** Leave the board and/or a round in progress (leaving the mine, or the world). */
+function exitPropHunt(p) {
+  leaveParty(p, partyLobbies.prophunt);
+  const round = p.ph;
+  if (!round) return;
+  p.ph = null;
+  const r = round.players.get(p.id);
+  if (r && !r.done) r.done = true; // whatever they last reported stands (0 if nothing)
+  // the leave note: the others must be able to un-possess an abandoned prop
+  relayPropHunt(round, p.id, { left: true });
+  if (!round.ended && [...round.players.values()].every((x) => x.done)) endPropHunt(round);
+}
+
+// ---------- Capy Doodles ----------
+// The one game the server actually referees: it owns the word list, hands the
+// three choices to the drawer alone, masks the answer for everyone else, and
+// scores guesses itself. Guessers' clients never receive the word before they
+// earn it, so there is nothing to read out of the DOM.
+
+// ~130 all-ages nouns, all of them things a capy could point at in the cove.
+const DOODLE_WORDS = [
+  'smoothie', 'chairlift', 'top hat', 'shark', 'pickaxe', 'minecart',
+  'lantern', 'crystal', 'mushroom', 'barrel', 'crate', 'sled',
+  'snowman', 'fountain', 'palm tree', 'seashell', 'crab', 'surfboard',
+  'beach ball', 'sandcastle', 'fishing rod', 'jellyfish', 'starfish', 'dolphin',
+  'iceberg', 'snowball', 'mitten', 'scarf', 'cocoa', 'marshmallow',
+  'blender', 'banana', 'mango', 'strawberry', 'pineapple', 'waffle',
+  'pancake', 'cupcake', 'cookie', 'donut', 'ice cream', 'popcorn',
+  'teapot', 'mug', 'apron', 'chef hat', 'disco ball', 'speaker',
+  'headphones', 'drum', 'guitar', 'piano', 'trumpet', 'microphone',
+  'neon sign', 'campfire', 'tent', 'lamp post', 'bridge', 'ladder',
+  'bucket', 'shovel', 'wheelbarrow', 'rope', 'anchor', 'sailboat',
+  'canoe', 'paddle', 'lighthouse', 'treasure chest', 'compass', 'telescope',
+  'balloon', 'kite', 'umbrella', 'sunglasses', 'backpack', 'wagon',
+  'bicycle', 'skateboard', 'rocket', 'robot', 'teddy bear', 'beanbag',
+  'sofa', 'bookshelf', 'aquarium', 'fireplace', 'pillow', 'blanket',
+  'alarm clock', 'mailbox', 'postcard', 'present', 'ribbon', 'birthday cake',
+  'candle', 'party hat', 'confetti', 'trophy', 'medal', 'crown',
+  'viking helm', 'pirate hat', 'propeller cap', 'flower pot', 'cactus', 'sunflower',
+  'acorn', 'pinecone', 'vine', 'waterfall', 'rainbow', 'snowflake',
+  'moon', 'star', 'butterfly', 'toucan', 'frog', 'turtle',
+  'snail', 'duckling', 'otter', 'bumblebee', 'firefly', 'owl',
+  'parrot', 'monkey', 'hammock', 'torch', 'statue', 'gemstone',
+];
+
+/** Case, spacing and punctuation all forgiven: "Top  Hat!" matches "top hat". */
+const normalizeWord = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/** Edit distance, abandoned once it passes `max`: near-misses only, cheaply. */
+function editDistance(a, b, max = 1) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  if (a.length > 64 || b.length > 64) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + cost);
+      if (row[j] < best) best = row[j];
+    }
+    if (best > max) return max + 1; // no later row can come back under it
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+/** Three fresh choices; a word already drawn this game never comes back. */
+function pickWords(used) {
+  const out = [];
+  for (let guard = 0; out.length < 3 && guard < 400; guard++) {
+    const w = DOODLE_WORDS[Math.floor(Math.random() * DOODLE_WORDS.length)];
+    if (!out.includes(w) && !used.has(w)) out.push(w);
+  }
+  // 130 words against 5 rounds means this never runs, but a repeat still beats
+  // a round that never starts
+  for (let i = 0; out.length < 3 && i < DOODLE_WORDS.length; i++) {
+    if (!out.includes(DOODLE_WORDS[i])) out.push(DOODLE_WORDS[i]);
+  }
+  return out;
+}
+
+const maskOf = (word) => word.replace(/[a-z0-9]/gi, '_');
+
+const doodleStandings = (g) => [...g.players.values()]
+  .map(({ id, name, score }) => ({ id, name, score }))
+  .sort((a, b) => b.score - a.score);
+
+/** Everyone still connected, still in this game. */
+function doodleMembers(g) {
+  const out = [];
+  for (const id of g.players.keys()) {
+    const p = world.players.get(id);
+    if (p && p.dd === g) out.push(p);
+  }
+  return out;
+}
+
+function broadcastDoodle(g, msg) {
+  const raw = JSON.stringify(msg);
+  for (const p of doodleMembers(g)) if (p.ws?.readyState === 1) p.ws.send(raw);
+}
+
+function sendDoodleState(g, extra = {}) {
+  const base = {
+    t: 'dd-state', phase: g.phase, round: g.round, rounds: g.rounds,
+    drawerId: g.drawerId, mask: g.mask, len: g.word ? g.word.length : 0,
+    ms: Math.max(0, g.phaseEndsAt - Date.now()),
+    scores: doodleStandings(g), guessed: [...g.guessed],
+    ...extra,
+  };
+  for (const p of doodleMembers(g)) {
+    // the word IS the game: nobody but the drawer sees it before the reveal
+    const mine = (g.word && (p.id === g.drawerId || g.phase === 'reveal'))
+      ? { ...base, word: g.word }
+      : base;
+    sendTo(p, mine);
+  }
+}
+
+function clearDoodleTimers(g) {
+  clearTimeout(g.timer);
+  for (const h of g.reveals) clearTimeout(h);
+  g.timer = null;
+  g.reveals = [];
+}
+
+function addDoodleScore(g, id, points) {
+  const row = g.players.get(id);
+  if (row) row.score += points;
+}
+
+function startDoodle(members) {
+  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
+  const g = {
+    seed, ended: false, phase: 'pick', phaseEndsAt: 0,
+    order: members.map((p) => p.id), turn: 0,
+    players: new Map(), // id -> { id, name, score }; a capy who walks out is dropped
+    rounds: Math.min(members.length, DD_MAX_ROUNDS),
+    round: 0, drawerId: null, word: null, norm: '', mask: null, choices: [],
+    used: new Set(), guessed: new Set(), correct: 0, drawStartedAt: 0,
+    timer: null, reveals: [],
+  };
+  for (const p of members) {
+    p.dd = g;
+    g.players.set(p.id, { id: p.id, name: p.name, score: 0 });
+  }
+  const roster = members.map((p) => ({ id: p.id, name: p.name, color: p.color, hat: p.hat }));
+  for (const p of members) sendTo(p, { t: 'dd-start', seed, players: roster, rounds: g.rounds });
+  // 'dd-start' sends the jungle off to lazy-load the doodle chunk; round one's
+  // 'dd-words' and 'dd-state' would land before it mounts and be lost, leaving
+  // the drawer staring at an easel with no word choices. Give it a beat first.
+  g.timer = setTimeout(() => {
+    try { nextDoodleRound(g); } catch (e) { console.error('[dd] first round failed:', e?.message || e); }
+  }, DD_MOUNT_MS);
+}
+
+/** Next capy in sign-up order who is still here, or null if nobody is. */
+function nextDrawer(g) {
+  for (let n = 0; n < g.order.length; n++) {
+    const id = g.order[(g.turn + n) % g.order.length];
+    const p = world.players.get(id);
+    if (p && p.dd === g) { g.turn = (g.turn + n + 1) % g.order.length; return id; }
+  }
+  return null;
+}
+
+function nextDoodleRound(g) {
+  clearDoodleTimers(g);
+  if (g.ended) return;
+  if (g.round >= g.rounds || doodleMembers(g).length < partyLobbies.doodle.min) { endDoodle(g); return; }
+  const drawerId = nextDrawer(g);
+  if (!drawerId) { endDoodle(g); return; }
+  g.round++;
+  g.drawerId = drawerId;
+  g.phase = 'pick';
+  g.word = null;
+  g.norm = '';
+  g.mask = null;
+  g.guessed.clear();
+  g.correct = 0;
+  g.choices = pickWords(g.used);
+  g.phaseEndsAt = Date.now() + DD_PICK_MS;
+  const drawer = world.players.get(drawerId);
+  if (drawer) sendTo(drawer, { t: 'dd-words', words: [...g.choices], round: g.round });
+  sendDoodleState(g);
+  // a drawer who wanders off to make cocoa must not stall the whole jungle
+  g.timer = setTimeout(() => {
+    try { beginDoodleDrawing(g, 0); } catch (e) { console.error('[dd] auto-pick failed:', e?.message || e); }
+  }, DD_PICK_MS);
+}
+
+function beginDoodleDrawing(g, choice) {
+  clearDoodleTimers(g);
+  if (g.ended || g.phase !== 'pick') return;
+  const drawer = world.players.get(g.drawerId);
+  if (!drawer || drawer.dd !== g) { revealDoodle(g, 'left'); return; }
+  const i = Number.isInteger(choice) && choice >= 0 && choice < g.choices.length ? choice : 0;
+  g.word = g.choices[i];
+  g.norm = normalizeWord(g.word);
+  g.mask = maskOf(g.word);
+  g.used.add(g.word);
+  g.phase = 'draw';
+  g.drawStartedAt = Date.now();
+  g.phaseEndsAt = g.drawStartedAt + DD_DRAW_MS;
+  sendDoodleState(g);
+  for (const ms of DD_REVEAL_MS) {
+    g.reveals.push(setTimeout(() => {
+      try { revealLetter(g); } catch (e) { console.error('[dd] reveal failed:', e?.message || e); }
+    }, ms));
+  }
+  g.timer = setTimeout(() => {
+    try { revealDoodle(g, 'time'); } catch (e) { console.error('[dd] round end failed:', e?.message || e); }
+  }, DD_DRAW_MS);
+}
+
+/** Drop one letter out of the mask, never past half the word. */
+function revealLetter(g) {
+  if (g.ended || g.phase !== 'draw' || !g.word) return;
+  const hidden = [];
+  for (let i = 0; i < g.mask.length; i++) if (g.mask[i] === '_') hidden.push(i);
+  const letters = g.word.replace(/[^a-z0-9]/gi, '').length;
+  if (hidden.length <= Math.ceil(letters / 2)) return;
+  const i = hidden[Math.floor(Math.random() * hidden.length)];
+  g.mask = g.mask.slice(0, i) + g.word[i] + g.mask.slice(i + 1);
+  broadcastDoodle(g, { t: 'dd-mask', mask: g.mask, round: g.round });
+}
+
+/** First in gets the most, and every second of dithering costs a little. */
+function guessPoints(order, fracLeft) {
+  const base = DD_GUESS_POINTS[Math.min(order, DD_GUESS_POINTS.length - 1)];
+  return Math.max(40, Math.round(base * (0.6 + 0.4 * Math.max(0, Math.min(1, fracLeft)))));
+}
+
+/** True once every capy who could guess has. */
+function allGuessed(g) {
+  const guessers = doodleMembers(g).filter((p) => p.id !== g.drawerId);
+  return guessers.length > 0 && guessers.every((p) => g.guessed.has(p.id));
+}
+
+function scoreDoodleGuess(g, p) {
+  const fracLeft = 1 - (Date.now() - g.drawStartedAt) / DD_DRAW_MS;
+  const points = guessPoints(g.correct, fracLeft);
+  g.correct++;
+  g.guessed.add(p.id);
+  addDoodleScore(g, p.id, points);
+  addDoodleScore(g, g.drawerId, DD_DRAWER_POINTS);
+  const base = {
+    t: 'dd-correct', id: p.id, name: p.name, points,
+    drawerId: g.drawerId, drawerPoints: DD_DRAWER_POINTS,
+    scores: doodleStandings(g),
+  };
+  for (const other of doodleMembers(g)) {
+    // the answer is the reward: only the capy who earned it gets it early
+    sendTo(other, other.id === p.id ? { ...base, word: g.word, you: true } : base);
+  }
+  if (allGuessed(g)) revealDoodle(g, 'solved');
+}
+
+function revealDoodle(g, reason) {
+  clearDoodleTimers(g);
+  if (g.ended) return;
+  g.phase = 'reveal';
+  g.phaseEndsAt = Date.now() + DD_GAP_MS;
+  sendDoodleState(g, { reason });
+  g.timer = setTimeout(() => {
+    try { nextDoodleRound(g); } catch (e) { console.error('[dd] next round failed:', e?.message || e); }
+  }, DD_GAP_MS);
+}
+
+function endDoodle(g) {
+  if (g.ended) return;
+  g.ended = true;
+  clearDoodleTimers(g);
+  const scores = doodleStandings(g);
+  const podium = scores.slice(0, 3);
+  const members = doodleMembers(g);
+  for (const p of members) { p.dd = null; sendTo(p, { t: 'dd-end', podium, scores }); }
+  // Unlike the client-reported minigame score, this podium is the server's own
+  // bookkeeping: it validated every guess that made it. A game that emptied out
+  // pays nobody, so nobody can farm it by having their second capy walk away.
+  // (Two accounts playing it out honestly still earns 30 between them; the
+  // hourly backstop bounds that, same as the den's match bonus.)
+  if (members.length < partyLobbies.doodle.min) return;
+  podium.forEach((row, i) => {
+    if (row.score <= 0) return;
+    const winner = members.find((p) => p.id === row.id);
+    if (winner) grantCoins(winner, DD_PODIUM_COINS[i], 'doodle podium');
+  });
+}
+
+/** Leave the board and/or a game in progress (leaving the jungle, or the world). */
+function exitDoodle(p) {
+  leaveParty(p, partyLobbies.doodle);
+  const g = p.dd;
+  if (!g) return;
+  p.dd = null;
+  g.players.delete(p.id); // dropped from the round: their points go with them
+  g.guessed.delete(p.id);
+  if (g.ended) return;
+  if (doodleMembers(g).length < partyLobbies.doodle.min) { endDoodle(g); return; }
+  // nobody can guess a doodle nobody is drawing: cut the round short and rotate
+  if (p.id === g.drawerId) { revealDoodle(g, 'left'); return; }
+  sendDoodleState(g); // the scoreboard loses a row for everyone else
+  if (g.phase === 'draw' && allGuessed(g)) revealDoodle(g, 'solved');
+}
+
 // ---------- websocket ----------
 // maxPayload: nothing the protocol carries comes close; the ws default is 100MiB.
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
@@ -763,6 +1274,8 @@ wss.on('connection', (ws) => {
             lastChat: 0, joinWindow: 0, joinCount: 0, run: null, earned: [],
             socialWindow: 0, socialCount: 0, race: null,
             table: null, match: null, matchWindow: 0, matchCount: 0,
+            ph: null, phWindow: 0, phCount: 0,
+            dd: null, ddWindow: 0, ddCount: 0, ddGuessWindow: 0, ddGuessCount: 0,
           };
           world.players.set(p.id, p);
           sendTo(p, { t: 'welcome', id: p.id, profile: { ...profile, registered: p.registered } });
@@ -1081,6 +1594,114 @@ wss.on('connection', (ws) => {
           if (match.seats.every((id) => match.reports.has(id))) endMatch(match, 'done');
           break;
         }
+
+        // ---- Prop Hunt (the mine) -------------------------------------------
+        case 'ph-join':
+          if (socialLimited(p, t0)) break;
+          joinParty(p, partyLobbies.prophunt);
+          break;
+        case 'ph-leave':
+          if (socialLimited(p, t0)) break;
+          exitPropHunt(p); // the board, and a round in progress if there is one
+          break;
+        case 'ph-msg': {
+          // hot path: a seeker sends one of these most frames, so it gets its
+          // own budget rather than the social one, and nothing it carries is
+          // read here or seen by anyone outside the round
+          const round = p.ph;
+          if (!round || round.ended) break;
+          if (t0 - p.phWindow > 1000) { p.phWindow = t0; p.phCount = 0; }
+          if (++p.phCount > PH_MSG_LIMIT) break;
+          // the client's envelope field is 'm' (see the contract block at the
+          // top of src/minigames/games/prophunt.js); 'data' stays accepted so
+          // an older client is not cut off mid-round
+          const payload = m.m !== undefined ? m.m : m.data;
+          if (payload === undefined) break;
+          let size = 0;
+          try { size = JSON.stringify(payload).length; } catch { break; }
+          if (!size || size > PH_MSG_MAX) break;
+          relayPropHunt(round, p.id, payload);
+          break;
+        }
+        case 'ph-done': {
+          const round = p.ph;
+          const r = round?.players.get(p.id);
+          if (!round || round.ended || !r || r.done) break; // one score per capy
+          r.score = Math.max(0, Math.min(10_000_000, Math.floor(Number(m.score) || 0)));
+          r.done = true;
+          if ([...round.players.values()].every((x) => x.done)) endPropHunt(round);
+          break;
+        }
+
+        // ---- Capy Doodles (the jungle) --------------------------------------
+        case 'dd-join':
+          if (socialLimited(p, t0)) break;
+          joinParty(p, partyLobbies.doodle);
+          break;
+        case 'dd-leave':
+          if (socialLimited(p, t0)) break;
+          exitDoodle(p);
+          break;
+        case 'dd-pick': {
+          const g = p.dd;
+          if (!g || g.ended || g.phase !== 'pick' || g.drawerId !== p.id) break;
+          beginDoodleDrawing(g, Math.floor(Number(m.i) || 0));
+          break;
+        }
+        case 'dd-stroke': {
+          // hot path, like ph-msg: batched brush segments, relayed unread
+          const g = p.dd;
+          if (!g || g.ended || g.phase !== 'draw' || g.drawerId !== p.id) break;
+          if (t0 - p.ddWindow > 1000) { p.ddWindow = t0; p.ddCount = 0; }
+          if (++p.ddCount > DD_STROKE_LIMIT) break;
+          // undo and clear are strokes too: they carry no points, and dropping
+          // them leaves every guesser looking at a drawing the drawer erased
+          const op = m.op === 'undo' || m.op === 'clear' ? m.op : null;
+          if (!op && m.pts === undefined) break;
+          let raw;
+          if (op) {
+            raw = JSON.stringify({ t: 'dd-stroke', from: p.id, op });
+          } else {
+            let size = 0;
+            try { size = JSON.stringify(m.pts).length; } catch { break; }
+            if (!size || size > DD_STROKE_MAX) break;
+            // colour, width, stroke id and the end flag all have to survive the
+            // hop or the relayed drawing is one black hairline with no breaks
+            raw = JSON.stringify({
+              t: 'dd-stroke', from: p.id, pts: m.pts,
+              s: Math.floor(Number(m.s) || 0),
+              c: Math.floor(Number(m.c) || 0),
+              w: Math.floor(Number(m.w) || 0),
+              e: m.e ? 1 : 0,
+            });
+          }
+          for (const other of doodleMembers(g)) {
+            if (other.id !== p.id && other.ws?.readyState === 1) other.ws.send(raw);
+          }
+          break;
+        }
+        case 'dd-guess': {
+          const g = p.dd;
+          if (!g || g.ended || g.phase !== 'draw' || !g.word) break;
+          if (p.id === g.drawerId || g.guessed.has(p.id)) break; // no second bite
+          if (t0 - p.ddGuessWindow > 1000) { p.ddGuessWindow = t0; p.ddGuessCount = 0; }
+          if (++p.ddGuessCount > DD_GUESS_LIMIT) break;
+          const guess = normalizeWord(String(m.text || '').slice(0, CHAT_MAX_LEN));
+          if (!guess) break;
+          if (guess === g.norm) {
+            scoreDoodleGuess(g, p);
+          } else if (editDistance(guess, g.norm, 1) <= 1) {
+            // One letter out. The nudge goes to the guesser and nobody else, or
+            // the room would triangulate the word off someone else's near miss.
+            // It rides a 'close' dd-state rather than a frame of its own: the
+            // protocol registry has no dd-close, and a raw-re-emitted dd-state
+            // is exactly what the round UI is already listening to.
+            sendTo(p, { t: 'dd-state', close: true, round: g.round });
+          }
+          // A wrong guess is answered with silence: the round's guess box is not
+          // a second chat channel, so nothing unmoderated fans out from here.
+          break;
+        }
       }
     } catch (e) {
       console.error(`[ws] handler error on '${m.t}':`, e?.message || e);
@@ -1125,6 +1746,11 @@ setInterval(() => {
     if (players.length) broadcastToRoom(roomId, { t: 'state', players });
   }
 }, NET_TICK_MS);
+
+// ---------- tick: the mine pays its miners ----------
+setInterval(() => {
+  try { digTick(); } catch (e) { console.error('[mine] dig tick failed:', e?.message || e); }
+}, DIG_TICK_MS);
 
 server.listen(PORT, () => {
   console.log(`Capy Cove server on http://localhost:${PORT} (rooms: ${ROOM_IDS.join(', ')}, default: ${DEFAULT_ROOM})`);

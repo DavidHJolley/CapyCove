@@ -408,10 +408,16 @@ export class BeachRoom extends Room {
     this._buildBeachStuff(scene);
     this._buildCritters(scene);
     this._buildExit(scene);
+    this._buildJungleMouth(scene);
 
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 4),
       from_plaza: new THREE.Vector3(6.5, 0, 2), // open sand, unoccluded from the room camera
+      // just inside the fern gap: 3.95 out from exit-jungle (r 2.8), so the
+      // walk-through exit arms on the first frame instead of bouncing you back.
+      // West of the driftwood log at (0.5,-8.5): that log and the palm behind it
+      // have overlapping colliders, so the walkable gap is the one on this side.
+      from_jungle: new THREE.Vector3(-0.1, 0, -6.0),
     };
     // gentle east bias: keeps the cove and dock in frame even at the eastern
     // from_plaza spawn (a stronger offset framed mostly open sea there)
@@ -1367,6 +1373,154 @@ export class BeachRoom extends Room {
     });
   }
 
+  // ---- jungle path mouth (north dune) --------------------------------------
+  /**
+   * The way into the Tangle Jungle: a gap in a fern-and-foliage fringe along
+   * the north shoreline, a packed-sand path leading into it, two vine-wrapped
+   * gateposts and a signpost. The fringe doubles as a screen: it hides the open
+   * sea behind the dune so the path reads as leading INTO something.
+   */
+  _buildJungleMouth(scene) {
+    const parts = [];
+    const P = (g, c) => parts.push({ g, c });
+    this.anim.jFerns = [];
+
+    // ---- packed-sand path north out of the cove
+    // The corridor threads the gap between the west palm and the driftwood log,
+    // then bends north-west out through the fringe.
+    const curve = new THREE.CatmullRomCurve3(
+      [[0.8, -4.2], [0.15, -6.2], [-0.45, -8.2], [-0.7, -9.8], [-0.85, -11.1]]
+        .map(([x, z]) => new THREE.Vector3(x, 0, z)),
+    );
+    const N = 26;
+    const pp = new Float32Array((N + 1) * 2 * 3);
+    const pu = new Float32Array((N + 1) * 2 * 2);
+    const pi = new Uint16Array(N * 6);
+    for (let i = 0; i <= N; i++) {
+      const u = i / N;
+      const p = curve.getPointAt(u);
+      const tg = curve.getTangentAt(u);
+      const nx = -tg.z, nz = tg.x;
+      const hw = 1.25 - Math.cos(u * Math.PI) * 0.2;
+      const k = i * 2;
+      for (let s = 0; s < 2; s++) {
+        const sgn = s ? 1 : -1;
+        const x = p.x + nx * hw * sgn, z = p.z + nz * hw * sgn;
+        pp[(k + s) * 3] = x; pp[(k + s) * 3 + 1] = sandY(x, z) + 0.035; pp[(k + s) * 3 + 2] = z;
+        pu[(k + s) * 2] = u * 5; pu[(k + s) * 2 + 1] = s;
+      }
+      if (i < N) {
+        const o = i * 6;
+        pi[o] = k; pi[o + 1] = k + 1; pi[o + 2] = k + 2;
+        pi[o + 3] = k + 1; pi[o + 4] = k + 3; pi[o + 5] = k + 2;
+      }
+    }
+    const pg = new THREE.BufferGeometry();
+    pg.setAttribute('position', new THREE.BufferAttribute(pp, 3));
+    pg.setAttribute('uv', new THREE.BufferAttribute(pu, 2));
+    pg.setIndex(new THREE.BufferAttribute(pi, 1));
+    pg.computeVertexNormals();
+    const path = new THREE.Mesh(pg, glowTex(0xffffff, texPath(), {
+      transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3,
+    }));
+    path.renderOrder = 1;
+    scene.add(path);
+
+    // ---- gateposts: driftwood wrapped in vines, one either side of the gap
+    for (const [gx, gz] of [[-2.0, -9.7], [0.55, -10.2]]) {
+      const gy = sandY(gx, gz);
+      P(xf(new THREE.CylinderGeometry(0.16, 0.21, 2.5, 7), gx, gy + 1.2, gz, 0, 0, (gx < 0 ? 1 : -1) * 0.06), 0xcfbb9a);
+      P(xf(new THREE.SphereGeometry(0.22, 8, 6), gx, gy + 2.42, gz, 0, 0, 0, 1, 0.8, 1), 0x7ac74f);
+      for (let i = 0; i < 4; i++) {
+        const a = i * 1.7;
+        P(xf(new THREE.TorusGeometry(0.2, 0.035, 4, 10), gx, gy + 0.5 + i * 0.45, gz, 1.35, a, 0), 0x63ad3c);
+      }
+      this.obstacles.push({ x: gx, z: gz, r: 0.45 });
+    }
+
+    // ---- signpost, its board square to the play camera
+    const sp = spot(1.7, -6.5, 1.0, 2.6);
+    const spy = sandY(sp.x, sp.z);
+    P(xf(new THREE.CylinderGeometry(0.13, 0.16, 2.9, 7), sp.x, spy + 1.45, sp.z), 0x9a6c3e);
+    P(xf(new THREE.SphereGeometry(0.19, 8, 6), sp.x, spy + 2.95, sp.z), 0xc98f52);
+    P(xf(new THREE.BoxGeometry(0.46, 0.13, 0.46), sp.x, spy + 0.06, sp.z), 0xd6a86a);
+    P(xf(new THREE.BoxGeometry(2.4, 0.62, 0.12), sp.x, spy + 2.1, sp.z, 0, -0.2, 0), 0xa87844);
+    this.obstacles.push({ x: sp.x, z: sp.z, r: 0.5 });
+
+    scene.add(Object.assign(new THREE.Mesh(merge(parts), makeToon(0xffffff, {
+      unique: true, vertexColors: true,
+    })), { castShadow: true, receiveShadow: true }));
+
+    const face = new THREE.Mesh(new THREE.PlaneGeometry(2.3, 0.58),
+      glowTex(0xf7ead2, texSign('TANGLE JUNGLE', 'vines, ruins & doodles', '#4e8a34')));
+    face.position.set(sp.x + Math.sin(-0.2) * 0.08, spy + 2.1, sp.z + Math.cos(-0.2) * 0.08);
+    face.rotation.y = -0.2;
+    scene.add(face);
+
+    // ---- the fringe itself: fern clumps + dark foliage along the north shore
+    const clumpG = merge([0, 1, 2, 3, 4, 5, 6].map((i) => ({
+      g: xf(new THREE.ConeGeometry(0.16, 1.5, 4), 0, 0.62, 0,
+        0.42, (i / 7) * TAU, 0, 1, 1, 1),
+      c: i % 2 ? 0x7ac74f : 0x5f9c38,
+    })));
+    const bushG = merge([0, 1, 2, 3].map((i) => {
+      const a = (i / 4) * TAU;
+      return {
+        g: xf(new THREE.SphereGeometry(0.78, 8, 6), Math.cos(a) * 0.5, 0.55 + (i % 2) * 0.22, Math.sin(a) * 0.5,
+          0, 0, 0, 1, 0.82, 1),
+        c: [0x4e8a34, 0x3f6b2c, 0x63ad3c, 0x5f9c38][i],
+      };
+    }));
+
+    const ferns = new THREE.InstancedMesh(clumpG, makeToon(0xffffff, {
+      unique: true, vertexColors: true, side: THREE.DoubleSide,
+    }), 20);
+    ferns.castShadow = true;
+    ferns.frustumCulled = false;
+    const bushes = new THREE.InstancedMesh(bushG, makeToon(0xffffff, {
+      unique: true, vertexColors: true,
+    }), 22);
+    bushes.castShadow = true;
+
+    let fi = 0, bi = 0;
+    // th sweeps the north shore; the path window is left open
+    for (let i = 0; i < 30; i++) {
+      const th = -2.42 + (i / 29) * 1.62;
+      if (Math.abs(th + 1.725) < 0.3) continue; // the gap the path walks through
+      const R = shoreR(th);
+      for (const [dr, isBush] of [[-0.55, true], [-1.5, false]]) {
+        const r = R + dr - Math.random() * 0.5;
+        const x = CX + Math.cos(th) * r, z = CZ + Math.sin(th) * r;
+        const y = sandY(x, z);
+        if (isBush) {
+          if (bi >= 22 || i % 3 === 1) continue;
+          // tall enough to hide the open sea behind the gap: the path has to
+          // read as leading INTO the jungle, not out onto the water
+          instAt(bushes, bi++, x, y - 0.2, z, Math.random() * TAU, 0, 0, 1.5 + Math.random() * 1.0);
+        } else {
+          if (fi >= 20) continue;
+          const sc = 0.85 + Math.random() * 0.6;
+          this.anim.jFerns.push({ i: fi, x, y, z, yaw: Math.random() * TAU, sc, ph: Math.random() * TAU });
+          instAt(ferns, fi++, x, y, z, 0, 0, 0, sc);
+        }
+      }
+    }
+    ferns.count = fi;
+    bushes.count = bi;
+    ferns.instanceMatrix.needsUpdate = true;
+    bushes.instanceMatrix.needsUpdate = true;
+    scene.add(ferns, bushes);
+    this.anim.jFernMesh = ferns;
+
+    this.hotspots.push({
+      id: 'exit-jungle',
+      position: new THREE.Vector3(-0.7, 0, -9.9),
+      radius: 2.8,
+      label: 'Follow the path to the Tangle Jungle',
+      action: (g) => g.goToRoom('jungle', 'beach'),
+    });
+  }
+
   // ---- per-frame -----------------------------------------------------------
   update(dt, game) {
     const t = (this.t += dt);
@@ -1421,6 +1575,17 @@ export class BeachRoom extends Room {
         Math.sin(t * 1.6 + f.ph) * 0.05, f.sc);
     }
     fm.instanceMatrix.needsUpdate = true;
+
+    // the jungle-mouth ferns nod in the onshore breeze
+    if (a.jFernMesh) {
+      for (const f of a.jFerns) {
+        instAt(a.jFernMesh, f.i, f.x, f.y, f.z,
+          f.yaw + Math.sin(t * 0.9 + f.ph) * 0.08,
+          Math.sin(t * 1.3 + f.ph) * 0.06,
+          Math.sin(t * 1.05 + f.ph * 1.4) * 0.07, f.sc);
+      }
+      a.jFernMesh.instanceMatrix.needsUpdate = true;
+    }
 
     // umbrellas
     for (const u of a.umbrellas) {
