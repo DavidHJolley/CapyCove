@@ -141,6 +141,80 @@ function openEditor(game) {
   let shiftDrag = false;
   let lastClick = null;   // free mode: click the same spot to cycle deeper
   let pickIndex = 0;
+
+  /**
+   * Editor camera. The engine's static mode copies `_staticCam` verbatim every
+   * frame once its arrival ease is done, so driving that is a clean takeover
+   * with no engine changes: wheel dollies, right-drag orbits, middle-drag (or
+   * Shift+right-drag) pans, F frames the selection. The player's own camera
+   * mode is restored on close.
+   */
+  const cam = { target: new THREE.Vector3(), dist: 18, yaw: 0, pitch: 0.9 };
+  const savedMode = engine.cameraMode;
+  let camDrag = null; // { mode: 'orbit'|'pan', x, y }
+
+  function camInit() {
+    const p = engine.playerAvatar?.group.position;
+    cam.target.copy(p || new THREE.Vector3());
+    const off = engine.camera.position.clone().sub(cam.target);
+    cam.dist = Math.max(3, off.length());
+    cam.yaw = Math.atan2(off.x, off.z);
+    cam.pitch = Math.asin(THREE.MathUtils.clamp(off.y / (off.length() || 1), -0.99, 0.99));
+    camApply();
+  }
+
+  function camApply() {
+    const cp = Math.cos(cam.pitch);
+    const pos = new THREE.Vector3(
+      cam.target.x + Math.sin(cam.yaw) * cp * cam.dist,
+      cam.target.y + Math.sin(cam.pitch) * cam.dist,
+      cam.target.z + Math.cos(cam.yaw) * cp * cam.dist,
+    );
+    engine._staticCam = { position: pos, lookAt: cam.target.clone() };
+    engine.cameraMode = 'static';
+    engine._camEase = 0;
+  }
+
+  function camFrame() {
+    if (mode === 'free' && free) cam.target.copy(freePos());
+    else if (mode === 'handles' && sel) cam.target.copy(sel.mesh.position);
+    else return;
+    cam.dist = Math.max(3, Math.min(cam.dist, 12));
+    camApply();
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    cam.dist = THREE.MathUtils.clamp(cam.dist * (e.deltaY > 0 ? 1.12 : 0.89), 1.5, 140);
+    camApply();
+  }
+
+  function onCamDown(e) {
+    if (e.button !== 2 && e.button !== 1) return false;
+    e.preventDefault();
+    e.stopPropagation();
+    camDrag = { mode: e.button === 1 || e.shiftKey ? 'pan' : 'orbit', x: e.clientX, y: e.clientY };
+    return true;
+  }
+
+  function onCamMove(e) {
+    if (!camDrag) return false;
+    const dx = e.clientX - camDrag.x;
+    const dy = e.clientY - camDrag.y;
+    camDrag.x = e.clientX;
+    camDrag.y = e.clientY;
+    if (camDrag.mode === 'orbit') {
+      cam.yaw -= dx * 0.006;
+      cam.pitch = THREE.MathUtils.clamp(cam.pitch + dy * 0.005, -0.2, 1.45);
+    } else {
+      const right = new THREE.Vector3().setFromMatrixColumn(engine.camera.matrix, 0);
+      const up = new THREE.Vector3().setFromMatrixColumn(engine.camera.matrix, 1);
+      const k = cam.dist * 0.0016;
+      cam.target.addScaledVector(right, -dx * k).addScaledVector(up, dy * k);
+    }
+    camApply();
+    return true;
+  }
   const freeMoves = new Map(); // path -> { label, from:[x,y,z], to:[x,y,z], obj, instanceId }
 
   const pinGeo = new THREE.ConeGeometry(0.16, 0.5, 10);
@@ -148,7 +222,7 @@ function openEditor(game) {
 
   const KEYS = {
     handles: '<b>Drag a pin</b> to move that number - <b>Shift-drag</b> the gold prop pin moves a whole station<br><b>Arrows</b> nudge (Shift = 0.5), <b>[ ]</b> turn the prop - <b>Esc</b> closes. Walking still works.',
-    free: '<b>Click</b> grabs the whole prop - <b>click again</b> on the same spot for what is behind it - <b>Tab</b> drills into its parts<br><b>Drag</b> to move, <b>arrows</b> nudge, <b>PgUp/Dn</b> height, <b>[ ]</b> rotate, <b>- =</b> resize, <b>H</b> hide<br>Hold <b>Shift</b> for bigger steps. Visual preview only.',
+    free: '<b>Click</b> grabs the whole prop - <b>click again</b> for what is behind - <b>Tab</b> drills in (part, then one instance or one welded piece)<br><b>Drag</b> move, <b>arrows</b> nudge, <b>PgUp/Dn</b> height, <b>[ ]</b> rotate, <b>- =</b> resize, <b>H</b> hide<br><b>Wheel</b> zoom, <b>right-drag</b> orbit, <b>middle/Shift-right</b> pan, <b>F</b> frame it<br>Hold <b>Shift</b> for bigger steps. Visual preview only.',
   };
 
   // ---- shared helpers ------------------------------------------------------
@@ -164,11 +238,13 @@ function openEditor(game) {
     if (box) { box.parent?.remove(box); box.geometry?.dispose?.(); box.material?.dispose?.(); box = null; }
   }
 
-  function showBox(obj, instanceId) {
+  function showBox(obj, instanceId, piece = null) {
     clearBox();
     if (!obj) return;
     const b = new THREE.Box3();
-    if (instanceId != null && obj.isInstancedMesh) {
+    if (piece) {
+      b.copy(pieceBox(obj, piece));
+    } else if (instanceId != null && obj.isInstancedMesh) {
       obj.getMatrixAt(instanceId, _m);
       const g = obj.geometry;
       if (!g.boundingBox) g.computeBoundingBox();
@@ -275,6 +351,7 @@ function openEditor(game) {
   // ---- free mode -----------------------------------------------------------
   function freePos(target = new THREE.Vector3()) {
     if (!free) return target;
+    if (free.piece) return target.copy(free.pieceState.pos);
     if (free.instanceId != null) {
       free.obj.getMatrixAt(free.instanceId, _m);
       return target.setFromMatrixPosition(_m);
@@ -282,9 +359,39 @@ function openEditor(game) {
     return target.copy(free.obj.position);
   }
 
+  /**
+   * A welded piece has no transform of its own, so we track one alongside it
+   * and push the DELTA into its slice of the vertex buffer: translate in the
+   * mesh's local space, rotate and scale about the piece's own centre.
+   */
+  function pieceTransform(fn) {
+    const st = free.pieceState;
+    const p = st.pos.clone();
+    const q = _yaw(st.rot);
+    const s = new THREE.Vector3(st.scale, st.scale, st.scale);
+    fn(p, q, s);
+    const newYaw = new THREE.Euler().setFromQuaternion(q, 'YXZ').y;
+    const dYaw = newYaw - st.rot;
+    const dScale = st.scale ? s.x / st.scale : 1;
+
+    const inv = new THREE.Matrix4().copy(free.obj.matrixWorld).invert();
+    const origin = new THREE.Vector3().applyMatrix4(inv);
+    const localDelta = p.clone().sub(st.pos).applyMatrix4(inv).sub(origin);
+
+    pieceApply(free.obj, free.piece, (m) => {
+      m.makeRotationY(dYaw);
+      m.scale(new THREE.Vector3(dScale, dScale, dScale));
+      m.setPosition(localDelta);
+    });
+    free.piece.center.add(localDelta);
+    st.pos.copy(p); st.rot = newYaw; st.scale = s.x;
+  }
+
   function freeApply(fn) {
     if (!free) return;
-    if (free.instanceId != null) {
+    if (free.piece) {
+      pieceTransform(fn);
+    } else if (free.instanceId != null) {
       free.obj.getMatrixAt(free.instanceId, _m);
       _m.decompose(_p, _q, _s);
       fn(_p, _q, _s);
@@ -313,19 +420,97 @@ function openEditor(game) {
         fromScale: free.startScale, toScale: st.scale,
       });
     }
-    showBox(free.obj, free.instanceId);
+    showBox(free.obj, free.instanceId, free.piece);
     paint();
   }
 
   /** Current yaw (radians) and uniform scale of the free selection. */
   function freeState() {
     if (!free) return { rot: 0, scale: 1 };
+    if (free.piece) return { rot: free.pieceState.rot, scale: free.pieceState.scale };
     if (free.instanceId != null) {
       free.obj.getMatrixAt(free.instanceId, _m);
       _m.decompose(_p, _q, _s);
       return { rot: new THREE.Euler().setFromQuaternion(_q, 'YXZ').y, scale: _s.x };
     }
     return { rot: free.obj.rotation.y, scale: free.obj.scale.x };
+  }
+
+  /**
+   * Merged props (30 rocks welded into one mesh for one draw call) have no
+   * children to drill into, but they DO have seams: each rock is a connected
+   * component of the index buffer. Label them once with union-find and the
+   * editor can move, turn and resize a single welded piece by rewriting just
+   * its slice of the position attribute. Cached on the geometry.
+   */
+  function piecesOf(geo) {
+    if (geo.userData.__pieces) return geo.userData.__pieces;
+    const pos = geo.attributes.position;
+    const idx = geo.index?.array;
+    if (pos.count > 200000) { geo.userData.__pieces = null; return null; }
+    const parent = new Uint32Array(pos.count);
+    for (let i = 0; i < pos.count; i++) parent[i] = i;
+    const find = (a) => { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
+    const union = (a, b) => { const ra = find(a); const rb = find(b); if (ra !== rb) parent[rb] = ra; };
+
+    // Unindexed geometry (icosahedrons, and anything merged from them) repeats
+    // a shared corner once per triangle, so weld by position first or every
+    // triangle looks like its own island.
+    if (!idx) {
+      const weld = new Map();
+      for (let i = 0; i < pos.count; i++) {
+        const k = `${Math.round(pos.getX(i) * 1000)},${Math.round(pos.getY(i) * 1000)},${Math.round(pos.getZ(i) * 1000)}`;
+        const seen = weld.get(k);
+        if (seen === undefined) weld.set(k, i); else union(i, seen);
+      }
+      for (let t = 0; t + 2 < pos.count; t += 3) { union(t, t + 1); union(t, t + 2); }
+    } else {
+      for (let t = 0; t < idx.length; t += 3) { union(idx[t], idx[t + 1]); union(idx[t], idx[t + 2]); }
+    }
+    const byRoot = new Map();
+    for (let v = 0; v < pos.count; v++) {
+      const r = find(v);
+      if (!byRoot.has(r)) byRoot.set(r, []);
+      byRoot.get(r).push(v);
+    }
+    if (byRoot.size < 2) { geo.userData.__pieces = null; return null; }
+    const pieces = [...byRoot.values()].map((verts) => {
+      const c = new THREE.Vector3();
+      for (const v of verts) c.x += pos.getX(v), c.y += pos.getY(v), c.z += pos.getZ(v);
+      c.multiplyScalar(1 / verts.length);
+      return { verts: Uint32Array.from(verts), center: c };
+    });
+    const rootOf = new Map();
+    pieces.forEach((p, i) => rootOf.set(find(p.verts[0]), i));
+    geo.userData.__pieces = {
+      pieces,
+      faceToPiece: (faceIndex) => rootOf.get(find(idx ? idx[faceIndex * 3] : faceIndex * 3)) ?? 0,
+    };
+    return geo.userData.__pieces;
+  }
+
+  /** Apply a transform to one welded piece, about its own centre. */
+  function pieceApply(mesh, piece, fn) {
+    const pos = mesh.geometry.attributes.position;
+    const c = piece.center;
+    const v = new THREE.Vector3();
+    const m = new THREE.Matrix4();
+    fn(m); // caller composes a matrix in piece-local space
+    for (const i of piece.verts) {
+      v.set(pos.getX(i) - c.x, pos.getY(i) - c.y, pos.getZ(i) - c.z).applyMatrix4(m);
+      pos.setXYZ(i, v.x + c.x, v.y + c.y, v.z + c.z);
+    }
+    pos.needsUpdate = true;
+    mesh.geometry.computeBoundingSphere();
+    mesh.geometry.computeBoundingBox();
+  }
+
+  function pieceBox(mesh, piece) {
+    const pos = mesh.geometry.attributes.position;
+    const b = new THREE.Box3();
+    const v = new THREE.Vector3();
+    for (const i of piece.verts) b.expandByPoint(v.set(pos.getX(i), pos.getY(i), pos.getZ(i)));
+    return b.applyMatrix4(mesh.matrixWorld);
   }
 
   /** scene-child ... hit object, so selection can start at the whole prop. */
@@ -337,37 +522,56 @@ function openEditor(game) {
   }
 
   /**
-   * Select at a depth along the pick chain. Depth 0 is the whole prop (the
-   * group the room added to the scene), deeper is one of its parts, and the
-   * last level of an InstancedMesh hit is the single instance. Clicking picks
-   * the PROP, because "move that bench" is the common intent and grabbing one
-   * plank of it is the rare one; Tab drills in.
+   * The ladder of things one click could mean, outermost first: the prop, its
+   * parts, then the finest grain available: one instance of an InstancedMesh,
+   * or one welded piece of a merged mesh (that is how a single rock comes out
+   * of a 30-rock batch). Clicking takes the top rung because "move that bench"
+   * is the common intent; Tab climbs down, Shift+Tab back up.
    */
-  function selectDepth(chain, depth, rawInstanceId) {
-    const levels = chain.length + (rawInstanceId != null ? 1 : 0);
-    const d = ((depth % levels) + levels) % levels;
-    const isInstance = rawInstanceId != null && d === chain.length;
-    const obj = chain[Math.min(d, chain.length - 1)];
-    selectFree(obj, isInstance ? rawInstanceId : null, { chain, depth: d, levels, rawInstanceId });
+  function buildLevels(chain, rawInstanceId, faceIndex) {
+    const levels = chain.map((o) => ({ kind: 'obj', obj: o }));
+    const leaf = chain[chain.length - 1];
+    if (rawInstanceId != null) {
+      levels.push({ kind: 'instance', obj: leaf, instanceId: rawInstanceId });
+    } else if (faceIndex != null && leaf.isMesh && leaf.geometry) {
+      const pk = piecesOf(leaf.geometry);
+      if (pk) levels.push({ kind: 'piece', obj: leaf, pieceIndex: pk.faceToPiece(faceIndex), pack: pk });
+    }
+    return levels;
   }
 
-  function selectFree(obj, instanceId, nav = null) {
-    const path = pathOf(obj, engine.scene) + (instanceId != null ? `#${instanceId}` : '');
+  function selectDepth(nav, depth) {
+    const { levels } = nav;
+    const d = ((depth % levels.length) + levels.length) % levels.length;
+    selectLevel({ ...nav, depth: d });
+  }
+
+  function selectLevel(nav) {
+    const lv = nav.levels[nav.depth];
+    const obj = lv.obj;
+    const instanceId = lv.kind === 'instance' ? lv.instanceId : null;
+    const piece = lv.kind === 'piece' ? lv.pack.pieces[lv.pieceIndex] : null;
     const kids = obj.children?.length || 0;
-    const what = instanceId != null ? 'instance'
-      : (nav?.depth ?? 0) > 0 ? 'part'
-        : kids ? `whole prop, ${kids} part${kids === 1 ? '' : 's'}` : 'prop';
-    free = {
-      obj, instanceId, path, label: `${labelOf(obj, instanceId)} (${what})`,
-      start: [0, 0, 0], nav: nav || { chain: pickChain(obj), depth: 0, levels: 1, rawInstanceId: instanceId },
-    };
+    const what = lv.kind === 'instance' ? 'one instance'
+      : lv.kind === 'piece' ? `1 of ${lv.pack.pieces.length} welded pieces`
+        : nav.depth > 0 ? 'part'
+          : kids ? `whole prop, ${kids} part${kids === 1 ? '' : 's'}` : 'prop';
+    const path = pathOf(obj, engine.scene)
+      + (instanceId != null ? `#${instanceId}` : '')
+      + (piece ? `:piece${lv.pieceIndex}` : '');
+
+    free = { obj, instanceId, piece, path, label: `${labelOf(obj, instanceId)} (${what})`, start: [0, 0, 0], nav };
+    if (piece) {
+      const wc = piece.center.clone().applyMatrix4(obj.matrixWorld);
+      free.pieceState = { pos: wc, rot: 0, scale: 1 };
+    }
     const cur = freePos();
     const st = freeState();
     const known = freeMoves.get(path);
     free.start = known ? known.from.slice() : [cur.x, cur.y, cur.z];
     free.startRot = known ? known.fromRot : st.rot;
     free.startScale = known ? known.fromScale : st.scale;
-    showBox(obj, instanceId);
+    showBox(obj, instanceId, piece);
     paint();
   }
 
@@ -392,7 +596,10 @@ function openEditor(game) {
         row.className = `ed-row${free?.path === path ? ' on' : ''}`;
         row.innerHTML = `<span class="ed-dot" style="background:#7ee0ff"></span><span>${rec.label}</span>`
           + `<span class="ed-xz">${f2(rec.to[0])}, ${f2(rec.to[2])}</span>`;
-        row.onclick = () => { selectFree(rec.obj, rec.instanceId); };
+        row.onclick = () => {
+          const chain = pickChain(rec.obj);
+          selectDepth({ chain, levels: buildLevels(chain, rec.instanceId, null), depth: 0 }, chain.length - 1);
+        };
         list.appendChild(row);
       }
       if (!freeMoves.size) {
@@ -457,6 +664,7 @@ function openEditor(game) {
   const ndc = (e) => new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
 
   function onDown(e) {
+    if (onCamDown(e)) return;          // right/middle: orbit or pan the camera
     if (e.button !== 0) return;
     ray.setFromCamera(ndc(e), engine.camera);
 
@@ -493,8 +701,10 @@ function openEditor(game) {
     lastClick = { x: e.clientX, y: e.clientY };
     const h = ranked[pickIndex].h;
 
-    // start at the whole prop; Tab drills down to its parts
-    selectDepth(pickChain(h.object), 0, h.instanceId ?? null);
+    // start at the whole prop; Tab drills down to parts, then to one instance
+    // or one welded piece (which is how a single rock leaves a merged batch)
+    const chain = pickChain(h.object);
+    selectDepth({ chain, levels: buildLevels(chain, h.instanceId ?? null, h.faceIndex ?? null), depth: 0 }, 0);
     const cur = freePos();
     plane.constant = -cur.y;
     if (ray.ray.intersectPlane(plane, hit)) grab.copy(cur).sub(hit);
@@ -502,6 +712,7 @@ function openEditor(game) {
   }
 
   function onMove(e) {
+    if (onCamMove(e)) return;
     if (!dragging) return;
     ray.setFromCamera(ndc(e), engine.camera);
     if (!ray.ray.intersectPlane(plane, hit)) return;
@@ -517,6 +728,7 @@ function openEditor(game) {
   }
 
   function onUp() {
+    camDrag = null;
     if (!dragging) return;
     dragging = false;
     if (mode === 'handles' && sel) commitPin(sel, sel.mesh.position.x, sel.mesh.position.z);
@@ -568,7 +780,9 @@ function openEditor(game) {
       _: () => freeApply((p, q, sc) => sc.multiplyScalar(0.8)),
       '=': () => freeApply((p, q, sc) => sc.multiplyScalar(e.shiftKey ? 1.25 : 1.0526)),
       '+': () => freeApply((p, q, sc) => sc.multiplyScalar(1.25)),
-      Tab: () => selectDepth(free.nav.chain, free.nav.depth + (e.shiftKey ? -1 : 1), free.nav.rawInstanceId),
+      Tab: () => selectDepth(free.nav, free.nav.depth + (e.shiftKey ? -1 : 1)),
+      f: () => camFrame(),
+      F: () => camFrame(),
       h: () => { if (free.instanceId == null) { free.obj.visible = !free.obj.visible; paint(); } },
       H: () => { if (free.instanceId == null) { free.obj.visible = !free.obj.visible; paint(); } },
     };
@@ -578,7 +792,10 @@ function openEditor(game) {
     fn();
   }
 
+  const noMenu = (e) => e.preventDefault(); // right-drag orbits instead
   canvas.addEventListener('pointerdown', onDown, true);
+  canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
+  canvas.addEventListener('contextmenu', noMenu);
   addEventListener('pointermove', onMove);
   addEventListener('pointerup', onUp);
   addEventListener('keydown', onKey, true);
@@ -615,12 +832,16 @@ function openEditor(game) {
 
   const poll = setInterval(() => sync(), 400);
   sync(true);
+  camInit();
   game.toast('Layout editor on. Ctrl+E to close.');
 
   open = true;
   teardown = () => {
     clearInterval(poll);
     canvas.removeEventListener('pointerdown', onDown, true);
+    canvas.removeEventListener('wheel', onWheel, true);
+    canvas.removeEventListener('contextmenu', noMenu);
+    engine.setCameraMode ? engine.setCameraMode(savedMode) : (engine.cameraMode = savedMode);
     removeEventListener('pointermove', onMove);
     removeEventListener('pointerup', onUp);
     removeEventListener('keydown', onKey, true);

@@ -158,14 +158,24 @@ a station by patching its `yaw`. `editorExport(id)` returns the pasteable row.
 Rooms opt in with `editable(id, objs)` + those four methods; only the lounge
 has so far (see its STATIONS table for the pattern).
 
-**Free** (works in every room, no opt-in): raycast-pick ANY object, including
-a single instance inside an `InstancedMesh`. Drag to move, `[`/`]` rotate,
-`-`/`=` scale, PgUp/PgDn height, Tab to select the parent, H to hide. This is
-a VISUAL preview: nothing derived from a number follows it, and the change is
-session-only. The panel prints position, rotation and scale plus a scene path
-so the value can be found in the room builder. Irreducible limit: props merged
-into one BufferGeometry at build time move as a whole, since splitting them
-would cost the draw calls the merge was buying.
+**Free** (works in every room, no opt-in): raycast-pick ANY object. Clicking
+takes the whole prop; Tab drills down through its parts to the finest grain
+available, which is one instance of an `InstancedMesh` OR one welded piece of
+a merged mesh. Merged props keep no record of their parts, so the editor finds
+the seams itself: union-find over the geometry (welding by position first,
+since icosahedrons and friends come out unindexed) labels each connected
+component, and a piece is moved/turned/resized by rewriting just its slice of
+the position attribute about its own centroid. That is how a single rock comes
+out of a 30-rock, one-draw-call batch.
+Controls: drag to move, arrows nudge, PgUp/PgDn height, `[`/`]` rotate, `-`/`=`
+scale, H hide, click the same spot again to cycle past the front-most object,
+Shift for bigger steps. Camera: wheel zooms, right-drag orbits, middle-drag or
+Shift+right-drag pans, F frames the selection (it drives `engine._staticCam`
+while open and restores the player's camera mode on close). Particle systems,
+lines, sprites and depth-writeless glow overlays are unpickable, and oversized
+backdrops sort last. Free edits are a VISUAL preview: nothing derived from a
+number follows, and they are session-only. The panel prints position, rotation
+and scale plus a scene path so the value can be found in the room builder.
 
 ## Historical roadmap notes (2026-08-06)
 
