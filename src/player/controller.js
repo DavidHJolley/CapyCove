@@ -24,12 +24,25 @@ export class WalkController {
     if (this.moving) { this.moving = false; this.avatar.setAnim('idle'); }
   }
 
-  /** Snap y to ground under (x, z). Returns false if off the ground meshes. */
+  /** Multi-floor ground snap: take the HIGHEST surface within step-up range
+   *  (1.2 units), so ramps/piers that overlap lower ground lift the walker
+   *  instead of sinking them through the planks; anything higher than a step
+   *  (a mezzanine overhead) is ignored, so walking beneath it stays below.
+   *  Returns false if off the ground meshes. */
   snapToGround(room, pos) {
     this.ray.set(new THREE.Vector3(pos.x, pos.y + 5, pos.z), DOWN);
     const hits = this.ray.intersectObjects(room.groundMeshes, false);
     if (!hits.length) return false;
-    pos.y = hits[0].point.y;
+    let best = null;
+    for (const h of hits) {
+      if (h.point.y - pos.y <= 1.2 && (!best || h.point.y > best.point.y)) best = h;
+    }
+    if (!best) {
+      for (const h of hits) {
+        if (!best || Math.abs(h.point.y - pos.y) < Math.abs(best.point.y - pos.y)) best = h;
+      }
+    }
+    pos.y = best.point.y;
     return true;
   }
 

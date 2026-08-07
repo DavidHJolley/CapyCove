@@ -40,6 +40,12 @@ export class Engine {
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 300);
     this.camDefault = { offset: new THREE.Vector3(0, 14, 19), lookHeight: 1 };
     this.camTarget = new THREE.Vector3();
+    // 'follow' = soft-follow the player; 'static' = fixed whole-room vantage
+    // (per-room via room.staticCamera, engine fallback otherwise)
+    this.cameraMode = (() => {
+      try { return localStorage.getItem('capycove-cam') === 'static' ? 'static' : 'follow'; } catch { return 'follow'; }
+    })();
+    this._staticCam = null;
 
     this.overlayRoot = document.getElementById('overlay-root');
 
@@ -123,6 +129,12 @@ export class Engine {
       this.camera.position.copy(spawn).add(this.camCfg.offset);
       this.camTarget.copy(spawn);
 
+      const sc = this.room.staticCamera;
+      this._staticCam = {
+        position: sc?.position?.clone?.() || this.camCfg.offset.clone().multiplyScalar(1.6),
+        lookAt: sc?.lookAt?.clone?.() || new THREE.Vector3(0, 1, 0),
+      };
+
       this.roomAge = 0;
       this.game.audio?.setRoom?.(id);
       fade.classList.remove('on');
@@ -146,8 +158,20 @@ export class Engine {
   snapY(pos, room) {
     this.ray.set(_rayOrigin.set(pos.x, pos.y + 8, pos.z), DOWN);
     const hits = this.ray.intersectObjects(room.groundMeshes, false);
-    if (hits.length) pos.y = hits[0].point.y;
-    return !!hits.length;
+    if (!hits.length) return false;
+    // highest surface within step range, else nearest: mirror of
+    // WalkController.snapToGround (see the rationale there)
+    let best = null;
+    for (const h of hits) {
+      if (h.point.y - pos.y <= 1.2 && (!best || h.point.y > best.point.y)) best = h;
+    }
+    if (!best) {
+      for (const h of hits) {
+        if (!best || Math.abs(h.point.y - pos.y) < Math.abs(best.point.y - pos.y)) best = h;
+      }
+    }
+    pos.y = best.point.y;
+    return true;
   }
 
   // ---- input ---------------------------------------------------------------
@@ -261,6 +285,15 @@ export class Engine {
     }
   }
 
+  /** Flip between follow and static camera; persisted. Returns the new mode. */
+  toggleCameraMode() {
+    this.cameraMode = this.cameraMode === 'static' ? 'follow' : 'static';
+    try { localStorage.setItem('capycove-cam', this.cameraMode); } catch {}
+    this.game.events.emit('camera-mode', this.cameraMode);
+    this.game.audio?.play?.('click');
+    return this.cameraMode;
+  }
+
   // ---- main loop -----------------------------------------------------------
   start() {
     this.renderer.setAnimationLoop(() => this._tick());
@@ -275,12 +308,18 @@ export class Engine {
       this.room.update(dt, this.game);
       this.game.net?.update?.(dt);
 
-      // camera: soft-follow the player
-      const p = this.playerAvatar.group.position;
-      this.camTarget.lerp(p, Math.min(1, dt * 3.5));
-      const desired = this.camTarget.clone().add(this.camCfg.offset);
-      this.camera.position.lerp(desired, Math.min(1, dt * 3.5));
-      this.camera.lookAt(this.camTarget.x, this.camTarget.y + this.camCfg.lookHeight, this.camTarget.z);
+      if (this.cameraMode === 'static' && this._staticCam) {
+        // fixed whole-room vantage; still eased so toggling glides
+        this.camera.position.lerp(this._staticCam.position, Math.min(1, dt * 3.5));
+        this.camera.lookAt(this._staticCam.lookAt);
+      } else {
+        // camera: soft-follow the player
+        const p = this.playerAvatar.group.position;
+        this.camTarget.lerp(p, Math.min(1, dt * 3.5));
+        const desired = this.camTarget.clone().add(this.camCfg.offset);
+        this.camera.position.lerp(desired, Math.min(1, dt * 3.5));
+        this.camera.lookAt(this.camTarget.x, this.camTarget.y + this.camCfg.lookHeight, this.camTarget.z);
+      }
 
       this.renderer.render(this.scene, this.camera);
       this._updateOverlays();
