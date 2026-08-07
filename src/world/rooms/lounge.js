@@ -3,6 +3,7 @@ import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
 import { createAvatar } from '../../player/avatar.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
+import { getOverrides } from '../layout.js';
 
 // ---------------------------------------------------------------------------
 // The Game Den: the warm timber games room INSIDE the Frosty Peak ski lodge,
@@ -252,6 +253,31 @@ const STATIONS = [
   },
 ];
 const STATION_BY_ID = new Map(STATIONS.map((s) => [s.id, s]));
+
+// Pristine copy of every coordinate the dev layout editor may move. The editor
+// stores its changes in src/world/layout.js and this file re-applies them onto
+// STATIONS at the top of build(); mutating the module table in place is
+// deliberate, because a dozen call sites read STATIONS/STATION_BY_ID and this
+// way none of them need to know the editor exists. Reset restores from here.
+const STATIONS_BASE = STATIONS.map((s) => ({
+  at: s.at.slice(), hs: s.hs.slice(), aiAt: s.aiAt.slice(), sign: s.sign.slice(),
+  seats: s.seats.map((q) => q.slice()), yaw: s.yaw,
+}));
+
+/** Fold any dev-editor overrides into STATIONS before a build reads them. */
+function applyStationOverrides() {
+  const ov = getOverrides('lounge');
+  STATIONS.forEach((s, i) => {
+    const base = STATIONS_BASE[i];
+    const p = ov?.get(s.id) || null;
+    s.at = (p?.at || base.at).slice();
+    s.hs = (p?.hs || base.hs).slice();
+    s.aiAt = (p?.aiAt || base.aiAt).slice();
+    s.sign = (p?.sign || base.sign).slice();
+    s.seats = (p?.seats || base.seats).map((q) => q.slice());
+    s.yaw = p?.yaw !== undefined ? p.yaw : base.yaw;
+  });
+}
 
 const TAU = Math.PI * 2;
 // Chair cushions top out at 0.68; a capybara's rear sits 0.12 under its root
@@ -1204,6 +1230,7 @@ export class LoungeRoom extends Room {
   name = 'The Game Den';
 
   build(scene, game) {
+    applyStationOverrides(); // dev layout editor (Ctrl+E); a no-op normally
     this.t = 0;
     this._d = new THREE.Object3D();
     this._col = new THREE.Color();
@@ -3127,20 +3154,53 @@ export class LoungeRoom extends Room {
   }
 
   /**
-   * Dev layout editor hook: hand back the station's STATIONS row with the drag
-   * baked in. Everything a station owns (prop, both chairs, sign post, the two
-   * prompts and their rings, the obstacle circles) is derived from these five
-   * coordinate pairs, so shifting them all by the same delta keeps the cluster
-   * together, which dragging the prop alone cannot do.
+   * Dev layout editor: every number of a station that may be dragged, as a
+   * labelled handle. Each one is a real coordinate in the STATIONS table, so
+   * moving a handle and rebuilding puts the sign post, chair, prompt zone or
+   * obstacle circle exactly where a normal visit would.
    */
-  editorExport(id, d) {
+  editorHandles(id) {
+    const s = STATION_BY_ID.get(id);
+    if (!s) return [];
+    const out = [
+      { key: 'at', label: `${id}: prop`, xz: s.at, color: 0xf2b64a },
+      { key: 'sign', label: `${id}: sign`, xz: s.sign, color: 0x7ee0ff },
+      { key: 'hs', label: `${id}: sit zone`, xz: s.hs, color: 0xe8657a },
+      { key: 'aiAt', label: `${id}: vs-bot zone`, xz: s.aiAt, color: 0xe8657a },
+    ];
+    s.seats.forEach((q, i) => out.push({
+      key: `seats.${i}`, label: `${id}: chair ${i + 1}`, xz: q, color: 0x7ac74f,
+    }));
+    return out.map((h) => ({ ...h, y: s.y || 0 }));
+  }
+
+  /** Turn one dragged handle into a patch for src/world/layout.js. */
+  editorPatch(id, key, xz) {
     const s = STATION_BY_ID.get(id);
     if (!s) return null;
-    const p = ([x, z]) => `[${(x + d.dx).toFixed(2)}, ${(z + d.dz).toFixed(2)}]`;
-    const yawLine = Math.abs(d.dyaw) > 0.001
-      ? ` yaw: ${((s.yaw ?? 0) + d.dyaw).toFixed(2)},` : '';
+    if (key.startsWith('seats.')) {
+      const seats = s.seats.map((q) => q.slice());
+      seats[+key.split('.')[1]] = xz;
+      return { seats };
+    }
+    return { [key]: xz };
+  }
+
+  /** Move every number of a station together (Shift-drag on the prop handle). */
+  editorPatchAll(id, dx, dz) {
+    const s = STATION_BY_ID.get(id);
+    if (!s) return null;
+    const m = ([x, z]) => [+(x + dx).toFixed(2), +(z + dz).toFixed(2)];
+    return { at: m(s.at), hs: m(s.hs), aiAt: m(s.aiAt), sign: m(s.sign), seats: s.seats.map(m) };
+  }
+
+  /** The pasteable STATIONS row, as the room currently stands. */
+  editorExport(id) {
+    const s = STATION_BY_ID.get(id);
+    if (!s) return null;
+    const p = ([x, z]) => `[${x.toFixed(2)}, ${z.toFixed(2)}]`;
     return `${id} (STATIONS row):\n`
-      + `  at: ${p(s.at)}, hs: ${p(s.hs)}, aiAt: ${p(s.aiAt)}, sign: ${p(s.sign)},${yawLine}\n`
+      + `  at: ${p(s.at)}, hs: ${p(s.hs)}, aiAt: ${p(s.aiAt)}, sign: ${p(s.sign)},\n`
       + `  seats: [${s.seats.map(p).join(', ')}],`;
   }
 

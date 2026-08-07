@@ -212,6 +212,41 @@ export class Engine {
     }
   }
 
+  /**
+   * Dev: rebuild the current room in place, keeping the player where they
+   * stand and skipping the fade. The layout editor uses this after changing a
+   * number, so signs, chairs, prompt zones and colliders all land exactly
+   * where a normal visit would put them (most of them are merged into shared
+   * instanced batches and cannot be moved any other way).
+   */
+  rebuildRoom() {
+    if (!this.room || !this.scene || !this.playerAvatar) return null;
+    const RoomClass = this.room.constructor;
+    const pos = this.playerAvatar.group.position.clone();
+    const rot = this.playerAvatar.group.rotation.y;
+
+    this._teardownRoom();
+    this.room = new RoomClass();
+    this.scene = new THREE.Scene();
+    this.room.build(this.scene, this.game);
+    this.scene.add(this.remoteGroup);
+
+    this.playerAvatar.group.position.copy(pos);
+    this.playerAvatar.group.rotation.y = rot;
+    this.snapY(this.playerAvatar.group.position, this.room);
+    this.scene.add(this.playerAvatar.group);
+    this.controller.stop();
+
+    if (this.lastClock && this.room.onClock) {
+      const c = this.lastClock;
+      try { this.room.onClock(c.dayT, c.weather, c.aurora, c); }
+      catch (e) { console.error('[engine] onClock:', e); }
+    }
+    this.roomAge = 0;
+    this._resolveStaticCam(false);
+    return this.room;
+  }
+
   _teardownRoom() {
     for (const [, el] of this.hotspotEls) el.remove();
     this.hotspotEls.clear();
