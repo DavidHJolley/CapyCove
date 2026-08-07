@@ -10,9 +10,12 @@ import { BOT_ZONES } from '../../../shared/constants.js';
 // the door leads back out onto the mountain, so every window looks at snow,
 // pines and the far ridges.
 //
-//   GROUND FLOOR (loud): the arcade cabinet, the shuffleboard and the big
-//   four-in-a-row stand, spread wide around the open middle, plus the cocoa bar
-//   and the way out.
+//   GROUND FLOOR (loud): four corner territories around one open middle. The
+//   arcade cabinet is hard against the west wall, the four-in-a-row stand is
+//   angled across the south-west, the shuffleboard runs down the east wall and
+//   the cocoa bar is tucked into the south-east behind the stair foot; the rug,
+//   the door and the walking lanes between them are everything else. See the
+//   STATIONS table for the plan and the rules it obeys.
 //   THE LOFT (quiet): a timber mezzanine across the north end at y = 3.2 on
 //   chunky posts, reached by a boxed stair up the east wall. The grand stone
 //   fireplace is up here on the gable wall, with chess and the card table
@@ -158,12 +161,33 @@ const OUTLINE = '#2d2417';
 // floor it is on, where the prop stands, where each of its two prompts fires,
 // where its sign post goes, and where its two chairs sit.
 //
+// GROUND FLOOR PLAN (playtest note: "the games are too close and it is hard to
+// tell what game is what"). The ground floor is now four corner territories
+// around the open rug, with a walking lane between every pair:
+//
+//        x -11 ..................... 0 ..................... x +11
+//   z -2  [ PADDLE PANIC ]        (open rug / bot circle)   [ SHUFFLE ]
+//         cabinet on the west      the room's crossroads     board on the
+//   z  1  wall, chairs and         stays plain floor         east wall, chairs
+//         prompts facing east                                facing east
+//   ---- west lane (z 1..3) ------------------- east lane (z 3.5..4.8) -------
+//   z  4  [ FOUR IN A ROW ]                                 [ COCOA BAR ]
+//   z  6  angled across the        the door and the          tucked into the
+//         south-west corner        beanbag are the middle    south-east corner
+//
 // Layout rules the numbers obey, all of them checked against the obstacle list:
 //   * chairs sit clear of every collider (+0.15) and at least 0.9 from their
 //     own sign post, so nothing grows through a capybara's hat;
 //   * `hs` (sit down) and `aiAt` (play the house) are ~1.4 apart with most of
 //     that in z, because the camera trails 14 south: two prompts separated in
 //     x land on top of each other, separated in z they stack neatly;
+//   * ONE named sign per station, and no two stations' signs, chairs or prompt
+//     rings may overlap on screen from the arrival spawn. The camera trades
+//     height against depth (a 4-high board four metres nearer the lens paints
+//     over a 3-high cabinet behind it), so stations are separated by ANGLE:
+//     a station's whole cluster keeps its own |x| / depth band;
+//   * nothing a player needs to read sits south of z ~6.8: the planted half
+//     wall by the door cuts the camera's line to the floor beyond that;
 //   * the loft's prompts run tighter radii (1.5 / 1.2) and stay north of
 //     z = -2.9. Hotspot proximity is measured in 2D, so a generous radius up
 //     here would pop a chess prompt for somebody leaning on the rail below;
@@ -172,22 +196,47 @@ const OUTLINE = '#2d2417';
 // `ai` is the opponent each minigame actually names in its own code.
 const STATIONS = [
   {
+    // Hard against the west wall (cabinet spans x -10.5..-8.5, plaster at
+    // -10.8) and as far north as the balcony rail allows, so the whole
+    // south-west quarter belongs to the four-in-a-row stand instead.
     id: 'pong', label: 'Play Paddle Panic', name: 'PADDLE PANIC',
     sub: 'out-volley the house bot', ai: 'Blip', y: 0, yaw: 0.95,
-    at: [-8.2, -0.2], hs: [-6.3, 0.5], aiAt: [-6.15, 1.95], sign: [-8.6, 2.2],
-    seats: [[-6.9, -1.3], [-7.0, 1.2]],
+    // The sign stands at the MOUTH of the corner, not back by the wall beside
+    // the cabinet: from the follow camera the four-in-a-row stand fills the
+    // left edge of the frame out to about a sixth of the screen width, and a
+    // board tucked behind it at x -9.9 was invisible from the arrival spawn
+    // (checked by raycasting the camera at all nine points of the board).
+    at: [-9.5, -0.9], hs: [-7.95, 0.06], aiAt: [-7.8, 1.46], sign: [-7.9, 2.6],
+    seats: [[-7.62, -1.03], [-9.02, 0.92]],
   },
   {
+    // Along the east wall, north of the stair foot: the board's south end and
+    // the cocoa counter are 1.4 apart, which is the lane everyone walks to get
+    // upstairs. Shorter than it was (5.4, see _shuffle) for exactly that.
     id: 'shuffle', label: 'Play Shuffle Showdown', name: 'SHUFFLE SHOWDOWN',
     sub: 'slide it, do not shove it', ai: 'Waxwell', y: 0,
-    at: [6.3, 0.9], hs: [4.3, 0.9], aiAt: [4.2, 2.35], sign: [7.9, -1.3],
-    seats: [[4.75, -0.6], [4.75, 2.4]],
+    at: [7.5, 0.0], hs: [5.45, -0.35], aiAt: [5.35, 1.05], sign: [6.0, 3.5],
+    seats: [[5.9, -1.45], [5.9, 2.0]],
   },
   {
+    // Angled across the south-west corner with its back to the west wall and
+    // its face turned into the room. The angle is walkability as much as looks:
+    // 3.4 metres of stand is a wall a click-to-move walker has to slide down,
+    // so it lies ALONG the west side rather than across the diagonal everyone
+    // walks to reach the arcade, and its far end is pushed into the plaster
+    // rather than leaving a metre-wide slot beside it (a walker wall-follows to
+    // an open tip, turns for its target, re-enters the tip and stalls there:
+    // sealed, the north-west corner is simply entered around the open end).
+    // Every station-to-station route on this floor was walked to pick it.
+    // signH: this is the station nearest the lens, so its board is a low one,
+    // out at the mouth of the corner like a sandwich board. At the standard
+    // 2.42 it rode up into the same strip of frame as the arcade's prompt rings
+    // three metres behind it (the camera trades height against depth), which is
+    // the exact "signs reading over each other" the playtest called out.
     id: 'connect4', label: 'Play Four in a Row', name: 'FOUR IN A ROW',
-    sub: 'drop, stack, gloat', ai: 'Dizzy', y: 0, yaw: 0.95,
-    at: [-8.6, 5.4], hs: [-6.5, 4.9], aiAt: [-6.35, 6.35], sign: [-6.3, 7.6],
-    seats: [[-6.9, 4.3], [-6.9, 6.6]],
+    sub: 'drop, stack, gloat', ai: 'Dizzy', y: 0, yaw: 1.15, signH: 1.5,
+    at: [-9.4, 4.4], hs: [-8.21, 4.93], aiAt: [-8.11, 6.33], sign: [-5.6, 6.6],
+    seats: [[-7.65, 3.92], [-8.59, 6.02]],
   },
   {
     id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS',
@@ -641,6 +690,14 @@ function texChip() {
   return canvasTexture(CHIP_W, CHIP_H, (g, w, h) => paintChip(g, w, h, 'open', 'OPEN'));
 }
 
+/**
+ * The cabinet's marquee. It used to spell PADDLE PANIC in neon, two metres from
+ * the station sign post that spells PADDLE PANIC in paint: from the follow
+ * camera the two boards land on top of each other and the corner reads as two
+ * different games shouting the same name. Every station gets exactly ONE name,
+ * on its sign, so the neon is a wordless glyph now: two paddles, a ball and its
+ * trail, which says "bat-and-ball machine" at a glance and repeats nothing.
+ */
 function texMarquee() {
   const w = 512, h = 160;
   return canvasTexture(w, h, (g) => {
@@ -658,14 +715,33 @@ function texMarquee() {
       g.arc(16 + i * 19.4, h - 14, 6, 0, 7);
       g.fill();
     }
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    fitFont(g, 'PADDLE PANIC', w - 90, 72, '900');
+    // the glyph: paddle, ball, paddle, all of it glowing the same neon pink
     g.shadowColor = '#ff9be8';
-    g.shadowBlur = 24;
+    g.shadowBlur = 26;
     g.fillStyle = '#fff3ff';
-    g.fillText('PADDLE PANIC', w / 2, h * 0.5);
-    g.fillText('PADDLE PANIC', w / 2, h * 0.5);
+    for (const [px, py] of [[96, h * 0.5 - 14], [w - 96, h * 0.5 + 14]]) {
+      rrect(g, px - 15, py - 34, 30, 68, 15);
+      g.fill();
+    }
+    g.beginPath();
+    g.arc(w / 2, h * 0.5, 17, 0, 7);
+    g.fill();
+    // the volley: a dashed arc from one paddle past the ball to the other
+    g.strokeStyle = 'rgba(255,214,255,0.85)';
+    g.lineWidth = 7;
+    g.lineCap = 'round';
+    g.setLineDash([16, 20]);
+    g.beginPath();
+    g.moveTo(126, h * 0.5 - 10);
+    g.quadraticCurveTo(w / 2, h * 0.5 - 52, w - 126, h * 0.5 + 18);
+    g.stroke();
+    g.setLineDash([]);
+    // three sparks off the far paddle, so the still frame still reads as motion
+    for (let i = 0; i < 3; i++) {
+      g.beginPath();
+      g.arc(w - 60 - i * 4, h * 0.5 + 14 - 30 + i * 30, 5 - i, 0, 7);
+      g.fill();
+    }
     g.shadowBlur = 0;
   });
 }
@@ -1759,8 +1835,8 @@ export class LoungeRoom extends Room {
     // where daylight through the opening does the job.
     for (const [x, y, z, col, i, dist] of [
       [0, 4.2, 2.2, 0xffd8a4, 15, 15],
-      [-8.0, 3.4, 4.6, 0xffcf9a, 13, 13],
-      [8.0, 3.4, 4.6, 0xffd6a8, 13, 13],
+      [-8.4, 3.4, 2.2, 0xffcf9a, 13, 14],
+      [8.5, 3.4, 4.4, 0xffd6a8, 13, 14],
       [0, 2.3, -4.6, 0xffb877, 7, 9],
       [-6.6, MZ_Y + 2.0, -4.4, 0xffc890, 12, 11],
       [6.6, MZ_Y + 2.0, -4.4, 0xffc890, 12, 11],
@@ -2261,9 +2337,13 @@ export class LoungeRoom extends Room {
       // The loft's posts are stubby (board top 4.88, i.e. deck + 1.68). The
       // camera's line to a standing capybara's head passes deck + 1.7 about a
       // metre south of them, so a full-height post up here would blot out
-      // whoever was walking behind it.
+      // whoever was walking behind it. A station may also name its own height
+      // (`signH`): the ground floor's southernmost board is a low one, because
+      // this camera trades height against depth and a full-height post that
+      // close to the lens rides up into the frame belonging to the station
+      // three metres behind it.
       const [sx, sz] = s.sign;
-      const h = y ? 1.35 : 2.42;
+      const h = s.signH ?? (y ? 1.35 : 2.42);
       const yaw = Math.atan2(-sx, 12 - sz);
       const nx = Math.sin(yaw), nz = Math.cos(yaw);
       cyl.add(PAL.wood, sx, y + (h + 0.35) / 2, sz, 0.18, h + 0.35, 0.18);
@@ -2393,11 +2473,19 @@ export class LoungeRoom extends Room {
     this.obstacles.push({ x: s.at[0], z: s.at[1], r: 1.15 });
   }
 
-  /** SHUFFLEBOARD: long waxed table with the scoring zones painted on it. */
+  /**
+   * SHUFFLEBOARD: long waxed table with the scoring zones painted on it, laid
+   * along the east wall.
+   *
+   * 5.4 long, not the 6.0 it was: the board and the cocoa counter share that
+   * wall with the stair between them, and the only way upstairs is the lane
+   * across their ends. At 6.0 (plus 1.15 collider caps) that lane pinched to
+   * half a metre and walkers ground along the counter to find it.
+   */
   _shuffle(scene, B, s) {
     const { box, cyl } = B;
     const [x, z] = s.at;
-    const LEN = 6.0, WID = 1.25, TOP = 0.78;
+    const LEN = 5.4, WID = 1.25, TOP = 0.78;
     box.add(PAL.woodMid, x, TOP - 0.11, z, WID + 0.34, 0.22, LEN + 0.3);
     const top = new THREE.Mesh(new THREE.PlaneGeometry(WID, LEN), this._toonMap(texShuffleTop()));
     top.rotation.x = -Math.PI / 2;
@@ -2412,8 +2500,8 @@ export class LoungeRoom extends Room {
       }
     }
     for (const [px, pz, col] of [
-      [-0.28, -2.2, PAL.coral], [0.22, -1.9, PAL.coral], [-0.1, -1.3, PAL.sky],
-      [0.3, -0.8, PAL.sky], [-0.36, 2.3, PAL.coral], [0.34, 2.4, PAL.sky],
+      [-0.28, -2.0, PAL.coral], [0.22, -1.7, PAL.coral], [-0.1, -1.15, PAL.sky],
+      [0.3, -0.7, PAL.sky], [-0.36, 2.05, PAL.coral], [0.34, 2.15, PAL.sky],
     ]) {
       cyl.add(col, x + px, TOP + 0.06, z + pz, 0.34, 0.1, 0.34);
       cyl.add(0xfff6e3, x + px, TOP + 0.115, z + pz, 0.2, 0.02, 0.2);
@@ -2422,16 +2510,26 @@ export class LoungeRoom extends Room {
     // It used to be on the west wall; the board lives on the east side now. The
     // stair rail keeps every walker at least 0.6 west of it, so nobody can ever
     // stand behind it and be hidden by it.
+    //
+    // North of the board's middle on purpose: down at the board's south end it
+    // shared a patch of frame with the cocoa sign and the stair sign, which is
+    // three boards in one glance. Up here it has the whole upper-right to
+    // itself and still reads as this table's scoreboard.
     const sb = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.12), this._flat(texScoreboard()));
     sb.rotation.y = -1.0;
-    sb.position.set(ST_X0 - 0.24, 2.2, z + 0.7);
+    sb.position.set(ST_X0 - 0.24, 2.05, z + 1.2);
     scene.add(sb);
-    box.add(PAL.wood, ST_X0 - 0.18, 2.2, z + 0.7, 1.7, 1.3, 0.1, 0, -1.0, 0);
-    cyl.add(PAL.brass, x + 1.06, 0.94, z + 3.1, 0.28, 0.3, 0.28);
+    box.add(PAL.wood, ST_X0 - 0.18, 2.05, z + 1.2, 1.7, 1.3, 0.1, 0, -1.0, 0);
+    // the wax tin, sat on the room-side rail near the far end, where it is not
+    // standing in the lane to the stair
+    cyl.add(PAL.brass, x - (WID / 2 + 0.14), 1.06, z - 1.95, 0.28, 0.3, 0.28);
 
-    this.obstacles.push(
-      { x, z: z - 2.4, r: 1.15 }, { x, z, r: 1.15 }, { x, z: z + 2.4, r: 1.15 },
-    );
+    // Same rule as the four-in-a-row stand: a row of overlapping circles whose
+    // union is a smooth capsule down the board, spaced well inside their own
+    // radius so the rims cross at a shallow angle. The old three at 2.4 did not
+    // even touch (2 x 1.15 = 2.3), so a walker could squeeze between them and
+    // end up standing on the playing surface.
+    for (let i = -3; i <= 3; i++) this.obstacles.push({ x, z: z + i * 0.59, r: 1.05 });
   }
 
   /** CARDS: round green felt, a fanned hand, element tokens, wall lantern. */
@@ -2618,15 +2716,22 @@ export class LoungeRoom extends Room {
     this._c4Disc = hover;
     this._c4Base = y0 + GH + 0.45;
 
-    // The grid is 3.4 long: one collider at its centre would leave both ends
-    // walkable-through, so two more ride its long axis (local +x, which the
-    // yaw swings around with the stand).
-    const ax = Math.cos(yaw) * 1.5, az = -Math.sin(yaw) * 1.5;
-    this.obstacles.push(
-      { x, z, r: 1.35 },
-      { x: x - ax, z: z - az, r: 1.0 },
-      { x: x + ax, z: z + az, r: 1.0 },
-    );
+    // The grid is 3.4 long, so its collider is a ROW of circles along the long
+    // axis (local +x, which the yaw swings around with the stand). Spacing
+    // matters as much as coverage: the old three (1.35 in the middle, 1.0 at
+    // 1.5 either side) crossed rims at a sharp angle and left a deep notch on
+    // the north face. A walker aiming into that notch had both push-outs cancel
+    // and the stuck timer stopped them dead two metres short of the arcade, so
+    // the row is even radii at 0.42 now, which unions into a smooth capsule
+    // that walkers slide along instead of jamming into. 0.95 of radius, too:
+    // the stand is a slab plus its two disc trays, about a metre thick all in,
+    // and every 10cm of surplus bubble here is 10cm the chairs and the sit
+    // prompt in front of it have to give back to the camera's dead ground
+    // behind the planted half wall (z > ~6.8).
+    const ax = Math.cos(yaw) * 0.42, az = -Math.sin(yaw) * 0.42;
+    for (let i = -3; i <= 3; i++) {
+      this.obstacles.push({ x: x + ax * i, z: z + az * i, r: 0.95 });
+    }
   }
 
   /** Padded three-legged stool: the cocoa bar's seating. */
@@ -2724,9 +2829,12 @@ export class LoungeRoom extends Room {
     }
 
     // The regular: a capybara fast asleep on a beanbag, parked between the
-    // doorway and the four-in-a-row stand, clear of the bot circle and of the
-    // planted half wall behind him.
-    const bx = -3.4, bz = 6.2;
+    // doorway and the four-in-a-row stand, clear of the bot circle, and now
+    // backed right up into the planting on the half wall. At z 6.2 his collider
+    // sat square in the middle of the lane along the south wall, so a walk from
+    // either spawn to the four-in-a-row house prompt ran straight into a
+    // sleeping capybara and stopped dead against him.
+    const bx = -3.4, bz = 7.4;
     ball.add(0x8e6f4e, bx, 0.32, bz, 2.0, 0.72, 1.8);
     const sleeper = new THREE.Group();
     sleeper.position.set(bx, 0.52, bz);
@@ -2767,10 +2875,13 @@ export class LoungeRoom extends Room {
   // -------------------------------------------------------------------------
   _buildBar(scene, B) {
     const { box, boxFlat, cyl, bead, cone } = B;
-    // South of the stair foot (ST_Z0 3.6) with a 1.5-wide lane left between
-    // them: the two share the east wall, and that lane is how everybody gets
-    // upstairs, so the counter is not allowed to creep north into it.
-    const BX = 8.9, Z0 = 4.6, Z1 = 7.8;
+    // Tucked into the SOUTH-EAST corner, back from the stair foot (ST_Z0 3.6).
+    // The counter, the stair and the shuffleboard all want the east wall, and
+    // the lane across the counter's north end is how everybody gets upstairs:
+    // at its old z 4.6 that lane was half a metre wide once the collider caps
+    // of both neighbours were counted, so the bar sits south of the traffic and
+    // the corner is its own territory.
+    const BX = 8.9, Z0 = 5.4, Z1 = 8.0;
     const cz = (Z0 + Z1) / 2, len = Z1 - Z0;
 
     box.add(PAL.wainscot, BX, 0.56, cz, 1.1, 1.12, len);
@@ -2778,8 +2889,8 @@ export class LoungeRoom extends Room {
     boxFlat.add(PAL.coral, BX - 0.58, 0.66, cz, 0.06, 0.32, len - 0.3);
     // back shelf against the east wall, below the window sill
     boxFlat.add(PAL.wood, HW - 0.36, 1.5, cz, 0.44, 0.1, len);
-    for (let i = 0; i < 7; i++) {
-      cyl.add([PAL.cream, PAL.gold, PAL.coral][i % 3], HW - 0.36, 1.72, Z0 + 0.4 + i * 0.5, 0.3, 0.34, 0.3);
+    for (let i = 0; i < 6; i++) {
+      cyl.add([PAL.cream, PAL.gold, PAL.coral][i % 3], HW - 0.36, 1.72, Z0 + 0.35 + i * 0.4, 0.3, 0.34, 0.3);
     }
     cyl.add(PAL.brass, BX, 1.55, cz - 0.9, 0.62, 0.6, 0.62);
     cone.add(PAL.brass, BX, 1.95, cz - 0.9, 0.66, 0.34, 0.66);
@@ -2813,17 +2924,27 @@ export class LoungeRoom extends Room {
     scene.add(steam);
     this._steam = steam;
 
+    // The sign, on its own post at the counter's north-west corner rather than
+    // flat on the wall behind it. Hung on the wall at x 9.4 it projected onto
+    // the very edge of a 16:9 frame and the word COCOA was sliced off; out here
+    // it stands clear of the stair sign below it and reads whole.
+    // 3.5 up, which is a head above the "UP TO THE LOFT" board on the stair
+    // skirt just north of it: from the arrival spawn those two sit in the same
+    // column of the frame, and only the height keeps them apart.
+    const SGX = BX - 0.55, SGZ = Z0 - 0.1, SGY = 3.5, SGR = -0.55;
+    cyl.add(PAL.wood, SGX, (SGY - 0.4) / 2, SGZ, 0.16, SGY - 0.4, 0.16);
     const sign = new THREE.Mesh(new THREE.PlaneGeometry(1.9, 0.95), this._flat(texCocoa()));
-    sign.rotation.y = -0.7;
-    sign.position.set(BX + 0.46, 3.0, cz - 0.5);
+    sign.rotation.y = SGR;
+    sign.position.set(SGX + Math.sin(SGR) * 0.07, SGY, SGZ + Math.cos(SGR) * 0.07);
     scene.add(sign);
-    boxFlat.add(PAL.wood, BX + 0.52, 3.0, cz - 0.5, 0.1, 1.1, 2.1, 0, -0.7, 0);
+    box.add(PAL.wood, SGX, SGY, SGZ, 2.0, 1.05, 0.1, 0, SGR, 0);
+    bead.add(PAL.gold, SGX, SGY + 0.62, SGZ, 0.22, 0.22, 0.22);
 
-    this._stool(B, BX - 1.65, Z0 + 0.6, PAL.gold);
+    this._stool(B, BX - 1.65, Z0 + 0.7, PAL.gold);
     this._stool(B, BX - 1.65, Z0 + 2.0, PAL.gold);
 
     this.obstacles.push(
-      { x: BX, z: Z0 + 0.4, r: 1.05 }, { x: BX, z: cz, r: 1.05 }, { x: BX, z: Z1 - 0.4, r: 1.05 },
+      { x: BX, z: Z0 + 0.45, r: 1.05 }, { x: BX, z: cz, r: 1.05 }, { x: BX, z: Z1 - 0.45, r: 1.05 },
     );
   }
 
