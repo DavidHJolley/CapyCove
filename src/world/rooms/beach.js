@@ -416,6 +416,8 @@ export class BeachRoom extends Room {
     // gentle east bias: keeps the cove and dock in frame even at the eastern
     // from_plaza spawn (a stronger offset framed mostly open sea there)
     this.cameraHint = { offset: new THREE.Vector3(3.5, 13, 16), lookHeight: 1.1 };
+    // static camera: the whole cove plus the dock out to the fishing spot
+    this.staticCamera = { position: new THREE.Vector3(-3, 20, 27), lookAt: new THREE.Vector3(-3, 1, -1) };
 
     scene.updateMatrixWorld(true); // ground raycasts happen before the first render
   }

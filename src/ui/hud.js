@@ -17,6 +17,7 @@ export function initHud(game) {
     <div class="hud-top-right">
       <div class="coins-pill" id="coins-pill"><span class="coin-ico">&#9679;</span><span id="coin-count">0</span></div>
       <button class="hud-btn" id="btn-shop" title="Wardrobe & Shop">&#127913;</button>
+      <button class="hud-btn" id="btn-cam" title="Camera view">&#127909;</button>
       <button class="hud-btn" id="btn-mute" title="Sound">&#128266;</button>
     </div>
     <div class="hud-bottom">
@@ -207,6 +208,35 @@ export function initHud(game) {
     game.events.emit('mute', m);
   };
   game.events.on('mute', (m) => setMuteIcon(!!m));
+
+  // camera view: soft-follow your capy, or one fixed shot of the whole room.
+  // The engine owns the mode (and persists it); the button just mirrors it.
+  const camBtn = $('btn-cam');
+  const CAM_COPY = {
+    follow: 'Camera: following your capy. Press C for a fixed view of the whole room.',
+    static: 'Camera: fixed view of the whole room. Press C to follow your capy.',
+  };
+  const setCamBtn = (mode) => {
+    const wide = mode === 'static';
+    camBtn.setAttribute('aria-pressed', wide ? 'true' : 'false');
+    camBtn.title = wide ? CAM_COPY.static : CAM_COPY.follow;
+    // styles.css has no pressed state for .hud-btn, so the "on" look is set
+    // here: gold like the coins pill, matching the HUD's accent
+    camBtn.style.background = wide ? 'linear-gradient(180deg, #ffe6b4 0%, #f2b64a 100%)' : '';
+  };
+  setCamBtn(game.engine?.cameraMode || 'follow');
+  camBtn.onclick = () => game.engine?.toggleCameraMode();
+  game.events.on('camera-mode', (mode) => {
+    setCamBtn(mode);
+    game.toast(mode === 'static' ? 'Camera: whole room' : 'Camera: follow your capy', 1800);
+  });
+  // C toggles it too. Same guard as the main.js hotkeys: not while typing in a
+  // field, not while a minigame owns the screen, not on a held key.
+  addEventListener('keydown', (e) => {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (game.activeMinigame || e.repeat) return;
+    if (e.key === 'c' || e.key === 'C') game.engine?.toggleCameraMode();
+  });
 
   // shop (loaded on demand, like the plaza hotspot, so it stays out of the entry chunk)
   $('btn-shop').onclick = () => import('./shop.js')

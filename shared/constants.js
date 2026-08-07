@@ -2,7 +2,7 @@
 
 export const GAME_NAME = 'Capy Cove';
 
-export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge'];
+export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'mine', 'jungle'];
 export const DEFAULT_ROOM = 'plaza';
 
 export const ROOM_INFO = {
@@ -12,6 +12,8 @@ export const ROOM_INFO = {
   cafe: { name: 'The Smoothie Shack', desc: 'Blend it like you mean it' },
   club: { name: 'Groove Grotto', desc: 'Underground dance cave' },
   lounge: { name: 'The Game Den', desc: 'Tables, trophies and tussles' },
+  mine: { name: 'The Glimmer Mine', desc: 'Coins in the walls, hiders in the props' },
+  jungle: { name: 'The Tangle Jungle', desc: 'Vines, ruins and doodles' },
 };
 
 // Minigames: id -> reward formula. Server clamps client-reported scores with these.
@@ -24,6 +26,8 @@ export const MINIGAMES = {
   chess: { name: 'Grand Capy Chess', room: 'lounge', maxCoinsPerRun: 100 },
   connect4: { name: 'Four in a Row', room: 'lounge', maxCoinsPerRun: 60 },
   cards: { name: 'Capy Clash', room: 'lounge', maxCoinsPerRun: 100 },
+  prophunt: { name: 'Prop Hunt', room: 'mine', maxCoinsPerRun: 90 },
+  doodle: { name: 'Capy Doodles', room: 'jungle', maxCoinsPerRun: 90 },
 };
 
 // Hat catalog. Client renders these procedurally (src/player/hats.js must have a
@@ -56,6 +60,8 @@ export const BOT_ZONES = {
   cafe: { x: 0, z: 2, r: 4 },
   club: { x: 0, z: 2, r: 4.5 },
   lounge: { x: 0, z: 2, r: 4 },
+  mine: { x: 0, z: 3, r: 4 },
+  jungle: { x: 0, z: 3, r: 4.5 },
 };
 
 // Furniture catalog for player houses. Client builders live in

@@ -691,6 +691,8 @@ export class CafeRoom extends Room {
       from_plaza: new THREE.Vector3(0, 0, 4.3),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 10, 13), lookHeight: 1 };
+    // static camera: the full interior, counter to doormat, without clipping the rafters
+    this.staticCamera = { position: new THREE.Vector3(0, 15.5, 17.5), lookAt: new THREE.Vector3(0, 1.2, -0.5) };
     this.hotspots.push(
       {
         id: 'play-smoothie',

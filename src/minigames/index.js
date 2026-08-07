@@ -9,4 +9,6 @@ export const GAMES = {
   chess: () => import('./games/chess.js').then((m) => m.ChessGame),
   connect4: () => import('./games/connect4.js').then((m) => m.Connect4Game),
   cards: () => import('./games/cards.js').then((m) => m.CardsGame),
+  prophunt: () => import('./games/prophunt.js').then((m) => m.PropHuntGame),
+  doodle: () => import('./games/doodle.js').then((m) => m.DoodleGame),
 };

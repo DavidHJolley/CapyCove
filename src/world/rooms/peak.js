@@ -944,6 +944,8 @@ export class PeakRoom extends Room {
     );
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11.5, 20), lookHeight: 1.8 };
+    // static camera: the sled gate up top, the lodge door east, the frozen pond west
+    this.staticCamera = { position: new THREE.Vector3(-1, 24.5, 30), lookAt: new THREE.Vector3(-1, 1.5, -3) };
 
     // Live only while this room is: both handles are dropped in dispose().
     if (game?.events?.on) {

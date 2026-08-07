@@ -255,6 +255,13 @@ export class NetClient {
         this.lastTables.set(m.game, m);
         game.events.emit('table', m);
         break;
+      // ---- party wave (wave 6): re-emitted raw; rooms/games own the shapes
+      case 'dig-tick': case 'ph-lobby': case 'ph-start': case 'ph-state':
+      case 'ph-end': case 'dd-lobby': case 'dd-start': case 'dd-words':
+      case 'dd-mask': case 'dd-stroke': case 'dd-correct': case 'dd-state':
+      case 'dd-end':
+        game.events.emit(m.t, m);
+        break;
       case 'match-start':
         game.events.emit('match-start', m);
         break;

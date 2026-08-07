@@ -213,6 +213,8 @@ export class ClubRoom extends Room {
     scene.fog = new THREE.FogExp2(0x110a20, 0.017);
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11, 15), lookHeight: 1 };
+    // static camera: off-axis so the stalactite curtain misses the DJ booth and the LED floor
+    this.staticCamera = { position: new THREE.Vector3(4.5, 16.5, 22.5), lookAt: new THREE.Vector3(0, 1.5, -2) };
 
     this._buildCave(scene);
     this._buildDanceFloor(scene);

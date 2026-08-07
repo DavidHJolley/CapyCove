@@ -6,6 +6,21 @@ import { WalkController } from '../player/controller.js';
 const DOWN = new THREE.Vector3(0, -1, 0);
 const _rayOrigin = new THREE.Vector3(); // snapY runs per remote per frame; don't allocate
 
+// Static ("whole room") camera: the vantage is fixed, so the only motion is a
+// short ease when you switch into the mode or walk into a new room.
+const CAM_EASE = 0.5;
+// The fallback vantage keeps the game's 3/4 read: same elevation as the default
+// follow offset (atan(14/19) ~= 36.4 degrees), looking north from the south.
+const FALLBACK_DIR = new THREE.Vector3(0, 14, 19).normalize();
+const FALLBACK_MARGIN = 1.14;
+// the window shape rooms author their staticCamera against
+const REF_ASPECT = 16 / 9;
+const _box = new THREE.Box3();
+const _sub = new THREE.Box3();
+const _corner = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _up = new THREE.Vector3();
+
 /**
  * Engine: renderer, camera, main loop, room lifecycle, click-to-move,
  * hotspot prompts, and world-anchored DOM overlays (name tags, chat bubbles).
@@ -39,6 +54,7 @@ export class Engine {
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 300);
     this.camDefault = { offset: new THREE.Vector3(0, 14, 19), lookHeight: 1 };
+    this.camCfg = { offset: this.camDefault.offset, lookHeight: this.camDefault.lookHeight };
     this.camTarget = new THREE.Vector3();
     // 'follow' = soft-follow the player; 'static' = fixed whole-room vantage
     // (per-room via room.staticCamera, engine fallback otherwise)
@@ -46,6 +62,11 @@ export class Engine {
       try { return localStorage.getItem('capycove-cam') === 'static' ? 'static' : 'follow'; } catch { return 'follow'; }
     })();
     this._staticCam = null;
+    this._staticAuto = false; // fallback vantage: refit it when the aspect changes
+    this._camEase = 0;        // seconds left in the entry/arrival ease
+    this._camFrom = new THREE.Vector3();
+    this._lookFrom = new THREE.Vector3();
+    this._lookNow = new THREE.Vector3();
 
     this.overlayRoot = document.getElementById('overlay-root');
 
@@ -60,6 +81,9 @@ export class Engine {
     this.renderer.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    // whole-room framing depends on the aspect: a tall phone window has to pull
+    // back further than a wide desktop one, authored vantage or computed
+    if (this.room) this._resolveStaticCam(false);
   }
 
   // ---- player --------------------------------------------------------------
@@ -128,12 +152,9 @@ export class Engine {
       };
       this.camera.position.copy(spawn).add(this.camCfg.offset);
       this.camTarget.copy(spawn);
-
-      const sc = this.room.staticCamera;
-      this._staticCam = {
-        position: sc?.position?.clone?.() || this.camCfg.offset.clone().multiplyScalar(1.6),
-        lookAt: sc?.lookAt?.clone?.() || new THREE.Vector3(0, 1, 0),
-      };
+      this._lookNow.set(spawn.x, spawn.y + this.camCfg.lookHeight, spawn.z);
+      // arriving in a new room glides out to its vantage instead of cutting
+      this._resolveStaticCam(true);
 
       this.roomAge = 0;
       this.game.audio?.setRoom?.(id);
@@ -285,13 +306,103 @@ export class Engine {
     }
   }
 
+  // ---- camera modes --------------------------------------------------------
+  /**
+   * Work out where the fixed "whole room" vantage sits. Rooms author their own
+   * (`room.staticCamera = { position, lookAt }`); anything that does not gets a
+   * computed fit of its walkable ground from the usual south-elevated 3/4 angle.
+   */
+  _resolveStaticCam(ease) {
+    if (!this.room) return;
+    const sc = this.room.staticCamera;
+    if (sc?.position && sc?.lookAt) {
+      this._staticAuto = false;
+      const position = sc.position.clone();
+      const lookAt = sc.lookAt.clone();
+      // Rooms frame their vantage on a 16:9 window. A narrower one sees less
+      // width at the same distance, so back off along the authored view line:
+      // the angle and the centre of the shot survive, the sides stay in frame.
+      const k = REF_ASPECT / Math.max(0.35, this.camera.aspect);
+      if (k > 1.001) position.sub(lookAt).multiplyScalar(Math.min(k, 2.2)).add(lookAt);
+      this._staticCam = { position, lookAt };
+    } else {
+      this._staticAuto = true;
+      // no ground to fit (a room still building, or one with none): park on the
+      // usual follow vantage rather than dumping the player inside the floor
+      this._staticCam = this._fitGround() || {
+        position: this.camTarget.clone().add(this.camCfg.offset),
+        lookAt: this.camTarget.clone().setY(this.camTarget.y + this.camCfg.lookHeight),
+      };
+    }
+    if (ease) this._beginCamEase();
+  }
+
+  /**
+   * Pull the camera back along FALLBACK_DIR until every corner of the walkable
+   * bounding box is inside the frustum. Exact per corner: with the camera at
+   * `look + dir*d`, a corner q (relative to `look`) needs
+   * d >= q.dir + |q.right| / tan(hfov/2) and the same for the vertical axis.
+   */
+  _fitGround() {
+    _box.makeEmpty();
+    for (const m of this.room.groundMeshes || []) {
+      if (!m) continue;
+      m.updateWorldMatrix(true, false);
+      _sub.setFromObject(m);
+      if (!_sub.isEmpty()) _box.union(_sub);
+    }
+    if (_box.isEmpty()) return null;
+
+    const look = _box.getCenter(new THREE.Vector3());
+    look.y = _box.min.y + Math.min(1.4, (_box.max.y - _box.min.y) * 0.5 + 0.6);
+
+    const dir = FALLBACK_DIR;
+    _right.set(0, 1, 0).cross(dir);                      // camera right = worldUp x dir
+    if (_right.lengthSq() < 1e-6) _right.set(1, 0, 0);
+    _right.normalize();
+    _up.copy(dir).cross(_right).normalize();             // camera up = dir x right
+
+    const tanV = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const tanH = tanV * Math.max(0.35, this.camera.aspect);
+    let d = 0;
+    for (let i = 0; i < 8; i++) {
+      _corner.set(
+        i & 1 ? _box.max.x : _box.min.x,
+        i & 2 ? _box.max.y : _box.min.y,
+        i & 4 ? _box.max.z : _box.min.z,
+      ).sub(look);
+      const along = _corner.dot(dir);
+      d = Math.max(d, along + Math.abs(_corner.dot(_right)) / tanH,
+        along + Math.abs(_corner.dot(_up)) / tanV);
+    }
+    d = THREE.MathUtils.clamp(d * FALLBACK_MARGIN, 8, 240);
+    return { position: look.clone().addScaledVector(dir, d), lookAt: look };
+  }
+
+  /** Remember where the camera is now so the next 0.5s glides from here. */
+  _beginCamEase() {
+    this._camFrom.copy(this.camera.position);
+    this._lookFrom.copy(this._lookNow);
+    this._camEase = CAM_EASE;
+  }
+
+  /** 'follow' | 'static'. Persisted; a no-op if already there. */
+  setCameraMode(mode, { silent = false } = {}) {
+    const next = mode === 'static' ? 'static' : 'follow';
+    if (next === this.cameraMode) return this.cameraMode;
+    this.cameraMode = next;
+    try { localStorage.setItem('capycove-cam', next); } catch {}
+    if (next === 'static') this._resolveStaticCam(true);
+    else this._camEase = 0; // follow does its own soft lerp back to the player
+    if (!silent) this.game.events.emit('camera-mode', next);
+    return next;
+  }
+
   /** Flip between follow and static camera; persisted. Returns the new mode. */
   toggleCameraMode() {
-    this.cameraMode = this.cameraMode === 'static' ? 'follow' : 'static';
-    try { localStorage.setItem('capycove-cam', this.cameraMode); } catch {}
-    this.game.events.emit('camera-mode', this.cameraMode);
+    const next = this.setCameraMode(this.cameraMode === 'static' ? 'follow' : 'static');
     this.game.audio?.play?.('click');
-    return this.cameraMode;
+    return next;
   }
 
   // ---- main loop -----------------------------------------------------------
@@ -308,17 +419,30 @@ export class Engine {
       this.room.update(dt, this.game);
       this.game.net?.update?.(dt);
 
+      const p = this.playerAvatar.group.position;
       if (this.cameraMode === 'static' && this._staticCam) {
-        // fixed whole-room vantage; still eased so toggling glides
-        this.camera.position.lerp(this._staticCam.position, Math.min(1, dt * 3.5));
-        this.camera.lookAt(this._staticCam.lookAt);
+        // Fixed whole-room vantage. The only motion is the short arrival ease,
+        // so nothing drifts while you walk around underneath it.
+        const { position, lookAt } = this._staticCam;
+        if (this._camEase > 0) {
+          this._camEase = Math.max(0, this._camEase - dt);
+          const u = 1 - this._camEase / CAM_EASE;
+          const k = u * u * (3 - 2 * u); // smoothstep: no snap at either end
+          this.camera.position.lerpVectors(this._camFrom, position, k);
+          this._lookNow.lerpVectors(this._lookFrom, lookAt, k);
+        } else {
+          this.camera.position.copy(position);
+          this._lookNow.copy(lookAt);
+        }
+        this.camera.lookAt(this._lookNow);
+        this.camTarget.copy(p); // keep follow ready to take over from the player
       } else {
         // camera: soft-follow the player
-        const p = this.playerAvatar.group.position;
         this.camTarget.lerp(p, Math.min(1, dt * 3.5));
         const desired = this.camTarget.clone().add(this.camCfg.offset);
         this.camera.position.lerp(desired, Math.min(1, dt * 3.5));
-        this.camera.lookAt(this.camTarget.x, this.camTarget.y + this.camCfg.lookHeight, this.camTarget.z);
+        this._lookNow.set(this.camTarget.x, this.camTarget.y + this.camCfg.lookHeight, this.camTarget.z);
+        this.camera.lookAt(this._lookNow);
       }
 
       this.renderer.render(this.scene, this.camera);
