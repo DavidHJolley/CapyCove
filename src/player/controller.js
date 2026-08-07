@@ -16,11 +16,26 @@ export class WalkController {
   }
 
   setTarget(v3) {
+    this.queue = [];
+    this._to(v3);
+  }
+
+  /** Walk through the points in order (multi-leg routes: stairs between
+   *  floors). The last point is the destination. */
+  setPath(points) {
+    if (!points?.length) return;
+    this.queue = points.slice(1).map((p) => p.clone());
+    this._to(points[0]);
+  }
+
+  _to(v3) {
     this.target = v3.clone();
+    this.stuckT = 0;
   }
 
   stop() {
     this.target = null;
+    this.queue = [];
     if (this.moving) { this.moving = false; this.avatar.setAnim('idle'); }
   }
 
@@ -52,7 +67,8 @@ export class WalkController {
       const to = new THREE.Vector3(this.target.x - g.position.x, 0, this.target.z - g.position.z);
       const dist = to.length();
       if (dist < 0.12) {
-        this.stop();
+        if (this.queue?.length) this._to(this.queue.shift());
+        else this.stop();
       } else {
         to.normalize();
         const step = Math.min(this.speed * dt, dist);
@@ -82,10 +98,20 @@ export class WalkController {
         }
 
         if (this.snapToGround(room, next)) {
+          // an obstacle can absorb the whole step (pressed flat against a
+          // wall): running in place looks wrong, so a walker who is not
+          // actually moving goes idle and gives up on the target
+          const moved = Math.hypot(next.x - g.position.x, next.z - g.position.z);
           g.position.copy(next);
           const yaw = Math.atan2(to.x, to.z);
           const delta = ((((yaw - g.rotation.y) % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
           g.rotation.y += delta * Math.min(1, dt * 14);
+          if (moved < step * 0.15) {
+            this.stuckT = (this.stuckT || 0) + dt;
+            if (this.stuckT > 0.35) { this.stop(); return; }
+          } else {
+            this.stuckT = 0;
+          }
           if (!this.moving) { this.moving = true; this.avatar.setAnim('walk'); }
         } else {
           this.stop(); // walked off the walkable area

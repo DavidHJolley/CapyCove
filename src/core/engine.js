@@ -181,6 +181,8 @@ export class Engine {
   _teardownRoom() {
     for (const [, el] of this.hotspotEls) el.remove();
     this.hotspotEls.clear();
+    this._marker = null; // scene dispose frees it; rebuilt lazily per room
+    this._markerScene = null;
     if (this.scene) {
       this.scene.remove(this.remoteGroup);
       if (this.playerAvatar) this.scene.remove(this.playerAvatar.group);
@@ -236,10 +238,40 @@ export class Engine {
 
     const hits = this.ray.intersectObjects(this.room.groundMeshes, false);
     if (hits.length) {
-      this.controller.setTarget(hits[0].point);
+      const pt = hits[0].point;
+      // rooms with multiple storeys route the walk (stairs between floors):
+      // routeTo returns the intermediate waypoints, or null for a direct walk
+      const route = this.room.routeTo?.(this.playerAvatar.group.position, pt);
+      if (Array.isArray(route) && route.length) this.controller.setPath([...route, pt]);
+      else this.controller.setTarget(pt);
+      this._showClickMarker(pt);
       if (this.playerAvatar.state.anim === 'dance') this.playerAvatar.setAnim('idle');
       this.game.audio?.play?.('step');
     }
+  }
+
+  /** Brief expanding ring where the player clicked, so the destination reads. */
+  _showClickMarker(pt) {
+    if (!this.scene) return;
+    if (!this._marker || this._markerScene !== this.scene) {
+      const mesh = new THREE.Mesh(
+        new THREE.RingGeometry(0.26, 0.4, 24),
+        new THREE.MeshBasicMaterial({
+          color: 0xfff0b8, transparent: true, opacity: 0.9,
+          depthWrite: false, side: THREE.DoubleSide,
+        }),
+      );
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.renderOrder = 5;
+      this._marker = mesh;
+      this._markerScene = this.scene;
+      this.scene.add(mesh);
+    }
+    this._marker.position.set(pt.x, pt.y + 0.05, pt.z);
+    this._marker.scale.setScalar(1);
+    this._marker.material.opacity = 0.9;
+    this._marker.visible = true;
+    this._markerT = 0;
   }
 
   // ---- world-anchored DOM overlays ----------------------------------------
@@ -430,6 +462,18 @@ export class Engine {
       this.roomAge += dt;
       // rooms with their own movement (The Drift's swim) disable the walker
       if (this.controller.enabled !== false) this.controller.update(dt, this.room);
+
+      // click marker: quick bloom-and-fade
+      if (this._marker?.visible && this._markerScene === this.scene) {
+        this._markerT += dt;
+        const k = this._markerT / 0.55;
+        if (k >= 1) {
+          this._marker.visible = false;
+        } else {
+          this._marker.scale.setScalar(1 + k * 0.7);
+          this._marker.material.opacity = 0.9 * (1 - k);
+        }
+      }
       this.playerAvatar.update(dt);
       this.room.update(dt, this.game);
       this.game.net?.update?.(dt);

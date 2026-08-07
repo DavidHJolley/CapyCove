@@ -2980,6 +2980,21 @@ export class LoungeRoom extends Room {
     }
   }
 
+  /**
+   * Multi-storey routing (engine hook): a click on the other floor walks via
+   * the stair instead of pressing into the balcony rail. Returns the
+   * intermediate waypoints, or null for a same-floor direct walk. The stair
+   * lane is x in [ST_X0, HW], base at z ~ ST_Z0, top on the east wing at MZ_S.
+   */
+  routeTo(from, to) {
+    const floorOf = (p) => (p.y > 1.6 ? 1 : 0);
+    if (floorOf(from) === floorOf(to)) return null;
+    const cx = (ST_X0 + HW) / 2; // stair centreline
+    const base = new THREE.Vector3(cx, 0, ST_Z0 + 0.7);
+    const top = new THREE.Vector3(cx, MZ_Y, MZ_S - 0.5);
+    return floorOf(from) === 0 ? [base, top] : [top, base];
+  }
+
   // -------------------------------------------------------------------------
   update(dt) {
     const t = (this.t += dt);
