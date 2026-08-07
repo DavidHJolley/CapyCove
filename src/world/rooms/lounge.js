@@ -207,8 +207,11 @@ const STATIONS = [
     // left edge of the frame out to about a sixth of the screen width, and a
     // board tucked behind it at x -9.9 was invisible from the arrival spawn
     // (checked by raycasting the camera at all nine points of the board).
-    at: [-9.5, -0.9], hs: [-7.95, 0.06], aiAt: [-7.8, 1.46], sign: [-7.9, 2.6],
-    seats: [[-7.62, -1.03], [-9.02, 0.92]],
+    // Playtester layout pass (2026-08-07, dev editor): the cabinet came off the
+    // wall into the room and its board moved west behind it, so the arcade and
+    // the four-in-a-row stand stopped sharing a strip of frame.
+    at: [-6.98, -0.93], hs: [-5.43, 0.03], aiAt: [-5.28, 1.43], sign: [-8.55, 0.24],
+    seats: [[-5.15, -1.06], [-6.50, 0.89]],
   },
   {
     // Along the east wall, north of the stair foot: the board's south end and
@@ -216,8 +219,8 @@ const STATIONS = [
     // upstairs. Shorter than it was (5.4, see _shuffle) for exactly that.
     id: 'shuffle', label: 'Play Shuffle Showdown', name: 'SHUFFLE SHOWDOWN',
     sub: 'slide it, do not shove it', ai: 'Waxwell', y: 0,
-    at: [7.5, 0.0], hs: [5.45, -0.35], aiAt: [5.35, 1.05], sign: [6.0, 3.5],
-    seats: [[5.9, -1.45], [5.9, 2.0]],
+    at: [5.63, 1.04], hs: [3.58, 0.69], aiAt: [3.48, 2.09], sign: [7.47, -0.36],
+    seats: [[4.03, -0.41], [4.03, 3.04]],
   },
   {
     // Angled across the south-west corner with its back to the west wall and
@@ -236,20 +239,20 @@ const STATIONS = [
     // the exact "signs reading over each other" the playtest called out.
     id: 'connect4', label: 'Play Four in a Row', name: 'FOUR IN A ROW',
     sub: 'drop, stack, gloat', ai: 'Dizzy', y: 0, yaw: 1.15, signH: 1.5,
-    at: [-9.4, 4.4], hs: [-8.21, 4.93], aiAt: [-8.11, 6.33], sign: [-5.6, 6.6],
-    seats: [[-7.65, 3.92], [-8.59, 6.02]],
+    at: [-9.48, 4.15], hs: [-8.29, 4.68], aiAt: [-8.19, 6.08], sign: [-10.06, 6.44],
+    seats: [[-7.73, 3.67], [-8.67, 5.77]],
   },
   {
     id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS',
     sub: 'think before you nibble', ai: 'Grandmaster Pebble', y: MZ_Y,
-    at: [6.4, -5.6], hs: [6.4, -4.15], aiAt: [6.4, -2.95], sign: [8.35, -4.4],
-    seats: [[4.75, -5.6], [8.05, -5.6]],
+    at: [6.40, -5.60], hs: [6.40, -4.15], aiAt: [6.40, -2.95], sign: [8.99, -5.86],
+    seats: [[4.75, -5.60], [8.05, -5.60]],
   },
   {
     id: 'cards', label: 'Play Capy Clash', name: 'CAPY CLASH',
     sub: 'elements at dawn', ai: 'Grandmaster Pebble', y: MZ_Y,
-    at: [-6.6, -5.6], hs: [-6.6, -4.15], aiAt: [-6.6, -2.95], sign: [-8.6, -4.4],
-    seats: [[-8.25, -5.6], [-4.95, -5.6]],
+    at: [-6.60, -5.60], hs: [-6.60, -4.15], aiAt: [-6.60, -2.95], sign: [-9.47, -3.80],
+    seats: [[-8.25, -5.60], [-4.95, -5.60]],
   },
 ];
 const STATION_BY_ID = new Map(STATIONS.map((s) => [s.id, s]));
