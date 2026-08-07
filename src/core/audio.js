@@ -5,6 +5,9 @@
 //   audio.play(name)      - one-shot sfx: click, coin, step, splash, whoosh,
 //                           success, fail, pop, ding (+ extras, see SFX below)
 //   audio.setRoom(roomId) - crossfade the generative music bed to that room
+//                           (one bed per room id in TRACKS: plaza, beach, peak,
+//                           cafe, club, lounge, mine, jungle, drift; any other
+//                           id fades to silence and is otherwise ignored)
 //   audio.toggleMute()    - returns new muted state
 //   audio.muted
 //
@@ -331,6 +334,101 @@ function birdChirp(dest, t) {
   }
 }
 
+/** A lower, slower two-note call sitting under the chirps. */
+function birdWhoop(dest, t) {
+  const base = rnd(620, 900);
+  const n = 2 + ((Math.random() * 2) | 0);
+  for (let i = 0; i < n; i++) {
+    const tt = t + i * rnd(0.28, 0.42);
+    tone(dest, tt, {
+      type: 'sine', f0: base * rnd(0.94, 1.06), f1: base * rnd(1.3, 1.55),
+      dur: 0.17, glide: 0.16, vol: 0.05, a: 0.03,
+    });
+    tone(dest, tt, {
+      type: 'triangle', f0: base * 2, f1: base * 2.8, dur: 0.13, glide: 0.13, vol: 0.012, a: 0.03,
+    });
+  }
+}
+
+/** Cave water drip: a bright blip that falls away, built to be reverbed. */
+function drip(dest, t, { vol = 0.13, f0 = 1650 } = {}) {
+  const f = f0 * rnd(0.8, 1.28);
+  tone(dest, t, { type: 'sine', f0: f, f1: f * 0.36, dur: 0.11, glide: 0.1, vol, a: 0.002 });
+  tone(dest, t, { type: 'sine', f0: f * 2.02, f1: f * 0.82, dur: 0.05, glide: 0.05, vol: vol * 0.3, a: 0.001 });
+  noise(dest, t, { dur: 0.012, vol: vol * 0.22, type: 'highpass', freq: 5200 });
+}
+
+/** A pickaxe on rock, heard from another tunnel: metal tink plus falling dust. */
+function pickTink(dest, t, { vol = 0.09 } = {}) {
+  const f = rnd(2100, 3000);
+  tone(dest, t, { type: 'square', f0: f, f1: f * 0.78, dur: 0.035, glide: 0.03, vol: vol * 0.35, a: 0.001 });
+  tone(dest, t, { type: 'sine', f0: f * 1.51, dur: 0.06, vol: vol * 0.22, a: 0.001 });
+  noise(dest, t, { dur: 0.05, vol: vol * 0.5, type: 'bandpass', freq: 3600, q: 1.2, sweep: 0.45 });
+  noise(dest, t, { dur: 0.14, vol: vol * 0.12, type: 'lowpass', freq: 700, sweep: 0.5 });
+}
+
+/** Skin-headed hand drum. `mode` is 'bass' (palm), 'tone' (edge) or 'slap'. */
+function handDrum(dest, t, mode = 'tone', { vol = 0.2 } = {}) {
+  if (mode === 'bass') {
+    tone(dest, t, { type: 'sine', f0: 112, f1: 62, dur: 0.26, glide: 0.09, vol, a: 0.004 });
+    noise(dest, t, { dur: 0.03, vol: vol * 0.18, type: 'lowpass', freq: 1200 });
+  } else if (mode === 'slap') {
+    tone(dest, t, { type: 'triangle', f0: 430, f1: 264, dur: 0.07, glide: 0.05, vol: vol * 0.5, a: 0.002 });
+    noise(dest, t, { dur: 0.055, vol: vol * 0.72, type: 'bandpass', freq: 2600, q: 0.9, sweep: 0.5 });
+  } else {
+    tone(dest, t, { type: 'sine', f0: 232, f1: 150, dur: 0.14, glide: 0.07, vol: vol * 0.8, a: 0.003 });
+    noise(dest, t, { dur: 0.035, vol: vol * 0.3, type: 'bandpass', freq: 1700, q: 1.1, sweep: 0.6 });
+  }
+}
+
+/** One log pop in a fire: a tiny click with a puff of ember hiss behind it. */
+function crackle(dest, t, { vol = 0.07 } = {}) {
+  noise(dest, t, { dur: rnd(0.006, 0.016), vol, type: 'bandpass', freq: rnd(1400, 4200), q: 1.6, rate: 1.3 });
+  if (chance(0.4)) noise(dest, t + 0.012, { dur: rnd(0.03, 0.08), vol: vol * 0.35, type: 'highpass', freq: 3600, sweep: 0.6 });
+}
+
+/** Whale song: a long moaning glide with vibrato, filtered soft and dark. */
+function whaleCall(dest, t, { midi = 45, vol = 0.12, len = 2.8 } = {}) {
+  const f = mtof(midi);
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.Q.value = 1.6;
+  lp.frequency.setValueAtTime(f * 6, t);
+  lp.frequency.linearRampToValueAtTime(f * 2.6, t + len);
+  const g = ctx.createGain();
+  const peak = Math.max(0.0004, vol);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + len * 0.3);
+  g.gain.setValueAtTime(peak, t + len * 0.62);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+  lp.connect(g);
+  g.connect(dest);
+
+  const vib = ctx.createOscillator();
+  vib.type = 'sine';
+  vib.frequency.value = rnd(4.2, 6.4);
+  const vibAmt = ctx.createGain();
+  vibAmt.gain.value = f * 0.014;
+  vib.connect(vibAmt);
+
+  for (const [type, mul, amp] of [['sine', 1, 1], ['triangle', 2, 0.2], ['sine', 3.01, 0.07]]) {
+    const o = ctx.createOscillator();
+    o.type = type;
+    const b = f * mul;
+    o.frequency.setValueAtTime(b * 0.66, t);
+    o.frequency.exponentialRampToValueAtTime(b * 1.16, t + len * 0.3);
+    o.frequency.exponentialRampToValueAtTime(b * 0.92, t + len * 0.68);
+    o.frequency.exponentialRampToValueAtTime(b * 0.58, t + len);
+    vibAmt.connect(o.frequency);
+    const og = ctx.createGain();
+    og.gain.value = amp;
+    o.connect(og); og.connect(lp);
+    o.start(t); o.stop(t + len + 0.12);
+  }
+  vib.start(t);
+  vib.stop(t + len + 0.12);
+}
+
 // --------------------------------------------------------------- harmony ----
 
 // Chord qualities as semitone offsets from the root. Rhythm arrays below are
@@ -444,7 +542,10 @@ function fadeOutAll() {
 
 // ================================================================ TRACKS =====
 
-const TRACKS = {};
+// Null-prototype: a room id that happens to be an Object.prototype key (or a
+// dynamic 'house:<owner>' id) must read as "no bed" and fade to silence, never
+// as an inherited function that startTrack would try to call.
+const TRACKS = Object.create(null);
 
 // ---- Sunny Plaza: bright marimba ostinato, shaker, birdsong ----------------
 
@@ -966,6 +1067,414 @@ TRACKS.club = (tr) => {
   };
 };
 
+// ---- The Game Den: fireside rhodes, soft nylon pluck, a burning log --------
+
+TRACKS.lounge = (tr) => {
+  const bpm = 72;
+  const t0 = ctx.currentTime;
+
+  const keys = ctx.createGain(); keys.gain.value = 0.85; keys.connect(tr.out); keys.connect(tr.send);
+  const nylon = ctx.createGain(); nylon.gain.value = 0.8; nylon.connect(tr.out); nylon.connect(tr.send);
+  const low = ctx.createGain(); low.gain.value = 0.85; low.connect(tr.out);
+  const kit = panNode(tr.out, -0.1);
+  const fire = ctx.createGain(); fire.gain.value = 1; fire.connect(tr.out);
+  const fireSend = ctx.createGain(); fireSend.gain.value = 0.18; fire.connect(fireSend); fireSend.connect(tr.send);
+
+  // The hearth: a low roaring bed under everything, gusting slowly.
+  const fireSrc = ctx.createBufferSource();
+  fireSrc.buffer = noiseBuf;
+  fireSrc.loop = true;
+  fireSrc.playbackRate.value = 0.6;
+  const fireLp = ctx.createBiquadFilter();
+  fireLp.type = 'lowpass'; fireLp.frequency.value = 300; fireLp.Q.value = 0.6;
+  const fireGain = ctx.createGain(); fireGain.gain.value = 0.055;
+  fireSrc.connect(fireLp); fireLp.connect(fireGain); fireGain.connect(fire);
+  const gust = ctx.createOscillator();
+  gust.type = 'sine'; gust.frequency.value = 0.071;
+  const gustAmt = ctx.createGain(); gustAmt.gain.value = 0.022;
+  gust.connect(gustAmt); gustAmt.connect(fireGain.gain);
+  fireSrc.start(t0, Math.random());
+  gust.start(t0);
+  tr.sources.push(fireSrc, gust);
+
+  // Gmaj7 - Em7 - Cmaj7 - D7, one bar each: the slow warm one.
+  const prog = [
+    { root: 43, v: [59, 62, 66, 71], arp: [55, 62, 66, 71] },
+    { root: 40, v: [59, 62, 67, 71], arp: [52, 59, 67, 71] },
+    { root: 36, v: [59, 64, 67, 71], arp: [48, 55, 64, 67] },
+    { root: 38, v: [57, 62, 66, 69], arp: [50, 57, 62, 66] },
+  ];
+  const arpMask = [1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1];
+  let ai = 0;
+
+  return {
+    // sparse, slow and mostly decaying: measured on the music bus this bed came
+    // out ~12dB under the plaza, so it gets a lift here rather than per voice
+    bpm, level: 1.55,
+    onStep(t, s) {
+      const bar = (s / 16) | 0;
+      const k = s % 16;
+      const ch = prog[bar % prog.length];
+
+      // chords: a full one on the bar, a lighter answer half way through
+      if (k === 0) {
+        ch.v.forEach((n, i) => rhodes(keys, t + i * 0.014, n, { vol: 0.14 - i * 0.014, dur: rnd(1.9, 2.4) }));
+      }
+      if (k === 8 && chance(0.7)) {
+        ch.v.slice(1).forEach((n, i) => rhodes(keys, t + i * 0.02, n, { vol: 0.07, dur: 1.3 }));
+      }
+
+      // nylon pluck wandering up and down the voicing
+      if (arpMask[k] && chance(0.85)) {
+        const n = ch.arp[ai % ch.arp.length] + (chance(0.12) ? 12 : 0);
+        ai += chance(0.3) ? 2 : 1;
+        pluck(nylon, t, n, { vol: k === 0 ? 0.15 : 0.1, dur: rnd(0.9, 1.4), bright: 6 });
+      }
+
+      // the bass is written for the level lift above: 0.19 here lands about
+      // where the plaza's sub sits once the track gain is applied
+      if (k === 0) tone(low, t, { type: 'sine', f0: mtof(ch.root - 12), dur: 1.5, vol: 0.19, a: 0.03 });
+      if (k === 10) tone(low, t, { type: 'sine', f0: mtof(ch.root - 5), dur: 0.6, vol: 0.075, a: 0.03 });
+
+      // the softest possible pulse: a brush on 2 and 4
+      if (k === 4 || k === 12) brush(kit, t, { vol: 0.045, dur: 0.14, freq: 3800 });
+
+      // logs popping, in ones and twos
+      if (chance(0.14)) {
+        const p = panNode(fire, rnd(-0.55, 0.55));
+        crackle(p, t + rnd(0, 0.2), { vol: rnd(0.035, 0.085) });
+        if (chance(0.35)) crackle(p, t + rnd(0.06, 0.3), { vol: rnd(0.02, 0.05) });
+      }
+      // a log settling in the grate
+      if (k === 0 && bar % 8 === 5 && chance(0.4)) {
+        tone(fire, t, { type: 'sine', f0: 96, f1: 58, dur: 0.3, glide: 0.2, vol: 0.07, a: 0.01 });
+        for (let i = 0; i < 5; i++) crackle(fire, t + 0.05 + i * rnd(0.03, 0.09), { vol: rnd(0.03, 0.07) });
+      }
+    },
+  };
+};
+
+// ---- The Glimmer Mine: tunnel drips, deep music box, a very low drone ------
+
+TRACKS.mine = (tr) => {
+  const bpm = 52;
+  const t0 = ctx.currentTime;
+
+  // Anything that happens down here answers itself: a long filtered delay
+  // feeding the shared reverb is the whole character of the room.
+  const cave = ctx.createGain(); cave.gain.value = 1;
+  const dly = ctx.createDelay(2);
+  dly.delayTime.value = 0.47;
+  const fb = ctx.createGain(); fb.gain.value = 0.4;
+  const dlyLp = ctx.createBiquadFilter();
+  dlyLp.type = 'lowpass'; dlyLp.frequency.value = 2100;
+  cave.connect(dly); dly.connect(dlyLp); dlyLp.connect(fb); fb.connect(dly);
+  const echo = ctx.createGain(); echo.gain.value = 0.5;
+  dlyLp.connect(echo);
+  cave.connect(tr.out); cave.connect(tr.send);
+  echo.connect(tr.out); echo.connect(tr.send);
+
+  const boxes = ctx.createGain(); boxes.gain.value = 0.9; boxes.connect(tr.out); boxes.connect(tr.send);
+  const low = ctx.createGain(); low.gain.value = 1; low.connect(tr.out);
+
+  // Cave air: a lowpassed hiss so the silence is never digital silence.
+  const airSrc = ctx.createBufferSource();
+  airSrc.buffer = noiseBuf; airSrc.loop = true; airSrc.playbackRate.value = 0.5;
+  const airLp = ctx.createBiquadFilter();
+  airLp.type = 'lowpass'; airLp.frequency.value = 270; airLp.Q.value = 0.5;
+  const airGain = ctx.createGain(); airGain.gain.value = 0.035;
+  airSrc.connect(airLp); airLp.connect(airGain); airGain.connect(tr.out);
+  airSrc.start(t0, Math.random());
+  tr.sources.push(airSrc);
+
+  // The drone: sub sine plus two quiet partials, breathing on a slow LFO.
+  // Level checked against the plaza bed on the real music bus: a continuous
+  // 35-40Hz tone reads quiet but measures LOUD, so this stays deliberately
+  // low (0.085 puts the settled mine bed just under the plaza's RMS).
+  const droneGain = ctx.createGain(); droneGain.gain.value = 0.0001;
+  droneGain.connect(low);
+  droneGain.gain.setValueAtTime(0.0001, t0);
+  droneGain.gain.linearRampToValueAtTime(0.085, t0 + 5);
+  const droneOsc = [];
+  for (const [type, mul, amp] of [['sine', 1, 1], ['sine', 2, 0.3], ['triangle', 3.01, 0.07]]) {
+    const o = ctx.createOscillator();
+    o.type = type;
+    o.frequency.value = mtof(26) * mul;
+    const g = ctx.createGain(); g.gain.value = amp;
+    o.connect(g); g.connect(droneGain);
+    o.start(t0);
+    tr.sources.push(o);
+    droneOsc.push({ o, mul });
+  }
+  const breath = ctx.createOscillator();
+  breath.type = 'sine'; breath.frequency.value = 0.043;
+  const breathAmt = ctx.createGain(); breathAmt.gain.value = 0.028;
+  breath.connect(breathAmt); breathAmt.connect(droneGain.gain);
+  breath.start(t0);
+  tr.sources.push(breath);
+
+  const ROOTS = [26, 26, 24, 22];       // D, D, C, Bb: eight bars each
+  const scale = [50, 53, 55, 57, 60, 62, 65]; // D minor pentatonic + the 4th
+  let prev = -1;
+
+  return {
+    bpm, level: 0.92,
+    onStep(t, s) {
+      const bar = (s / 16) | 0;
+      const k = s % 16;
+
+      if (k === 0 && bar % 8 === 0) {
+        const root = ROOTS[((bar / 8) | 0) % ROOTS.length];
+        for (const d of droneOsc) d.o.frequency.setTargetAtTime(mtof(root) * d.mul, t, 1.7);
+      }
+
+      // deep music-box notes, never the same note twice in a row
+      if (k % 8 === 0 && chance(k === 0 ? 0.5 : 0.22)) {
+        let n = pick(scale);
+        if (n === prev) n = pick(scale);
+        prev = n;
+        bell(panNode(boxes, rnd(-0.5, 0.5)), t, n, { vol: 0.15, dur: rnd(2.6, 3.8) });
+        if (chance(0.4)) bell(boxes, t + rnd(0.5, 0.95), n + pick([-5, 3, 7]), { vol: 0.075, dur: 2.3 });
+      }
+
+      // drips, wide and rare, each one answered by the tunnel
+      if (chance(0.06)) drip(panNode(cave, rnd(-0.9, 0.9)), t + rnd(0, 0.2), { vol: rnd(0.08, 0.15) });
+
+      // somebody working two galleries over: a short run of tinks
+      if (k === 4 && chance(0.26)) {
+        const p = panNode(cave, rnd(-0.85, 0.85));
+        const n = 2 + ((Math.random() * 3) | 0);
+        for (let i = 0; i < n; i++) pickTink(p, t + i * rnd(0.34, 0.5), { vol: rnd(0.045, 0.085) });
+      }
+
+      // a cart rolling somewhere below
+      if (k === 8 && bar % 4 === 2 && chance(0.35)) {
+        noise(low, t, { dur: 1.5, vol: 0.04, type: 'lowpass', freq: 230, q: 0.7, sweep: 1.7, rate: 0.5, a: 0.4 });
+      }
+    },
+  };
+};
+
+// ---- The Tangle Jungle: birdsong layers, hand drums, marimba phrases -------
+
+TRACKS.jungle = (tr) => {
+  const bpm = 92;
+  const t0 = ctx.currentTime;
+
+  const mall = ctx.createGain(); mall.gain.value = 0.85; mall.connect(tr.out); mall.connect(tr.send);
+  const drums = ctx.createGain(); drums.gain.value = 1; drums.connect(tr.out);
+  const drumSend = ctx.createGain(); drumSend.gain.value = 0.26; drums.connect(drumSend); drumSend.connect(tr.send);
+  const low = ctx.createGain(); low.gain.value = 0.85; low.connect(tr.out);
+  const birds = ctx.createGain(); birds.gain.value = 1; birds.connect(tr.out); birds.connect(tr.send);
+  const air = ctx.createGain(); air.gain.value = 1; air.connect(tr.out); air.connect(tr.send);
+
+  // Canopy: leaves and the far side of the waterfall, wandering slowly.
+  const leafSrc = ctx.createBufferSource();
+  leafSrc.buffer = noiseBuf; leafSrc.loop = true; leafSrc.playbackRate.value = 1.15;
+  const leafBp = ctx.createBiquadFilter();
+  leafBp.type = 'bandpass'; leafBp.frequency.value = 1500; leafBp.Q.value = 0.8;
+  const leafGain = ctx.createGain(); leafGain.gain.value = 0.03;
+  leafSrc.connect(leafBp); leafBp.connect(leafGain); leafGain.connect(tr.out);
+  const leafLfo = ctx.createOscillator();
+  leafLfo.type = 'sine'; leafLfo.frequency.value = 0.061;
+  const leafAmt = ctx.createGain(); leafAmt.gain.value = 700;
+  leafLfo.connect(leafAmt); leafAmt.connect(leafBp.frequency);
+  const swayLfo = ctx.createOscillator();
+  swayLfo.type = 'sine'; swayLfo.frequency.value = 0.037;
+  const swayAmt = ctx.createGain(); swayAmt.gain.value = 0.014;
+  swayLfo.connect(swayAmt); swayAmt.connect(leafGain.gain);
+  leafSrc.start(t0, Math.random());
+  leafLfo.start(t0); swayLfo.start(t0);
+  tr.sources.push(leafSrc, leafLfo, swayLfo);
+
+  // E dorian vamp: Em7 - Em7 - A7 - G6, one bar each.
+  const prog = [
+    { root: 40, tones: [64, 67, 71, 74, 76, 79] },
+    { root: 40, tones: [64, 66, 71, 74, 76, 81] },
+    { root: 45, tones: [64, 69, 73, 76, 81, 85] },
+    { root: 43, tones: [62, 67, 71, 74, 79, 83] },
+  ];
+  const mask = [1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0];
+  const dBass = [0, 6, 10];
+  const dTone = [4, 12];
+  const dSlap = [3, 7, 11, 14];
+  let idx = 0;
+
+  return {
+    bpm, level: 1,
+    onStep(t, s) {
+      const bar = (s / 16) | 0;
+      const k = s % 16;
+      const ch = prog[bar % prog.length];
+
+      if (k === 0) idx = (bar % 2) ? 1 : 0;
+
+      // marimba phrases, walking through the voicing
+      if (mask[k]) {
+        const n = ch.tones[idx % ch.tones.length];
+        idx += chance(0.3) ? 2 : 1;
+        marimba(mall, t, n, { vol: k === 0 ? 0.34 : 0.22, dur: k === 0 ? 0.9 : 0.6 });
+        if (k === 0) marimba(mall, t, n - 12, { vol: 0.11, dur: 0.7 });
+      }
+
+      // hand drums: palm on the pulse, edge on the backbeat, ghost slaps
+      if (dBass.includes(k)) handDrum(drums, t, 'bass', { vol: k === 0 ? 0.22 : 0.15 });
+      if (dTone.includes(k)) handDrum(drums, t, 'tone', { vol: 0.17 });
+      if (dSlap.includes(k) && chance(0.55)) handDrum(drums, t, 'slap', { vol: rnd(0.05, 0.1) });
+      // seed-pod shaker on the offbeat sixteenths
+      if (k % 4 === 1 || k % 4 === 3) {
+        noise(air, t, { dur: 0.04, vol: k % 4 === 3 ? 0.045 : 0.026, type: 'highpass', freq: 6200, rate: 1.7 });
+      }
+
+      if (k === 0) tone(low, t, { type: 'sine', f0: mtof(ch.root - 12), dur: 1.1, vol: 0.3, a: 0.02 });
+      if (k === 11) tone(low, t, { type: 'sine', f0: mtof(ch.root - 5), dur: 0.4, vol: 0.12, a: 0.02 });
+
+      // birdsong in layers: near chirps, far chirps, the occasional low call
+      if (k === 0 && chance(0.6)) birdChirp(panNode(birds, rnd(-0.85, 0.85)), t + rnd(0.05, 1.2));
+      if (k === 8 && chance(0.4)) birdChirp(panNode(birds, rnd(-0.9, 0.9)), t + rnd(0, 0.9));
+      if (k === 0 && bar % 4 === 3 && chance(0.45)) birdWhoop(panNode(birds, rnd(-0.7, 0.7)), t + rnd(0, 1.4));
+      // insects, way up in the leaves
+      if (k === 6 && bar % 2 === 1 && chance(0.3)) {
+        const p = panNode(air, rnd(-0.9, 0.9));
+        const n = 6 + ((Math.random() * 5) | 0);
+        for (let i = 0; i < n; i++) {
+          noise(p, t + i * 0.035, { dur: 0.02, vol: 0.02, type: 'bandpass', freq: rnd(6400, 7800), q: 5, rate: 1.8 });
+        }
+      }
+    },
+  };
+};
+
+// ---- The Drift: whale song over sub-bass pads and watery shimmer -----------
+
+TRACKS.drift = (tr) => {
+  const bpm = 44;
+  const t0 = ctx.currentTime;
+
+  const song = ctx.createGain(); song.gain.value = 0.9; song.connect(tr.out); song.connect(tr.send);
+  const spark = ctx.createGain(); spark.gain.value = 0.8; spark.connect(tr.out); spark.connect(tr.send);
+
+  // Shimmer: light on water, a bandpassed hiss drifting over a slow LFO.
+  const shSrc = ctx.createBufferSource();
+  shSrc.buffer = noiseBuf; shSrc.loop = true; shSrc.playbackRate.value = 1.3;
+  const shBp = ctx.createBiquadFilter();
+  shBp.type = 'bandpass'; shBp.frequency.value = 1700; shBp.Q.value = 1.3;
+  const shGain = ctx.createGain(); shGain.gain.value = 0.032;
+  shSrc.connect(shBp); shBp.connect(shGain);
+  shGain.connect(tr.out); shGain.connect(tr.send);
+  const shLfo = ctx.createOscillator();
+  shLfo.type = 'sine'; shLfo.frequency.value = 0.048;
+  const shAmt = ctx.createGain(); shAmt.gain.value = 900;
+  shLfo.connect(shAmt); shAmt.connect(shBp.frequency);
+  const tideLfo = ctx.createOscillator();
+  tideLfo.type = 'sine'; tideLfo.frequency.value = 0.029;
+  const tideAmt = ctx.createGain(); tideAmt.gain.value = 0.016;
+  tideLfo.connect(tideAmt); tideAmt.connect(shGain.gain);
+  shSrc.start(t0, Math.random());
+  shLfo.start(t0); tideLfo.start(t0);
+  tr.sources.push(shSrc, shLfo, tideLfo);
+
+  // Pad: four detuned voices gliding between chords, plus a sub under the root.
+  const padFilter = ctx.createBiquadFilter();
+  padFilter.type = 'lowpass'; padFilter.frequency.value = 620; padFilter.Q.value = 0.9;
+  const padGain = ctx.createGain(); padGain.gain.value = 0.0001;
+  padFilter.connect(padGain);
+  padGain.connect(tr.out); padGain.connect(tr.send);
+  padGain.gain.setValueAtTime(0.0001, t0);
+  padGain.gain.linearRampToValueAtTime(0.22, t0 + 6);
+  const padLfo = ctx.createOscillator();
+  padLfo.type = 'sine'; padLfo.frequency.value = 0.041;
+  const padLfoAmt = ctx.createGain(); padLfoAmt.gain.value = 240;
+  padLfo.connect(padLfoAmt); padLfoAmt.connect(padFilter.frequency);
+  padLfo.start(t0);
+  tr.sources.push(padLfo);
+
+  const VOICES = 4;
+  const padOsc = [];
+  for (let v = 0; v < VOICES; v++) {
+    const p = panNode(padFilter, (v / (VOICES - 1)) * 1.3 - 0.65);
+    const pair = [];
+    for (let d = 0; d < 2; d++) {
+      const o = ctx.createOscillator();
+      o.type = d ? 'sine' : 'triangle';
+      o.detune.value = d ? 9 : -9;
+      o.frequency.value = 110;
+      const g = ctx.createGain();
+      g.gain.value = d ? 0.075 : 0.05;
+      o.connect(g); g.connect(p);
+      o.start(t0);
+      tr.sources.push(o);
+      pair.push(o);
+    }
+    padOsc.push(pair);
+  }
+
+  // same rule as the mine drone: sub energy measures far louder than it sounds
+  const subGain = ctx.createGain(); subGain.gain.value = 0.08; subGain.connect(tr.out);
+  const sub = ctx.createOscillator();
+  sub.type = 'sine';
+  sub.frequency.value = mtof(26);
+  sub.connect(subGain);
+  sub.start(t0);
+  tr.sources.push(sub);
+
+  // Dm - Bb - F - C, very slow: two bars each (about 22 seconds a chord).
+  const prog = [
+    [38, 45, 50, 57],
+    [34, 41, 46, 53],
+    [41, 48, 53, 60],
+    [36, 43, 48, 55],
+  ];
+  const glints = [84, 86, 89, 91, 93];
+
+  return {
+    bpm, level: 0.86,
+    onStep(t, s) {
+      const bar = (s / 16) | 0;
+      const k = s % 16;
+
+      if (k === 0 && bar % 2 === 0) {
+        const ch = prog[(((bar / 2) | 0) % prog.length)];
+        ch.forEach((n, i) => {
+          const f = mtof(n);
+          for (const o of padOsc[i]) o.frequency.setTargetAtTime(f, t, 2.2);
+        });
+        sub.frequency.setTargetAtTime(mtof(ch[0] - 12), t, 2.4);
+        padGain.gain.cancelScheduledValues(t);
+        padGain.gain.setValueAtTime(Math.max(0.001, padGain.gain.value), t);
+        padGain.gain.linearRampToValueAtTime(0.26, t + 4.5);
+        padGain.gain.linearRampToValueAtTime(0.18, t + 16);
+      }
+
+      // Big Blue, somewhere out in the blue
+      if (k === 0 && bar % 4 === 1 && chance(0.6)) {
+        const ch = prog[(((bar / 2) | 0) % prog.length)];
+        whaleCall(panNode(song, rnd(-0.5, 0.5)), t + rnd(0.2, 2.4), {
+          midi: ch[0] + pick([0, 7, 12]),
+          vol: rnd(0.075, 0.12), len: rnd(2.6, 4.2),
+        });
+      }
+      if (k === 8 && bar % 8 === 6 && chance(0.35)) {
+        whaleCall(panNode(song, rnd(-0.8, 0.8)), t + rnd(0, 1.5), { midi: 33, vol: 0.06, len: rnd(3.4, 5) });
+      }
+
+      // glints of light, high and quiet
+      if (k % 4 === 0 && chance(0.16)) {
+        bell(panNode(spark, rnd(-0.85, 0.85)), t + rnd(0, 0.6), pick(glints), { vol: 0.04, dur: rnd(2.4, 4) });
+      }
+      // a string of bubbles rising past you
+      if (chance(0.035)) {
+        const p = panNode(spark, rnd(-0.9, 0.9));
+        const n = 2 + ((Math.random() * 3) | 0);
+        for (let i = 0; i < n; i++) {
+          const f = rnd(420, 760);
+          tone(p, t + i * rnd(0.07, 0.16), { type: 'sine', f0: f, f1: f * 2.3, dur: 0.075, vol: 0.035, a: 0.004 });
+        }
+      }
+    },
+  };
+};
+
 // ==================================================================== SFX ====
 
 let comboN = 0;
@@ -1134,7 +1643,9 @@ export const audio = {
     } catch { /* a dropped sfx must never break gameplay */ }
   },
 
-  /** Crossfade the generative music bed to the given room's mood. */
+  /** Crossfade the generative music bed to the given room's mood. An id with
+   *  no bed (a dynamic 'house:<owner>' room, a typo, anything at all) just
+   *  fades the current one out and plays nothing: never throws, never warns. */
   setRoom(roomId) {
     const id = roomId || null;
     if (id === currentRoom && tracks.some((t) => !t.dying && t.id === id)) return;

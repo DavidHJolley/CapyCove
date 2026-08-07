@@ -38,8 +38,15 @@ import { MINIGAMES } from '../../../shared/constants.js';
  *    guess whose length matches the mask and whose revealed letters all line up
  *    is pinged as close. Levenshtein needs the word, which guessers must never
  *    have, so this is the honest client-side approximation.
- *  - The drawer may pick from a small local word list if 'dd-words' never
- *    arrives (4s grace). A round with a word beats a round stuck on "waiting".
+ *  - If 'dd-words' never arrives (4s grace) the drawer is offered the three
+ *    CARDS instead of three words. The server resolves the picked index against
+ *    ITS OWN choices and answers with the word it holds, so the easel never
+ *    shows a word the server did not pick. A round with a word beats a round
+ *    stuck on "waiting"; a round with the WRONG word is worse than both, and
+ *    that is exactly what a local word list produces.
+ *  - Party clocks are anchored to a wall-clock deadline built from the server's
+ *    remaining ms, never accumulated out of rAF deltas: browsers freeze
+ *    requestAnimationFrame in a background tab and the round does not wait.
  */
 
 // ------------------------------------------------------------------ tuning --
@@ -512,20 +519,10 @@ const DRAWINGS = [
   ]),
 ];
 
-/**
- * Local fallback word list. The server owns the real ~120-word list and every
- * verdict; these only ever appear as drawer choices when 'dd-words' goes
- * missing, so a round never stalls on a blank easel.
- */
-const WORD_POOL = [
-  'smoothie', 'chairlift', 'top hat', 'shark', 'sled', 'crab', 'palm tree',
-  'snowman', 'mushroom', 'crystal', 'pickaxe', 'minecart', 'campfire',
-  'cupcake', 'boat', 'flower', 'fish', 'lantern', 'bucket', 'starfish',
-  'igloo', 'seashell', 'waterfall', 'butterfly', 'toucan', 'vine', 'drum',
-  'beach ball', 'sandcastle', 'fishing rod', 'coin', 'crown', 'scarf',
-  'bowtie', 'pineapple', 'banana', 'coconut', 'ice cream', 'donut', 'kite',
-  'umbrella', 'ladder', 'barrel', 'crate', 'rope', 'bench', 'fountain', 'raft',
-];
+// There is deliberately NO local word list for party rounds. The server owns
+// the words, and any word this file invented for the drawer's card would be a
+// word the server never chose: the drawer would draw one thing while every
+// guesser was scored against another. See _showMysteryPicks.
 
 const DOODLE_LINES = {
   start: [
@@ -806,6 +803,9 @@ export class DoodleGame extends Minigame {
     this.timeLeft = 0;
     this.timeTotal = 1;
     this.lastBeep = -1;
+    // party only: Date.now() at which the server's phase runs out. The round
+    // clock is read off this, never counted down with rAF deltas.
+    this.endAt = 0;
 
     // scoring
     this.score = 0;
@@ -1350,7 +1350,11 @@ export class DoodleGame extends Minigame {
     if (this._szAcc >= 12) { this._szAcc = 0; this._checkSize(); }
 
     if (this.phase === 'draw') {
-      this.timeLeft = Math.max(0, this.timeLeft - dt);
+      // Party: the deadline is the server's, held as wall-clock time. Solo: the
+      // clock and Doodles' crayon advance together off the same rAF dt, so a
+      // backgrounded solo run simply pauses, which is the honest outcome.
+      if (this.mode === 'party' && this.endAt) this._syncClock();
+      else this.timeLeft = Math.max(0, this.timeLeft - dt);
       this._paintClock();
       if (this.mode === 'solo') {
         this._advanceReplay(dt);
@@ -1383,6 +1387,18 @@ export class DoodleGame extends Minigame {
     }
     if (this.dirty) this._paint();
   };
+
+  /**
+   * Re-read the party clock off the wall clock. `endAt` is set from the ms the
+   * server puts on every dd-state, so this survives everything rAF does not: a
+   * backgrounded tab, a throttled timer, a stalled frame. Come back from
+   * another tab and the timer shows what the round actually has left, because
+   * the server's round never paused.
+   */
+  _syncClock() {
+    if (!this.endAt) return;
+    this.timeLeft = Math.max(0, (this.endAt - Date.now()) / 1000);
+  }
 
   _paintClock() {
     const left = Math.ceil(this.timeLeft);
@@ -1631,6 +1647,7 @@ export class DoodleGame extends Minigame {
 
   _soloReset() {
     this.mode = 'solo';
+    this.endAt = 0;
     this.maxScore = SOLO_MAX;
     this._setScore(0);
     this.streak = 0;
@@ -2035,6 +2052,18 @@ export class DoodleGame extends Minigame {
     if (solved) {
       P.correct = new Set(solved.map((c) => this._idOf(c?.id ?? c)).filter(Boolean));
     }
+    // THE word. The server puts it on this frame for the drawer alone (and for
+    // everyone at the reveal), and this is the only place a word is ever
+    // believed: what the pick card said was a label on a button, not an
+    // agreement. Adopting it here is what keeps the drawer's banner, the
+    // guessers' mask and every scored guess talking about the same word.
+    if (typeof m.word === 'string') {
+      const w = normWord(m.word);
+      if (w && w !== P.word) {
+        P.word = w;
+        if (this.phase === 'draw' && this._iAmDrawer()) this._drawerWord();
+      }
+    }
     // the server clocks its phases in milliseconds ('ms'); everything here is
     // seconds, so that is the one field that needs converting rather than aliasing
     const ms = num(m.ms);
@@ -2043,6 +2072,8 @@ export class DoodleGame extends Minigame {
     if (dur != null && dur > 0) this.timeTotal = dur;
     if (left != null) {
       this.timeLeft = Math.max(0, left);
+      // anchor, do not accumulate: see _syncClock
+      this.endAt = Date.now() + this.timeLeft * 1000;
       if (this.timeLeft > this.timeTotal) this.timeTotal = this.timeLeft;
       this.lastBeep = -1;
       this._paintClock();
@@ -2085,11 +2116,16 @@ export class DoodleGame extends Minigame {
     if (this._iAmDrawer()) {
       this._setRole('YOUR TURN: PICK A WORD');
       this._badge('CHOOSING A WORD');
-      // grace period: if dd-words never lands, offer local choices so the
-      // round still happens (documented deviation)
+      // Grace period: if dd-words never lands, offer the three CARDS so the
+      // round still happens (documented deviation). Guarded on a card actually
+      // being on screen, never on "have they clicked yet": a drawer who spends
+      // six seconds deciding must not have the real choices swapped out from
+      // under their cursor. That swap was the bug: the click then sent an index
+      // into a list the server had never heard of.
       this._after(4000, () => {
-        if (this.phase === 'pick' && this._iAmDrawer() && !this.party.picked) {
-          this._showPicks(this._localWords());
+        if (this.phase === 'pick' && this._iAmDrawer()
+          && !this.party.picked && !this._picksOpen()) {
+          this._showMysteryPicks();
         }
       });
     } else {
@@ -2118,8 +2154,7 @@ export class DoodleGame extends Minigame {
     this._showGuess(!mine && !P.correct.has(P.meId), 'Type your guess, hit Enter');
     this.el.paper?.classList.toggle('mg-dd-draw', mine);
     if (mine) {
-      this._setRole('YOU ARE DRAWING');
-      this._setMask(P.word || P.mask || '', !!P.word);
+      this._drawerWord();
       this._badge('EVERYONE IS WATCHING');
       this.game.audio?.play?.('whoosh');
     } else {
@@ -2127,7 +2162,25 @@ export class DoodleGame extends Minigame {
       this._setMask(P.mask || '');
       this._badge('');
     }
+    this._syncClock();
     this._paintClock();
+  }
+
+  /**
+   * The drawer's banner. Painted from P.word, which only ever comes off a
+   * server frame; until that lands there is nothing honest to show, so it says
+   * so instead of guessing.
+   */
+  _drawerWord() {
+    const P = this.party;
+    if (!P) return;
+    if (P.word) {
+      this._setMask(P.word, true);
+      this._setRole('YOU ARE DRAWING');
+    } else {
+      this._setMask(P.mask || '');
+      this._setRole(P.picked ? 'GETTING YOUR WORD...' : 'YOU ARE DRAWING');
+    }
   }
 
   _enterReveal(word) {
@@ -2155,21 +2208,24 @@ export class DoodleGame extends Minigame {
     if (!words) return;
     words = words.map((s) => String(s || '').slice(0, 24)).filter(Boolean).slice(0, 3);
     if (!words.length) return;
+    // a words frame for a later round is a fresh pick phase, whatever we did in
+    // the last one (the state frame that resets this may still be in flight)
+    const round = num(m?.round, m?.r);
+    if (round != null && Math.round(round) > P.round) { P.picked = false; P.word = ''; }
     this._showPicks(words);
   }
 
-  _localWords() {
-    const out = [];
-    const used = new Set();
-    while (out.length < 3 && used.size < WORD_POOL.length) {
-      const i = Math.floor(Math.random() * WORD_POOL.length);
-      if (used.has(i)) continue;
-      used.add(i);
-      out.push(WORD_POOL[i]);
-    }
-    return out;
+  /** Is a word-choice card on screen right now? */
+  _picksOpen() {
+    return !!(this.el.over?.classList.contains('mg-dd-on')
+      && this.el.over.querySelector('.mg-dd-pick'));
   }
 
+  /**
+   * The server's three words, in the server's order. The index that goes back
+   * on dd-pick is an index into THIS array, so it is never reordered, filtered
+   * or replaced with anything of our own invention.
+   */
   _showPicks(words) {
     const P = this.party;
     if (!P || P.picked) return;
@@ -2187,21 +2243,59 @@ export class DoodleGame extends Minigame {
       b.addEventListener('click', () => {
         const i = Number(b.dataset.i);
         const word = words[i];
-        if (!word || P.picked) return;
-        P.picked = true;
-        P.word = normWord(word);
-        // only the drawer is ever offered words: trust that over a drawer id
-        // the state frame may have labelled differently
-        P.drawerId = P.meId;
-        this.game.audio?.play?.('click');
-        this.game.net?.send?.({ t: 'dd-pick', i, word });
-        this._closeOver();
-        this._setMask(P.word, true);
-        this._setRole('YOU ARE DRAWING');
-        this._showTools(true);
-        this.el.paper?.classList.add('mg-dd-draw');
+        if (!word) return;
+        this._sendPick(i, word);
       });
     });
+  }
+
+  /**
+   * 'dd-words' never landed (lost frame, or we mounted after it). The three
+   * choices still exist on the server, so offer the CARDS rather than invent
+   * words: pick one and the easel fills in what the server was holding. Showing
+   * a made-up word here is what made a drawer draw 'sandcastle' while everyone
+   * else was being scored against something else entirely.
+   */
+  _showMysteryPicks() {
+    const P = this.party;
+    if (!P || P.picked) return;
+    this.game.audio?.play?.('open');
+    this._over(`
+      <div class="mg-dd-card">
+        <h2>Your turn to draw</h2>
+        <div class="mg-dd-sub">THE WORD CARDS BLEW INTO THE FERNS. PICK ONE ANYWAY.</div>
+        <div class="mg-dd-picks">
+          ${[0, 1, 2].map((i) => `<button class="mg-dd-pick" data-i="${i}">CARD ${i + 1}</button>`).join('')}
+        </div>
+        <div class="mg-dd-sub" style="margin:10px 0 0">THE EASEL WILL TELL YOU WHAT IT SAYS</div>
+      </div>`);
+    this.el.over.querySelectorAll('.mg-dd-pick').forEach((b) => {
+      b.addEventListener('click', () => this._sendPick(Number(b.dataset.i), ''));
+    });
+  }
+
+  /**
+   * Commit to a choice. The word on the button is NOT painted on the banner:
+   * the server resolves the index against its own three choices and answers
+   * with the word the round actually has, and that answer (dd-state, drawer
+   * only) is the one thing this screen will show. One RTT of "getting your
+   * word..." is worth never drawing a word nobody is being scored against.
+   */
+  _sendPick(i, word) {
+    const P = this.party;
+    if (!P || P.picked) return;
+    P.picked = true;
+    P.word = '';
+    // only the drawer is ever offered words: trust that over a drawer id the
+    // state frame may have labelled differently
+    P.drawerId = P.meId;
+    this.game.audio?.play?.('click');
+    this.game.net?.send?.(word ? { t: 'dd-pick', i, word } : { t: 'dd-pick', i });
+    this._closeOver();
+    this._showTools(true);
+    this.el.paper?.classList.add('mg-dd-draw');
+    this._drawerWord();
+    this._badge('CRAYONS UP');
   }
 
   _onMask(m) {
@@ -2309,6 +2403,12 @@ export class DoodleGame extends Minigame {
         this._feed(`<b>you</b> so close!`, 'mg-dd-close');
       }
       return;
+    }
+    // the server hands the answer to the capy who just earned it, and nobody
+    // else: another server-sourced word, so it is safe to keep
+    if (typeof m?.word === 'string') {
+      const w = normWord(m.word);
+      if (w) P.word = w;
     }
     if (id) {
       P.correct.add(id);
@@ -2432,6 +2532,7 @@ export class DoodleGame extends Minigame {
     this.subs.length = 0;
     this.party = null;
     this.mode = 'solo';
+    this.endAt = 0; // the solo clock counts itself down
     if (this.ctxRef && this.game.__partyCtx === this.ctxRef) this.game.__partyCtx = null;
     this.ctxRef = null;
   }

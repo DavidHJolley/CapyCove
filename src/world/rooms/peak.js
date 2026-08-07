@@ -176,11 +176,15 @@ const AUR_COLS = 40;   // columns per band (vertices are COLS+1 wide)
 const AUR_ROWS = 4;    // rows per band (ROWS+1 tall); row 0 and ROWS fade to black
 const AUR_BANDS = 3;
 
-// Snowball toy. The server allows one throw a second; the local cooldown sits a
-// beat outside that so a throw is never eaten by the rate limiter.
+// Snowball toy, on the RIGHT mouse button. It used to share the left button
+// with walking, which playtested badly: every attempt to cross the clearing
+// wound up a throw instead. Left click is now pure walking, exactly as in every
+// other room. (A right button is a mouse thing: there is no snowball on touch
+// any more, which is the price of never stealing the walk tap again.)
+// The server allows one throw a second; the local cooldown sits a beat outside
+// that so a throw is never eaten by the rate limiter.
 const SNOW_HOLD_CAP = 1.0;    // seconds of hold = full power
-const SNOW_MIN_HOLD = 0.17;   // shorter than this was an ordinary walk click
-const SNOW_RANGE_MIN = 3.5;
+const SNOW_RANGE_MIN = 3.5;   // a quick right-click lobs this far; hold for more
 const SNOW_RANGE_MAX = 13.0;
 const SNOW_COOLDOWN = 1.15;
 const SNOW_HIT_R = 0.8;       // LIVING-COVE: a capy within 0.8 of the landing
@@ -193,8 +197,8 @@ const _ndc = new THREE.Vector2();
 const _aimV = new THREE.Vector3();
 
 // Shown once per session, the first time someone stands around in the snow:
-// nobody discovers a hold-to-aim toy on their own (module scope so a second
-// visit to the peak does not nag).
+// nobody discovers a right-click hold-to-aim toy on their own (module scope so
+// a second visit to the peak does not nag).
 let _hintShown = false;
 
 /** Flight time and apex of a thrown snowball. Every client runs these on the
@@ -1307,24 +1311,32 @@ export class PeakRoom extends Room {
     }
 
     /*
-     * Aiming has to see the press BEFORE the engine turns it into a walk
-     * target, and the engine listens on the canvas itself (engine._onPointer).
-     * These sit on window in the CAPTURE phase, so they run first no matter
-     * what; a press we decide to take calls stopPropagation and the canvas
-     * listener never sees it. Everything else - clicks on other capybaras
-     * (profile cards), on hotspot prompt buttons, on any HUD element, and every
-     * press while the throw is cooling down - is passed straight through
-     * untouched, so walking and the whole existing UI behave exactly as before.
+     * Aiming lives on the RIGHT button, so it can never collide with walking:
+     * engine._onPointer bails on any button but 0, which means a right press is
+     * not a walk target and we have nothing to swallow. Left clicks, clicks on
+     * other capybaras (profile cards), hotspot prompt buttons and every HUD
+     * element are therefore untouched by this room.
+     *
+     * The listeners sit on window in the CAPTURE phase so a drag that wanders
+     * off the canvas (or over a HUD panel) still tracks and still lands.
+     *
+     * The one thing that has to go is the browser context menu: it pops on the
+     * very press-and-release that throws the ball. _contextMenu kills it over
+     * the world canvas (and while a throw is charging) and nowhere else, and
+     * the listener leaves with the room in dispose(), so right-click is back to
+     * normal the moment you walk out of the peak.
      */
     this._onDown = (e) => this._pointerDown(e);
     this._onMove = (e) => this._pointerMove(e);
     this._onUp = (e) => this._pointerUp(e);
     this._onCancel = () => this._cancelAim();
+    this._onContext = (e) => this._contextMenu(e);
     addEventListener('pointerdown', this._onDown, true);
     addEventListener('pointermove', this._onMove, true);
     addEventListener('pointerup', this._onUp, true);
     addEventListener('pointercancel', this._onCancel, true);
     addEventListener('blur', this._onCancel);
+    addEventListener('contextmenu', this._onContext, true);
   }
 
   /* --- race lobby --------------------------------------------------------- */
@@ -3181,8 +3193,9 @@ export class PeakRoom extends Room {
   /* --- snowballs (LIVING-COVE A2: ambient play toys) ---------------------- */
 
   /**
-   * Hold a click on the snow, an arc preview grows out of your capybara, let go
-   * and it flies. The frame that goes out is {t:'snow', to:[x,z]}; every client
+   * Hold the RIGHT button on the snow, an arc preview grows out of your
+   * capybara, let go and it flies (left click stays plain old walking).
+   * The frame that goes out is {t:'snow', to:[x,z]}; every client
    * in the room (the thrower included, locally, so their own throw never waits
    * on the round trip) runs the SAME arc from the sender's feet to that point,
    * so everyone watches one snowball, not their own guess at one.
@@ -3452,7 +3465,7 @@ export class PeakRoom extends Room {
       if (this._hintT > 7) {
         this._hintT = -1;
         _hintShown = true;
-        this._game?.toast?.('Hold a click on the snow to lob a snowball at someone.');
+        this._game?.toast?.('Right-click and hold on the snow to lob a snowball at someone.');
       }
     }
 
@@ -3626,25 +3639,42 @@ export class PeakRoom extends Room {
     return true;
   }
 
+  /**
+   * The browser menu would land on top of the aim (and on Windows it pops on
+   * the very release that throws), so it is suppressed over the world canvas
+   * and while a throw is charging. Anywhere else - the HUD, the chat box, a
+   * name tag - right-click keeps its normal menu, and once this room is
+   * disposed the listener goes with it.
+   */
+  _contextMenu(e) {
+    const engine = this._game?.engine;
+    if (this._aim || (engine?.canvas && e.target === engine.canvas)) e.preventDefault();
+  }
+
   _pointerDown(e) {
-    if (e.button !== 0 || this._aim) return;
+    // RIGHT button only: the left button walks, and this room never touches it.
+    if (e.button !== 2 || this._aim) return;
     const game = this._game;
     const engine = game?.engine;
     if (!engine || engine.paused || game.activeMinigame) return;
     if (e.target !== engine.canvas) return;   // a HUD or prompt click: not ours
-    if (this._cool > 0) return;               // cooling down: leave it as a walk
+    if (this._cool > 0) return;               // still packing the last one
     if (this._localSlot !== null) return;     // seated in the race lineup
     if (!this._setRay(e)) return;
-    // clicking a capybara opens their profile card; that path is the engine's
-    if (this._ray.intersectObjects(engine.remoteGroup.children, true).length) return;
     if (!this._groundPoint(_aimV)) return;
-    e.stopPropagation(); // ...so the engine's click-to-walk does not also fire
     this._aim = { t: 0, x: _aimV.x, z: _aimV.z, cx: _aimV.x, cz: _aimV.z };
-    engine.controller?.stop?.();
+    // A release before the first update() must still throw somewhere sane, so
+    // the landing point is clamped into range now, at zero power.
+    this._clampAim(this._aim, 0);
+    engine.controller?.stop?.(); // plant your feet to throw
   }
 
   _pointerMove(e) {
     if (!this._aim) return;
+    // The button came up somewhere we never heard about (the window lost the
+    // pointer, another listener ate the event): the first buttonless move is
+    // the release, rather than leaving the capybara wound up forever.
+    if (e.buttons !== undefined && !(e.buttons & 2)) { this._release(); return; }
     if (!this._setRay(e)) return;
     if (this._groundPoint(_aimV)) {
       this._aim.x = _aimV.x;
@@ -3653,13 +3683,17 @@ export class PeakRoom extends Room {
   }
 
   _pointerUp(e) {
+    if (!this._aim) return;
+    if (e && e.button !== undefined && e.button !== 2) return; // a left click, mid-aim
+    this._release();
+  }
+
+  /** Let the wound-up throw go. */
+  _release() {
     const a = this._aim;
     if (!a) return;
     this._cancelAim();
-    // a flick of a click was never a throw: walk there, exactly as the engine
-    // would have if we had not swallowed the press
-    if (a.t < SNOW_MIN_HOLD) this._walkTo(e);
-    else this._throw(a.cx, a.cz);
+    this._throw(a.cx, a.cz);
   }
 
   _cancelAim() {
@@ -3668,16 +3702,26 @@ export class PeakRoom extends Room {
     if (this._aimRing) this._aimRing.visible = false;
   }
 
-  _walkTo(e) {
-    const engine = this._game?.engine;
-    if (!engine?.controller) return;
-    if (e && Number.isFinite(e.clientX) && !this._setRay(e)) return;
-    const hits = this._ray.intersectObjects(this.groundMeshes, false);
-    if (!hits.length) return;
-    engine.controller.setTarget(hits[0].point);
-    const av = engine.playerAvatar;
-    if (av?.state.anim === 'dance') av.setAnim('idle');
-    this._game?.audio?.play?.('step');
+  /**
+   * Pull the aim point into throwing range for a given power (0..1): hold
+   * longer, throw further. Aiming at your own feet throws where you look.
+   */
+  _clampAim(a, pow) {
+    const avatar = this._game?.engine?.playerAvatar;
+    const p = avatar?.group?.position;
+    if (!p) return;
+    let dx = a.x - p.x;
+    let dz = a.z - p.z;
+    let d = Math.hypot(dx, dz);
+    if (d < 1e-3) {
+      dx = Math.sin(avatar.group.rotation.y);
+      dz = Math.cos(avatar.group.rotation.y);
+      d = 1;
+    }
+    const range = SNOW_RANGE_MIN + (SNOW_RANGE_MAX - SNOW_RANGE_MIN) * pow;
+    const s = Math.min(1, range / d);
+    a.cx = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, p.x + dx * s));
+    a.cz = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, p.z + dz * s));
   }
 
   /** Let go: fly it locally at once, and tell the room. */
@@ -3946,18 +3990,7 @@ export class PeakRoom extends Room {
     const pow = Math.min(1, a.t / SNOW_HOLD_CAP);
 
     // power caps the range: hold longer, throw further
-    let dx = a.x - p.x;
-    let dz = a.z - p.z;
-    let d = Math.hypot(dx, dz);
-    if (d < 1e-3) { // aimed at your own feet: throw where you are looking
-      dx = Math.sin(avatar.group.rotation.y);
-      dz = Math.cos(avatar.group.rotation.y);
-      d = 1;
-    }
-    const range = SNOW_RANGE_MIN + (SNOW_RANGE_MAX - SNOW_RANGE_MIN) * pow;
-    const s = Math.min(1, range / d);
-    a.cx = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, p.x + dx * s));
-    a.cz = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, p.z + dz * s));
+    this._clampAim(a, pow);
 
     // Plant, face the throw and wind up. avatar.update() has already rebuilt
     // its rest pose this frame (the engine runs it before room.update), so the
@@ -3997,10 +4030,7 @@ export class PeakRoom extends Room {
     // A pointer released outside the window never reports back, and a stuck aim
     // would leave the capybara wound up forever: four seconds is three past the
     // power cap, so let it fly.
-    if (a.t > 4) {
-      this._cancelAim();
-      this._throw(a.cx, a.cz);
-    }
+    if (a.t > 4) this._release();
   }
 
   /* --- race lobby, per frame ---------------------------------------------- */
@@ -4060,7 +4090,10 @@ export class PeakRoom extends Room {
     removeEventListener('pointerup', this._onUp, true);
     removeEventListener('pointercancel', this._onCancel, true);
     removeEventListener('blur', this._onCancel);
+    // ...and the browser's own right-click menu is handed back to the page
+    removeEventListener('contextmenu', this._onContext, true);
     this._onDown = this._onMove = this._onUp = this._onCancel = null;
+    this._onContext = null;
     this._aim = null;
 
     // The player's avatar (and the remotes') outlive this room, so anything we

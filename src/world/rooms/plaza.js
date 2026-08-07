@@ -347,6 +347,58 @@ function stripeTex() {
   });
 }
 
+/** Soft radial falloff for the lamp light pools. A hard-edged additive disc
+ *  reads as a sticker on the cobbles and cuts a visible arc through anything it
+ *  overlaps (planter rims, bench legs); a fade reads as spill from the lamp. */
+function poolTex() {
+  const S = 64;
+  return canvasTexture(S, S, (ctx) => {
+    const grad = ctx.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.42, 'rgba(255,255,255,0.66)');
+    grad.addColorStop(0.76, 'rgba(255,255,255,0.22)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, S, S);
+  });
+}
+
+/** Poster for the shop's south wall: the side you actually walk past. */
+function shopPosterTex() {
+  const w = 256, h = 320;
+  return canvasTexture(w, h, (ctx) => {
+    ctx.fillStyle = '#fff3e0';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = '#e8657a';
+    ctx.lineWidth = 12;
+    ctx.strokeRect(11, 11, w - 22, h - 22);
+    ctx.fillStyle = '#4d3b52';           // top hat
+    ctx.fillRect(90, 66, 76, 70);
+    ctx.fillRect(58, 128, 140, 18);
+    ctx.fillStyle = '#f2b64a';
+    ctx.fillRect(90, 110, 76, 18);
+    ctx.fillStyle = '#e8657a';           // party cone
+    ctx.beginPath();
+    ctx.moveTo(128, 168);
+    ctx.lineTo(98, 226);
+    ctx.lineTo(158, 226);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#4fb3e8';
+    ctx.beginPath();
+    ctx.arc(128, 168, 11, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#5b3a1e';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    fitFont(ctx, 'NEW HATS', w - 54, 42);
+    ctx.fillText('NEW HATS', w / 2, 262);
+    ctx.fillStyle = '#8a5c2c';
+    fitFont(ctx, 'try one on inside', w - 60, 24, 'normal');
+    ctx.fillText('try one on inside', w / 2, 294);
+  });
+}
+
 // The old cove notice board, redressed as the Quest Board (LIVING-COVE.md D).
 // The pinned notes keep their flavour; two of them gained tick boxes so the
 // board reads as "there are things to do here" from across the plaza.
@@ -789,8 +841,12 @@ export class PlazaRoom extends Room {
     // grotto mouth, so rather than add six new lights (and six more shadow-free
     // but still per-frame-lit surfaces) the spill is one additive instanced
     // decal. Same read, one draw call, no new casters.
+    // The pool carries a radial falloff map (poolTex) rather than being a flat
+    // disc: at full opacity a hard rim sliced a bright arc across the topiary
+    // planter and the flower-bed stone it reached, which read as a decal bug.
     const poolMat = glowAdd(0xffd88f, 0);
-    const poolGeo = new THREE.CircleGeometry(1.55, 16);
+    poolMat.map = poolTex();
+    const poolGeo = new THREE.CircleGeometry(1.55, 20);
     const poolMesh = inst(scene, poolGeo, poolMat, pts.map(([x, z]) =>
       T([x, 0.11, z], [-Math.PI / 2, 0, 0], 0.25)), false, false);
     poolMesh.visible = false;
@@ -809,7 +865,11 @@ export class PlazaRoom extends Room {
     const beads = [], beadPts = [];
     for (const [ia, ib] of spans) {
       const a = pts[ia], b = pts[ib];
-      const top = 3.25, sag = 0.7; // low point 2.55: clears avatar + name tags
+      // Tied to the very top of each lamp (cap tip is 3.82), not to its middle:
+      // at 3.25 the cord ran straight through the glowing globe at 3.28 and the
+      // three spans meeting at a lamp made a bright tangle there. Low point is
+      // now 3.2, still well clear of avatars and name tags.
+      const top = 3.9, sag = 0.7;
       let prev = null;
       for (let s = 0; s <= 14; s++) {
         const u = s / 14;
@@ -866,7 +926,12 @@ export class PlazaRoom extends Room {
 
   // --------------------------------------------------------- flower beds --
   _buildFlowerBeds(scene, rand) {
-    const beds = [[-7.27, -4.2], [-3.4, -10.6], [3.4, -10.6], [9.6, 5.6]];
+    // The east bed sits in the grass wedge between the cafe path and the club
+    // path. At (9.6, 5.6) it hugged the cafe side, leaving a thin ragged sliver
+    // of grass along the club path and reaching into the east lamp's light
+    // pool; (10.3, 5.9) centres it with an even ~1.15 margin off both path
+    // edges and clears the lamp, so the ring reads as planted, not dropped.
+    const beds = [[-7.27, -4.2], [-3.4, -10.6], [3.4, -10.6], [10.3, 5.9]];
     const rim = [], soil = [], stems = [];
     const blooms = [[], []];
     for (const [x, z] of beds) {
@@ -913,10 +978,10 @@ export class PlazaRoom extends Room {
     }
     inst(sway, new THREE.IcosahedronGeometry(1, 0), makeGlow(0xfff0a8), dots, false, false);
 
-    const plaqueTex = woodSignTex('Do not nibble', 'he is a friend', '#eadfc2', '#4a6b30', '#8bb45e');
-    put(g, new THREE.BoxGeometry(1.5, 0.62, 0.1), makeToon(C.woodDark), 0, 0.74, 1.6, { rot: [-0.3, 0, 0] });
-    put(g, new THREE.PlaneGeometry(1.4, 0.56), toonMap(0xffffff, plaqueTex), 0, 0.75, 1.66,
-      { rot: [-0.3, 0, 0], cast: false });
+    // The leaning "Do not nibble" plaque that used to prop against this planter
+    // is gone: from the plaza it read as a stray sled-shaped board tipped over
+    // beside the quest board, and its joke is already one of the NOTICES the
+    // board itself hands out. The topiary keeps the corner on its own.
 
     this.obstacles.push({ x, z, r: 1.7 });
     this.anim.topiary = sway;
@@ -931,13 +996,15 @@ export class PlazaRoom extends Room {
     const x = -9.9, z = 4.4;
     const g = new THREE.Group();
     g.position.set(x, 0, z);
-    // It used to face the plaza centre (yaw 1.90), which put its BACK to the
-    // follow camera whenever you stood at its own hotspot: you walked up to a
-    // plank wall. Now that it is the Quest Board that matters, so it is swung
-    // round to face south-east and read face-on from the play camera. The
-    // hotspot is pinned below rather than derived from the yaw, so the walk
-    // line from spawn to the beach gate still passes through it.
-    g.rotation.y = 0.95;
+    // Facing the plaza centre (the original yaw 1.90) put its BACK to the play
+    // camera; the later 0.95 fixed that but left the board sitting at a
+    // different angle from the mural wall 6.6 away, so this whole civic corner
+    // read as furniture dropped at random. It now shares the mural wall's yaw
+    // exactly: the two faces are parallel, square-on to the static camera and
+    // 9 degrees off square from the follow camera at spawn. The hotspot is
+    // pinned below rather than derived from the yaw, so the walk line from
+    // spawn to the beach gate still passes through it.
+    g.rotation.y = 0.304;
     scene.add(g);
 
     const wood = makeToon(C.wood), woodD = makeToon(C.woodDark);
@@ -953,13 +1020,11 @@ export class PlazaRoom extends Room {
     star.scale.set(1, 1.5, 1);
     this.anim.questStar = star;
 
-    const papers = [], pdata = [];
-    [[-1.02, 0.95], [1.05, 1.15], [-0.9, 2.85]].forEach((s, i) => {
-      pdata.push({ x: s[0], y: s[1], phase: i * 1.7 });
-      papers.push(T([s[0], s[1], 0.12]));
-    });
-    const mesh = inst(g, new THREE.PlaneGeometry(0.42, 0.55), makeGlow(0xfffaf0), papers, false, false);
-    this.anim.papers = { mesh, data: pdata };
+    // The three loose white sheets that used to flap here are gone. They hung
+    // off the left and right edges of the plank face (and one above the
+    // shingle), so from the plaza they read as litter caught on the board
+    // rather than as pinned notes. The four notes drawn INTO questBoardTex sit
+    // squarely on the cork and say the same thing without the clutter.
 
     this.obstacles.push({ x, z, r: 1.1 });
     this.hotspots.push({
@@ -1149,7 +1214,7 @@ export class PlazaRoom extends Room {
       { rot: [0, -Math.PI / 2, 0], cast: false });
     put(g, new THREE.BoxGeometry(1.1, 0.14, 2.1), makeToon(C.stone), fw - 0.6, 0.09, 0, { recv: true });
 
-    // windows + flower boxes (instanced across both windows)
+    // windows + flower boxes (instanced across every window)
     const frame = makeToon(C.woodDark);
     const frames = [], glasses = [], boxes = [], dots = [];
     for (const wz of [-2.2, 2.2]) {
@@ -1158,6 +1223,16 @@ export class PlazaRoom extends Room {
       boxes.push(T([fw - 0.22, 1.34, wz]));
       for (let i = 0; i < 5; i++) dots.push(T([fw - 0.24, 1.56, wz - 0.55 + i * 0.28], null, 0.15));
     }
+    // South wall (sw = its local z). It is the face you walk toward from spawn,
+    // and it shipped as 5.2 x 4.0 of blank plaster: a finished-looking shopfront
+    // from the west and an unfinished box from the south. It gets the SAME
+    // window/box/bloom instances turned a quarter turn, so dressing it costs no
+    // extra draw calls and the glass still lerps warm at dusk with the others.
+    const sw = 3.4, wx = 1.15;
+    frames.push(T([wx, 2.2, sw], [0, Math.PI / 2, 0]));
+    glasses.push(T([wx, 2.2, sw + 0.12]));
+    boxes.push(T([wx, 1.34, sw + 0.22], [0, Math.PI / 2, 0]));
+    for (let i = 0; i < 5; i++) dots.push(T([wx - 0.55 + i * 0.28, 1.56, sw + 0.24], null, 0.15));
     inst(g, new THREE.BoxGeometry(0.2, 1.5, 1.7), frame, frames);
     // glass reflects the sky by day and the warm shop interior after dusk
     const glassMat = glowFade(0x9fdcf5, 0.9);
@@ -1166,16 +1241,40 @@ export class PlazaRoom extends Room {
     inst(g, new THREE.BoxGeometry(0.42, 0.3, 1.5), makeToon(C.wood), boxes);
     inst(g, new THREE.IcosahedronGeometry(1, 0), makeToon(C.coral), dots, false, false);
 
-    // striped awning with a scalloped valance
+    // striped awning with a scalloped valance: the long shopfront one, plus a
+    // short one over the south window. Both valance rods ride one instanced
+    // mesh and both scallop runs ride another.
     const stripes = stripeTex();
     stripes.wrapS = stripes.wrapT = THREE.RepeatWrapping;
     stripes.repeat.set(1, 7);
     put(g, new THREE.BoxGeometry(1.95, 0.13, 6.6), toonMap(0xffffff, stripes), fw - 0.92, 3.06, 0,
       { rot: [0, 0, 0.3] });
-    put(g, new THREE.BoxGeometry(0.16, 0.16, 6.7), frame, fw - 1.83, 2.79, 0, { cast: false });
+    const stripesS = stripeTex();
+    stripesS.wrapS = stripesS.wrapT = THREE.RepeatWrapping;
+    stripesS.repeat.set(1, 2.4);   // same stripe width as the shopfront awning
+    // The quarter turn puts the 2.2 length along the wall and the 0.3 tips the
+    // outer lip down toward the plaza, exactly like the west awning.
+    put(g, new THREE.BoxGeometry(1.3, 0.12, 2.2), toonMap(0xffffff, stripesS), wx, 3.15, sw + 0.6,
+      { rot: [0.3, Math.PI / 2, 0] });
+    inst(g, new THREE.BoxGeometry(0.16, 0.16, 6.7), frame, [
+      T([fw - 1.83, 2.79, 0]),
+      T([wx, 2.97, sw + 1.2], [0, Math.PI / 2, 0], [1, 1, 2.2 / 6.7]),
+    ], false, false);
     const scallop = [];
     for (let i = 0; i < 11; i++) scallop.push(T([fw - 1.86, 2.78, -3.0 + i * 0.6], null, [0.16, 0.3, 0.3]));
+    for (let i = 0; i < 5; i++) scallop.push(T([wx - 0.9 + i * 0.45, 2.96, sw + 1.23], null, [0.3, 0.3, 0.16]));
     inst(g, new THREE.SphereGeometry(1, 8, 6), makeToon(C.coral), scallop, false, false);
+
+    // south wall trim: corner posts, a band under the eaves and the poster
+    // board, all four on one instanced box
+    inst(g, new THREE.BoxGeometry(1, 1, 1), frame, [
+      T([0, 3.74, sw + 0.06], null, [5.3, 0.24, 0.22]),
+      T([-2.46, 2.12, sw + 0.06], null, [0.26, 3.48, 0.22]),
+      T([2.46, 2.12, sw + 0.06], null, [0.26, 3.48, 0.22]),
+      T([-1.2, 2.2, sw + 0.07], null, [1.32, 1.62, 0.12]),
+    ], true, true);
+    put(g, new THREE.PlaneGeometry(1.12, 1.4), toonMap(0xffffff, shopPosterTex()),
+      -1.2, 2.2, sw + 0.15, { cast: false });
 
     // shop sign over the awning
     put(g, new THREE.BoxGeometry(0.18, 1.5, 4.1), frame, fw - 0.05, 4.15, 0);
@@ -1357,7 +1456,7 @@ export class PlazaRoom extends Room {
       { x: -13, z: 0, r: 4.2 }, { x: 0, z: -13, r: 4.2 }, { x: 13, z: 2, r: 4.2 },
       { x: 10.6, z: -4.8, r: 6.6 }, { x: 10.9, z: 13.2, r: 7.0 },
       { x: -6.9, z: 6.9, r: 3.0 }, { x: -9.9, z: 4.4, r: 3.0 },
-      { x: -9.4, z: 6.6, r: 2.4 }, { x: 9.6, z: 5.6, r: 2.4 },
+      { x: -9.4, z: 6.6, r: 2.4 }, { x: 10.3, z: 5.9, r: 2.4 },
       { x: -4.6, z: 12.4, r: 2.2 }, // clearing around the lawn bench
       { x: -9.9, z: 11.0, r: 5.6 }, // mural wall: nothing grows in front of it
     ];
@@ -1425,8 +1524,13 @@ export class PlazaRoom extends Room {
 
   // ------------------------------------------------------------ critters --
   _buildCritters(scene, rand) {
+    // Seven, not fourteen, and in the room's own coral/gold rather than the old
+    // near-white pinks. Two unlit pale rectangles flapping over a cobbled square
+    // read as a scrap of paper caught in the wind, not as a butterfly, and at
+    // fourteen of them the plaza was permanently speckled with litter. Saturated
+    // wings at half the count read as the critters they always were.
     const flies = [], wingsA = [], wingsB = [];
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 7; i++) {
       const a = rand() * Math.PI * 2;
       const r = 3.5 + rand() * 11;
       flies.push({
@@ -1438,26 +1542,19 @@ export class PlazaRoom extends Room {
       const target = i % 2 ? wingsB : wingsA;
       target.push(T([0, -9, 0]), T([0, -9, 0]));
     }
-    const wingGeo = new THREE.BoxGeometry(0.34, 0.02, 0.24);
+    const wingGeo = new THREE.BoxGeometry(0.26, 0.02, 0.19);
     this.anim.flies = {
       flies,
-      meshA: inst(scene, wingGeo, makeGlow(0xffd6e8), wingsA, false, false),
-      meshB: inst(scene, wingGeo, makeGlow(0xfff0a8), wingsB, false, false),
+      meshA: inst(scene, wingGeo, makeGlow(C.coral), wingsA, false, false),
+      meshB: inst(scene, wingGeo, makeGlow(C.gold), wingsB, false, false),
     };
 
-    // petals on the breeze
-    const petals = [], pdata = [];
-    for (let i = 0; i < 26; i++) {
-      pdata.push({
-        x: -20 + rand() * 40, y: 0.6 + rand() * 3.4, z: -16 + rand() * 32,
-        sp: 1.1 + rand() * 1.3, ph: rand() * 6.28, spin: 0.6 + rand() * 1.4,
-      });
-      petals.push(T([0, -9, 0]));
-    }
-    this.anim.petals = {
-      mesh: inst(scene, new THREE.CircleGeometry(0.11, 5), glowFade(0xffd7e2, 0.95), petals, false, false),
-      data: pdata,
-    };
+    // The 26 "petals on the breeze" that used to cross the island are gone.
+    // Unlit pale pentagons at head height, drifting in a straight line across
+    // the whole plaza, read as loose sheets of paper blowing through a tidy
+    // town square rather than as blossom, and there were enough of them to
+    // speckle every frame. The butterflies above still carry the ambient
+    // motion; the fountain, bunting and clouds carry the rest.
   }
 
   // ---------------------------------------------------------------- rain --
@@ -1728,21 +1825,10 @@ export class PlazaRoom extends Room {
       a.questStar.rotation.y += dt * 1.3;
     }
 
-    // topiary + pinned papers
+    // topiary
     if (a.topiary) {
       a.topiary.rotation.z = Math.sin(t * 0.9) * 0.035;
       a.topiary.rotation.x = Math.sin(t * 0.7 + 1.0) * 0.025;
-    }
-    if (a.papers) {
-      for (let i = 0; i < a.papers.data.length; i++) {
-        const p = a.papers.data[i];
-        _o2.position.set(p.x, p.y, 0.12);
-        _o2.rotation.set(0, Math.sin(t * 2.4 + p.phase) * 0.35, Math.sin(t * 1.7 + p.phase) * 0.12);
-        _o2.scale.setScalar(1);
-        _o2.updateMatrix();
-        a.papers.mesh.setMatrixAt(i, _o2.matrix);
-      }
-      a.papers.mesh.instanceMatrix.needsUpdate = true;
     }
 
     // grotto glow + rising notes
@@ -1789,26 +1875,6 @@ export class PlazaRoom extends Room {
       }
       a.flies.meshA.instanceMatrix.needsUpdate = true;
       a.flies.meshB.instanceMatrix.needsUpdate = true;
-    }
-
-    // drifting petals
-    if (a.petals) {
-      const d = a.petals.data;
-      for (let i = 0; i < d.length; i++) {
-        const p = d[i];
-        p.x += dt * p.sp * wind;
-        if (p.x > 20) {
-          p.x = -20;
-          p.z += 7.3;
-          if (p.z > 16) p.z -= 32;
-        }
-        _o2.position.set(p.x, p.y + Math.sin(t * 1.4 + p.ph) * 0.5, p.z + Math.sin(t * 0.8 + p.ph) * 1.2);
-        _o2.rotation.set(t * p.spin, t * p.spin * 0.7 + p.ph, 0);
-        _o2.scale.setScalar(1);
-        _o2.updateMatrix();
-        a.petals.mesh.setMatrixAt(i, _o2.matrix);
-      }
-      a.petals.mesh.instanceMatrix.needsUpdate = true;
     }
 
     // rain streaks + puddle gloss (hidden and skipped entirely when dry)

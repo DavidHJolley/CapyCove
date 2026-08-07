@@ -35,22 +35,39 @@ import { MINIGAMES } from '../../../shared/constants.js';
  *
  * Payloads (`k` tags the kind; every field is validated on arrival, unknown
  * kinds are ignored, and only the round's seeker may send clk/cat/mis/snf):
- *   { k:'clk', r, ph, t, x, z, ry }  seeker @5Hz: round, phase ('hide'|'seek'|
- *                                    'over'), seconds left, and their pose so
- *                                    hiders watch them coming
+ *   { k:'clk', r, ph, t, ms, x, z, ry }  seeker @5Hz: round, phase ('hide'|
+ *                                    'seek'), MILLISECONDS left in that phase
+ *                                    (`t` is the same number in seconds, kept
+ *                                    for readability), and their pose so hiders
+ *                                    watch them coming
  *   { k:'hid', r, p, x, z, ry }      hider locks in ONE frame at hide-phase end:
- *                                    prop index + nudge offset + prop yaw
+ *                                    prop index + where they parked it (ABSOLUTE
+ *                                    chamber coords, since a possessed prop may
+ *                                    glide anywhere walkable) + prop yaw
  *   { k:'cat', r, p }                seeker caught whoever is in prop p
  *   { k:'mis', r, x, z }             seeker's wrong click (dust puff everywhere)
  *   { k:'snf', r, x, z }             seeker sniffed here (ripple ring)
  *   { k:'sc',  r, s }                sender's own score for round r
  * The seeker's client is authoritative for catches and for the round clock
  * inside their own round; hiders slave their timer to 'clk'.
+ *
+ * CLOCKS ARE WALL CLOCKS. Every phase owns an absolute Date.now() deadline
+ * (r.introEnd / r.hideEnd / r.seekEnd, this.splashEnd, this.cardEnd) agreed the
+ * moment the hunt starts and re-agreed from the seeker's 'clk' frames. NOTHING
+ * counts down by accumulating rAF dt: a browser freezes rAF in a background
+ * tab, so a tabbed-out capybara would come back minutes behind the round they
+ * are standing in. _advance() walks the machine forward to whatever phase the
+ * wall clock says we are in, one idempotent transition at a time, which is also
+ * why the cave-in curtain can only ever be raised once per round (r.curtain).
  * ---------------------------------------------------------------------------
  *
  * DEVIATIONS from the spec, all deliberate:
  *  - Solo hide phase is 6s, not 25s: the AI hide instantly, so the curtain is
  *    pure theatre and 25s of staring at planks is not a game.
+ *  - A possessed prop is not leashed to its shelf: click anywhere walkable and
+ *    it glides there (gently: a crate that sprints is a crate that gets found).
+ *    The spec's 3-unit nudge made half the chamber unusable and every hider
+ *    findable by elimination.
  *  - The seeker must be within REACH (5.5u) to accuse a prop. Clicking a prop
  *    further away walks them to it instead of costing 5 points, so the -5 is
  *    always a real guess and never a misjudged pixel at 30 metres.
@@ -69,10 +86,13 @@ const ROUNDS = 2;
 const HIDE_SECS = 25;        // party hide phase
 const HIDE_SECS_SOLO = 6;    // solo: AI hide instantly, this is just the curtain
 const SEEK_SECS = 90;
+const SPLASH_SECS = 6;       // party: the splash counts itself down
+const INTRO_SECS = 2.4;      // three countdown beats of 0.8s
+const CARD_SECS = 6;         // the between-rounds interstitial
 const PROP_COUNT = 30;
 const SOLO_HIDERS = 5;
-const LEASH = 3;             // how far a hider may nudge a prop from its origin
-const NUDGE_SPEED = 2.6;
+const GLIDE_SPEED = 2.4;     // a possessed prop creeps; it never sprints
+const GLIDE_TURN = 2.1;
 const REACH = 5.5;           // seeker must be this close to accuse
 const FIND_POINTS = 25;
 const WRONG_PENALTY = 5;
@@ -84,6 +104,12 @@ const CLK_HZ = 5;            // seeker clock/pose broadcasts per second
 const HALF_X = 15.5;         // walkable half-extent of the chamber
 const HALF_Z = 12.5;
 const CEIL_Y = 8.5;
+// The seeker starts here, a few paces in from the door: any closer to the wall
+// and the camera boom has nowhere to stand and the first frame is all floor.
+const SPAWN_Z = HALF_Z - 4.2;
+// Nothing structural hangs below this: the walk/prop cameras top out under it,
+// and anything above it is registered as fadeable overhead (see _overhead).
+const OVERHEAD_Y = 6.3;
 
 const ROCK = 0x6b5b46;
 const ROCK_D = 0x4a3d2e;
@@ -132,6 +158,41 @@ const hex6 = (c) => `#${((c >>> 0) & 0xffffff).toString(16).padStart(6, '0')}`;
 /** Shortest signed angle from a to b. */
 function angDelta(a, b) {
   return ((((b - a) % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+}
+
+/**
+ * Does the segment p->q pass through box `b` (grown by margin m)? Slab test,
+ * used to spot the ceiling beam that has parked itself between the camera and
+ * whatever the player is trying to watch.
+ */
+function segHitsBox(px, py, pz, qx, qy, qz, b, m) {
+  let t0 = 0;
+  let t1 = 1;
+  const lo = [b.x0 - m, b.y0 - m, b.z0 - m];
+  const hi = [b.x1 + m, b.y1 + m, b.z1 + m];
+  const p = [px, py, pz];
+  const d = [qx - px, qy - py, qz - pz];
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(d[i]) < 1e-6) {
+      if (p[i] < lo[i] || p[i] > hi[i]) return false;
+      continue;
+    }
+    let a = (lo[i] - p[i]) / d[i];
+    let c = (hi[i] - p[i]) / d[i];
+    if (a > c) { const t = a; a = c; c = t; }
+    if (a > t0) t0 = a;
+    if (c < t1) t1 = c;
+    if (t0 > t1) return false;
+  }
+  return true;
+}
+
+/** Squared distance from a point to an axis-aligned box. */
+function distToBox2(x, y, z, b) {
+  const dx = Math.max(b.x0 - x, 0, x - b.x1);
+  const dy = Math.max(b.y0 - y, 0, y - b.y1);
+  const dz = Math.max(b.z0 - z, 0, z - b.z1);
+  return dx * dx + dy * dy + dz * dz;
 }
 
 /**
@@ -234,11 +295,17 @@ const PROP_KINDS = [
       parts: [
         { geo: cyl(0.3, 0.36, 0.1, 10), color: IRON_D, y: 0.05 },
         { geo: cyl(0.06, 0.08, 1.5, 8), color: IRON_D, y: 0.8 },
-        { geo: box(0.36, 0.44, 0.36), color: IRON, y: 1.7 },
-        { geo: cone(0.32, 0.22, 8), color: IRON_D, y: 2.03 },
+        // an open cage, not a sealed box: the flame has to be SEEN, or a lit
+        // lantern reads as a black post with a hat on
+        { geo: box(0.34, 0.06, 0.34), color: IRON, y: 1.47 },
+        { geo: box(0.34, 0.06, 0.34), color: IRON, y: 1.93 },
+        ...[[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([sx, sz]) => ({
+          geo: cyl(0.035, 0.035, 0.46, 5), color: IRON, x: sx * 0.14, y: 1.7, z: sz * 0.14,
+        })),
+        { geo: cone(0.32, 0.22, 8), color: IRON_D, y: 2.06 },
         { geo: cyl(0.03, 0.03, 0.3, 6), color: IRON_D, y: 1.7, x: 0.19, z: 0.19 },
       ],
-      glow: [{ geo: sph(0.17, 10, 8), color: AMBER, y: 1.7 }],
+      glow: [{ geo: sph(0.16, 10, 8), color: AMBER, y: 1.7 }],
     }),
   },
   {
@@ -337,9 +404,73 @@ const PROP_KINDS = [
   },
 ];
 
-// Which kinds get drawn more often: a room of nothing but minecarts is not a
-// mine, and the tall silhouettes make the best hiding spots so they stay rare.
-const KIND_WEIGHTS = [14, 8, 13, 7, 12, 8, 10, 6, 7, 5, 10];
+const KIND_IX = {};
+PROP_KINDS.forEach((k, i) => { KIND_IX[k.id] = i; });
+
+/**
+ * WHERE THE PROPS LIVE.
+ *
+ * A prop hunt is only fun if every prop could plausibly be furniture, so the
+ * 30 possessables are not scattered: they fill hand-authored spots in the
+ * chamber that a mining crew would actually use. Crates stack by the walls and
+ * the pantry, barrels ring the mess, lanterns stand at the posts and junctions,
+ * pickaxes lean on the working face, minecarts sit ON the rails, glowcaps grow
+ * in the damp south-west corner, crystal clusters break out of the seams.
+ *
+ * There are more spots than props, so each match's seed picks a subset (and,
+ * where a spot lists alternatives, which of them turns up) with a small jitter:
+ * the same room, arranged by a different shift. `ry` is a fixed yaw for things
+ * that must line up (carts on rails, crates squared to a wall); everything else
+ * gets a seeded angle.
+ */
+const PROP_SLOTS = [
+  // --- the entrance end: crates and barrels dumped just inside the door -----
+  { x: -4.9, z: 11.0, ry: 0.08, k: ['crate_stack'] },
+  { x: -6.3, z: 10.4, ry: -0.2, k: ['crate'] },
+  { x: 5.2, z: 11.1, k: ['barrel'] },
+  { x: 6.5, z: 10.4, k: ['barrel', 'crate'] },
+  { x: 4.6, z: 8.5, k: ['lantern'] },
+  { x: -4.3, z: 7.8, ry: 0.22, k: ['pickaxe'] },
+  { x: 8.4, z: 10.8, k: ['crate'] },
+  // --- the damp south-west corner: puddle, moss, glowcaps ------------------
+  { x: -13.9, z: 10.7, k: ['mushroom_cluster'] },
+  { x: -12.2, z: 11.6, k: ['mushroom'] },
+  { x: -14.4, z: 7.4, k: ['mushroom'] },
+  { x: -11.0, z: 9.1, k: ['rock_pile', 'rock'] },
+  { x: -9.7, z: 11.6, k: ['crate'] },
+  // --- the rail line down the west side ------------------------------------
+  { x: -7.6, z: 5.6, ry: 0, j: 0.1, k: ['minecart'] },
+  { x: -7.6, z: -4.0, ry: 0, j: 0.1, k: ['minecart'] },
+  { x: -9.7, z: 1.6, k: ['rock_pile'] },
+  { x: -5.7, z: -0.6, ry: -0.12, k: ['crate'] },
+  { x: -5.5, z: 7.6, k: ['lantern'] },
+  { x: -9.9, z: -5.6, k: ['barrel'] },
+  { x: -12.9, z: -2.2, ry: 0.05, k: ['crate_stack'] },
+  { x: -13.7, z: 3.4, k: ['crystal'] },
+  // --- the working face along the north wall -------------------------------
+  { x: -3.2, z: -10.5, ry: 0.18, k: ['pickaxe'] },
+  { x: 2.4, z: -10.7, ry: -0.15, k: ['pickaxe'] },
+  { x: -0.7, z: -9.4, k: ['rock'] },
+  { x: 5.4, z: -10.3, k: ['rock_pile'] },
+  { x: 7.9, z: -10.9, k: ['crystal'] },
+  { x: -6.7, z: -10.8, k: ['crystal'] },
+  { x: -1.7, z: -7.3, ry: 0.1, k: ['crate_stack'] },
+  // --- the hoist corner, north-east ----------------------------------------
+  { x: 10.2, z: -11.2, k: ['barrel'] },
+  { x: 14.0, z: -5.4, ry: -0.06, k: ['crate_stack'] },
+  { x: 9.0, z: -6.3, k: ['lantern'] },
+  // --- the shelving and the mess, east -------------------------------------
+  { x: 13.8, z: -1.2, ry: 0.04, k: ['crate'] },
+  { x: 13.6, z: 2.6, ry: -0.05, k: ['crate_stack', 'crate'] },
+  { x: 8.5, z: 4.2, k: ['barrel'] },
+  { x: 12.4, z: 9.7, k: ['barrel', 'crate'] },
+  { x: 14.4, z: 6.0, k: ['mushroom_cluster'] },
+  // --- a few out in the open, so hugging a wall is never a certainty -------
+  { x: 0.6, z: 2.4, k: ['crate', 'barrel'] },
+  { x: -2.7, z: 4.6, k: ['rock'] },
+  { x: 3.7, z: -3.2, ry: 0.3, k: ['crate_stack'] },
+  { x: -3.1, z: -1.0, k: ['lantern'] },
+];
 
 const AI_NAMES = ['Pebble', 'Nibbles', 'Marzipan', 'Twig', 'Coco', 'Bramble',
   'Yuzu', 'Dumpling', 'Sprout', 'Waffle', 'Pickle', 'Mochi'];
@@ -598,6 +729,13 @@ export class PropHuntGame extends Minigame {
     this.raf = 0;
     this.time = 0;
     this._last = 0;
+    // every deadline below is an absolute Date.now() stamp (see the header)
+    this.t0 = Date.now();
+    this.splashEnd = Infinity;
+    this.cardEnd = Infinity;
+    this.now = this.t0;
+    this.overhead = [];
+    this.blockers = [];
     this.disposed = false;
     this.listeners = [];
     this.subs = [];
@@ -630,6 +768,11 @@ export class PropHuntGame extends Minigame {
     super.mount(root);
     this.party = this._readParty();
     this.seed = this.party ? this.party.seed : (Date.now() >>> 0);
+    // The anchor every phase deadline hangs off. In a party this is the moment
+    // 'ph-start' landed, which is the same instant (give or take the wire) on
+    // all six screens, so nobody's splash, hide or seek runs on its own clock.
+    this.t0 = this.party?.t0 || Date.now();
+    this.now = Date.now();
     this._buildDom(root);
     this._buildScene();
     this._buildRoster();
@@ -675,14 +818,22 @@ export class PropHuntGame extends Minigame {
     if (seekIdx < 0) seekIdx = seed % players.length;
     const meIdx = players.findIndex((p) => p.id === this.selfId);
     if (meIdx < 0) return null; // we are not on the roster: hunt alone instead
-    return { seed, players, seekIdx, meIdx };
+    // The lobby may stamp the moment 'ph-start' landed; we only trust it if it
+    // reads as OUR clock (a server-side stamp from a skewed machine would put
+    // every deadline in the wrong century). Missing or odd falls back to now,
+    // which is within a frame of it anyway: we mount on that same message.
+    const stamped = Number(ctx.t0 ?? ctx.at ?? ctx.startedAt);
+    const now = Date.now();
+    const t0 = Number.isFinite(stamped) && Math.abs(now - stamped) < 30000 ? stamped : now;
+    return { seed, players, seekIdx, meIdx, t0 };
   }
 
   /** Match roster: the party, or me plus five AI hiders with capy names. */
   _buildRoster() {
     const mk = (p) => ({
-      ...p, score: 0, roundScore: 0, role: 'hider', prop: -1, ox: 0, oz: 0, ry: 0,
-      caught: false, aliveT: 0, ticks: 0, hidden: false, finds: 0, misses: 0,
+      // px/pz: where this capy parked their prop, in ABSOLUTE chamber coords
+      ...p, score: 0, roundScore: 0, role: 'hider', prop: -1, px: 0, pz: 0, ry: 0,
+      caught: false, caughtAt: 0, ticks: 0, hidden: false, finds: 0, misses: 0,
       // rounds[i] is the banked score for round i; reported[i] is what that
       // player's own client said it was, which always wins over our guess
       rounds: [], reported: [],
@@ -790,6 +941,7 @@ export class PropHuntGame extends Minigame {
     if (!this.card) return;
     const c = this.card;
     this.card = null;
+    if (this.f) { this.f.cardgo = null; this.f.go = null; }
     c.classList.add('out');
     c.addEventListener('animationend', () => c.remove());
   }
@@ -816,7 +968,7 @@ export class PropHuntGame extends Minigame {
           <div class="mg-ph-rcard">
             <h3>IF YOU HIDE</h3>
             <div class="mg-ph-rline"><span class="mg-ph-key">CLICK</span><span>a prop to become it, puff and all.</span></div>
-            <div class="mg-ph-rline"><span class="mg-ph-key">WASD</span><span>shuffle it up to ${LEASH} steps from home.</span></div>
+            <div class="mg-ph-rline"><span class="mg-ph-key">CLICK</span><span>the floor and glide anywhere in the chamber.</span></div>
             <div class="mg-ph-rline"><span class="mg-ph-key">Q / E</span><span>turn it. Then hold very, very still.</span></div>
             <div class="mg-ph-rline"><span class="mg-ph-key">+1</span><span>every ${TICK_SECS} seconds you stay undiscovered.</span></div>
           </div>
@@ -840,14 +992,16 @@ export class PropHuntGame extends Minigame {
       </div>`);
     this.f.go = card.querySelector('[data-f="go"]');
     const play = card.querySelector('[data-a="play"]');
-    if (play) play.onclick = () => this._beginRound(0);
+    if (play) play.onclick = () => this._beginRound(0, Date.now());
     card.querySelector('[data-a="back"]').onclick = () => {
       this.game.audio?.play?.('click');
       this.quit();
     };
     // A party cannot wait for six people to read: the seeker's clock is already
-    // ticking, so the splash counts itself down and any key skips it.
-    this.splashT = party ? 6 : Infinity;
+    // ticking, so the splash counts itself down and any key skips it. The
+    // deadline is absolute, so a client that mounts with its tab in the
+    // background still drops into round 1 with everybody else.
+    this.splashEnd = party ? this.t0 + SPLASH_SECS * 1000 : Infinity;
   }
 
   _popupAt(x, y, z, text, cls = '') {
@@ -923,9 +1077,16 @@ export class PropHuntGame extends Minigame {
     sun.shadow.camera.far = 64;
     sun.shadow.bias = -0.0009;
     this.scene.add(sun);
-    for (const [x, z, c] of [[-9, -7, 0xffb060], [9, -6, 0xffb060], [0, 7, 0xffc27a]]) {
-      const pl = new THREE.PointLight(c, 26, 26, 1.6);
-      pl.position.set(x, 5.4, z);
+    // one warm fill per landmark: the working face, the rail line, the mess
+    // brazier, and a cold one over the damp corner so it reads as damp
+    for (const [x, y, z, c, i, d] of [
+      [0, 4.6, -10.4, 0xffc27a, 26, 22],
+      [-7.6, 5.0, -1.0, 0xffb060, 22, 22],
+      [12.8, 3.2, 7.6, 0xff9a4c, 26, 18],
+      [-12.6, 3.4, 8.6, 0x6fd8d0, 14, 14],
+    ]) {
+      const pl = new THREE.PointLight(c, i, d, 1.6);
+      pl.position.set(x, y, z);
       this.scene.add(pl);
     }
 
@@ -940,9 +1101,9 @@ export class PropHuntGame extends Minigame {
     this.geos.push(ringGeo);
     this.ringGeo = ringGeo;
     this.hoverRing = this._ring(0xf2b64a, 0.85);
-    this.leashRing = this._ring(0x4fb3e8, 0.35);
+    this.moveRing = this._ring(0x4fb3e8, 0.5); // where a possessed prop is gliding
     this.hoverRing.visible = false;
-    this.leashRing.visible = false;
+    this.moveRing.visible = false;
     for (let i = 0; i < 5; i++) {
       const r = this._ring(0xfff6e3, 0);
       r.visible = false;
@@ -976,14 +1137,55 @@ export class PropHuntGame extends Minigame {
   }
 
   /**
-   * The chamber: rock shell, timbers, rails, rubble and stalactites merged into
-   * ONE vertex-coloured mesh (plus one unlit mesh for every glowing bit), so the
-   * whole set dressing is four draw calls and the prop budget goes on props.
+   * Register a merged mesh that hangs OVER the play space (lintels, ceiling
+   * boarding, lantern strings, the roof itself). Each gets its own material and
+   * its own world-space AABB so _updateOcclusion can fade it out of the way the
+   * instant it comes between the camera and whatever the camera is watching.
+   * `roof` pieces simply vanish once the camera climbs above them.
+   */
+  _overhead(parts, opts = {}) {
+    const geo = mergeParts(parts);
+    if (!geo) return null;
+    geo.computeBoundingBox();
+    const mat = opts.glow
+      ? new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true })
+      : makeToon(0xffffff, { unique: true, vertexColors: true, transparent: true });
+    this.geos.push(geo);
+    this.mats.push(mat);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.receiveShadow = !opts.glow;
+    this.scene.add(mesh);
+    const b = geo.boundingBox;
+    this.overhead.push({
+      mesh, mat, fade: 1, roof: !!opts.roof,
+      x0: b.min.x, x1: b.max.x, y0: b.min.y, y1: b.max.y, z0: b.min.z, z1: b.max.z,
+    });
+    return mesh;
+  }
+
+  /**
+   * The chamber: a working corner of the Glimmer Mine in the room's own
+   * language (timber portal frames, lantern strings, a rail line with a spur to
+   * the hoist, a cable-spool mess, shelving, crystal seams, a damp corner). All
+   * of the standing dressing merges into ONE vertex-coloured mesh plus one
+   * unlit mesh for the glowing bits; everything overhead is split out per piece
+   * so it can get out of the camera's way.
    */
   _buildChamber() {
     const rng = mulberry32((this.seed ^ 0x9e3779b9) >>> 0);
     const solid = [];
     const glow = [];
+    this.overhead = [];
+    this.blockers = [];
+
+    const RAIL_X = -7.6;          // the main rail run, down the west side
+    const SPUR_Z = -8.6;          // the spur that feeds the hoist
+    const MESS = { x: 10.8, z: 6.4 };
+    const LIFT = { x: 12.7, z: -8.7 };
+    const POOL = { x: -12.4, z: 9.2 };
+    const DOOR_Z = HALF_Z + 1.0;  // the way in, cut through the south wall
+    /** Static furniture the seeker walks around (props do their own thing). */
+    const block = (x, z, r) => this.blockers.push({ x, z, r });
 
     // ---- floor: one plane with a canvas speckle so it is not a flat slab ----
     const tex = canvasTexture(256, 256, (c, w, h) => {
@@ -995,16 +1197,28 @@ export class PropHuntGame extends Minigame {
         c.globalAlpha = 0.25 + Math.random() * 0.4;
         c.fillRect(Math.random() * w, Math.random() * h, s, s * (0.4 + Math.random()));
       }
-      c.globalAlpha = 1;
-      for (let i = 0; i < 26; i++) { // scuffed cart tracks
-        c.strokeStyle = '#57462f';
+      // a few scuffed cart tracks, faint: any more and packed mine dirt starts
+      // to read as decking
+      c.globalAlpha = 0.35;
+      for (let i = 0; i < 7; i++) {
+        c.strokeStyle = '#5f4d34';
         c.lineWidth = 1 + Math.random() * 2;
         c.beginPath();
         const y = Math.random() * h;
         c.moveTo(0, y);
-        c.lineTo(w, y + (Math.random() - 0.5) * 26);
+        c.lineTo(w, y + (Math.random() - 0.5) * 40);
         c.stroke();
       }
+      c.globalAlpha = 1;
+      for (let i = 0; i < 220; i++) { // grit
+        c.fillStyle = ['#5a482f', '#847053'][(Math.random() * 2) | 0];
+        c.globalAlpha = 0.3 + Math.random() * 0.35;
+        const r = 1 + Math.random() * 2.5;
+        c.beginPath();
+        c.arc(Math.random() * w, Math.random() * h, r, 0, 6.283);
+        c.fill();
+      }
+      c.globalAlpha = 1;
     });
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
@@ -1019,35 +1233,24 @@ export class PropHuntGame extends Minigame {
     this.floor = floor;
 
     // ---- ceiling + stalactites -------------------------------------------
-    // Kept as their own meshes: the hider's free cam flies ABOVE the chamber,
-    // and a roof you cannot see through is not much of a hiding view. Both are
-    // hidden whenever the camera climbs over them (see _updateCamera).
-    const ceil = new THREE.Mesh(
-      new THREE.PlaneGeometry(HALF_X * 2 + 8, HALF_Z * 2 + 8),
-      makeToon(0x231a11),
-    );
-    ceil.rotation.x = Math.PI / 2;
-    ceil.position.y = CEIL_Y;
-    this.scene.add(ceil);
-    this.ceilMeshes = [ceil];
+    // Their own fadeable meshes: the hider's free cam flies ABOVE the chamber,
+    // and a roof you cannot see through is not much of a hiding view.
+    this._overhead([{
+      geo: box(HALF_X * 2 + 8, 0.4, HALF_Z * 2 + 8), color: 0x231a11, y: CEIL_Y + 0.2,
+    }], { roof: true });
     const stal = [];
     for (let i = 0; i < 34; i++) {
       const x = (rng() * 2 - 1) * (HALF_X + 2);
       const z = (rng() * 2 - 1) * (HALF_Z + 2);
-      // capped at 2.3 long so the lowest tip sits at y 6.3: the walk camera
-      // tops out at 5.75 and must never sweep through a stalactite
-      const len = 0.7 + rng() * 1.6;
+      // capped at 2.0 long so the lowest tip sits at y 6.6, clear of OVERHEAD_Y
+      // and well clear of the walk camera: the boom never sweeps through one
+      const len = 0.7 + rng() * 1.3;
       stal.push({
         geo: cone(0.24 + rng() * 0.3, len, 7), color: rng() < 0.5 ? ROCK_D : ROCK,
         x, y: CEIL_Y - len / 2 + 0.1, z, rx: Math.PI,
       });
     }
-    const stalGeo = mergeParts(stal);
-    if (stalGeo) {
-      const sm = new THREE.Mesh(stalGeo, makeToon(0xffffff, { vertexColors: true }));
-      this.scene.add(sm);
-      this.ceilMeshes.push(sm);
-    }
+    this._overhead(stal, { roof: true });
 
     // ---- rock shell: chunky boulders all the way round, plus a solid backing
     const wallAt = (x, z, s, tone) => solid.push({
@@ -1057,7 +1260,8 @@ export class PropHuntGame extends Minigame {
     for (let i = 0; i < 30; i++) {
       const t = (i / 30) * (HALF_X * 2 + 3) - (HALF_X + 1.5);
       wallAt(t, -HALF_Z - 1.1 - rng() * 0.7, 1.1 + rng() * 0.9, i % 3 ? ROCK : ROCK_D);
-      wallAt(t, HALF_Z + 1.1 + rng() * 0.7, 1.1 + rng() * 0.9, i % 3 ? ROCK_D : ROCK);
+      // the south wall opens: that gap is the tunnel the seeker walks in from
+      if (Math.abs(t) > 3.8) wallAt(t, HALF_Z + 1.1 + rng() * 0.7, 1.1 + rng() * 0.9, i % 3 ? ROCK_D : ROCK);
     }
     for (let i = 0; i < 24; i++) {
       const t = (i / 24) * (HALF_Z * 2 + 3) - (HALF_Z + 1.5);
@@ -1083,47 +1287,232 @@ export class PropHuntGame extends Minigame {
       }
     }
 
-    // ---- timber support frames along both long walls ----------------------
-    const frameZ = [-9.6, -3.2, 3.2, 9.6];
-    for (const z of frameZ) {
+    // ---- the way in: a timbered door frame cut through the south wall ------
+    // It sits OUTSIDE the walkable floor: the camera boom stops at z 13.1, so
+    // the seeker cam can never end up behind the frame staring at planks.
+    for (const sx of [-1, 1]) {
+      solid.push({ geo: box(0.44, 4.1, 0.52), color: sx > 0 ? WOOD : WOOD_D, x: sx * 2.9, y: 2.05, z: DOOR_Z });
+      solid.push({ geo: box(0.62, 0.24, 0.7), color: WOOD_D, x: sx * 2.9, y: 0.12, z: DOOR_Z });
+      solid.push({ geo: box(0.24, 0.94, 0.24), color: WOOD_L, x: sx * 2.52, y: 3.56, z: DOOR_Z, rz: sx * 0.72 });
+    }
+    solid.push({ geo: box(7.0, 0.44, 0.62), color: WOOD_L, y: 4.32, z: DOOR_Z });
+    solid.push({ geo: box(6.3, 0.24, 0.74), color: WOOD_D, y: 4.62, z: DOOR_Z });
+    // two receding frames and then darkness: the tunnel back up to the mine
+    for (let i = 1; i <= 2; i++) {
+      const w = 2.45 - i * 0.28;
+      const h = 3.5 - i * 0.34;
       for (const sx of [-1, 1]) {
-        const x = sx * (HALF_X - 0.9);
-        solid.push({ geo: box(0.42, 5.2, 0.42), color: WOOD, x, y: 2.6, z });
-        solid.push({ geo: box(0.5, 0.34, 1.9), color: WOOD_D, x, y: 5.3, z });
-        solid.push({ geo: box(0.32, 1.2, 0.32), color: WOOD_L, x: x - sx * 0.5, y: 4.7, z, rz: sx * 0.7 });
+        solid.push({ geo: box(0.3, h, 0.3), color: i % 2 ? WOOD_D : ROCK_D, x: sx * w, y: h / 2, z: DOOR_Z + 0.62 * i });
       }
-      // lintel beam across the ceiling ties the two posts together
-      solid.push({ geo: box(HALF_X * 2 - 1, 0.4, 0.5), color: WOOD_D, y: 5.35, z });
+      solid.push({ geo: box(w * 2 + 0.5, 0.26, 0.3), color: WOOD_D, y: h, z: DOOR_Z + 0.62 * i });
     }
+    solid.push({ geo: box(6.2, 4.4, 0.4), color: 0x150f0a, y: 2.2, z: DOOR_Z + 1.9 });
 
-    // ---- rail line down the west side with sleepers -----------------------
-    const railX = -7.6;
-    for (const dx of [-0.55, 0.55]) {
-      solid.push({ geo: box(0.14, 0.14, HALF_Z * 2 + 4), color: IRON, x: railX + dx, y: 0.16 });
+    // ---- timber support frames: four bays down the hall --------------------
+    // Posts merge into the room mesh; everything from the lintel up is its own
+    // fadeable piece, because a beam is the most reliable way in all of scenery
+    // to fill a camera with wood.
+    const frame = (z, halfW, h) => {
+      const up = [];
+      for (const sx of [-1, 1]) {
+        const x = sx * halfW;
+        solid.push({ geo: box(0.4, h, 0.4), color: sx > 0 ? WOOD : WOOD_D, x, y: h / 2, z });
+        solid.push({ geo: box(0.56, 0.2, 0.56), color: WOOD_D, x, y: 0.1, z });
+        solid.push({ geo: box(0.24, 1.0, 0.24), color: WOOD_L, x: x - sx * 0.34, y: h - 0.52, z, rz: sx * 0.72 });
+        block(x, z, 0.5);
+      }
+      up.push({ geo: box(halfW * 2 + 0.9, 0.38, 0.44), color: WOOD_L, y: h + 0.19, z });
+      up.push({ geo: box(halfW * 2 + 0.4, 0.2, 0.6), color: WOOD_D, y: h + 0.48, z });
+      for (let i = -1; i <= 1; i++) {
+        up.push({
+          geo: box(halfW * 2 + 0.6, 0.14, 0.34), color: i ? WOOD : WOOD_L,
+          y: h + 0.72, z: z + i * 0.62,
+        });
+      }
+      this._overhead(up);
+    };
+    // posts hug the walls: a support post standing a metre INTO the hall is a
+    // post the camera ends up peering through
+    for (const z of [-9.2, -3.6, 2.0, 7.6]) frame(z, HALF_X - 0.45, 6.4);
+
+    // ---- the rail line: main run west, spur east to the hoist --------------
+    const gauge = 0.55;
+    for (const dx of [-gauge, gauge]) {
+      solid.push({ geo: box(0.12, 0.14, HALF_Z * 2 + 2.6), color: IRON, x: RAIL_X + dx, y: 0.17 });
     }
-    for (let i = 0; i < 22; i++) {
-      solid.push({
-        geo: box(1.7, 0.12, 0.34), color: WOOD_D,
-        x: railX, y: 0.06, z: -HALF_Z - 1.6 + i * 1.25,
+    for (let i = 0; i < 24; i++) {
+      solid.push({ geo: box(1.8, 0.12, 0.32), color: WOOD_D, x: RAIL_X, y: 0.06, z: -HALF_Z - 1 + i * 1.15 });
+    }
+    for (const dz of [-gauge, gauge]) {
+      solid.push({ geo: box(18.2, 0.12, 0.14), color: IRON, x: RAIL_X + 9.1, y: 0.17, z: SPUR_Z + dz });
+    }
+    for (let i = 0; i < 15; i++) {
+      solid.push({ geo: box(0.32, 0.12, 1.8), color: WOOD_D, x: RAIL_X + 0.6 + i * 1.2, y: 0.06, z: SPUR_Z });
+    }
+    solid.push({ geo: box(1.9, 0.14, 1.9), color: IRON_D, x: RAIL_X, y: 0.08, z: SPUR_Z });
+    // buffer stops, coral-tipped exactly like the ones in the room upstairs
+    for (const [bx, bz, ry] of [
+      [RAIL_X, HALF_Z - 0.4, 0], [RAIL_X, -HALF_Z + 0.4, 0], [RAIL_X + 18.4, SPUR_Z, Math.PI / 2],
+    ]) {
+      solid.push({ geo: box(1.4, 0.44, 0.26), color: WOOD_D, x: bx, y: 0.3, z: bz, ry });
+      solid.push({ geo: box(1.46, 0.15, 0.32), color: CORAL, x: bx, y: 0.56, z: bz, ry });
+      block(bx, bz, 0.7);
+    }
+    // ore spilled at the junction, still glinting
+    for (let i = 0; i < 9; i++) {
+      const a = rng() * 6.283;
+      const d = 0.6 + rng() * 1.5;
+      glow.push({
+        geo: oct(0.1 + rng() * 0.08), color: i % 3 ? AMBER : TEAL,
+        x: RAIL_X + Math.cos(a) * d, y: 0.12, z: SPUR_Z + Math.sin(a) * d,
       });
     }
-    // and a short spur east, for the eye
-    for (const dx of [-0.55, 0.55]) {
-      solid.push({ geo: box(0.14, 0.14, 12), color: IRON, x: 9.4 + dx, y: 0.16, z: 3 });
+
+    // ---- the hoist in the north-east corner --------------------------------
+    for (const [ox, oz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      solid.push({
+        geo: box(0.28, 4.8, 0.28), color: ox * oz > 0 ? WOOD : WOOD_D,
+        x: LIFT.x + ox * 1.25, y: 2.4, z: LIFT.z + oz * 1.25,
+      });
+      solid.push({ geo: box(0.42, 0.2, 0.42), color: WOOD_D, x: LIFT.x + ox * 1.25, y: 0.1, z: LIFT.z + oz * 1.25 });
+      solid.push({ geo: box(0.14, 2.3, 0.14), color: IRON, x: LIFT.x + ox * 0.92, y: 1.35, z: LIFT.z + oz * 0.92 });
     }
-    for (let i = 0; i < 10; i++) {
-      solid.push({ geo: box(1.7, 0.12, 0.34), color: WOOD_D, x: 9.4, y: 0.06, z: -2.4 + i * 1.25 });
+    for (const sz of [-1, 1]) {
+      solid.push({ geo: box(3.2, 0.26, 0.28), color: WOOD_L, x: LIFT.x, y: 4.92, z: LIFT.z + sz * 1.25 });
+    }
+    solid.push({ geo: cyl(0.07, 0.07, 2.7, 6), color: IRON_D, x: LIFT.x, y: 5.18, z: LIFT.z, rx: Math.PI / 2 });
+    solid.push({ geo: cyl(0.4, 0.4, 0.16, 12), color: IRON, x: LIFT.x, y: 5.18, z: LIFT.z + 0.6, rx: Math.PI / 2 });
+    solid.push({ geo: box(2.0, 0.16, 2.0), color: WOOD_L, x: LIFT.x, y: 0.2, z: LIFT.z });
+    solid.push({ geo: box(2.12, 0.18, 2.12), color: IRON_D, x: LIFT.x, y: 2.5, z: LIFT.z });
+    for (let i = 0; i < 5; i++) {
+      solid.push({ geo: cyl(0.04, 0.04, 2.2, 5), color: IRON, x: LIFT.x - 0.72 + i * 0.36, y: 1.35, z: LIFT.z - 0.92 });
+    }
+    glow.push({ geo: box(0.2, 0.26, 0.2), color: 0xffd08a, x: LIFT.x + 0.62, y: 2.12, z: LIFT.z + 0.62 });
+    block(LIFT.x, LIFT.z, 1.9);
+
+    // ---- shelving along the east wall --------------------------------------
+    for (const sz of [-2.6, 1.8]) {
+      const sx = HALF_X - 0.5;
+      for (const dz of [-1.5, 1.5]) {
+        solid.push({ geo: box(0.24, 2.7, 0.24), color: WOOD_D, x: sx, y: 1.35, z: sz + dz });
+      }
+      for (let i = 0; i < 3; i++) {
+        solid.push({ geo: box(0.8, 0.12, 3.3), color: i === 1 ? WOOD : WOOD_L, x: sx, y: 0.55 + i * 0.95, z: sz });
+      }
+      for (let i = 0; i < 5; i++) {
+        solid.push({
+          geo: box(0.44, 0.42, 0.44), color: i % 2 ? WOOD_L : WOOD,
+          x: sx - 0.08, y: 0.82 + (i % 3) * 0.95, z: sz - 1.2 + rng() * 2.4, ry: rng() * 0.5,
+        });
+      }
+      glow.push({ geo: oct(0.16), color: rng() < 0.5 ? TEAL : AMBER, x: sx - 0.12, y: 1.68, z: sz + 0.9 });
+      block(sx + 0.3, sz, 1.5);
     }
 
-    // ---- an old elevator cage in the north-east corner (pure decor) -------
-    const cx = HALF_X - 2.6;
-    const cz = -HALF_Z + 2.4;
-    for (const [ox, oz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
-      solid.push({ geo: box(0.2, 3.4, 0.2), color: IRON, x: cx + ox * 1.1, y: 1.7, z: cz + oz * 1.1 });
+    // ---- the mess: cable-spool table, mugs, stools, a brazier --------------
+    solid.push({ geo: cyl(1.1, 1.1, 0.14, 16), color: WOOD_L, x: MESS.x, y: 0.86, z: MESS.z });
+    solid.push({ geo: cyl(0.36, 0.36, 0.86, 10), color: WOOD_D, x: MESS.x, y: 0.43, z: MESS.z });
+    solid.push({ geo: cyl(1.05, 1.05, 0.15, 16), color: WOOD, x: MESS.x, y: 0.07, z: MESS.z });
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * 6.283 + 0.6;
+      const mx = MESS.x + Math.cos(a) * 0.52;
+      const mz = MESS.z + Math.sin(a) * 0.52;
+      solid.push({ geo: cyl(0.13, 0.11, 0.22, 9), color: [CORAL, TEAL, AMBER][i], x: mx, y: 1.04, z: mz });
     }
-    solid.push({ geo: box(2.6, 0.2, 2.6), color: IRON_D, x: cx, y: 0.1, z: cz });
-    solid.push({ geo: box(2.8, 0.24, 2.8), color: IRON_D, x: cx, y: 3.5, z: cz });
-    solid.push({ geo: cyl(0.06, 0.06, 5, 6), color: IRON, x: cx, y: 6, z: cz });
+    // somebody has to make the tea
+    solid.push({ geo: cyl(0.26, 0.3, 0.3, 10), color: IRON, x: MESS.x - 0.24, y: 1.08, z: MESS.z + 0.12 });
+    solid.push({ geo: cyl(0.1, 0.06, 0.24, 6), color: IRON_D, x: MESS.x - 0.52, y: 1.16, z: MESS.z + 0.18, rz: 0.7 });
+    block(MESS.x, MESS.z, 1.5);
+    // barrel stools: the same silhouette as the barrels you can BE, on purpose
+    for (const [sx2, sz2] of [
+      [MESS.x + 1.9, MESS.z - 1.0], [MESS.x - 0.5, MESS.z + 2.0], [MESS.x - 1.9, MESS.z - 0.7],
+    ]) {
+      solid.push({ geo: cyl(0.44, 0.38, 0.86, 12), color: WOOD, x: sx2, y: 0.43, z: sz2 });
+      solid.push({ geo: cyl(0.47, 0.47, 0.1, 12), color: IRON, x: sx2, y: 0.62, z: sz2 });
+      block(sx2, sz2, 0.55);
+    }
+    const BRZ = { x: MESS.x + 2.2, z: MESS.z + 1.4 };
+    solid.push({ geo: cyl(0.54, 0.36, 0.52, 12), color: IRON, x: BRZ.x, y: 0.44, z: BRZ.z });
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * 6.283;
+      solid.push({
+        geo: cyl(0.06, 0.06, 0.42, 5), color: IRON_D,
+        x: BRZ.x + Math.cos(a) * 0.3, y: 0.2, z: BRZ.z + Math.sin(a) * 0.3,
+        rz: Math.cos(a) * 0.3, rx: Math.sin(a) * 0.3,
+      });
+    }
+    glow.push({ geo: sph(0.4, 10, 7), color: 0xff8a3c, x: BRZ.x, y: 0.64, z: BRZ.z, sy: 0.42 });
+    block(BRZ.x, BRZ.z, 0.75);
+
+    // ---- the damp corner, which is why the glowcaps grow down here ---------
+    solid.push({ geo: cyl(1.9, 1.9, 0.1, 20), color: 0x33473f, x: POOL.x, y: 0.04, z: POOL.z });
+    glow.push({ geo: cyl(1.55, 1.55, 0.02, 20), color: 0x1d5f66, x: POOL.x, y: 0.1, z: POOL.z });
+    for (let i = 0; i < 8; i++) {
+      const a = rng() * 6.283;
+      const d = 1.9 + rng() * 1.7;
+      solid.push({
+        geo: dodec(0.26 + rng() * 0.3), color: rng() < 0.5 ? 0x5c6b46 : ROCK_D,
+        x: POOL.x + Math.cos(a) * d, y: 0.12, z: POOL.z + Math.sin(a) * d, sy: 0.6, ry: rng() * 3,
+      });
+    }
+    // moss, kept dim: bright green splats on a mine floor read as spilled paint
+    for (let i = 0; i < 6; i++) {
+      const r = 0.3 + rng() * 0.35;
+      solid.push({
+        geo: cyl(r, r, 0.03, 9), color: 0x33513c,
+        x: POOL.x + (rng() * 2 - 1) * 2.8, y: 0.03, z: POOL.z + (rng() * 2 - 1) * 2.4,
+      });
+    }
+
+    // ---- the working face: the seam this whole chamber is chasing ----------
+    for (let i = 0; i < 8; i++) {
+      const x = -12.4 + i * 3.4 + (rng() - 0.5) * 0.8;
+      const h = 0.9 + rng() * 0.8;
+      solid.push({
+        geo: box(3.0, h, 1.3), color: i % 2 ? ROCK : ROCK_L,
+        x, y: h / 2, z: -HALF_Z - 0.25, ry: (rng() - 0.5) * 0.14,
+      });
+    }
+    // the seam itself: crystal breaking OUT of the rock, every cluster socketed
+    // in its own lump of stone so it reads as a vein and not as floating gems
+    for (let i = 0; i < 14; i++) {
+      const t = i / 13;
+      const x = -11 + t * 21;
+      const y = 0.9 + Math.sin(t * 3.4) * 0.7 + t * 0.5;
+      const z = -HALF_Z - 0.5 + rng() * 0.3;
+      solid.push({
+        geo: dodec(0.5 + rng() * 0.4), color: i % 2 ? ROCK_D : ROCK,
+        x, y: y - 0.3, z: z - 0.4, sy: 0.9, ry: rng() * 3,
+      });
+      for (let j = 0; j < 2; j++) {
+        glow.push({
+          geo: oct(0.2 + rng() * 0.22), color: (i + j) % 3 === 0 ? AMBER : TEAL,
+          x: x + (rng() - 0.5) * 0.8, y: y + (rng() - 0.5) * 0.5, z: z + (rng() - 0.5) * 0.3,
+          sy: 1.3 + rng() * 0.8, ry: rng() * 3, rz: (rng() - 0.5) * 0.9,
+        });
+      }
+    }
+    // the scaffold the last shift left leaning on the face
+    for (const sx of [-1, 1]) {
+      solid.push({ geo: box(0.22, 2.7, 0.22), color: WOOD, x: -9.5 + sx * 1.5, y: 1.35, z: -HALF_Z + 0.95 });
+    }
+    solid.push({ geo: box(3.5, 0.16, 0.9), color: WOOD_L, x: -9.5, y: 1.42, z: -HALF_Z + 0.95 });
+    solid.push({ geo: box(3.5, 0.16, 0.9), color: WOOD, x: -9.5, y: 2.62, z: -HALF_Z + 0.95 });
+    block(-9.5, -HALF_Z + 0.95, 1.7);
+
+    // ---- lanterns bracketed to the walls: where the warm light comes from --
+    for (const [bx, bz, ix, iz] of [
+      [-HALF_X + 0.2, -4.0, 1, 0], [-HALF_X + 0.2, 6.4, 1, 0],
+      [HALF_X - 0.2, -2.0, -1, 0], [HALF_X - 0.2, 9.4, -1, 0],
+      [-2.4, -HALF_Z + 0.2, 0, 1], [7.6, HALF_Z - 0.2, 0, -1],
+    ]) {
+      solid.push({
+        geo: box(ix ? 0.62 : 0.16, 0.14, ix ? 0.16 : 0.62), color: IRON_D,
+        x: bx + ix * 0.3, y: 3.5, z: bz + iz * 0.3,
+      });
+      solid.push({ geo: box(0.34, 0.44, 0.34), color: IRON, x: bx + ix * 0.56, y: 3.24, z: bz + iz * 0.56 });
+      glow.push({ geo: sph(0.17, 8, 6), color: AMBER, x: bx + ix * 0.56, y: 3.24, z: bz + iz * 0.56 });
+    }
 
     // ---- glowing crystal seams pressed into the walls --------------------
     for (let i = 0; i < 22; i++) {
@@ -1134,8 +1523,14 @@ export class PropHuntGame extends Minigame {
       else if (side === 1) { x = along * HALF_X; z = HALF_Z + 0.5; }
       else if (side === 2) { x = -HALF_X - 0.5; z = along * HALF_Z; }
       else { x = HALF_X + 0.5; z = along * HALF_Z; }
-      const y = 0.6 + rng() * 3.4;
+      const y = 0.6 + rng() * 3.0;
       const c = rng() < 0.55 ? AMBER : TEAL;
+      // a knuckle of rock behind every seam: crystals hanging in mid-air on a
+      // dark wall read as bugs, not geology
+      solid.push({
+        geo: dodec(0.7 + rng() * 0.5), color: rng() < 0.5 ? ROCK_D : ROCK,
+        x: x * 1.03, y: y - 0.2, z: z * 1.03, sy: 0.9, ry: rng() * 3,
+      });
       for (let j = 0; j < 3; j++) {
         glow.push({
           geo: oct(0.16 + rng() * 0.22), color: c,
@@ -1145,34 +1540,64 @@ export class PropHuntGame extends Minigame {
       }
     }
 
-    // ---- two lantern strings slung across the ceiling ---------------------
-    // Hung high with a shallow sag: the deepest bulb sits at y 6.1, above the
-    // 5.75 the seeker camera can reach, so the boom never swings through one.
-    for (const [z0, z1, yTop] of [[-8, -5, 7.4], [5, 8, 7.2]]) {
-      const bulbs = 11;
-      for (let i = 0; i < bulbs; i++) {
-        const t = i / (bulbs - 1);
-        const x = -HALF_X + 1 + t * (HALF_X * 2 - 2);
-        const sag = Math.sin(t * Math.PI) * 1.1;
+    // ---- two lantern strings, slung frame to frame ------------------------
+    // Hung at 7.35 with a shallow sag (lowest bulb 6.8), well over every
+    // camera; registered as overhead so that if one ever does cross the shot
+    // it fades instead of dangling in front of the seeker's face.
+    const yTop = 7.35;
+    const sagOf = (t) => yTop - Math.sin(t * Math.PI) * 0.55;
+    for (const [z0, z1] of [[-9.2, -3.6], [2.0, 7.6]]) {
+      const wire = [];
+      const bulbs = [];
+      const n = 11;
+      const xAt = (t) => -HALF_X + 1.2 + t * (HALF_X * 2 - 2.4);
+      for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        const x = xAt(t);
         const z = z0 + (z1 - z0) * t;
-        const y = yTop - sag;
-        glow.push({ geo: sph(0.19, 8, 6), color: i % 3 === 1 ? CORAL : AMBER, x, y, z });
-        solid.push({ geo: cyl(0.035, 0.035, 0.34, 5), color: IRON_D, x, y: y + 0.24, z });
-        if (i < bulbs - 1) {
-          const t2 = (i + 1) / (bulbs - 1);
-          const x2 = -HALF_X + 1 + t2 * (HALF_X * 2 - 2);
-          const y2 = yTop - Math.sin(t2 * Math.PI) * 1.1;
-          const z2 = z0 + (z1 - z0) * t2;
-          const dx = x2 - x; const dy = y2 - y; const dz = z2 - z;
+        const y = sagOf(t);
+        bulbs.push({ geo: sph(0.19, 8, 6), color: i % 3 === 1 ? CORAL : AMBER, x, y, z });
+        wire.push({ geo: cone(0.13, 0.2, 6), color: IRON_D, x, y: y + 0.22, z });
+        if (i < n - 1) {
+          const t2 = (i + 1) / (n - 1);
+          const dx = xAt(t2) - x;
+          const dy = sagOf(t2) - y;
+          const dz = (z0 + (z1 - z0) * t2) - z;
           const len = Math.hypot(dx, dy, dz);
-          solid.push({
+          wire.push({
             geo: cyl(0.022, 0.022, len, 4), color: IRON_D,
-            x: x + dx / 2, y: y + dy / 2 + 0.4, z: z + dz / 2,
-            rz: Math.atan2(dx, dy) * -1, rx: Math.atan2(dz, dy),
+            x: x + dx / 2, y: y + dy / 2 + 0.33, z: z + dz / 2,
+            rz: -Math.atan2(dx, dy), rx: Math.atan2(dz, dy),
           });
         }
       }
+      this._overhead(wire);
+      this._overhead(bulbs, { glow: true });
     }
+
+    // ---- the board over the door, for anyone who wandered in by mistake ---
+    const boardTex = canvasTexture(512, 160, (c, w, h) => {
+      c.fillStyle = '#f4e3c0';
+      c.fillRect(0, 0, w, h);
+      c.strokeStyle = '#8a6642';
+      c.lineWidth = 10;
+      c.strokeRect(9, 9, w - 18, h - 18);
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillStyle = '#8a4a3c';
+      c.font = '900 54px "Trebuchet MS", system-ui, sans-serif';
+      c.fillText('CHAMBER THREE', w / 2, 58);
+      c.fillStyle = '#7a6242';
+      c.font = '700 27px "Trebuchet MS", system-ui, sans-serif';
+      c.fillText('mind the crates', w / 2, 112);
+    });
+    const boardMat = new THREE.MeshBasicMaterial({ map: boardTex });
+    this.mats.push(boardMat);
+    const board = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.0), boardMat);
+    this.geos.push(board.geometry);
+    board.position.set(0, 3.5, DOOR_Z - 0.38);
+    board.rotation.y = Math.PI; // faces into the chamber
+    this.scene.add(board);
 
     const solidGeo = mergeParts(solid);
     if (solidGeo) {
@@ -1238,85 +1663,59 @@ export class PropHuntGame extends Minigame {
       this.props.push({
         i, kind: 0, group, body, glow, ox: 0, oz: 0, x: 0, z: 0, ry0: 0, ry: 0,
         scale: 1, r: 1, h: 1, holder: null, cover: 0, pulse: 0,
+        goto: null, bob: 0, moving: 0, dustT: 0,
       });
       this.pickables.push(body, glow);
     }
   }
 
   /**
-   * Seeded prop layout. Anchors hug the walls and cluster in a few pockets so
-   * the room reads as a working mine, with a scatter of decoys in the open: a
-   * hider by the wall must not be a certainty.
+   * Seeded prop layout, dealt from the authored PROP_SLOTS table so every prop
+   * lands somewhere a mining crew would plausibly have left one. There are more
+   * slots than props: the seed picks which spots this match uses, which kind
+   * fills a slot that lists alternatives, and a small jitter on each. Same
+   * room, arranged by a different shift, identical on all six screens.
    */
   _layoutProps(seed) {
     const rng = mulberry32((seed ^ 0x2f6e2b1) >>> 0);
-    const weightTotal = KIND_WEIGHTS.reduce((a, b) => a + b, 0);
-    const pickKind = () => {
-      let r = rng() * weightTotal;
-      for (let i = 0; i < KIND_WEIGHTS.length; i++) {
-        r -= KIND_WEIGHTS[i];
-        if (r <= 0) return i;
-      }
-      return 0;
-    };
-
-    const anchors = [];
-    for (let i = 0; i < 13; i++) {
-      const side = (rng() * 4) | 0;
-      const along = (rng() * 2 - 1) * 0.86;
-      const inset = 1.5 + rng() * 2.2;
-      if (side === 0) anchors.push({ x: along * HALF_X, z: -HALF_Z + inset });
-      else if (side === 1) anchors.push({ x: along * HALF_X, z: HALF_Z - inset });
-      else if (side === 2) anchors.push({ x: -HALF_X + inset, z: along * HALF_Z });
-      else anchors.push({ x: HALF_X - inset, z: along * HALF_Z });
+    const order = PROP_SLOTS.map((s, i) => i);
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = (rng() * (i + 1)) | 0;
+      const t = order[i]; order[i] = order[j]; order[j] = t;
     }
-    for (let i = 0; i < 4; i++) {
-      anchors.push({ x: (rng() * 2 - 1) * (HALF_X - 5), z: (rng() * 2 - 1) * (HALF_Z - 4.5) });
-    }
+    // sorted back into table order so the deal never bunches the used slots
+    const chosen = order.slice(0, Math.min(PROP_COUNT, order.length)).sort((a, b) => a - b);
 
-    const placed = [];
-    const spawn = { x: 0, z: HALF_Z - 2.4 };
-    for (const p of this.props) {
-      const kind = pickKind();
+    for (let i = 0; i < this.props.length; i++) {
+      const p = this.props[i];
+      const slot = PROP_SLOTS[chosen[i % chosen.length]];
+      const kind = KIND_IX[slot.k[(rng() * slot.k.length) | 0]] ?? 0;
       const k = PROP_KINDS[kind];
-      const scale = 0.88 + rng() * 0.3;
+      const scale = 0.9 + rng() * 0.24;
       const rad = k.r * scale;
-      let x = 0; let z = 0; let ok = false;
-      for (let tries = 0; tries < 80 && !ok; tries++) {
-        if (rng() < 0.68) {
-          const a = anchors[(rng() * anchors.length) | 0];
-          x = a.x + (rng() * 2 - 1) * 2.4;
-          z = a.z + (rng() * 2 - 1) * 2.4;
-        } else {
-          x = (rng() * 2 - 1) * (HALF_X - 1.6);
-          z = (rng() * 2 - 1) * (HALF_Z - 1.6);
-        }
-        if (Math.abs(x) > HALF_X - rad - 0.9 || Math.abs(z) > HALF_Z - rad - 0.9) continue;
-        if (Math.hypot(x - spawn.x, z - spawn.z) < 4.2) continue; // never in the seeker's lap
-        ok = true;
-        for (const q of placed) {
-          if (Math.hypot(x - q.x, z - q.z) < rad + q.r + 0.75 + LEASH * 0.1) { ok = false; break; }
-        }
-      }
-      if (!ok) { x = (rng() * 2 - 1) * (HALF_X - 3); z = (rng() * 2 - 1) * (HALF_Z - 3); }
-      placed.push({ x, z, r: rad });
+      const j = slot.j ?? 0.42;
+      const x = clamp(slot.x + (rng() * 2 - 1) * j, -HALF_X + rad + 0.4, HALF_X - rad - 0.4);
+      const z = clamp(slot.z + (rng() * 2 - 1) * j, -HALF_Z + rad + 0.4, HALF_Z - rad - 0.4);
 
       p.kind = kind;
       p.scale = scale;
       p.r = rad;
       p.h = k.h * scale;
-      p.ox = x; p.oz = z;
+      p.ox = x; p.oz = z;   // home: where the mine left it, and where it resets
       p.x = x; p.z = z;
-      p.ry0 = rng() * Math.PI * 2;
+      // things that must line up (carts on rails, crates squared to a wall)
+      // carry a yaw in the table; everything else gets a seeded angle
+      p.ry0 = slot.ry != null ? slot.ry + (rng() - 0.5) * 0.12 : rng() * Math.PI * 2;
       p.ry = p.ry0;
       p.holder = null;
       p.pulse = 0;
+      p.goto = null;
       p.body.geometry = this.kindGeo[kind].body || this.kindGeo[0].body;
       const gl = this.kindGeo[kind].glow;
       p.glow.visible = !!gl;
       if (gl) p.glow.geometry = gl;
       p.group.position.set(x, 0, z);
-      p.group.rotation.y = p.ry;
+      p.group.rotation.set(0, p.ry, 0);
       p.group.scale.setScalar(scale);
     }
 
@@ -1341,8 +1740,8 @@ export class PropHuntGame extends Minigame {
     this.seekerAv = createAvatar({ color: 0xb08a5a, hat: 'none' });
     this.scene.add(this.seekerAv.group);
     this.seeker = {
-      x: 0, z: HALF_Z - 2.4, ry: Math.PI, anim: 'idle', moveTo: null,
-      netX: 0, netZ: HALF_Z - 2.4, netRy: Math.PI, seen: false, sniffCd: 0,
+      x: 0, z: SPAWN_Z, ry: Math.PI, anim: 'idle', moveTo: null,
+      netX: 0, netZ: SPAWN_Z, netRy: Math.PI, seen: false, sniffReady: 0,
     };
     this.seekerAv.group.position.set(this.seeker.x, 0, this.seeker.z);
 
@@ -1400,8 +1799,21 @@ export class PropHuntGame extends Minigame {
   }
 
   // ------------------------------------------------------------ round flow --
-  /** Kick off round `n` (0-based): assign roles, reset props, start hiding. */
-  _beginRound(n) {
+  /**
+   * Kick off round `n` (0-based): assign roles, reset props, hand the round its
+   * absolute deadlines. `startAt` is the wall-clock ms the round is meant to
+   * begin (the splash deadline, or the previous round card's) so every client
+   * runs the same schedule even if one of them was tabbed out; it may be in the
+   * past, in which case _advance simply catches that client up.
+   *
+   * Idempotent: calling it twice for the round already running (the card button
+   * racing the card timer, a relayed frame arriving mid-transition) is a no-op,
+   * which is what keeps the cave-in curtain to exactly one appearance a round.
+   */
+  _beginRound(n, startAt) {
+    if (this.matchOver || n >= ROUNDS) return;
+    const r0 = this.round;
+    if (r0 && r0.n === n && !r0.over && this.phase !== 'splash' && this.phase !== 'results') return;
     this._clearCard();
     this._clearGhosts();
     for (const p of this.pops || []) { this.scene.remove(p.av.group); p.av.dispose(); }
@@ -1413,9 +1825,9 @@ export class PropHuntGame extends Minigame {
       p.role = i === seekIdx ? 'seeker' : 'hider';
       p.roundScore = 0;
       p.prop = -1;
-      p.ox = 0; p.oz = 0; p.ry = 0;
+      p.px = 0; p.pz = 0; p.ry = 0;
       p.caught = false;
-      p.aliveT = 0;
+      p.caughtAt = 0;
       p.ticks = 0;
       p.hidden = false;
       p.finds = 0;
@@ -1427,33 +1839,40 @@ export class PropHuntGame extends Minigame {
       p.x = p.ox; p.z = p.oz;
       p.ry = p.ry0;
       p.pulse = 0;
+      p.goto = null;
+      p.bob = 0;
+      p.moving = 0;
       p.hiddenByCatch = false;
       p.group.visible = true;
       p.group.position.set(p.x, 0, p.z);
-      p.group.rotation.y = p.ry;
+      p.group.rotation.set(0, p.ry, 0);
       p.group.scale.setScalar(p.scale);
     }
 
     const seekerPlayer = this.roster[seekIdx];
     this.iAmSeeker = this.me === seekerPlayer;
+    const at = Number.isFinite(startAt) ? startAt : Date.now();
+    const hideSecs = this.party ? HIDE_SECS : HIDE_SECS_SOLO;
     this.round = {
-      n, seekIdx, seekerPlayer,
-      phase: 'hide',
-      t: this.party ? HIDE_SECS : HIDE_SECS_SOLO,
-      total: this.party ? HIDE_SECS : HIDE_SECS_SOLO,
-      clkAcc: 0, grace: 3,
+      n, seekIdx, seekerPlayer, hideSecs,
+      at,
+      introEnd: at + INTRO_SECS * 1000,
+      hideEnd: at + (INTRO_SECS + hideSecs) * 1000,
+      seekEnd: at + (INTRO_SECS + hideSecs + SEEK_SECS) * 1000,
+      introStep: 0, curtain: false, over: false, clkAt: 0, grace: this._graceSecs(),
+      t: hideSecs, total: hideSecs,
     };
     this.seekerAv.setColor(seekerPlayer.color);
     this.seekerAv.setHat(seekerPlayer.hat);
     this.seeker.x = 0;
-    this.seeker.z = HALF_Z - 2.4;
+    this.seeker.z = SPAWN_Z;
     this.seeker.ry = Math.PI;
     this.seeker.netX = this.seeker.x;
     this.seeker.netZ = this.seeker.z;
     this.seeker.netRy = this.seeker.ry;
     this.seeker.seen = false;
     this.seeker.moveTo = null;
-    this.seeker.sniffCd = 0;
+    this.seeker.sniffReady = 0;
     this.seekerAv.group.position.set(this.seeker.x, 0, this.seeker.z);
     this.seekerAv.group.rotation.y = this.seeker.ry;
     this.myProp = null;
@@ -1461,8 +1880,7 @@ export class PropHuntGame extends Minigame {
     if (!this.party) this._aiHide();
 
     this.phase = 'intro';
-    this.introT = 2.4; // three beats of 0.8s: "3", "2", "1"
-    this.introStep = 0;
+    this.f.curtain.classList.remove('on');
     this.f.hud.classList.add('on');
     this.f.count.textContent = '';
     this._setCamMode(this.iAmSeeker ? 'walk' : 'free');
@@ -1471,7 +1889,7 @@ export class PropHuntGame extends Minigame {
     this.game.audio?.play?.('whoosh');
   }
 
-  /** AI hiders claim the best-covered props, spread out, with a plausible nudge. */
+  /** AI hiders claim the best-covered props, spread out, and settle in. */
   _aiHide() {
     const rng = mulberry32((this.seed + this.round?.n * 977 + 31) >>> 0);
     const pool = [...this.props].sort((a, b) => (b.cover + rng() * 1.2) - (a.cover + rng() * 1.2));
@@ -1488,11 +1906,13 @@ export class PropHuntGame extends Minigame {
       if (!chosen) chosen = pool.find((p) => !p.holder) || null;
       if (!chosen) continue;
       taken.push(chosen);
+      // AI shuffle their prop a pace or two, never out into the middle of the
+      // floor: a barrel that has wandered somewhere daft gives itself away
       const a = rng() * Math.PI * 2;
       const d = rng() * 1.1;
       who.prop = chosen.i;
-      who.ox = Math.cos(a) * d;
-      who.oz = Math.sin(a) * d;
+      who.px = chosen.ox + Math.cos(a) * d;
+      who.pz = chosen.oz + Math.sin(a) * d;
       who.ry = chosen.ry0 + (rng() - 0.5) * 1.4;
       who.hidden = true;
       chosen.holder = who;
@@ -1500,26 +1920,44 @@ export class PropHuntGame extends Minigame {
     }
   }
 
-  /** Move a prop to the offset/yaw its hider settled on. */
+  /** Park a prop where its hider left it (absolute chamber coords) + yaw. */
   _applyHide(who) {
     const p = this.props[who.prop];
     if (!p) return;
-    const nx = clamp(p.ox + who.ox, -HALF_X + p.r + 0.5, HALF_X - p.r - 0.5);
-    const nz = clamp(p.oz + who.oz, -HALF_Z + p.r + 0.5, HALF_Z - p.r - 0.5);
+    const nx = clamp(who.px, -HALF_X + p.r + 0.4, HALF_X - p.r - 0.4);
+    const nz = clamp(who.pz, -HALF_Z + p.r + 0.4, HALF_Z - p.r - 0.4);
     p.x = nx; p.z = nz;
     p.ry = who.ry;
+    p.goto = null;
     p.group.position.set(nx, 0, nz);
     p.group.rotation.y = p.ry;
   }
 
-  _startSeek() {
+  /** Idempotent: intro -> hide. The curtain drops HERE and only here. */
+  _enterHide(now) {
     const r = this.round;
-    if (!r || r.phase !== 'hide') return;
-    r.phase = 'seek';
+    if (!r || this.phase !== 'intro') return;
+    this.phase = 'hide';
+    this._countNumber(this.iAmSeeker ? 'COVER YOUR EYES' : 'HIDE!', true);
+    this.game.audio?.play?.('whoosh');
+    // No curtain for a hide phase that is already over (a client coming back
+    // from a frozen tab): a blindfold you see for one frame reads as a bug.
+    if (this.iAmSeeker && !r.curtain && r.hideEnd - now > 1200) {
+      r.curtain = true;
+      this.f.curtain.classList.add('on');
+    }
+  }
+
+  /** Idempotent: hide -> seek. Everyone's prop choice locks in right here. */
+  _startSeek(now = Date.now()) {
+    const r = this.round;
+    if (!r || (this.phase !== 'hide' && this.phase !== 'intro')) return;
+    if (this.phase === 'intro') this._enterHide(now);
     this.phase = 'seek';
-    r.t = SEEK_SECS;
-    r.total = SEEK_SECS;
-    r.grace = 3;
+    r.curtain = true;                 // spent for this round, whatever happens
+    r.grace = this._graceSecs();
+    if (r.hideEnd > now) r.hideEnd = now;
+    if (r.seekEnd <= now) r.seekEnd = now + SEEK_SECS * 1000;
     this.f.curtain.classList.remove('on');
 
     if (this.party && !this.iAmSeeker) {
@@ -1531,14 +1969,20 @@ export class PropHuntGame extends Minigame {
         this._possess(pick, true);
       }
       if (this.myProp) {
+        this.myProp.goto = null;
         this.me.prop = this.myProp.i;
+        this.me.px = this.myProp.x;
+        this.me.pz = this.myProp.z;
+        this.me.ry = this.myProp.ry;
         this.me.hidden = true;
         this._send({
           k: 'hid', r: r.n, p: this.myProp.i,
-          x: +this.me.ox.toFixed(2), z: +this.me.oz.toFixed(2), ry: +this.me.ry.toFixed(2),
+          x: +this.myProp.x.toFixed(2), z: +this.myProp.z.toFixed(2), ry: +this.myProp.ry.toFixed(2),
         });
       }
     }
+    // props freeze the moment seeking starts: no drifting, no waddle
+    if (this.myProp) { this.myProp.goto = null; this.myProp.moving = 0; }
     if (this.iAmSeeker) {
       this._setCamMode('walk');
       this._hint('Walk up to anything that looks too pleased with itself, then click it.');
@@ -1553,8 +1997,8 @@ export class PropHuntGame extends Minigame {
   /** Round over: bank everyone's round score and show the interstitial. */
   _endRound(reason) {
     const r = this.round;
-    if (!r || r.phase === 'over') return;
-    r.phase = 'over';
+    if (!r || r.over) return;
+    r.over = true;
     r.reason = reason;
 
     const active = this._activeHiders();
@@ -1586,7 +2030,8 @@ export class PropHuntGame extends Minigame {
 
   _showRoundCard() {
     this.phase = 'roundcard';
-    this.cardT = 6;
+    // absolute again: the next round starts at this stamp on every screen
+    this.cardEnd = Date.now() + CARD_SECS * 1000;
     const r = this.round;
     const swept = this.roster[r.seekIdx].swept;
     const found = this.roster.filter((p) => p.role === 'hider' && p.caught);
@@ -1608,16 +2053,32 @@ export class PropHuntGame extends Minigame {
         </div>
         <div class="mg-ph-score-note">Round ${r.n + 2} of ${ROUNDS}: <b>${esc(nextSeek.name)}</b> takes the lantern.</div>
         <div class="mg-ph-btns">
-          <button class="mg-ph-btn" data-a="next">Next round</button>
+          ${this.party ? '' : '<button class="mg-ph-btn" data-a="next">Next round</button>'}
         </div>
         <div class="mg-ph-blink" data-f="cardgo">starting on its own shortly...</div>
       </div>`);
-    this.card.querySelector('[data-a="next"]').onclick = () => {
-      this.game.audio?.play?.('click');
-      this._beginRound(r.n + 1);
-    };
+    // Solo only: in a party the next round begins on the shared deadline, or
+    // one impatient capybara would be hiding while everyone else reads.
+    const next = this.card.querySelector('[data-a="next"]');
+    if (next) {
+      next.onclick = () => {
+        this.game.audio?.play?.('click');
+        this._beginRound(r.n + 1, Date.now());
+      };
+    }
+    this.f.cardgo = this.card.querySelector('[data-f="cardgo"]');
     this.game.audio?.play?.(swept && this.iAmSeeker ? 'success' : 'ding');
   }
+
+  /**
+   * How long the seeker waits in an apparently empty chamber before calling the
+   * round off. Solo needs no patience (the AI are in their crates before the
+   * curtain lifts); a party needs plenty, because a hider whose tab is in the
+   * background has NO animation frames and only sends their 'hid' the moment
+   * somebody looks at that tab again. Ending the round while a real capybara is
+   * still hiding in a barrel is the worst possible outcome.
+   */
+  _graceSecs() { return this.party ? 15 : 3; }
 
   /** Hiders who actually got into a prop this round (the catchable set). */
   _activeHiders() {
@@ -1717,9 +2178,13 @@ export class PropHuntGame extends Minigame {
     this.boardEl = null;
     this._done = false; // Minigame.finish() guard: a fresh run pays again
     this.seed = (Date.now() >>> 0);
+    this.round = null;  // so _beginRound's "already running" guard lets us in
+    this.t0 = Date.now();
+    this.splashEnd = Infinity;
+    this.cardEnd = Infinity;
     this._buildRoster();
     this._layoutProps(this.seed);
-    this._beginRound(0);
+    this._beginRound(0, Date.now());
   }
 
   _leaveParty() {
@@ -1752,7 +2217,7 @@ export class PropHuntGame extends Minigame {
         if (e.metaKey || e.ctrlKey || e.altKey) return;
         if (['tab', 'shift', 'control', 'alt', 'meta', 'capslock', 'os', 'contextmenu'].includes(k)) return;
         e.preventDefault();
-        this._beginRound(0);
+        this._beginRound(0, Date.now());
         return;
       }
       if (e.repeat) return;
@@ -1852,8 +2317,18 @@ export class PropHuntGame extends Minigame {
       this.seeker.moveTo = { x: clamp(hit.point.x, -HALF_X + 0.6, HALF_X - 0.6), z: clamp(hit.point.z, -HALF_Z + 0.6, HALF_Z - 0.6) };
       return;
     }
-    // hider: click a prop to become it (hide phase only)
-    if (this.phase !== 'hide' || !hit.prop) return;
+    // hider: click a prop to become it, or click the floor to glide there
+    if (this.phase !== 'hide') return;
+    if (!hit.prop) {
+      const p = this.myProp;
+      if (!p) return;
+      p.goto = {
+        x: clamp(hit.point.x, -HALF_X + p.r + 0.4, HALF_X - p.r - 0.4),
+        z: clamp(hit.point.z, -HALF_Z + p.r + 0.4, HALF_Z - p.r - 0.4),
+      };
+      this.game.audio?.play?.('click');
+      return;
+    }
     if (this.myProp === hit.prop) return;
     if (this.party && hit.prop.holder && hit.prop.holder !== this.me) return;
     this._possess(hit.prop, false);
@@ -1869,12 +2344,18 @@ export class PropHuntGame extends Minigame {
       old.x = old.ox; old.z = old.oz; old.ry = old.ry0;
       old.group.position.set(old.x, 0, old.z);
       old.group.rotation.y = old.ry;
+      old.group.rotation.z = 0;
       old.pulse = 0;
+      old.goto = null;
+      old.bob = 0;
+      // stop the waddle dead: a crate left bobbing on its own is a giveaway
+      old.moving = 0;
     }
     this.myProp = prop;
     prop.holder = this.me;
+    prop.goto = null;
     this.me.prop = prop.i;
-    this.me.ox = 0; this.me.oz = 0;
+    this.me.px = prop.x; this.me.pz = prop.z;
     this.me.ry = prop.ry;
     this.me.hidden = true;
     this.particles.burst(prop.x, prop.h * 0.5, prop.z, 16, {
@@ -1883,48 +2364,63 @@ export class PropHuntGame extends Minigame {
     this.game.audio?.play?.('pop');
     if (!auto) this._popupAt(prop.x, prop.h + 0.5, prop.z, 'possessed!', 'teal');
     this._setCamMode('prop');
-    this.leashRing.position.set(prop.ox, 0.05, prop.oz);
-    this.leashRing.scale.setScalar(LEASH);
   }
 
-  /** WASD shuffles the possessed prop, Q/E turns it, both inside the leash. */
-  _nudgeProp(dt) {
+  /**
+   * Free prop movement. Click anywhere walkable and the prop glides there at a
+   * strolling pace; WASD steers it directly (camera-relative) and cancels the
+   * click order; Q/E turn it on the spot. No leash and no prop-prop collision:
+   * the chamber is the only boundary, and two crates overlapping for a moment
+   * matters far less than a hider who cannot reach the corner they want.
+   */
+  _updateGlide(dt) {
     const p = this.myProp;
     if (!p || this.phase !== 'hide') return;
     const k = this.keys;
+    if (k.has('q')) { p.ry += dt * GLIDE_TURN; p.group.rotation.y = p.ry; }
+    if (k.has('e')) { p.ry -= dt * GLIDE_TURN; p.group.rotation.y = p.ry; }
+    this.me.ry = p.ry;
+
     let ix = 0; let iz = 0;
     if (k.has('w') || k.has('arrowup')) iz -= 1;
     if (k.has('s') || k.has('arrowdown')) iz += 1;
     if (k.has('a') || k.has('arrowleft')) ix -= 1;
     if (k.has('d') || k.has('arrowright')) ix += 1;
-    if (k.has('q')) { p.ry += dt * 2.1; this.me.ry = p.ry; p.group.rotation.y = p.ry; }
-    if (k.has('e')) { p.ry -= dt * 2.1; this.me.ry = p.ry; p.group.rotation.y = p.ry; }
-    if (!ix && !iz) return;
-    const len = Math.hypot(ix, iz) || 1;
-    const yaw = this.cam.yaw;
-    const fx = -Math.sin(yaw); const fz = -Math.cos(yaw);
-    const rx = -fz; const rz = fx;
-    let nx = p.x + (fx * (-iz) + rx * ix) / len * NUDGE_SPEED * dt;
-    let nz = p.z + (fz * (-iz) + rz * ix) / len * NUDGE_SPEED * dt;
-    // leash: never further than LEASH from where the mine put this prop
-    const dx = nx - p.ox; const dz = nz - p.oz;
-    const d = Math.hypot(dx, dz);
-    if (d > LEASH) { nx = p.ox + (dx / d) * LEASH; nz = p.oz + (dz / d) * LEASH; }
-    nx = clamp(nx, -HALF_X + p.r + 0.5, HALF_X - p.r - 0.5);
-    nz = clamp(nz, -HALF_Z + p.r + 0.5, HALF_Z - p.r - 0.5);
-    for (const q of this.props) {
-      if (q === p) continue;
-      if (Math.hypot(nx - q.x, nz - q.z) < p.r + q.r + 0.15) return; // blocked
+    let vx = 0; let vz = 0;
+    if (ix || iz) {
+      p.goto = null;
+      const len = Math.hypot(ix, iz);
+      const yaw = this.cam.yaw;
+      const fx = -Math.sin(yaw); const fz = -Math.cos(yaw);
+      vx = (fx * -iz + -fz * ix) / len;
+      vz = (fz * -iz + fx * ix) / len;
+    } else if (p.goto) {
+      const dx = p.goto.x - p.x;
+      const dz = p.goto.z - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d < 0.18) { p.goto = null; } else { vx = dx / d; vz = dz / d; }
     }
-    p.x = nx; p.z = nz;
-    p.group.position.set(nx, 0, nz);
-    this.me.ox = nx - p.ox;
-    this.me.oz = nz - p.oz;
+    if (!vx && !vz) { p.moving = Math.max(0, p.moving - dt * 4); return; }
+
+    p.moving = Math.min(1, p.moving + dt * 5);
+    p.x = clamp(p.x + vx * GLIDE_SPEED * dt, -HALF_X + p.r + 0.4, HALF_X - p.r - 0.4);
+    p.z = clamp(p.z + vz * GLIDE_SPEED * dt, -HALF_Z + p.r + 0.4, HALF_Z - p.r - 0.4);
+    p.group.position.set(p.x, p.group.position.y, p.z);
+    this.me.px = p.x;
+    this.me.pz = p.z;
+    // a sneaking crate scuffs up dust, which is the whole joke
+    p.dustT -= dt;
+    if (p.dustT <= 0) {
+      p.dustT = 0.22;
+      this.particles.burst(p.x, 0.12, p.z, 2, {
+        colors: [0xa5906c, 0x8a785c], spread: 0.5, up: 0.7, size: 0.5, life: 0.5, g: 4,
+      });
+    }
   }
 
   _accuse(prop) {
     const r = this.round;
-    if (!r || r.phase !== 'seek') return;
+    if (!r || this.phase !== 'seek' || r.over) return;
     const victims = this.roster.filter((p) => p.role === 'hider' && !p.caught && p.prop === prop.i);
     if (victims.length) {
       if (this.party) this._send({ k: 'cat', r: r.n, p: prop.i });
@@ -1952,6 +2448,8 @@ export class PropHuntGame extends Minigame {
     if (!victims.length) return;
     for (const v of victims) {
       v.caught = true;
+      // stamped, not accumulated: survival points are (caughtAt - seekStart)
+      v.caughtAt = Date.now();
       this.roster[r.seekIdx].finds++;
       this._popCapy(v, prop.x, prop.z);
       if (v === this.me) {
@@ -1982,8 +2480,9 @@ export class PropHuntGame extends Minigame {
   /** Free warm/cold read: how many hiders are within SNIFF_R of the seeker. */
   _sniff() {
     if (!this.iAmSeeker || this.phase !== 'seek') return;
-    if (this.seeker.sniffCd > 0) { this.game.audio?.play?.('click'); return; }
-    this.seeker.sniffCd = SNIFF_CD;
+    const now = Date.now();
+    if (now < this.seeker.sniffReady) { this.game.audio?.play?.('click'); return; }
+    this.seeker.sniffReady = now + SNIFF_CD * 1000;
     const n = this._activeHiders().filter((h) => !h.caught
       && Math.hypot(this.props[h.prop].x - this.seeker.x, this.props[h.prop].z - this.seeker.z) < SNIFF_R).length;
     this._ripple(this.seeker.x, this.seeker.z, n ? 0xf2b64a : 0x7f92a5);
@@ -2004,9 +2503,10 @@ export class PropHuntGame extends Minigame {
   // ---------------------------------------------------------------- camera --
   _setCamMode(mode) {
     this.cam.mode = mode;
-    // walk and prop stay UNDER the 8.5 ceiling; free flies over it
-    if (mode === 'walk') { this.cam.dist = 9.5; this.cam.pitch = 0.5; this.cam.yaw = 0; }
-    if (mode === 'prop') { this.cam.dist = 9; this.cam.pitch = 0.52; }
+    // walk and prop sit well UNDER the timbers (eye ~5.0 against a 6.4 post);
+    // free flies over the roof, which fades away when it does
+    if (mode === 'walk') { this.cam.dist = 9.5; this.cam.pitch = 0.44; this.cam.yaw = 0; }
+    if (mode === 'prop') { this.cam.dist = 9; this.cam.pitch = 0.46; }
     if (mode === 'free') { this.cam.dist = 22; this.cam.pitch = 0.95; }
     this.wrap.classList.toggle('seek', mode === 'walk');
   }
@@ -2070,12 +2570,17 @@ export class PropHuntGame extends Minigame {
      * the whole boom (horizontal AND vertical) shortens by the same factor
      * until the camera is back inside, which reads as the camera politely
      * stepping in for a close shot rather than snapping overhead.
-     * Above the ceiling the spring is off: the free cam is meant to fly over
-     * the roof (which we hide) and look down at the floor.
+     * Only ABOVE the roof is the spring off: the free cam is meant to fly over
+     * the ceiling (which fades) and look down at the floor. Below that the
+     * camera stays inside the timber line, so it can never end up outside the
+     * chamber peering in between the support posts.
      */
-    if (wantY < CEIL_Y - 0.3) {
-      const limX = HALF_X + 0.6;
-      const limZ = HALF_Z + 0.6;
+    let lookX = c.tx;
+    let lookY = c.ty;
+    let lookZ = c.tz;
+    if (wantY < CEIL_Y + 0.5) {
+      const limX = HALF_X - 0.7;
+      const limZ = HALF_Z - 0.7;
       const ox = wantX - c.tx;
       const oz = wantZ - c.tz;
       let f = 1;
@@ -2089,9 +2594,19 @@ export class PropHuntGame extends Minigame {
       wantX = c.tx + ox * f;
       wantZ = c.tz + oz * f;
       // keep most of the height while the horizontal boom compresses: a camera
-      // that gets close AND low (seeker spawns 2.4 from the south wall) reads
-      // as jammed; sliding up the wall reads as an over-shoulder shot
-      wantY = c.ty + (wantY - c.ty) * Math.max(f, 0.7);
+      // that gets close AND low reads as jammed; sliding up the wall reads as
+      // an over-shoulder shot
+      wantY = c.ty + (wantY - c.ty) * Math.max(f, 0.72);
+      // ...and look PAST the subject by as much as the boom lost. Without this
+      // the shot at a wall collapses into a top-down of the seeker's hat: the
+      // spawn frame was all floor and no chamber.
+      if (f < 0.95) {
+        const push = (1 - f) * 5.5;
+        const dl = Math.hypot(ox, oz) || 1;
+        lookX = c.tx - (ox / dl) * push;
+        lookZ = c.tz - (oz / dl) * push;
+        lookY = c.ty + (1 - f) * 0.5;
+      }
     }
 
     const kk = Math.min(1, dt * 7);
@@ -2099,14 +2614,42 @@ export class PropHuntGame extends Minigame {
     n.x = lerp(n.x, wantX, kk);
     n.y = lerp(n.y, clamp(wantY, 1.5, 30), kk);
     n.z = lerp(n.z, wantZ, kk);
-    n.tx = lerp(n.tx, c.tx, kk);
-    n.ty = lerp(n.ty, c.ty, kk);
-    n.tz = lerp(n.tz, c.tz, kk);
-    // over the roof, the roof goes away
-    const overhead = n.y > CEIL_Y - 0.3;
-    for (const m of this.ceilMeshes || []) m.visible = !overhead;
+    n.tx = lerp(n.tx, lookX, kk);
+    n.ty = lerp(n.ty, lookY, kk);
+    n.tz = lerp(n.tz, lookZ, kk);
     this.camera.position.set(n.x, n.y, n.z);
     this.camera.lookAt(n.tx, n.ty, n.tz);
+    this._updateOcclusion(dt);
+  }
+
+  /**
+   * Nothing that hangs from the roof may EVER sit between the camera and what
+   * the camera is watching: the playtester's seeker cam was a screenful of
+   * ceiling beam. Every overhead piece keeps its own world AABB; if the eye ->
+   * look-target segment passes through it, or the eye is right up against it,
+   * it fades to a whisper and stops writing depth. Roof pieces (the ceiling and
+   * its stalactites) simply go away once the free cam climbs above them.
+   */
+  _updateOcclusion(dt) {
+    const n = this.camNow;
+    const above = n.y > CEIL_Y - 0.3;
+    const k = Math.min(1, dt * 9);
+    for (const o of this.overhead) {
+      let want = 1;
+      // Looking down from over the roof, the WHOLE ceiling structure clears
+      // out, not just the ceiling: a hider picking a spot has to see the floor,
+      // not four support beams and a bunting of lanterns lying across it.
+      if (above && n.y > o.y0) want = 0;
+      else if (segHitsBox(n.x, n.y, n.z, n.tx, n.ty, n.tz, o, 0.35)) want = 0.05;
+      else if (distToBox2(n.x, n.y, n.z, o) < 9) want = 0.05; // 3 units of nose
+      o.fade = lerp(o.fade, want, k);
+      const vis = o.fade > 0.02;
+      o.mesh.visible = vis;
+      if (!vis) continue;
+      o.mat.opacity = o.fade;
+      o.mat.transparent = o.fade < 0.995;
+      o.mat.depthWrite = o.fade > 0.9;
+    }
   }
 
   // ------------------------------------------------------------ per frame ---
@@ -2121,39 +2664,26 @@ export class PropHuntGame extends Minigame {
   }
 
   _update(dt) {
+    const now = Date.now();
+    this.now = now;
     this.particles.update(dt);
     this._updateAmbient(dt);
+    this._advance(now);
 
     switch (this.phase) {
       case 'splash':
-        this.splashT -= dt;
         if (this.f.go && this.party) {
-          const s = Math.max(0, Math.ceil(this.splashT));
+          const s = Math.max(0, Math.ceil((this.splashEnd - now) / 1000));
           this.f.go.textContent = `the lanterns go out in ${s}...`;
         }
-        if (this.splashT <= 0) this._beginRound(0);
         break;
-      case 'intro': {
-        this.introT -= dt;
-        const n = Math.ceil(this.introT / 0.8); // 3, 2, 1
-        if (n >= 1 && n <= 3 && n !== this.introStep) {
-          this.introStep = n;
-          this._countNumber(String(n), false);
-          this.game.audio?.play?.('tick');
-        }
-        if (this.introT <= 0) {
-          this.phase = 'hide';
-          this._countNumber(this.iAmSeeker ? 'COVER YOUR EYES' : 'HIDE!', true);
-          this.game.audio?.play?.('whoosh');
-          if (this.iAmSeeker) this.f.curtain.classList.add('on');
-        }
-        break;
-      }
-      case 'hide': this._updateHide(dt); break;
-      case 'seek': this._updateSeek(dt); break;
+      case 'hide': this._updateHide(dt, now); break;
+      case 'seek': this._updateSeek(dt, now); break;
       case 'roundcard':
-        this.cardT -= dt;
-        if (this.cardT <= 0 && this.round) this._beginRound(this.round.n + 1);
+        if (this.f.cardgo) {
+          const s = Math.max(0, Math.ceil((this.cardEnd - now) / 1000));
+          this.f.cardgo.textContent = s > 0 ? `next round in ${s}...` : 'here we go...';
+        }
         break;
       default: break;
     }
@@ -2166,46 +2696,80 @@ export class PropHuntGame extends Minigame {
     this._updateHud();
   }
 
-  _updateHide(dt) {
+  /**
+   * The phase machine, driven entirely by the wall clock. Each step is
+   * idempotent and each one is CHECKED, not chained, so a client returning from
+   * a frozen tab walks intro -> hide -> seek -> card in as many frames as it
+   * takes and lands in the phase everyone else is already in. Nothing here
+   * counts down: `now` is Date.now(), and the deadlines were agreed at the
+   * start of the hunt (and re-agreed from the seeker's 'clk' frames).
+   */
+  _advance(now) {
+    if (this.phase === 'splash') {
+      if (now >= this.splashEnd) this._beginRound(0, this.splashEnd);
+      return;
+    }
     const r = this.round;
     if (!r) return;
-    r.t -= dt;
+    if (this.phase === 'intro') {
+      const beat = (INTRO_SECS / 3) * 1000;
+      const step = Math.ceil((r.introEnd - now) / beat); // 3, 2, 1
+      if (step >= 1 && step <= 3 && step !== r.introStep) {
+        r.introStep = step;
+        this._countNumber(String(step), false);
+        this.game.audio?.play?.('tick');
+      }
+      if (now >= r.introEnd) this._enterHide(now);
+    }
+    if (this.phase === 'hide' && now >= r.hideEnd) this._startSeek(now);
+    if (this.phase === 'seek' && now >= r.seekEnd) this._endRound('time');
+    if (this.phase === 'roundcard' && now >= this.cardEnd) this._beginRound(r.n + 1, this.cardEnd);
+  }
+
+  _updateHide(dt, now) {
+    const r = this.round;
+    if (!r) return;
+    r.t = Math.max(0, (r.hideEnd - now) / 1000);
+    r.total = r.hideSecs;
     if (this.iAmSeeker) {
       this.f.cnum.textContent = String(Math.max(0, Math.ceil(r.t)));
-      this._broadcastClock(dt, 'hide');
+      this._broadcastClock(now, 'hide');
     } else {
-      this._nudgeProp(dt);
+      this._updateGlide(dt);
       this._updateHoverRing();
       if (!this.myProp) {
         this._hint('Click any prop to become it. Somewhere nobody would look twice.');
       } else {
-        this._hint('WASD to shuffle it, Q/E to turn it. Then freeze.');
+        this._hint('Click the floor to glide anywhere. Q/E turn it. Then freeze.');
       }
     }
-    if (r.t <= 0) this._startSeek();
   }
 
-  _updateSeek(dt) {
+  _updateSeek(dt, now) {
     const r = this.round;
     if (!r) return;
-    r.t -= dt;
+    r.t = Math.max(0, (r.seekEnd - now) / 1000);
+    r.total = SEEK_SECS;
     if (this.iAmSeeker) {
       this._updateSeekerWalk(dt);
-      this._broadcastClock(dt, 'seek');
-      this.seeker.sniffCd = Math.max(0, this.seeker.sniffCd - dt);
+      this._broadcastClock(now, 'seek');
       this._updateHoverRing();
     } else {
       this._updateHoverRing(true);
     }
 
-    // survival ticks for every hider still pretending to be furniture
+    // Survival ticks, measured between wall-clock stamps rather than added up
+    // frame by frame: a hider whose tab was in the background still earns every
+    // point they sat still for.
+    const start = r.seekEnd - SEEK_SECS * 1000;
     for (const h of this._activeHiders()) {
-      if (h.caught) continue;
-      h.aliveT += dt;
-      const t = Math.floor(h.aliveT / TICK_SECS);
+      const end = Math.min(h.caught ? (h.caughtAt || now) : now, r.seekEnd);
+      const t = Math.floor(clamp((end - start) / 1000, 0, SEEK_SECS) / TICK_SECS);
       if (t > h.ticks) {
+        const jump = t - h.ticks;
         h.ticks = t;
-        if (h === this.me && this.myProp) {
+        // only cheer for a tick we were actually present for
+        if (h === this.me && this.myProp && jump === 1) {
           this._popupAt(this.myProp.x, this.myProp.h + 0.6, this.myProp.z, '+1', 'teal');
           this.game.audio?.play?.('tick');
         }
@@ -2216,9 +2780,8 @@ export class PropHuntGame extends Minigame {
     if (active.length && active.every((h) => h.caught)) { this._endRound('sweep'); return; }
     if (!active.length) {
       r.grace -= dt;
-      if (r.grace <= 0) { this._endRound('empty'); return; }
+      if (r.grace <= 0) this._endRound('empty');
     }
-    if (r.t <= 0) this._endRound('time');
   }
 
   /** Seeker movement: WASD (camera-relative) or a click-to-walk order. */
@@ -2251,7 +2814,8 @@ export class PropHuntGame extends Minigame {
       let nz = s.z + vz * SEEK_SPEED * dt;
       nx = clamp(nx, -HALF_X + 0.6, HALF_X - 0.6);
       nz = clamp(nz, -HALF_Z + 0.6, HALF_Z - 0.6);
-      // slide around props instead of walking through the furniture
+      // slide around props and the standing furniture instead of walking
+      // through the mess table
       for (const p of this.props) {
         if (p.hiddenByCatch) continue;
         const dx = nx - p.x; const dz = nz - p.z;
@@ -2260,6 +2824,15 @@ export class PropHuntGame extends Minigame {
         if (d < min && d > 0.0001) {
           nx = p.x + (dx / d) * min;
           nz = p.z + (dz / d) * min;
+        }
+      }
+      for (const b of this.blockers) {
+        const dx = nx - b.x; const dz = nz - b.z;
+        const min = b.r + 0.45;
+        const d = Math.hypot(dx, dz);
+        if (d < min && d > 0.0001) {
+          nx = b.x + (dx / d) * min;
+          nz = b.z + (dz / d) * min;
         }
       }
       s.x = clamp(nx, -HALF_X + 0.6, HALF_X - 0.6);
@@ -2306,13 +2879,21 @@ export class PropHuntGame extends Minigame {
       p.pulse = lerp(p.pulse, mine ? 1 : 0, Math.min(1, dt * 6));
       const s = p.scale * (1 + p.pulse * (0.035 + Math.sin(t * 4) * 0.025));
       p.group.scale.setScalar(s);
+      // a gliding prop waddles: two dozen kilos of crate, walking
+      if (p.moving > 0.001 || p.group.position.y > 0.001) {
+        p.bob = p.moving > 0.01 ? Math.abs(Math.sin(t * 7)) * 0.075 * p.moving : lerp(p.group.position.y, 0, Math.min(1, dt * 8));
+        p.group.position.set(p.x, p.bob, p.z);
+        p.group.rotation.z = Math.sin(t * 7) * 0.03 * p.moving;
+      }
     }
-    const showLeash = !!this.myProp && this.phase === 'hide';
-    this.leashRing.visible = showLeash;
-    if (showLeash) {
-      this.leashRing.position.set(this.myProp.ox, 0.05, this.myProp.oz);
-      this.leashRing.scale.setScalar(LEASH);
-      this.leashRing.material.opacity = 0.25 + Math.sin(t * 3) * 0.08;
+    // where a possessed prop has been told to go
+    const p2 = this.myProp;
+    const showMove = !!(p2 && p2.goto && this.phase === 'hide');
+    this.moveRing.visible = showMove;
+    if (showMove) {
+      this.moveRing.position.set(p2.goto.x, 0.05, p2.goto.z);
+      this.moveRing.scale.setScalar(0.55 + Math.sin(t * 5) * 0.06);
+      this.moveRing.material.opacity = 0.4 + Math.sin(t * 5) * 0.14;
     }
   }
 
@@ -2409,14 +2990,18 @@ export class PropHuntGame extends Minigame {
 
     const phaseTxt = this.phase === 'hide' ? 'Hiding' : this.phase === 'seek' ? 'Seeking' : 'Round over';
     if (c.phase !== phaseTxt) { c.phase = phaseTxt; this.f.phaselbl.textContent = phaseTxt; }
-    const secs = Math.max(0, Math.ceil(r.t));
+    // straight off the wall clock: no accumulator to drift or freeze
+    const end = this.phase === 'seek' ? r.seekEnd : r.hideEnd;
+    const total = this.phase === 'seek' ? SEEK_SECS : r.hideSecs;
+    const left = clamp((end - this.now) / 1000, 0, total);
+    const secs = Math.max(0, Math.ceil(left));
     if (c.secs !== secs) {
       c.secs = secs;
       this.f.clock.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
       this.f.clock.classList.toggle('warn', secs <= 10 && live);
       if (secs <= 5 && secs > 0 && live) this.game.audio?.play?.('tick');
     }
-    this.f.bar.style.width = `${clamp((r.t / r.total) * 100, 0, 100)}%`;
+    this.f.bar.style.width = `${clamp((left / total) * 100, 0, 100)}%`;
 
     const active = this._activeHiders();
     const leftN = active.filter((h) => !h.caught).length;
@@ -2442,7 +3027,7 @@ export class PropHuntGame extends Minigame {
     const showSniff = this.iAmSeeker && this.phase === 'seek';
     this.f.sniff.classList.toggle('on', showSniff);
     if (showSniff) {
-      const cd = this.seeker.sniffCd;
+      const cd = Math.max(0, (this.seeker.sniffReady - this.now) / 1000);
       this.f.sniff.classList.toggle('cool', cd > 0);
       const txt = cd > 0 ? `${cd.toFixed(1)}s` : 'ready';
       if (c.sniff !== txt) { c.sniff = txt; this.f.sniffst.textContent = txt; }
@@ -2516,15 +3101,20 @@ export class PropHuntGame extends Minigame {
     this.game.net?.send?.({ t: 'ph-done', score: Math.max(0, Math.round(score) || 0) });
   }
 
-  /** The seeker owns the round clock and their own pose, at CLK_HZ. */
-  _broadcastClock(dt, ph) {
+  /**
+   * The seeker owns the round clock and their own pose, at CLK_HZ. What goes on
+   * the wire is TIME REMAINING, never a timestamp: the receiver turns it back
+   * into its own Date.now() deadline, so two capybaras whose system clocks
+   * disagree by an hour still hide for the same twenty-five seconds.
+   */
+  _broadcastClock(now, ph) {
     if (!this.party) return;
     const r = this.round;
-    r.clkAcc += dt;
-    if (r.clkAcc < 1 / CLK_HZ) return;
-    r.clkAcc = 0;
+    if (now - r.clkAt < 1000 / CLK_HZ) return;
+    r.clkAt = now;
+    const ms = Math.max(0, Math.round((ph === 'seek' ? r.seekEnd : r.hideEnd) - now));
     this._send({
-      k: 'clk', r: r.n, ph, t: +Math.max(0, r.t).toFixed(2),
+      k: 'clk', r: r.n, ph, ms, t: +(ms / 1000).toFixed(2),
       x: +this.seeker.x.toFixed(2), z: +this.seeker.z.toFixed(2), ry: +this.seeker.ry.toFixed(2),
     });
   }
@@ -2535,7 +3125,14 @@ export class PropHuntGame extends Minigame {
    * this round's seeker may move the clock, call catches or report misses.
    */
   _onRelay(m) {
-    if (!this.party || this.disposed || !this.round) return;
+    if (!this.party || this.disposed) return;
+    if (!this.round) {
+      // somebody is already playing while we are still reading the splash (a
+      // tab that mounted in the background): drop in, the clock frames below
+      // will pull our deadlines onto theirs within the frame
+      if (this.phase === 'splash') this._beginRound(0, Date.now());
+      if (!this.round) return;
+    }
     const from = m?.id ?? m?.from ?? null;
     const p = (m && typeof m.m === 'object' && m.m) ? m.m : m;
     if (from == null || from === this.selfId || !p || typeof p !== 'object') return;
@@ -2567,11 +3164,21 @@ export class PropHuntGame extends Minigame {
     switch (p.k) {
       case 'clk': {
         if (who !== r.seekerPlayer) return;
-        const t = Number(p.t);
-        if (Number.isFinite(t)) {
-          // slave our clock to the seeker's: snap on a big gap, ease otherwise
-          if (Math.abs(t - r.t) > 1.2) r.t = t;
-          else r.t = lerp(r.t, t, 0.25);
+        const now = Date.now();
+        // ms remaining -> our own absolute deadline. Only correct on real drift
+        // (>400ms), or every frame would jitter the countdown by the ping.
+        let ms = Number(p.ms);
+        if (!Number.isFinite(ms)) ms = Number(p.t) * 1000;
+        if (Number.isFinite(ms) && ms >= 0 && ms < 10 * 60 * 1000) {
+          const end = now + ms;
+          if (p.ph === 'seek') {
+            if (Math.abs(end - r.seekEnd) > 400) r.seekEnd = end;
+          } else if (p.ph === 'hide' && this.phase !== 'seek') {
+            if (Math.abs(end - r.hideEnd) > 400) {
+              r.hideEnd = end;
+              r.seekEnd = end + SEEK_SECS * 1000;
+            }
+          }
         }
         if (Number.isFinite(p.x) && Number.isFinite(p.z)) {
           this.seeker.netX = clamp(Number(p.x), -HALF_X, HALF_X);
@@ -2583,7 +3190,9 @@ export class PropHuntGame extends Minigame {
           }
         }
         if (Number.isFinite(p.ry)) this.seeker.netRy = Number(p.ry);
-        if (p.ph === 'seek' && this.phase === 'hide') this._startSeek();
+        // the seeker is already hunting and we are not: catch up at once
+        // (idempotent, and _startSeek walks us out of the intro if need be)
+        if (p.ph === 'seek' && (this.phase === 'hide' || this.phase === 'intro')) this._startSeek(now);
         break;
       }
       case 'hid': {
@@ -2592,16 +3201,15 @@ export class PropHuntGame extends Minigame {
         const prop = this.props[pi];
         if (!prop) return;
         who.prop = pi;
-        // the leash is a circle, not a square: a client claiming (3, 3) gets
-        // pulled back onto the ring rather than 4.2 units out
-        let ox = Number(p.x) || 0;
-        let oz = Number(p.z) || 0;
-        const d = Math.hypot(ox, oz);
-        if (d > LEASH) { ox = (ox / d) * LEASH; oz = (oz / d) * LEASH; }
-        who.ox = ox;
-        who.oz = oz;
+        // absolute chamber coords now that props roam freely: clamped to the
+        // walkable box, so a client claiming (900, 900) parks against the wall
+        who.px = clamp(Number(p.x) || 0, -HALF_X + prop.r + 0.4, HALF_X - prop.r - 0.4);
+        who.pz = clamp(Number(p.z) || 0, -HALF_Z + prop.r + 0.4, HALF_Z - prop.r - 0.4);
         who.ry = Number.isFinite(p.ry) ? Number(p.ry) : prop.ry0;
         who.hidden = true;
+        // a late check-in refills the patience: whatever kept this capy's tab
+        // asleep must not also cost the next one their round
+        r.grace = this._graceSecs();
         // first claimant owns the prop's pose; a second hider squeezes in silently
         if (!prop.holder) { prop.holder = who; this._applyHide(who); }
         break;
@@ -2714,9 +3322,10 @@ export class PropHuntGame extends Minigame {
     for (const m of this.mats) m.dispose?.();
     this.mats.length = 0;
     this.kindGeo = null;
-    this.ceilMeshes = null;
+    this.overhead.length = 0;
+    this.blockers.length = 0;
     this.hoverRing = null;
-    this.leashRing = null;
+    this.moveRing = null;
     this.myProp = null;
     this.round = null;
 

@@ -42,6 +42,18 @@ import { BOT_ZONES } from '../../../shared/constants.js';
  * with a shadow map reads as daylight leaking through the rock (same call the
  * Groove Grotto makes). Depth comes from the fog, the point lights and the
  * glow materials instead.
+ *
+ * THE CAMERA CORRIDOR (read before adding anything overhead). The follow camera
+ * sits at the player + (0, 11.5, 17.5), i.e. SOUTH of them and up, so every prop
+ * with a bigger z than the player stands between the two. The sight line to a
+ * capybara's body d paces south of them runs from 0.7 + 0.62*d (shins) to
+ * 1.9 + 0.55*d (hat). A prop is safe when it sits entirely under the first or
+ * over the second at its own z; anything in between is pasted over the player.
+ * That is why the stalactite field stops at the rim and skips the southern arc,
+ * why the adit has rock shoulders but no crown, why the spine frames carry one
+ * slim lintel instead of a lintel + cap + roof boarding, and why the lantern
+ * strings run high and across rather than down the middle of the room. Keep it
+ * that way: the mine reads as crowded the moment something tall lands in here.
  * ------------------------------------------------------------------------- */
 
 const TAU = Math.PI * 2;
@@ -652,10 +664,12 @@ export class MineRoom extends Room {
     // Arrivals stand a step beyond the adit's fire ring (radius * 0.8 = 1.92)
     // and outside its arming distance (radius + 0.75 = 3.15), so walking in
     // from the peak does not bounce straight back out; both look north down
-    // the room at the round door.
+    // the room at the round door. Both also stand clear (north) of the one
+    // stretch of the camera corridor the entrance cannot avoid: z 6.5 to 9.5,
+    // where the adit's own lintel and way-out board cross a capybara's body.
     this.spawnPoints = {
-      default: new THREE.Vector3(0, 0, 6.2),
-      from_peak: new THREE.Vector3(0, 0, 7.6),
+      default: new THREE.Vector3(0, 0, 5.5),
+      from_peak: new THREE.Vector3(0, 0, 6.1),
     };
 
     this._joinSpot = {
@@ -852,25 +866,35 @@ export class MineRoom extends Room {
     scene.add(rings);
     this._puddleMat = rings.material;
 
-    // ---- stalactites + rim boulders (instanced) ----------------------------
-    const dripGeo = faceted(new THREE.ConeGeometry(0.36, 1.9, 6));
+    // ---- stalactites (instanced) -------------------------------------------
+    // Hung around the rim only, short, and never in the southern arc: a spike
+    // over the middle of the floor lands square on the camera corridor (see the
+    // header) and reads as a black smear pasted across the room. Out here the
+    // ceiling is low, so even the longest tip stays above the sight line.
+    const dripGeo = faceted(new THREE.ConeGeometry(0.32, 1.5, 6));
     dripGeo.rotateX(Math.PI);
-    dripGeo.translate(0, -0.95, 0);
+    dripGeo.translate(0, -0.75, 0);
     // mid-tone, not rockDeep: these hang above the lantern lights and a
     // near-black material up there renders as flat cut-outs
-    const tites = new THREE.InstancedMesh(dripGeo, makeToon(0x4d3a2a), 26);
+    const TITE_N = 22;
+    const tites = new THREE.InstancedMesh(dripGeo, makeToon(0x4d3a2a), TITE_N);
     const d = this._dummy;
-    for (let i = 0; i < 26; i++) {
+    let tn = 0;
+    for (let i = 0; i < 300 && tn < TITE_N; i++) {
       const a = rng() * TAU;
-      const rad = 6 + rng() * 8;
+      const rad = 10.8 + rng() * 3.9;
       const x = Math.cos(a) * rad;
       const z = Math.sin(a) * rad;
-      d.position.set(x, this._ceilY(x, z) + 0.3, z);
-      d.rotation.set((rng() - 0.5) * 0.22, rng() * TAU, (rng() - 0.5) * 0.22);
-      d.scale.set(0.5 + rng() * 0.8, 0.6 + rng() * 1.5, 0.5 + rng() * 0.8);
+      if (z > 2.6 && Math.abs(x) < 10.6) continue;         // the camera corridor
+      if (z < WALL_Z + 1.2 && Math.abs(x) < 11) continue;  // behind the end wall
+      d.position.set(x, this._ceilY(x, z) + 0.25, z);
+      d.rotation.set((rng() - 0.5) * 0.2, rng() * TAU, (rng() - 0.5) * 0.2);
+      d.scale.set(0.55 + rng() * 0.55, 0.5 + rng() * 0.75, 0.55 + rng() * 0.55);
       d.updateMatrix();
-      tites.setMatrixAt(i, d.matrix);
+      tites.setMatrixAt(tn++, d.matrix);
     }
+    tites.count = tn;
+    tites.instanceMatrix.needsUpdate = true;
     tites.computeBoundingSphere();
     scene.add(tites);
     this._instanced.push(tites);
@@ -940,15 +964,23 @@ export class MineRoom extends Room {
     this._cPulse = new Float32Array(total);
 
     let i = 0;
-    const push = (x, z, teal, count, scale, y) => {
+    /**
+     * `cap`, where given, is the highest the tip of a crystal in this seam may
+     * reach: a seam growing up through the camera corridor hides whoever is
+     * standing north of it, so the ones out on the floor and along the southern
+     * wall are kept below the sight line rather than left to spike through it.
+     */
+    const push = (x, z, teal, count, scale, y, cap) => {
       const i0 = i;
       for (let k = 0; k < count; k++, i++) {
         const a = rng() * TAU;
         const rad = rng() * 0.95 * scale;
         const s = (0.5 + rng() * 0.95) * scale;
+        let sy = s * (0.8 + rng() * 1.3);
+        if (cap !== undefined) sy = Math.min(sy, Math.max(0.2, (cap - y) / 1.15));
         d.position.set(x + Math.cos(a) * rad, y, z + Math.sin(a) * rad);
         d.rotation.set((rng() - 0.5) * 0.55, rng() * TAU, (rng() - 0.5) * 0.55);
-        d.scale.set(s * (0.7 + rng() * 0.5), s * (0.8 + rng() * 1.3), s * (0.7 + rng() * 0.5));
+        d.scale.set(s * (0.7 + rng() * 0.5), sy, s * (0.7 + rng() * 0.5));
         d.updateMatrix();
         crystals.setMatrixAt(i, d.matrix);
         this._cHue[i] = (teal ? 0.47 : 0.105) + (rng() - 0.5) * 0.03;
@@ -958,7 +990,8 @@ export class MineRoom extends Room {
     };
 
     for (const [x, z, teal, count] of WALL_SEAMS) {
-      push(x, z, teal, count, 1.15, -0.12);
+      // the southern seams are the ones a capybara can end up standing behind
+      push(x, z, teal, count, 1.15, -0.12, z > 4 ? 2.9 : undefined);
       for (let k = 0; k < 3; k++) {
         const a = rng() * TAU;
         part(bases, new THREE.IcosahedronGeometry(0.62 + rng() * 0.3, 0), C.rockDeep, {
@@ -970,7 +1003,7 @@ export class MineRoom extends Room {
     for (const [x, z, teal, r] of BOULDER_SEAMS) {
       part(bases, new THREE.IcosahedronGeometry(r * 0.95, 0), C.rock, { sy: 0.78, x, y: r * 0.42, z });
       part(bases, new THREE.IcosahedronGeometry(r * 0.55, 0), C.rockDark, { x: x + r * 0.5, y: r * 0.3, z: z - r * 0.4 });
-      push(x, z, teal, 3, 0.62, r * 0.55);
+      push(x, z, teal, 3, 0.62, r * 0.55, 1.85);
       this.obstacles.push({ x, z, r });
     }
     // Low nubs just outside the bot zone: no colliders, ankle height, and the
@@ -988,8 +1021,14 @@ export class MineRoom extends Room {
 
   /* --- timber supports + lantern strings ---------------------------------- */
 
-  /** One portal frame: two posts, a lintel, corner braces, a snow of dust. */
-  _frame(p, x, z, halfW, h, yaw = 0) {
+  /**
+   * One portal frame: two posts, a lintel, corner braces, a snow of dust.
+   * `slim` drops the cap plate and thins the lintel: a frame that spans the
+   * room puts its whole depth across the camera corridor, and 0.26 of timber
+   * crosses a capybara for half a pace where 0.7 of stacked timber crossed
+   * them for two (and the roof boarding, which triples it, is skipped too).
+   */
+  _frame(p, x, z, halfW, h, yaw = 0, slim = false) {
     const c = Math.cos(yaw);
     const s = Math.sin(yaw);
     for (const sx of [-1, 1]) {
@@ -1003,28 +1042,40 @@ export class MineRoom extends Room {
       });
       this.obstacles.push({ x: px, z: pz, r: 0.42 });
     }
-    part(p, new THREE.BoxGeometry(halfW * 2 + 0.8, 0.34, 0.36), C.woodLit, { ry: yaw, x, y: h + 0.09, z });
-    part(p, new THREE.BoxGeometry(halfW * 2 + 0.3, 0.18, 0.5), C.woodDark, { ry: yaw, x, y: h + 0.33, z });
-    return { x, z, h, halfW, yaw };
+    part(p, new THREE.BoxGeometry(halfW * 2 + 0.8, slim ? 0.26 : 0.34, slim ? 0.34 : 0.36), C.woodLit, {
+      ry: yaw, x, y: h + 0.09, z,
+    });
+    if (!slim) part(p, new THREE.BoxGeometry(halfW * 2 + 0.3, 0.18, 0.5), C.woodDark, { ry: yaw, x, y: h + 0.33, z });
+    return { x, z, h, halfW, yaw, slim };
   }
 
   _timbers(scene) {
     const p = [];
-    // Spine frames: the walk from the adit to the deck ducks under these, and
-    // both leave lanes far wider than anything the walker needs.
-    const f1 = this._frame(p, 0, 8.6, 3.4, 3.3);
+    // Spine frames. These are the only things in here that cross the whole room,
+    // so both are slim and sit at heights whose sight line lands on floor nobody
+    // stands on: f2 clears the six join pads, f3 clears the elevator walk, the
+    // deck approach and the join prompt (see the camera corridor in the header).
+    // There is deliberately no third frame over the entrance half: the arrival
+    // walk and the mess share their floor with the bot zone, so every height a
+    // frame at z 8.6 could take put its lintel across somebody's head. The adit
+    // portal carries the timbering up there on its own.
+    //
     // f2's posts stand off the deck's front corners: a 12-wide lane onto the
     // stage, and both posts clear of the cart parked on the spur behind them
-    const f2 = this._frame(p, 0, -4.4, 6.0, 3.5);
-    const f3 = this._frame(p, 0, 0.4, 8.4, 3.4);
+    const f2 = this._frame(p, 0, -4.4, 6.0, 3.7, 0, true);
+    const f3 = this._frame(p, 0, 2.2, 8.4, 3.4, 0, true);
     // rail frames on the east run
     const f4 = this._frame(p, RAIL.x, -7.6, 1.5, 3.0);
     const f5 = this._frame(p, RAIL.x, 3.4, 1.5, 3.0);
-    // west, over the spur into the elevator
-    const f6 = this._frame(p, -5.0, SPUR.z, 1.6, 3.0);
+    // West, over the spur into the elevator: slim and low, because it stands
+    // between the camera and the two western join pads and a full-fat header
+    // here crossed a waiting capybara from the knees to the chin.
+    const f6 = this._frame(p, -5.0, SPUR.z, 1.6, 2.7, 0, true);
 
-    // ceiling boarding over each frame, so the roof reads as held up
-    for (const f of [f1, f2, f3, f4, f5, f6]) {
+    // ceiling boarding, so the roof reads as held up: only over the two rail
+    // frames, whose lintels are 3.8 wide and well off every walking lane
+    for (const f of [f2, f3, f4, f5, f6]) {
+      if (f.slim) continue;
       for (let i = -1; i <= 1; i++) {
         part(p, new THREE.BoxGeometry(f.halfW * 2 + 0.6, 0.12, 0.3), i ? C.wood : C.woodLit, {
           ry: f.yaw, x: f.x + Math.sin(f.yaw) * i * 0.55, y: f.h + 0.5, z: f.z + Math.cos(f.yaw) * i * 0.55,
@@ -1033,16 +1084,20 @@ export class MineRoom extends Room {
     }
     scene.add(solidMesh(p));
 
-    // ---- lantern strings, hung frame to frame ------------------------------
+    // ---- lantern strings ---------------------------------------------------
+    // Hung across the room and high, never down the middle of it: a run along
+    // the camera axis put a bulb on every capybara's face for its whole length,
+    // and a sag at 3.0 is exactly where the sight line to a standing capybara
+    // passes four paces out. These clear the tallest hat by a good margin.
     const wire = [];
     const bulbs = [];
     const runs = [
-      [[-3.4, 3.4, 8.6], [3.4, 3.4, 8.6], 5],
-      [[0, 3.6, 8.4], [0, 3.7, 0.6], 7],
-      [[0, 3.7, 0.2], [0, 3.6, -4.2], 5],
-      [[-8.2, 3.5, 0.4], [-5.0, 3.1, -3.0], 4],
-      [[8.2, 3.5, 0.4], [6.6, 3.1, 3.4], 3],
-      [[-6.4, 3.2, 6.2], [-0.2, 3.6, 8.4], 5],
+      [[-4.2, 4.85, 8.2], [4.2, 4.85, 8.2], 5],
+      [[-8.6, 4.5, 5.4], [-3.0, 4.85, 8.2], 4],
+      [[-8.4, 4.7, 2.2], [8.4, 4.7, 2.2], 8],
+      [[-8.2, 3.5, 2.2], [-5.0, 3.1, -3.0], 4],
+      [[8.2, 3.5, 2.2], [6.6, 3.1, 3.4], 3],
+      [[-6.2, 4.35, -1.2], [-2.0, 4.6, 1.2], 3],
     ];
     this._bulbSeed = [];
     let total = 0;
@@ -1508,10 +1563,12 @@ export class MineRoom extends Room {
     }
     this.obstacles.push({ x: bx, z: bz, r: 0.75 });
 
-    // notice board on two posts, square to the play camera and clear of both
-    // the veined boulder south of it and the crate stack behind it
-    const nx = -4.4;
-    const nz = 9.2;
+    // Notice board on two posts, square to the play camera. Stood beside the
+    // stores rather than out on the open floor: a 2.4-high board anywhere south
+    // of the mess sits chest-high across whoever is standing at the brazier,
+    // and out here the only sight lines through it are the crate corner's.
+    const nx = -6.4;
+    const nz = 9.4;
     for (const s of [-1, 1]) {
       part(p, new THREE.CylinderGeometry(0.09, 0.11, 2.3, 7), C.woodDark, { x: nx + s * 0.85, y: 1.15, z: nz });
     }
@@ -1561,11 +1618,17 @@ export class MineRoom extends Room {
         for (const s of [-1, 1]) this.obstacles.push({ x: s * (HW + 0.3), z, r: 0.55 });
       }
     }
-    // rock throat around the opening
-    for (let i = 0; i < 9; i++) {
-      const a = -0.35 + (i / 8) * (Math.PI + 0.7);
-      part(p, faceted(new THREE.IcosahedronGeometry(0.85 + (i % 3) * 0.3, 0)), i % 2 ? C.rockDark : C.rockDeep, {
-        sz: 0.7, x: Math.cos(a) * (HW + 1.15), y: 0.3 + Math.sin(a) * (H + 0.6), z: ADIT_Z + 0.4,
+    // Rock throat around the opening: two shoulders, and deliberately no crown.
+    // An arch over the way out sits at 4-5 up in the one place every arrival
+    // looks through, which is dead centre of the camera corridor for the whole
+    // entrance half of the room - it was the single worst occluder down here.
+    // Shouldered, the portal still reads as cut through rock and the sight line
+    // to anyone walking in passes clean over it.
+    for (let i = 0; i < 8; i++) {
+      const s = i < 4 ? -1 : 1;
+      const k = i % 4;
+      part(p, faceted(new THREE.IcosahedronGeometry(0.78 + (k % 3) * 0.26, 0)), k % 2 ? C.rockDark : C.rockDeep, {
+        sz: 0.7, x: s * (HW + 1.15 + Math.sin(k * 1.3) * 0.3), y: 0.2 + k * 0.6, z: ADIT_Z + 0.4,
       });
     }
     // snow blown in over the threshold, and a shovel stood against the frame
@@ -1612,8 +1675,11 @@ export class MineRoom extends Room {
     }
     scene.add(solidMesh(hoods));
 
-    const sign = new THREE.Mesh(new THREE.PlaneGeometry(2.4, 0.94), signMat(aditSignTexture()));
-    sign.position.set(0, 3.9, ADIT_Z - 0.3);
+    // Nailed across the header rather than hung above it: up at 3.9 the board
+    // floated in the sight line of anyone in the entrance half of the room, and
+    // down here it shares the lintel's slice of it instead of adding its own.
+    const sign = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 0.8), signMat(aditSignTexture()));
+    sign.position.set(0, 3.0, ADIT_Z - 0.3);
     sign.rotation.x = 0.16;
     scene.add(sign);
   }
