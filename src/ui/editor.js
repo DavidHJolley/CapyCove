@@ -1,31 +1,32 @@
 import * as THREE from 'three';
-import { setOverride, clearOverrides, getOverrides } from '../world/layout.js';
+import { setOverride, clearOverrides, getOverrides, getOverride } from '../world/layout.js';
 
 /**
  * Dev layout editor (Ctrl+E). Two modes, because rooms are built two ways.
  *
- * HANDLES mode (authored, exact): a room can publish its layout numbers via
- * `editorHandles(id)`. Each number is a pin; dropping one rewrites the number
- * and REBUILDS the room, so the sign post, chairs, prompt zones, glow rings
- * and colliders derived from it all land where a normal visit would put them.
- * This is the mode to use when a room offers it (currently the Game Den).
+ * HANDLES (authored, exact): a room publishes its layout numbers through
+ * `editorHandles(id)`; each is a pin. Dropping one rewrites the number and
+ * REBUILDS the room, so the sign, chairs, prompt zones and colliders derived
+ * from it all follow. `editorExport(id)` returns the pasteable row.
  *
- * FREE mode (works in every room, on every object): pick anything the camera
- * can see and move it. This drags the actual Object3D, including a single
- * instance inside an InstancedMesh (one tree out of a forest batch). It is a
- * VISUAL preview: nothing derived from a number follows, and the change lives
- * only in this session. Use it to find a position by eye, then read the
+ * FREE (every room, no opt-in): pick anything worth moving. Click selects the
+ * whole prop; Tab drills to its parts, then to one instance of an
+ * InstancedMesh or one welded piece of a merged mesh (merged props keep no
+ * record of their parts, so the seams are found with union-find over the
+ * geometry). Left-drag on empty space marquee-selects; the set then moves
+ * together. Ctrl+Z undoes. Free edits are a VISUAL preview: nothing derived
+ * from a number follows, and they last only for this visit, so read the
  * numbers out of the panel and put them in the room file.
  *
- * The irreducible limit: props merged into one BufferGeometry at build time
- * are a single object and can only move as a whole. Splitting them would cost
- * the draw calls the merge was buying.
+ * Deliberately unpickable: floors and walls (a room's groundMeshes), anything
+ * room-sized, particle systems, lines, sprites and glow overlays. Level-wide
+ * geometry is scenery you tune in code, and it used to swallow every click.
  */
 
 const STYLE_ID = 'cove-ed-styles';
 const CSS = `
 .cove-ed {
-  position: absolute; top: 64px; left: 14px; width: 336px; z-index: 55;
+  position: absolute; top: 64px; left: 14px; width: 340px; z-index: 55;
   background: rgba(28, 24, 18, 0.94); color: #fff6e3; border-radius: 16px;
   padding: 14px 16px; font-family: var(--font); font-size: 12.5px;
   box-shadow: 0 10px 30px rgba(0,0,0,.45); pointer-events: auto;
@@ -38,7 +39,7 @@ const CSS = `
 .cove-ed .ed-tab.on { background: #f2b64a; color: #2d2417; }
 .cove-ed .ed-keys { color: #b8a888; font-size: 11px; line-height: 1.5; margin-bottom: 9px; }
 .cove-ed .ed-keys b { color: #fff6e3; font-weight: 700; }
-.cove-ed .ed-list { max-height: 118px; overflow-y: auto; margin-bottom: 9px;
+.cove-ed .ed-list { max-height: 112px; overflow-y: auto; margin-bottom: 9px;
   border-radius: 10px; background: rgba(255,255,255,.05); padding: 4px; }
 .cove-ed .ed-row { display: flex; align-items: center; gap: 7px; padding: 4px 7px; border-radius: 8px;
   cursor: pointer; font-size: 11.5px; white-space: nowrap; }
@@ -49,14 +50,17 @@ const CSS = `
 .cove-ed .ed-sel { background: rgba(255,255,255,.07); border-radius: 10px; padding: 7px 10px;
   margin-bottom: 9px; font-weight: 700; min-height: 30px; font-size: 11.5px; }
 .cove-ed .ed-sel span { color: #7ee0ff; font-weight: 400; font-family: ui-monospace, Consolas, monospace; }
-.cove-ed textarea { width: 100%; height: 86px; resize: vertical; border: 0; border-radius: 10px;
+.cove-ed textarea { width: 100%; height: 84px; resize: vertical; border: 0; border-radius: 10px;
   padding: 8px 10px; font-family: ui-monospace, Consolas, monospace; font-size: 11px;
   background: #12100c; color: #cfe8b0; line-height: 1.45; }
 .cove-ed .ed-btns { display: flex; gap: 6px; margin-top: 9px; }
-.cove-ed button.ed-b { flex: 1; border: 0; border-radius: 999px; padding: 7px 10px; cursor: pointer;
+.cove-ed button.ed-b { flex: 1; border: 0; border-radius: 999px; padding: 7px 8px; cursor: pointer;
   font-family: var(--font); font-weight: 800; font-size: 12px; background: #f2b64a; color: #2d2417; }
 .cove-ed button.ghost { background: rgba(255,255,255,.14); color: #fff6e3; }
 .cove-ed button.ed-b:hover { filter: brightness(1.08); }
+.cove-ed button.ed-b:disabled { opacity: .4; cursor: default; filter: none; }
+.cove-ed-marquee { position: absolute; z-index: 54; border: 2px dashed #f2b64a;
+  background: rgba(242,182,74,.12); pointer-events: none; }
 `;
 
 let open = false;
@@ -69,29 +73,28 @@ export function toggleEditor(game) {
 }
 
 const f2 = (n) => (Math.round(n * 100) / 100).toFixed(2);
+const deg = (rad) => `${(rad * 180 / Math.PI).toFixed(1)}deg`;
 const _m = new THREE.Matrix4();
 const _p = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _s = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
 const _yaw = (rad) => new THREE.Quaternion().setFromAxisAngle(_up, rad);
-const deg = (rad) => `${(rad * 180 / Math.PI).toFixed(1)}deg`;
 
-/** Stable-ish address of an object inside the scene, for labels and re-apply. */
+/** Room-sized geometry is scenery, not furniture: never pick it. */
+const HUGE = 15;
+
 function pathOf(obj, scene) {
   const parts = [];
   let o = obj;
-  while (o && o !== scene) {
-    parts.unshift(o.parent ? o.parent.children.indexOf(o) : 0);
-    o = o.parent;
-  }
+  while (o && o !== scene) { parts.unshift(o.parent ? o.parent.children.indexOf(o) : 0); o = o.parent; }
   return parts.join('/');
 }
 
-function labelOf(obj, instanceId) {
+const labelOf = (obj, instanceId) => {
   const base = obj.name || (obj.isInstancedMesh ? 'instances' : obj.type);
   return instanceId == null ? base : `${base} #${instanceId}`;
-}
+};
 
 function openEditor(game) {
   const engine = game.engine;
@@ -119,6 +122,7 @@ function openEditor(game) {
     <textarea id="ed-out" readonly placeholder="Move something and the numbers appear here."></textarea>
     <div class="ed-btns">
       <button class="ed-b" id="ed-copy">Copy</button>
+      <button class="ed-b ghost" id="ed-undo" disabled>Undo</button>
       <button class="ed-b ghost" id="ed-reset">Reset</button>
       <button class="ed-b ghost" id="ed-close">Close</button>
     </div>`;
@@ -133,29 +137,32 @@ function openEditor(game) {
   let mode = 'handles';
   let room = null;
   let pins = [];
-  let sel = null;          // handles mode: a pin
-  let free = null;         // free mode: { obj, instanceId, path, label, start }
-  let box = null;          // selection outline
+  let sel = null;              // handles mode
+  let selection = [];          // free mode: entries, [0] is primary
+  let boxes = [];
   let dragging = false;
   let dragStart = null;
   let shiftDrag = false;
-  let lastClick = null;   // free mode: click the same spot to cycle deeper
-  let pickIndex = 0;
+  let lastPick = null;         // { x, y, index } for click-through cycling
+  const edits = new Map();     // path -> record for the export panel
+  const undoStack = [];
+  let marquee = null;          // { x0, y0, el }
 
-  /**
-   * Editor camera. The engine's static mode copies `_staticCam` verbatim every
-   * frame once its arrival ease is done, so driving that is a clean takeover
-   * with no engine changes: wheel dollies, right-drag orbits, middle-drag (or
-   * Shift+right-drag) pans, F frames the selection. The player's own camera
-   * mode is restored on close.
-   */
+  const pinGeo = new THREE.ConeGeometry(0.16, 0.5, 10);
+  const knobGeo = new THREE.SphereGeometry(0.1, 10, 8);
+
+  const KEYS = {
+    handles: '<b>Drag a pin</b> to move that number - <b>Shift-drag</b> the gold prop pin moves a whole station<br><b>Arrows</b> nudge (Shift = 0.5), <b>[ ]</b> turn the prop, <b>Ctrl+Z</b> undo - <b>Esc</b> closes.',
+    free: '<b>Click</b> a prop, <b>drag</b> it - <b>drag empty space</b> to box-select - <b>Alt+click</b> for what is behind<br><b>Tab</b> drills in (part, instance, welded piece) - <b>arrows</b> nudge, <b>PgUp/Dn</b> height, <b>[ ]</b> rotate, <b>- =</b> resize, <b>H</b> hide<br><b>Wheel</b> zoom, <b>right-drag</b> orbit, <b>middle/Shift-right</b> pan, <b>F</b> frame, <b>Ctrl+Z</b> undo',
+  };
+
+  // ---- editor camera -------------------------------------------------------
   const cam = { target: new THREE.Vector3(), dist: 18, yaw: 0, pitch: 0.9 };
   const savedMode = engine.cameraMode;
-  let camDrag = null; // { mode: 'orbit'|'pan', x, y }
+  let camDrag = null;
 
   function camInit() {
-    const p = engine.playerAvatar?.group.position;
-    cam.target.copy(p || new THREE.Vector3());
+    cam.target.copy(engine.playerAvatar?.group.position || new THREE.Vector3());
     const off = engine.camera.position.clone().sub(cam.target);
     cam.dist = Math.max(3, off.length());
     cam.yaw = Math.atan2(off.x, off.z);
@@ -165,20 +172,22 @@ function openEditor(game) {
 
   function camApply() {
     const cp = Math.cos(cam.pitch);
-    const pos = new THREE.Vector3(
-      cam.target.x + Math.sin(cam.yaw) * cp * cam.dist,
-      cam.target.y + Math.sin(cam.pitch) * cam.dist,
-      cam.target.z + Math.cos(cam.yaw) * cp * cam.dist,
-    );
-    engine._staticCam = { position: pos, lookAt: cam.target.clone() };
+    engine._staticCam = {
+      position: new THREE.Vector3(
+        cam.target.x + Math.sin(cam.yaw) * cp * cam.dist,
+        cam.target.y + Math.sin(cam.pitch) * cam.dist,
+        cam.target.z + Math.cos(cam.yaw) * cp * cam.dist,
+      ),
+      lookAt: cam.target.clone(),
+    };
     engine.cameraMode = 'static';
     engine._camEase = 0;
   }
 
   function camFrame() {
-    if (mode === 'free' && free) cam.target.copy(freePos());
-    else if (mode === 'handles' && sel) cam.target.copy(sel.mesh.position);
-    else return;
+    const p = mode === 'free' ? (selection[0] && entryPos(selection[0])) : sel?.mesh.position;
+    if (!p) return;
+    cam.target.copy(p);
     cam.dist = Math.max(3, Math.min(cam.dist, 12));
     camApply();
   }
@@ -191,8 +200,7 @@ function openEditor(game) {
 
   function onCamDown(e) {
     if (e.button !== 2 && e.button !== 1) return false;
-    e.preventDefault();
-    e.stopPropagation();
+    e.preventDefault(); e.stopPropagation();
     camDrag = { mode: e.button === 1 || e.shiftKey ? 'pan' : 'orbit', x: e.clientX, y: e.clientY };
     return true;
   }
@@ -201,8 +209,7 @@ function openEditor(game) {
     if (!camDrag) return false;
     const dx = e.clientX - camDrag.x;
     const dy = e.clientY - camDrag.y;
-    camDrag.x = e.clientX;
-    camDrag.y = e.clientY;
+    camDrag.x = e.clientX; camDrag.y = e.clientY;
     if (camDrag.mode === 'orbit') {
       cam.yaw -= dx * 0.006;
       cam.pitch = THREE.MathUtils.clamp(cam.pitch + dy * 0.005, -0.2, 1.45);
@@ -215,236 +222,39 @@ function openEditor(game) {
     camApply();
     return true;
   }
-  const freeMoves = new Map(); // path -> { label, from:[x,y,z], to:[x,y,z], obj, instanceId }
 
-  const pinGeo = new THREE.ConeGeometry(0.16, 0.5, 10);
-  const knobGeo = new THREE.SphereGeometry(0.1, 10, 8);
+  // ---- what may be picked --------------------------------------------------
+  const gizmos = () => [engine.remoteGroup, engine.playerAvatar?.group, engine._marker, ...boxes, ...pins.map((p) => p.mesh)].filter(Boolean);
 
-  const KEYS = {
-    handles: '<b>Drag a pin</b> to move that number - <b>Shift-drag</b> the gold prop pin moves a whole station<br><b>Arrows</b> nudge (Shift = 0.5), <b>[ ]</b> turn the prop - <b>Esc</b> closes. Walking still works.',
-    free: '<b>Click</b> grabs the whole prop - <b>click again</b> for what is behind - <b>Tab</b> drills in (part, then one instance or one welded piece)<br><b>Drag</b> move, <b>arrows</b> nudge, <b>PgUp/Dn</b> height, <b>[ ]</b> rotate, <b>- =</b> resize, <b>H</b> hide<br><b>Wheel</b> zoom, <b>right-drag</b> orbit, <b>middle/Shift-right</b> pan, <b>F</b> frame it<br>Hold <b>Shift</b> for bigger steps. Visual preview only.',
-  };
-
-  // ---- shared helpers ------------------------------------------------------
-  function clearPins() {
-    for (const p of pins) {
-      p.mesh.parent?.remove(p.mesh);
-      p.mesh.traverse((o) => o.material?.dispose?.());
-    }
-    pins = [];
-  }
-
-  function clearBox() {
-    if (box) { box.parent?.remove(box); box.geometry?.dispose?.(); box.material?.dispose?.(); box = null; }
-  }
-
-  function showBox(obj, instanceId, piece = null) {
-    clearBox();
-    if (!obj) return;
-    const b = new THREE.Box3();
-    if (piece) {
-      b.copy(pieceBox(obj, piece));
-    } else if (instanceId != null && obj.isInstancedMesh) {
-      obj.getMatrixAt(instanceId, _m);
-      const g = obj.geometry;
-      if (!g.boundingBox) g.computeBoundingBox();
-      b.copy(g.boundingBox).applyMatrix4(_m).applyMatrix4(obj.matrixWorld);
-    } else {
-      b.setFromObject(obj);
-    }
-    if (b.isEmpty()) return;
-    box = new THREE.Box3Helper(b, 0xf2b64a);
-    box.material.depthTest = false;
-    box.renderOrder = 998;
-    engine.scene.add(box);
-  }
-
-  const excluded = () => [engine.remoteGroup, engine.playerAvatar?.group, engine._marker, box, ...pins.map((p) => p.mesh)].filter(Boolean);
-
-  function isExcluded(obj) {
-    const ex = excluded();
+  function underGizmo(obj) {
+    const g = gizmos();
     let o = obj;
-    while (o) { if (ex.includes(o)) return true; o = o.parent; }
+    while (o) { if (g.includes(o)) return true; o = o.parent; }
     return false;
   }
 
-  /**
-   * Is this worth grabbing? Particle systems, lines and glow overlays have
-   * enormous bounding volumes and no surface anyone wants to move, and they
-   * were swallowing every click in rooms like the mine (its dust motes span
-   * the whole cavern). Backdrops (sky domes, cave shells) are pickable but
-   * sorted last, so they never hide the furniture in front of them.
-   */
-  function pickRank(obj) {
-    if (!obj.visible) return -1;
-    if (obj.isPoints || obj.isLine || obj.isLineSegments || obj.isSprite) return -1;
-    if (isExcluded(obj)) return -1;
+  function isGround(obj) {
+    const gm = room?.groundMeshes || [];
+    let o = obj;
+    while (o) { if (gm.includes(o)) return true; o = o.parent; }
+    return false;
+  }
+
+  function isPickable(obj) {
+    if (!obj.visible) return false;
+    if (obj.isPoints || obj.isLine || obj.isLineSegments || obj.isSprite) return false;
+    if (underGizmo(obj) || isGround(obj)) return false;
     const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-    if (mats.some((m) => m && m.transparent && m.depthWrite === false)) return -1; // haze, glow, light pools
+    if (mats.some((m) => m && m.transparent && m.depthWrite === false)) return false;
     const g = obj.geometry;
     if (g && !g.boundingSphere) g.computeBoundingSphere();
     const r = (g?.boundingSphere?.radius || 0) * Math.max(obj.scale.x, obj.scale.y, obj.scale.z);
-    return r > 28 ? 1 : 0; // 1 = backdrop, tried only after real props
+    return r <= HUGE; // walls, shells, sky domes and floors stay put
   }
 
-  // ---- handles mode --------------------------------------------------------
-  function makePin(color) {
-    const g = new THREE.Group();
-    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 });
-    const cone = new THREE.Mesh(pinGeo, mat);
-    cone.rotation.x = Math.PI;
-    cone.position.y = 0.25;
-    const knob = new THREE.Mesh(knobGeo, mat);
-    knob.position.y = 0.56;
-    g.add(cone, knob);
-    g.traverse((o) => { o.renderOrder = 999; });
-    return g;
-  }
-
-  function buildPins() {
-    clearPins();
-    if (mode !== 'handles') return;
-    for (const e of room?.editables || []) {
-      const handles = room.editorHandles?.(e.id);
-      if (handles?.length) {
-        for (const h of handles) {
-          const mesh = makePin(h.color ?? 0xf2b64a);
-          mesh.position.set(h.xz[0], (h.y || 0) + 0.05, h.xz[1]);
-          engine.scene.add(mesh);
-          pins.push({
-            entryId: e.id, key: h.key, label: h.label, color: h.color ?? 0xf2b64a,
-            y: h.y || 0, yaw: h.yaw ?? null, mesh,
-          });
-        }
-      } else {
-        const o = e.objs[0];
-        const mesh = makePin(0xf2b64a);
-        mesh.position.set(o.position.x, o.position.y + 0.05, o.position.z);
-        engine.scene.add(mesh);
-        pins.push({ entryId: e.id, key: '__obj', label: e.id, color: 0xf2b64a, y: o.position.y, mesh, legacyObjs: e.objs });
-      }
-    }
-  }
-
-  function commitPin(pin, x, z) {
-    if (pin.key === '__obj') {
-      const o = pin.legacyObjs[0];
-      const dx = x - o.position.x;
-      const dz = z - o.position.z;
-      pin.legacyObjs.forEach((q) => { q.position.x += dx; q.position.z += dz; });
-      paint();
-      return;
-    }
-    const xz = [+x.toFixed(2), +z.toFixed(2)];
-    const patch = shiftDrag && pin.key === 'at'
-      ? room.editorPatchAll?.(pin.entryId, xz[0] - dragStart[0], xz[1] - dragStart[1])
-      : room.editorPatch?.(pin.entryId, pin.key, xz);
-    if (!patch) return;
-    setOverride(room.id, pin.entryId, patch);
-    const keep = [pin.entryId, pin.key];
-    engine.rebuildRoom();
-    sync(true);
-    sel = pins.find((p) => p.entryId === keep[0] && p.key === keep[1]) || null;
-    paint();
-  }
-
-  // ---- free mode -----------------------------------------------------------
-  function freePos(target = new THREE.Vector3()) {
-    if (!free) return target;
-    if (free.piece) return target.copy(free.pieceState.pos);
-    if (free.instanceId != null) {
-      free.obj.getMatrixAt(free.instanceId, _m);
-      return target.setFromMatrixPosition(_m);
-    }
-    return target.copy(free.obj.position);
-  }
-
-  /**
-   * A welded piece has no transform of its own, so we track one alongside it
-   * and push the DELTA into its slice of the vertex buffer: translate in the
-   * mesh's local space, rotate and scale about the piece's own centre.
-   */
-  function pieceTransform(fn) {
-    const st = free.pieceState;
-    const p = st.pos.clone();
-    const q = _yaw(st.rot);
-    const s = new THREE.Vector3(st.scale, st.scale, st.scale);
-    fn(p, q, s);
-    const newYaw = new THREE.Euler().setFromQuaternion(q, 'YXZ').y;
-    const dYaw = newYaw - st.rot;
-    const dScale = st.scale ? s.x / st.scale : 1;
-
-    const inv = new THREE.Matrix4().copy(free.obj.matrixWorld).invert();
-    const origin = new THREE.Vector3().applyMatrix4(inv);
-    const localDelta = p.clone().sub(st.pos).applyMatrix4(inv).sub(origin);
-
-    pieceApply(free.obj, free.piece, (m) => {
-      m.makeRotationY(dYaw);
-      m.scale(new THREE.Vector3(dScale, dScale, dScale));
-      m.setPosition(localDelta);
-    });
-    free.piece.center.add(localDelta);
-    st.pos.copy(p); st.rot = newYaw; st.scale = s.x;
-  }
-
-  function freeApply(fn) {
-    if (!free) return;
-    if (free.piece) {
-      pieceTransform(fn);
-    } else if (free.instanceId != null) {
-      free.obj.getMatrixAt(free.instanceId, _m);
-      _m.decompose(_p, _q, _s);
-      fn(_p, _q, _s);
-      _m.compose(_p, _q, _s);
-      free.obj.setMatrixAt(free.instanceId, _m);
-      free.obj.instanceMatrix.needsUpdate = true;
-      if (free.obj.computeBoundingSphere) free.obj.computeBoundingSphere();
-    } else {
-      _p.copy(free.obj.position);
-      _q.copy(free.obj.quaternion);
-      _s.copy(free.obj.scale);
-      fn(_p, _q, _s);
-      free.obj.position.copy(_p);
-      free.obj.quaternion.copy(_q);
-      free.obj.scale.copy(_s);
-    }
-    const cur = freePos();
-    const st = freeState();
-    const rec = freeMoves.get(free.path);
-    if (rec) { rec.to = [cur.x, cur.y, cur.z]; rec.toRot = st.rot; rec.toScale = st.scale; }
-    else {
-      freeMoves.set(free.path, {
-        label: free.label, obj: free.obj, instanceId: free.instanceId,
-        from: free.start.slice(), to: [cur.x, cur.y, cur.z],
-        fromRot: free.startRot, toRot: st.rot,
-        fromScale: free.startScale, toScale: st.scale,
-      });
-    }
-    showBox(free.obj, free.instanceId, free.piece);
-    paint();
-  }
-
-  /** Current yaw (radians) and uniform scale of the free selection. */
-  function freeState() {
-    if (!free) return { rot: 0, scale: 1 };
-    if (free.piece) return { rot: free.pieceState.rot, scale: free.pieceState.scale };
-    if (free.instanceId != null) {
-      free.obj.getMatrixAt(free.instanceId, _m);
-      _m.decompose(_p, _q, _s);
-      return { rot: new THREE.Euler().setFromQuaternion(_q, 'YXZ').y, scale: _s.x };
-    }
-    return { rot: free.obj.rotation.y, scale: free.obj.scale.x };
-  }
-
-  /**
-   * Merged props (30 rocks welded into one mesh for one draw call) have no
-   * children to drill into, but they DO have seams: each rock is a connected
-   * component of the index buffer. Label them once with union-find and the
-   * editor can move, turn and resize a single welded piece by rewriting just
-   * its slice of the position attribute. Cached on the geometry.
-   */
+  // ---- welded pieces of a merged mesh --------------------------------------
   function piecesOf(geo) {
-    if (geo.userData.__pieces) return geo.userData.__pieces;
+    if ('__pieces' in geo.userData) return geo.userData.__pieces;
     const pos = geo.attributes.position;
     const idx = geo.index?.array;
     if (pos.count > 200000) { geo.userData.__pieces = null; return null; }
@@ -452,11 +262,9 @@ function openEditor(game) {
     for (let i = 0; i < pos.count; i++) parent[i] = i;
     const find = (a) => { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
     const union = (a, b) => { const ra = find(a); const rb = find(b); if (ra !== rb) parent[rb] = ra; };
-
-    // Unindexed geometry (icosahedrons, and anything merged from them) repeats
-    // a shared corner once per triangle, so weld by position first or every
-    // triangle looks like its own island.
     if (!idx) {
+      // unindexed (icosahedrons and anything merged from them) repeats a shared
+      // corner per triangle: weld by position or every triangle is an island
       const weld = new Map();
       for (let i = 0; i < pos.count; i++) {
         const k = `${Math.round(pos.getX(i) * 1000)},${Math.round(pos.getY(i) * 1000)},${Math.round(pos.getZ(i) * 1000)}`;
@@ -476,7 +284,7 @@ function openEditor(game) {
     if (byRoot.size < 2) { geo.userData.__pieces = null; return null; }
     const pieces = [...byRoot.values()].map((verts) => {
       const c = new THREE.Vector3();
-      for (const v of verts) c.x += pos.getX(v), c.y += pos.getY(v), c.z += pos.getZ(v);
+      for (const v of verts) { c.x += pos.getX(v); c.y += pos.getY(v); c.z += pos.getZ(v); }
       c.multiplyScalar(1 / verts.length);
       return { verts: Uint32Array.from(verts), center: c };
     });
@@ -489,22 +297,6 @@ function openEditor(game) {
     return geo.userData.__pieces;
   }
 
-  /** Apply a transform to one welded piece, about its own centre. */
-  function pieceApply(mesh, piece, fn) {
-    const pos = mesh.geometry.attributes.position;
-    const c = piece.center;
-    const v = new THREE.Vector3();
-    const m = new THREE.Matrix4();
-    fn(m); // caller composes a matrix in piece-local space
-    for (const i of piece.verts) {
-      v.set(pos.getX(i) - c.x, pos.getY(i) - c.y, pos.getZ(i) - c.z).applyMatrix4(m);
-      pos.setXYZ(i, v.x + c.x, v.y + c.y, v.z + c.z);
-    }
-    pos.needsUpdate = true;
-    mesh.geometry.computeBoundingSphere();
-    mesh.geometry.computeBoundingBox();
-  }
-
   function pieceBox(mesh, piece) {
     const pos = mesh.geometry.attributes.position;
     const b = new THREE.Box3();
@@ -513,65 +305,215 @@ function openEditor(game) {
     return b.applyMatrix4(mesh.matrixWorld);
   }
 
-  /** scene-child ... hit object, so selection can start at the whole prop. */
-  function pickChain(obj) {
-    const chain = [];
-    let o = obj;
-    while (o && o !== engine.scene) { chain.unshift(o); o = o.parent; }
-    return chain;
-  }
-
-  /**
-   * The ladder of things one click could mean, outermost first: the prop, its
-   * parts, then the finest grain available: one instance of an InstancedMesh,
-   * or one welded piece of a merged mesh (that is how a single rock comes out
-   * of a 30-rock batch). Clicking takes the top rung because "move that bench"
-   * is the common intent; Tab climbs down, Shift+Tab back up.
-   */
-  function buildLevels(chain, rawInstanceId, faceIndex) {
-    const levels = chain.map((o) => ({ kind: 'obj', obj: o }));
-    const leaf = chain[chain.length - 1];
-    if (rawInstanceId != null) {
-      levels.push({ kind: 'instance', obj: leaf, instanceId: rawInstanceId });
-    } else if (faceIndex != null && leaf.isMesh && leaf.geometry) {
-      const pk = piecesOf(leaf.geometry);
-      if (pk) levels.push({ kind: 'piece', obj: leaf, pieceIndex: pk.faceToPiece(faceIndex), pack: pk });
-    }
-    return levels;
-  }
-
-  function selectDepth(nav, depth) {
-    const { levels } = nav;
-    const d = ((depth % levels.length) + levels.length) % levels.length;
-    selectLevel({ ...nav, depth: d });
-  }
-
-  function selectLevel(nav) {
-    const lv = nav.levels[nav.depth];
-    const obj = lv.obj;
-    const instanceId = lv.kind === 'instance' ? lv.instanceId : null;
-    const piece = lv.kind === 'piece' ? lv.pack.pieces[lv.pieceIndex] : null;
+  // ---- selection entries ---------------------------------------------------
+  function makeEntry(obj, instanceId = null, piece = null, pieceIndex = null, pieceCount = 0, depth = 0, nav = null) {
     const kids = obj.children?.length || 0;
-    const what = lv.kind === 'instance' ? 'one instance'
-      : lv.kind === 'piece' ? `1 of ${lv.pack.pieces.length} welded pieces`
-        : nav.depth > 0 ? 'part'
+    const what = instanceId != null ? 'one instance'
+      : piece ? `1 of ${pieceCount} welded pieces`
+        : depth > 0 ? 'part'
           : kids ? `whole prop, ${kids} part${kids === 1 ? '' : 's'}` : 'prop';
     const path = pathOf(obj, engine.scene)
       + (instanceId != null ? `#${instanceId}` : '')
-      + (piece ? `:piece${lv.pieceIndex}` : '');
+      + (piece ? `:piece${pieceIndex}` : '');
+    const e = { obj, instanceId, piece, path, label: `${labelOf(obj, instanceId)} (${what})`, nav };
+    if (piece) e.pieceState = { pos: piece.center.clone().applyMatrix4(obj.matrixWorld), rot: 0, scale: 1 };
+    return e;
+  }
 
-    free = { obj, instanceId, piece, path, label: `${labelOf(obj, instanceId)} (${what})`, start: [0, 0, 0], nav };
-    if (piece) {
-      const wc = piece.center.clone().applyMatrix4(obj.matrixWorld);
-      free.pieceState = { pos: wc, rot: 0, scale: 1 };
+  function entryPos(e, out = new THREE.Vector3()) {
+    if (e.piece) return out.copy(e.pieceState.pos);
+    if (e.instanceId != null) { e.obj.getMatrixAt(e.instanceId, _m); return out.setFromMatrixPosition(_m); }
+    return out.copy(e.obj.position);
+  }
+
+  function entryState(e) {
+    if (e.piece) return { rot: e.pieceState.rot, scale: e.pieceState.scale };
+    if (e.instanceId != null) {
+      e.obj.getMatrixAt(e.instanceId, _m); _m.decompose(_p, _q, _s);
+      return { rot: new THREE.Euler().setFromQuaternion(_q, 'YXZ').y, scale: _s.x };
     }
-    const cur = freePos();
-    const st = freeState();
-    const known = freeMoves.get(path);
-    free.start = known ? known.from.slice() : [cur.x, cur.y, cur.z];
-    free.startRot = known ? known.fromRot : st.rot;
-    free.startScale = known ? known.fromScale : st.scale;
-    showBox(obj, instanceId, piece);
+    return { rot: e.obj.rotation.y, scale: e.obj.scale.x };
+  }
+
+  /** Move/turn/resize one entry by a delta, rotating and scaling about itself. */
+  function entryDelta(e, d) {
+    const dx = d.dx || 0, dy = d.dy || 0, dz = d.dz || 0;
+    const dyaw = d.dyaw || 0, ds = d.ds || 1;
+    if (e.piece) {
+      const st = e.pieceState;
+      const inv = new THREE.Matrix4().copy(e.obj.matrixWorld).invert();
+      const origin = new THREE.Vector3().applyMatrix4(inv);
+      const local = new THREE.Vector3(dx, dy, dz).applyMatrix4(inv).sub(origin);
+      const pos = e.obj.geometry.attributes.position;
+      const c = e.piece.center;
+      const m = new THREE.Matrix4().makeRotationY(dyaw);
+      m.scale(new THREE.Vector3(ds, ds, ds));
+      m.setPosition(local);
+      const v = new THREE.Vector3();
+      for (const i of e.piece.verts) {
+        v.set(pos.getX(i) - c.x, pos.getY(i) - c.y, pos.getZ(i) - c.z).applyMatrix4(m);
+        pos.setXYZ(i, v.x + c.x, v.y + c.y, v.z + c.z);
+      }
+      pos.needsUpdate = true;
+      e.obj.geometry.computeBoundingSphere();
+      e.obj.geometry.computeBoundingBox();
+      c.add(local);
+      st.pos.add(new THREE.Vector3(dx, dy, dz));
+      st.rot += dyaw;
+      st.scale *= ds;
+      return;
+    }
+    if (e.instanceId != null) {
+      e.obj.getMatrixAt(e.instanceId, _m);
+      _m.decompose(_p, _q, _s);
+      _p.add(new THREE.Vector3(dx, dy, dz));
+      _q.multiply(_yaw(dyaw));
+      _s.multiplyScalar(ds);
+      _m.compose(_p, _q, _s);
+      e.obj.setMatrixAt(e.instanceId, _m);
+      e.obj.instanceMatrix.needsUpdate = true;
+      e.obj.computeBoundingSphere?.();
+      return;
+    }
+    e.obj.position.add(new THREE.Vector3(dx, dy, dz));
+    e.obj.quaternion.multiply(_yaw(dyaw));
+    e.obj.scale.multiplyScalar(ds);
+  }
+
+  /** Apply to the whole selection and remember it for undo + the export. */
+  function applyDelta(d, record = true) {
+    if (!selection.length) return;
+    for (const e of selection) {
+      entryDelta(e, d);
+      const cur = entryPos(e);
+      const st = entryState(e);
+      const rec = edits.get(e.path);
+      if (rec) { rec.to = [cur.x, cur.y, cur.z]; rec.toRot = st.rot; rec.toScale = st.scale; } else {
+        edits.set(e.path, {
+          label: e.label, entry: e,
+          from: [cur.x - (d.dx || 0), cur.y - (d.dy || 0), cur.z - (d.dz || 0)],
+          to: [cur.x, cur.y, cur.z],
+          fromRot: st.rot - (d.dyaw || 0), toRot: st.rot,
+          fromScale: st.scale / (d.ds || 1), toScale: st.scale,
+        });
+      }
+    }
+    if (record) pushUndo({ kind: 'delta', entries: selection.slice(), d });
+    showBoxes();
+    paint();
+  }
+
+  // ---- undo ----------------------------------------------------------------
+  function pushUndo(a) {
+    undoStack.push(a);
+    if (undoStack.length > 100) undoStack.shift();
+    $('ed-undo').disabled = false;
+  }
+
+  function undo() {
+    const a = undoStack.pop();
+    if (!a) return;
+    if (a.kind === 'delta') {
+      const keep = selection;
+      selection = a.entries;
+      applyDelta({ dx: -(a.d.dx || 0), dy: -(a.d.dy || 0), dz: -(a.d.dz || 0), dyaw: -(a.d.dyaw || 0), ds: 1 / (a.d.ds || 1) }, false);
+      selection = keep;
+    } else if (a.kind === 'vis') {
+      a.obj.visible = a.prev;
+    } else if (a.kind === 'override') {
+      if (a.prev) setOverride(a.roomId, a.propId, a.prev);
+      else { const ov = getOverrides(a.roomId); ov?.delete(a.propId); }
+      engine.rebuildRoom();
+      sync(true);
+    }
+    $('ed-undo').disabled = !undoStack.length;
+    showBoxes();
+    paint();
+    game.toast('Undone');
+  }
+
+  // ---- selection boxes -----------------------------------------------------
+  function clearBoxes() {
+    for (const b of boxes) { b.parent?.remove(b); b.geometry?.dispose?.(); b.material?.dispose?.(); }
+    boxes = [];
+  }
+
+  function showBoxes() {
+    clearBoxes();
+    for (const e of selection) {
+      const b = new THREE.Box3();
+      if (e.piece) b.copy(pieceBox(e.obj, e.piece));
+      else if (e.instanceId != null && e.obj.isInstancedMesh) {
+        e.obj.getMatrixAt(e.instanceId, _m);
+        const g = e.obj.geometry;
+        if (!g.boundingBox) g.computeBoundingBox();
+        b.copy(g.boundingBox).applyMatrix4(_m).applyMatrix4(e.obj.matrixWorld);
+      } else b.setFromObject(e.obj);
+      if (b.isEmpty()) continue;
+      const helper = new THREE.Box3Helper(b, selection.length > 1 ? 0x7ee0ff : 0xf2b64a);
+      helper.material.depthTest = false;
+      helper.renderOrder = 998;
+      engine.scene.add(helper);
+      boxes.push(helper);
+    }
+  }
+
+  function selectEntries(list) {
+    selection = list;
+    showBoxes();
+    paint();
+  }
+
+  // ---- handles mode --------------------------------------------------------
+  function clearPins() {
+    for (const p of pins) { p.mesh.parent?.remove(p.mesh); p.mesh.traverse((o) => o.material?.dispose?.()); }
+    pins = [];
+  }
+
+  function makePin(color) {
+    const g = new THREE.Group();
+    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 });
+    const cone = new THREE.Mesh(pinGeo, mat);
+    cone.rotation.x = Math.PI; cone.position.y = 0.25;
+    const knob = new THREE.Mesh(knobGeo, mat);
+    knob.position.y = 0.56;
+    g.add(cone, knob);
+    g.traverse((o) => { o.renderOrder = 999; });
+    return g;
+  }
+
+  function buildPins() {
+    clearPins();
+    if (mode !== 'handles') return;
+    for (const e of room?.editables || []) {
+      const handles = room.editorHandles?.(e.id);
+      if (!handles?.length) continue;
+      for (const h of handles) {
+        const mesh = makePin(h.color ?? 0xf2b64a);
+        mesh.position.set(h.xz[0], (h.y || 0) + 0.05, h.xz[1]);
+        engine.scene.add(mesh);
+        pins.push({ entryId: e.id, key: h.key, label: h.label, color: h.color ?? 0xf2b64a, y: h.y || 0, yaw: h.yaw ?? null, mesh });
+      }
+    }
+  }
+
+  function commitPin(pin, x, z, yawStep = 0) {
+    const prev = getOverride(room.id, pin.entryId);
+    let patch;
+    if (yawStep) patch = room.editorPatch?.(pin.entryId, 'yaw', +(pin.yaw + yawStep).toFixed(3));
+    else {
+      const xz = [+x.toFixed(2), +z.toFixed(2)];
+      patch = shiftDrag && pin.key === 'at'
+        ? room.editorPatchAll?.(pin.entryId, xz[0] - dragStart[0], xz[1] - dragStart[1])
+        : room.editorPatch?.(pin.entryId, pin.key, xz);
+    }
+    if (!patch) return;
+    pushUndo({ kind: 'override', roomId: room.id, propId: pin.entryId, prev: prev ? { ...prev } : null });
+    setOverride(room.id, pin.entryId, patch);
+    const keep = [pin.entryId, pin.key];
+    engine.rebuildRoom();
+    sync(true);
+    sel = pins.find((p) => p.entryId === keep[0] && p.key === keep[1]) || null;
     paint();
   }
 
@@ -591,26 +533,26 @@ function openEditor(game) {
       }
       $('ed-selinfo').textContent = sel ? sel.label : 'Nothing selected';
     } else {
-      for (const [path, rec] of freeMoves) {
+      for (const [, rec] of edits) {
         const row = document.createElement('div');
-        row.className = `ed-row${free?.path === path ? ' on' : ''}`;
+        row.className = `ed-row${selection.includes(rec.entry) ? ' on' : ''}`;
         row.innerHTML = `<span class="ed-dot" style="background:#7ee0ff"></span><span>${rec.label}</span>`
           + `<span class="ed-xz">${f2(rec.to[0])}, ${f2(rec.to[2])}</span>`;
-        row.onclick = () => {
-          const chain = pickChain(rec.obj);
-          selectDepth({ chain, levels: buildLevels(chain, rec.instanceId, null), depth: 0 }, chain.length - 1);
-        };
+        row.onclick = () => selectEntries([rec.entry]);
         list.appendChild(row);
       }
-      if (!freeMoves.size) {
+      if (!edits.size) {
         const row = document.createElement('div');
         row.className = 'ed-row';
-        row.textContent = 'Click something in the world to grab it';
+        row.textContent = 'Click a prop, or drag a box around several';
         list.appendChild(row);
       }
-      if (free) {
-        const c = freePos();
-        $('ed-selinfo').innerHTML = `${free.label}<br><span>${f2(c.x)}, ${f2(c.y)}, ${f2(c.z)} &nbsp; path ${free.path}</span>`;
+      if (selection.length > 1) {
+        $('ed-selinfo').innerHTML = `${selection.length} objects selected<br><span>they move together; rotate and resize about their own centres</span>`;
+      } else if (selection.length === 1) {
+        const e = selection[0];
+        const c = entryPos(e);
+        $('ed-selinfo').innerHTML = `${e.label}<br><span>${f2(c.x)}, ${f2(c.y)}, ${f2(c.z)} &nbsp; path ${e.path}</span>`;
       } else $('ed-selinfo').textContent = 'Nothing selected';
     }
     paintOut();
@@ -626,35 +568,32 @@ function openEditor(game) {
       $('ed-out').value = `// ${room.id}: paste into src/world/rooms/${room.id}.js\n${rows.join('\n')}`;
       return;
     }
-    if (!freeMoves.size) { $('ed-out').value = ''; return; }
+    if (!edits.size) { $('ed-out').value = ''; return; }
     const lines = [`// ${room.id}: free edits (visual preview: find these in the room builder)`];
-    for (const [path, r] of freeMoves) {
+    for (const [path, r] of edits) {
       const d = [r.to[0] - r.from[0], r.to[1] - r.from[1], r.to[2] - r.from[2]];
       lines.push(`${r.label}  [${path}]`);
       lines.push(`  pos (${f2(r.to[0])}, ${f2(r.to[1])}, ${f2(r.to[2])})   moved (${f2(d[0])}, ${f2(d[1])}, ${f2(d[2])})`);
-      if (Math.abs((r.toRot ?? 0) - (r.fromRot ?? 0)) > 0.001) {
-        lines.push(`  rotation.y ${deg(r.toRot)}  (turned ${deg(r.toRot - r.fromRot)})`);
-      }
-      if (Math.abs((r.toScale ?? 1) - (r.fromScale ?? 1)) > 0.001) {
-        lines.push(`  scale ${f2(r.toScale)}  (x${f2(r.toScale / (r.fromScale || 1))})`);
-      }
+      if (Math.abs((r.toRot ?? 0) - (r.fromRot ?? 0)) > 0.001) lines.push(`  rotation.y ${deg(r.toRot)}  (turned ${deg(r.toRot - r.fromRot)})`);
+      if (Math.abs((r.toScale ?? 1) - (r.fromScale ?? 1)) > 0.001) lines.push(`  scale ${f2(r.toScale)}`);
     }
     $('ed-out').value = lines.join('\n');
   }
 
-  /** Rebuild for whatever room we are standing in. */
   function sync(force = false) {
     if (!force && engine.room === room) return;
     room = engine.room;
     sel = null;
-    free = null;
-    clearBox();
-    if (engine.room !== room || force) freeMoves.clear();
+    selection = [];
+    clearBoxes();
+    edits.clear();
+    undoStack.length = 0;
+    $('ed-undo').disabled = true;
     buildPins();
     $('ed-room').textContent = room
       ? `${room.name}: ${mode === 'handles'
         ? `${pins.length} handle${pins.length === 1 ? '' : 's'}${pins.length ? '' : ' (no handle table: use Free)'}`
-        : 'free mode, every object'}`
+        : 'free mode, every prop'}`
       : 'no room';
     paint();
   }
@@ -663,13 +602,47 @@ function openEditor(game) {
   const canvas = engine.canvas;
   const ndc = (e) => new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
 
-  function onDown(e) {
-    if (onCamDown(e)) return;          // right/middle: orbit or pan the camera
-    if (e.button !== 0) return;
+  function candidates(e) {
     ray.setFromCamera(ndc(e), engine.camera);
+    return ray.intersectObjects(engine.scene.children, true).filter((h) => isPickable(h.object));
+  }
+
+  function topChain(obj) {
+    const chain = [];
+    let o = obj;
+    while (o && o !== engine.scene) { chain.unshift(o); o = o.parent; }
+    return chain;
+  }
+
+  function levelsFor(chain, instanceId, faceIndex) {
+    const levels = chain.map((o) => ({ kind: 'obj', obj: o }));
+    const leaf = chain[chain.length - 1];
+    if (instanceId != null) levels.push({ kind: 'instance', obj: leaf, instanceId });
+    else if (faceIndex != null && leaf.isMesh && leaf.geometry) {
+      const pk = piecesOf(leaf.geometry);
+      if (pk) levels.push({ kind: 'piece', obj: leaf, pieceIndex: pk.faceToPiece(faceIndex), pack: pk });
+    }
+    return levels;
+  }
+
+  function entryFromLevel(nav) {
+    const lv = nav.levels[nav.depth];
+    return makeEntry(
+      lv.obj, lv.kind === 'instance' ? lv.instanceId : null,
+      lv.kind === 'piece' ? lv.pack.pieces[lv.pieceIndex] : null,
+      lv.kind === 'piece' ? lv.pieceIndex : null,
+      lv.kind === 'piece' ? lv.pack.pieces.length : 0,
+      nav.depth, nav,
+    );
+  }
+
+  function onDown(e) {
+    if (onCamDown(e)) return;
+    if (e.button !== 0) return;
 
     if (mode === 'handles') {
       if (!pins.length) return;
+      ray.setFromCamera(ndc(e), engine.camera);
       const hits = ray.intersectObjects(pins.map((p) => p.mesh), true);
       if (!hits.length) return;
       e.stopPropagation(); e.preventDefault();
@@ -686,33 +659,55 @@ function openEditor(game) {
       return;
     }
 
-    // free mode: pick anything except players, gizmos, particles and glow
-    const ranked = ray.intersectObjects(engine.scene.children, true)
-      .map((h) => ({ h, rank: pickRank(h.object) }))
-      .filter((x) => x.rank >= 0)
-      .sort((a, b) => a.rank - b.rank);   // props first, backdrops last
-    if (!ranked.length) return;
+    const list = candidates(e);
+
+    // already-selected object under the cursor: grab it, do not re-pick. This
+    // is the fix for "clicking my selection kicks me to another layer".
+    const onSelection = list.find((h) => selection.some((s) => s.obj === h.object
+      && (s.instanceId == null || s.instanceId === h.instanceId)));
+    if (onSelection && !e.altKey) {
+      e.stopPropagation(); e.preventDefault();
+      startDrag(e);
+      return;
+    }
+
+    if (!list.length) {                       // empty space: marquee select
+      e.stopPropagation(); e.preventDefault();
+      marquee = { x0: e.clientX, y0: e.clientY, el: document.createElement('div') };
+      marquee.el.className = 'cove-ed-marquee';
+      document.getElementById('overlay-root').appendChild(marquee.el);
+      return;
+    }
+
     e.stopPropagation(); e.preventDefault();
+    // Alt+click steps past the front-most object to whatever is behind it
+    const same = lastPick && Math.hypot(e.clientX - lastPick.x, e.clientY - lastPick.y) < 6;
+    const index = e.altKey ? ((same ? lastPick.index : 0) + 1) % list.length : 0;
+    lastPick = { x: e.clientX, y: e.clientY, index };
+    const h = list[index];
+    const chain = topChain(h.object);
+    selectEntries([entryFromLevel({ chain, levels: levelsFor(chain, h.instanceId ?? null, h.faceIndex ?? null), depth: 0 })]);
+    startDrag(e);
+  }
 
-    // clicking the same spot again steps to whatever is behind the last pick,
-    // so a prop tucked under a table is still reachable
-    const same = lastClick && Math.hypot(e.clientX - lastClick.x, e.clientY - lastClick.y) < 6;
-    pickIndex = same ? (pickIndex + 1) % ranked.length : 0;
-    lastClick = { x: e.clientX, y: e.clientY };
-    const h = ranked[pickIndex].h;
-
-    // start at the whole prop; Tab drills down to parts, then to one instance
-    // or one welded piece (which is how a single rock leaves a merged batch)
-    const chain = pickChain(h.object);
-    selectDepth({ chain, levels: buildLevels(chain, h.instanceId ?? null, h.faceIndex ?? null), depth: 0 }, 0);
-    const cur = freePos();
+  function startDrag(e) {
+    if (!selection.length) return;
+    const cur = entryPos(selection[0]);
     plane.constant = -cur.y;
+    ray.setFromCamera(ndc(e), engine.camera);
     if (ray.ray.intersectPlane(plane, hit)) grab.copy(cur).sub(hit);
+    dragStart = [cur.x, cur.z];
     dragging = true;
   }
 
   function onMove(e) {
     if (onCamMove(e)) return;
+    if (marquee) {
+      const x = Math.min(marquee.x0, e.clientX), y = Math.min(marquee.y0, e.clientY);
+      const w = Math.abs(e.clientX - marquee.x0), h = Math.abs(e.clientY - marquee.y0);
+      Object.assign(marquee.el.style, { left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${h}px` });
+      return;
+    }
     if (!dragging) return;
     ray.setFromCamera(ndc(e), engine.camera);
     if (!ray.ray.intersectPlane(plane, hit)) return;
@@ -720,41 +715,64 @@ function openEditor(game) {
       sel.mesh.position.x = hit.x + grab.x;
       sel.mesh.position.z = hit.z + grab.z;
       paint();
-    } else if (mode === 'free' && free) {
-      const tx = hit.x + grab.x;
-      const tz = hit.z + grab.z;
-      freeApply((p) => { p.x = tx; p.z = tz; });
+    } else if (selection.length) {
+      const cur = entryPos(selection[0]);
+      applyDelta({ dx: hit.x + grab.x - cur.x, dz: hit.z + grab.z - cur.z }, false);
     }
   }
 
   function onUp() {
     camDrag = null;
+    if (marquee) {
+      const r = marquee.el.getBoundingClientRect();
+      marquee.el.remove();
+      marquee = null;
+      if (r.width > 6 && r.height > 6) marqueeSelect(r);
+      return;
+    }
     if (!dragging) return;
     dragging = false;
-    if (mode === 'handles' && sel) commitPin(sel, sel.mesh.position.x, sel.mesh.position.z);
+    if (mode === 'handles' && sel) { commitPin(sel, sel.mesh.position.x, sel.mesh.position.z); return; }
+    if (selection.length && dragStart) {
+      const cur = entryPos(selection[0]);
+      const d = { dx: cur.x - dragStart[0], dz: cur.z - dragStart[1] };
+      if (Math.abs(d.dx) > 0.001 || Math.abs(d.dz) > 0.001) pushUndo({ kind: 'delta', entries: selection.slice(), d });
+    }
+  }
+
+  /** Everything whose centre lands inside the rubber band. */
+  function marqueeSelect(rect) {
+    const picked = [];
+    const v = new THREE.Vector3();
+    for (const child of engine.scene.children) {
+      if (!isPickable(child)) continue;
+      child.getWorldPosition(v);
+      const p = v.clone().project(engine.camera);
+      if (p.z > 1) continue;
+      const sx = (p.x * 0.5 + 0.5) * innerWidth;
+      const sy = (-p.y * 0.5 + 0.5) * innerHeight;
+      if (sx >= rect.left && sx <= rect.right && sy >= rect.top && sy <= rect.bottom) {
+        picked.push(makeEntry(child));
+      }
+    }
+    selectEntries(picked);
+    game.toast(picked.length ? `${picked.length} selected` : 'Nothing in the box');
   }
 
   function onKey(e) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (e.key === 'Escape') { e.preventDefault(); teardown(); return; }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault(); e.stopPropagation(); undo(); return;
+    }
     const s = e.shiftKey ? 0.5 : 0.05;
 
     if (mode === 'handles') {
       if (!sel) return;
-      // [ ] turn the whole station: yaw is one of its numbers, so it survives
-      // the rebuild and the sign, chairs and zones keep their relationship
       if (e.key === '[' || e.key === ']') {
         if (sel.key !== 'at' || sel.yaw == null) return;
         e.preventDefault(); e.stopPropagation();
-        const step = (e.key === '[' ? -1 : 1) * (e.shiftKey ? 4 : 1) * Math.PI / 36;
-        const patch = room.editorPatch?.(sel.entryId, 'yaw', +(sel.yaw + step).toFixed(3));
-        if (!patch) return;
-        setOverride(room.id, sel.entryId, patch);
-        const keep = [sel.entryId, sel.key];
-        engine.rebuildRoom();
-        sync(true);
-        sel = pins.find((p) => p.entryId === keep[0] && p.key === keep[1]) || null;
-        paint();
+        commitPin(sel, 0, 0, (e.key === '[' ? -1 : 1) * (e.shiftKey ? 4 : 1) * Math.PI / 36);
         return;
       }
       const d = { ArrowUp: [0, -s], ArrowDown: [0, s], ArrowLeft: [-s, 0], ArrowRight: [s, 0] }[e.key];
@@ -766,25 +784,23 @@ function openEditor(game) {
       return;
     }
 
-    if (!free) return;
+    if (e.key === 'f' || e.key === 'F') { e.preventDefault(); camFrame(); return; }
+    if (!selection.length) return;
     const acts = {
-      ArrowUp: () => freeApply((p) => { p.z -= s; }),
-      ArrowDown: () => freeApply((p) => { p.z += s; }),
-      ArrowLeft: () => freeApply((p) => { p.x -= s; }),
-      ArrowRight: () => freeApply((p) => { p.x += s; }),
-      PageUp: () => freeApply((p) => { p.y += s; }),
-      PageDown: () => freeApply((p) => { p.y -= s; }),
-      '[': () => freeApply((p, q) => q.multiply(_yaw(-(e.shiftKey ? 4 : 1) * Math.PI / 36))),
-      ']': () => freeApply((p, q) => q.multiply(_yaw((e.shiftKey ? 4 : 1) * Math.PI / 36))),
-      '-': () => freeApply((p, q, sc) => sc.multiplyScalar(e.shiftKey ? 0.8 : 0.95)),
-      _: () => freeApply((p, q, sc) => sc.multiplyScalar(0.8)),
-      '=': () => freeApply((p, q, sc) => sc.multiplyScalar(e.shiftKey ? 1.25 : 1.0526)),
-      '+': () => freeApply((p, q, sc) => sc.multiplyScalar(1.25)),
-      Tab: () => selectDepth(free.nav, free.nav.depth + (e.shiftKey ? -1 : 1)),
-      f: () => camFrame(),
-      F: () => camFrame(),
-      h: () => { if (free.instanceId == null) { free.obj.visible = !free.obj.visible; paint(); } },
-      H: () => { if (free.instanceId == null) { free.obj.visible = !free.obj.visible; paint(); } },
+      ArrowUp: () => applyDelta({ dz: -s }), ArrowDown: () => applyDelta({ dz: s }),
+      ArrowLeft: () => applyDelta({ dx: -s }), ArrowRight: () => applyDelta({ dx: s }),
+      PageUp: () => applyDelta({ dy: s }), PageDown: () => applyDelta({ dy: -s }),
+      '[': () => applyDelta({ dyaw: -(e.shiftKey ? 4 : 1) * Math.PI / 36 }),
+      ']': () => applyDelta({ dyaw: (e.shiftKey ? 4 : 1) * Math.PI / 36 }),
+      '-': () => applyDelta({ ds: e.shiftKey ? 0.8 : 0.95 }),
+      '=': () => applyDelta({ ds: e.shiftKey ? 1.25 : 1.0526 }),
+      Tab: () => {
+        const nav = selection[0]?.nav;
+        if (!nav || selection.length !== 1) return;
+        const next = ((nav.depth + (e.shiftKey ? -1 : 1)) % nav.levels.length + nav.levels.length) % nav.levels.length;
+        selectEntries([entryFromLevel({ ...nav, depth: next })]);
+      },
+      h: () => hideSel(), H: () => hideSel(),
     };
     const fn = acts[e.key];
     if (!fn) return;
@@ -792,7 +808,16 @@ function openEditor(game) {
     fn();
   }
 
-  const noMenu = (e) => e.preventDefault(); // right-drag orbits instead
+  function hideSel() {
+    for (const e of selection) {
+      if (e.instanceId != null || e.piece) continue;
+      pushUndo({ kind: 'vis', obj: e.obj, prev: e.obj.visible });
+      e.obj.visible = !e.obj.visible;
+    }
+    paint();
+  }
+
+  const noMenu = (e) => e.preventDefault();
   canvas.addEventListener('pointerdown', onDown, true);
   canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
   canvas.addEventListener('contextmenu', noMenu);
@@ -804,14 +829,14 @@ function openEditor(game) {
     mode = m;
     $('ed-t-handles').classList.toggle('on', m === 'handles');
     $('ed-t-free').classList.toggle('on', m === 'free');
-    sel = null; free = null;
-    clearBox();
+    sel = null; selection = [];
+    clearBoxes();
     buildPins();
     sync(true);
   }
   $('ed-t-handles').onclick = () => setMode('handles');
   $('ed-t-free').onclick = () => setMode('free');
-
+  $('ed-undo').onclick = () => undo();
   $('ed-copy').onclick = () => {
     const text = $('ed-out').value;
     if (!text) { game.toast('Move something first'); return; }
@@ -824,7 +849,6 @@ function openEditor(game) {
     if (!room) return;
     if (mode === 'handles') clearOverrides(room.id);
     engine.rebuildRoom();
-    freeMoves.clear();
     sync(true);
     game.toast('Layout reset');
   };
@@ -841,12 +865,13 @@ function openEditor(game) {
     canvas.removeEventListener('pointerdown', onDown, true);
     canvas.removeEventListener('wheel', onWheel, true);
     canvas.removeEventListener('contextmenu', noMenu);
-    engine.setCameraMode ? engine.setCameraMode(savedMode) : (engine.cameraMode = savedMode);
     removeEventListener('pointermove', onMove);
     removeEventListener('pointerup', onUp);
     removeEventListener('keydown', onKey, true);
+    marquee?.el.remove();
+    engine.setCameraMode ? engine.setCameraMode(savedMode) : (engine.cameraMode = savedMode);
     clearPins();
-    clearBox();
+    clearBoxes();
     pinGeo.dispose();
     knobGeo.dispose();
     el.remove();
