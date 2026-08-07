@@ -1032,7 +1032,10 @@ export class PlazaRoom extends Room {
     this.obstacles.push({ x, z, r: 1.1 });
     this.hotspots.push({
       id: 'quest-board',
-      position: new THREE.Vector3(-8.29, 0, 3.85),
+      // Derived from the board, not pinned: a hardcoded world position stayed
+      // behind on the west lawn when the board moved, leaving the prompt
+      // floating in an empty corner. It sits 2.2 out from the reading face.
+      position: new THREE.Vector3(x + Math.sin(g.rotation.y) * 2.2, 0, z + Math.cos(g.rotation.y) * 2.2),
       radius: 2.4,
       label: 'Quest Board',
       // The old cove-notice toast survives as the offline fallback: if the
@@ -1361,16 +1364,21 @@ export class PlazaRoom extends Room {
       posts.push(L([1.45, 1.6, 0]), L([-1.45, 1.6, 0]));
       arches.push(L([0, 3.2, 0]));
       lamps.push(L([1.45, 3.44, 0]), L([-1.45, 3.44, 0]));
-      boards.push(L([0, 5.0, 0]));
-      poles.push(L([0, 5.9, 0]));
-      pennants.push(L([0.26, 6.2, 0], [0, 0, -Math.PI / 2]));
+      // The board hangs ABOVE the arch, so it has to clear the crown: the
+      // torus tops out at 3.2 + 1.45 + 0.28 = 4.93, and a 0.9-tall board
+      // centred at 5.0 started at 4.55, i.e. a third of it inside the stone.
+      // 5.55 leaves a finger of daylight under it. The pole and pennant ride
+      // the same lift so the assembly stays together.
+      boards.push(L([0, 5.55, 0]));
+      poles.push(L([0, 6.45, 0]));
+      pennants.push(L([0.26, 6.75, 0], [0, 0, -Math.PI / 2]));
       planters.push(L([2.5, 0.28, 0]), L([-2.5, 0.28, 0]));
       bushes.push(L([2.5, 0.74, 0]), L([-2.5, 0.74, 0]));
 
       // name board, painted on both faces so it reads coming and going
       const signMat = toonMap(0xffffff, woodSignTex(gt.name, ''));
-      put(g, planeGeo, signMat, 0, 5.0, 0.09, { cast: false });
-      put(g, planeGeo, signMat, 0, 5.0, -0.09, { rot: [0, Math.PI, 0], cast: false });
+      put(g, planeGeo, signMat, 0, 5.55, 0.09, { cast: false });
+      put(g, planeGeo, signMat, 0, 5.55, -0.09, { rot: [0, Math.PI, 0], cast: false });
 
       this.obstacles.push(
         { x: gt.x + px * 1.45, z: gt.z + pz * 1.45, r: 0.55 },
