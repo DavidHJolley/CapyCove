@@ -10,7 +10,7 @@ import { BOT_ZONES, HATS, BODY_COLORS, ROOM_IDS, WALK_SPEED } from '../shared/co
 // the world breathing at low population. What they gained: fixed identities
 // (the same capy every restart) and a daily schedule read off the world clock,
 // so the cafe is busy at breakfast, the club fills in the evening, the lounge
-// fills with sleepers at night, and somebody is always sitting at the bonfire.
+// hosts the nightlife after dark, and somebody is always at the bonfire.
 // What they deliberately did NOT gain: memory, gossip, dialogue grammar. That
 // effort went to the human-to-human systems instead.
 
@@ -41,9 +41,12 @@ const FIRESIDE = [
 ];
 
 // The day, in cove phase (0.0 dawn, 0.25 noon, 0.5 dusk, 0.75 midnight).
+// PLAYTESTER DIRECTION 2026-08-07: citizens do NOT sleep: a real-time clock
+// means night lasts real hours, and a dormitory made the whole cove boring
+// after dark. Nights are for dancing instead.
 const BREAKFAST = { from: 0.02, to: 0.10, room: 'cafe' };
 const EVENING = { from: 0.55, to: 0.70, room: 'club' };
-const SLEEP = { from: 0.70, to: 0.95, room: 'lounge' };
+const NIGHTLIFE = { from: 0.70, to: 0.95, room: 'club' };
 // The bonfire lights at dusk and dies at dawn; its keepers cover the whole of
 // it, so the circle is never empty (they skip the club and the dormitory).
 const FIRE_FROM = 0.50;
@@ -152,7 +155,7 @@ export class BotManager {
     if (bot.keeper && this.bonfire && t >= FIRE_FROM + j && t < FIRE_TO) {
       return { room: this.bonfire.room, post: true };
     }
-    if (inWindow(SLEEP)) return { room: SLEEP.room, sleep: true };
+    if (inWindow(NIGHTLIFE)) return { room: NIGHTLIFE.room };
     if (inWindow(EVENING)) return { room: EVENING.room };
     if (inWindow(BREAKFAST)) return { room: BREAKFAST.room };
     return null;
@@ -174,14 +177,11 @@ export class BotManager {
       }
       const atPost = !!(plan && plan.post && this.bonfire && bot.room === this.bonfire.room);
       bot.post = atPost ? this.firePost(bot) : null;
-      const sleeping = !!(plan && plan.sleep && bot.room === plan.room);
-      if (sleeping !== bot.asleep) {
-        bot.asleep = sleeping;
-        if (sleeping) { bot.anim = 'sit'; bot.target = null; }
-        else if (bot.anim === 'sit') bot.anim = 'idle';
-      }
+      // nobody sleeps (playtester direction): the flag stays for the pjoin
+      // snapshot shape but can only ever be false now
+      if (bot.asleep) { bot.asleep = false; if (bot.anim === 'sit') bot.anim = 'idle'; }
 
-      // ---- chatter (silenced in the dormitory: they are asleep)
+      // ---- chatter (the asleep guards below are inert now: nobody sleeps)
       bot.chatT -= dt;
       if (bot.chatT <= 0) {
         bot.chatT = 14 + Math.random() * 30;
@@ -263,8 +263,14 @@ export class BotManager {
     this.hooks.broadcastToRoom(oldRoom, { t: 'pleave', id: bot.id });
     const zone = BOT_ZONES[to];
     bot.room = to;
-    bot.x = zone.x;
-    bot.z = zone.z;
+    // every citizen owns a personal spot in each room, hash-scattered inside
+    // the zone: arrivals used to land on the exact zone centre, so the whole
+    // night shift slept in one capybara-totem stack in the Den
+    const h = [...`${bot.id}|${to}`].reduce((a, c) => ((a * 31 + c.charCodeAt(0)) >>> 0), 7);
+    const ang = (h % 360) * (Math.PI / 180);
+    const rad = zone.r * (0.25 + ((h >>> 9) % 60) / 100);
+    bot.x = zone.x + Math.cos(ang) * rad;
+    bot.z = zone.z + Math.sin(ang) * rad;
     bot.anim = 'idle';
     bot.target = null;
     bot.post = null;

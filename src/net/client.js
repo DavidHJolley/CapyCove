@@ -90,6 +90,10 @@ export class NetClient {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       this._handle(m);
+      // hidden tabs: rAF is frozen and timers are throttled, but message
+      // handlers always run: piggyback the engine's catch-up tick on traffic
+      // (the server's 10Hz state stream makes this reliable)
+      if (document.hidden) this.engine.backgroundTick?.();
     };
     this.ws.onclose = () => {
       this.connected = false;

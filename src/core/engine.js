@@ -73,6 +73,37 @@ export class Engine {
     this._resize();
 
     canvas.addEventListener('pointerdown', (e) => this._onPointer(e));
+
+    // Background tabs freeze requestAnimationFrame, which used to freeze the
+    // player mid-walk (locally AND for everyone else, since move frames stop).
+    // While hidden, a fallback tick keeps the walker and the net client
+    // simulating. Timers are throttled back there too, so the net client ALSO
+    // calls backgroundTick on incoming traffic (ws handlers never throttle).
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (!this._bgTimer) this._bgTimer = setInterval(() => this.backgroundTick(), 1000);
+      } else if (this._bgTimer) {
+        clearInterval(this._bgTimer);
+        this._bgTimer = null;
+      }
+    });
+  }
+
+  /** Reduced simulation step while the tab is hidden: movement + networking
+   *  only (no render, no camera, no overlays). Safe to call often; it
+   *  rate-limits itself and consumes the shared clock delta in substeps. */
+  backgroundTick() {
+    if (!document.hidden || !this.room || !this.scene || this.paused) return;
+    const now = performance.now();
+    if (now - (this._bgLast || 0) < 200) return;
+    this._bgLast = now;
+    let dt = Math.min(this.clock.getDelta(), 2); // catch up at most 2s at once
+    while (dt > 0) {
+      const step = Math.min(dt, 0.05);
+      if (this.controller.enabled !== false) this.controller.update(step, this.room);
+      this.game.net?.update?.(step);
+      dt -= step;
+    }
   }
 
   _resize() {
