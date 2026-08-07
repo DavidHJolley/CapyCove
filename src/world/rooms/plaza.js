@@ -993,7 +993,10 @@ export class PlazaRoom extends Room {
     // 0.47 of the spawn -> beach-gate walk line. Its hotspot still overlaps the
     // route, so passers-by are offered the read without being herded into it.
     // Wave 7 (LIVING-COVE.md D): the cove notice board IS the Quest Board now.
-    const x = -9.9, z = 4.4;
+    // Playtester layout pass (dev editor, 2026-08-07): brought in off the west
+    // lawn to the middle of the plaza, square to the arrival camera, so the
+    // day's jobs are the first thing you read when you walk in.
+    const x = 0.04, z = 1.0;
     const g = new THREE.Group();
     g.position.set(x, 0, z);
     // Facing the plaza centre (the original yaw 1.90) put its BACK to the play
@@ -1004,7 +1007,7 @@ export class PlazaRoom extends Room {
     // 9 degrees off square from the follow camera at spawn. The hotspot is
     // pinned below rather than derived from the yaw, so the walk line from
     // spawn to the beach gate still passes through it.
-    g.rotation.y = 0.304;
+    g.rotation.y = -0.045;
     scene.add(g);
 
     const wood = makeToon(C.wood), woodD = makeToon(C.woodDark);
@@ -1057,8 +1060,10 @@ export class PlazaRoom extends Room {
     // 20 back and 15 up, so the sight line to a player's feet at the quest
     // board clears y=5.36 where this wall stands. The first pass topped out at
     // 5.68 and cut the player's legs off. Everything here stays under ~5.1.
-    const x = -9.9, z = 11.0;
-    const yaw = 0.304;                     // normal ~ (0.30, 0.95)
+    // Playtester layout pass (dev editor, 2026-08-07): swung west and south so
+    // the wall faces the arrival approach instead of standing edge-on to it.
+    const x = -11.87, z = 6.63;
+    const yaw = 0.740;                     // 42.4 degrees
     const g = new THREE.Group();
     g.position.set(x, 0, z);
     g.rotation.y = yaw;
@@ -1189,10 +1194,14 @@ export class PlazaRoom extends Room {
 
   // ---------------------------------------------------------------- shop --
   _buildShop(scene) {
-    const cx = 10.6, cz = -4.8;   // building centre
-    const fw = -2.6;              // local x of the west-facing wall
+    // Playtester layout pass (dev editor, 2026-08-07): pushed north-east and
+    // turned 45 degrees so the shop presents a corner to the plaza instead of
+    // a flat wall, and its awning side faces the walk in from the fountain.
+    const cx = 11.21, cz = -7.43;  // building centre
+    const fw = -2.6;               // local x of the west-facing wall
     const g = new THREE.Group();
     g.position.set(cx, 0, cz);
+    g.rotation.y = Math.PI / 4;
     scene.add(g);
 
     put(g, new THREE.BoxGeometry(5.2, 4.0, 6.8), makeToon(C.cream), 0, 2.0, 0, { recv: true });
@@ -1301,15 +1310,26 @@ export class PlazaRoom extends Room {
     put(g, new THREE.SphereGeometry(0.26, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), makeToon(C.sky),
       sx, 1.02, sz + 0.76);
 
+    // Colliders and the counter prompt are placed in WORLD space, so they have
+    // to be turned by hand to match the building's 45 degrees: the three-circle
+    // spine now runs along the rotated long axis, and the shop prompt sits off
+    // the counter's new corner rather than due west of the old flat wall.
+    const rot = (lx, lz) => {
+      const c = Math.cos(Math.PI / 4), s = Math.sin(Math.PI / 4);
+      return { x: cx + lx * c + lz * s, z: cz - lx * s + lz * c };
+    };
+    const spine = [rot(0, -2.4), rot(0, 0), rot(0, 2.4)];
+    const counter = rot(sx, sz);
     this.obstacles.push(
-      { x: cx, z: cz - 2.4, r: 2.2 },
-      { x: cx, z: cz, r: 2.2 },
-      { x: cx, z: cz + 2.4, r: 2.2 },
-      { x: cx + sx, z: cz + sz, r: 1.3 },
+      { ...spine[0], r: 2.2 },
+      { ...spine[1], r: 2.2 },
+      { ...spine[2], r: 2.2 },
+      { ...counter, r: 1.3 },
     );
+    const prompt = rot(-4.0, 0);
     this.hotspots.push({
       id: 'shop',
-      position: new THREE.Vector3(7.2, 0, cz),
+      position: new THREE.Vector3(prompt.x, 0, prompt.z),
       radius: 2.6,
       label: 'Wardrobe & Hat Shop',
       action: (gm) => import('../../ui/shop.js').then((m) => m.openShop(gm)),
