@@ -3,19 +3,37 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
 
 /**
  * Paddle Panic : the Game Den's arcade cabinet, one-on-one against Blip, the
- * house champ capybara.
+ * house champ capybara, or against another capy sat at the den table.
  *
- * The whole minigame is a cabinet: marquee, side art with Blip's portrait, a
- * phosphor CRT (2D canvas + scanline/vignette overlays) and a control deck.
- * Everything is drawn procedurally; no WebGL, no assets.
+ * The whole minigame is a cabinet: marquee, side art with the opponent's
+ * portrait, a phosphor CRT (2D canvas + scanline/vignette overlays) and a
+ * control deck. Everything is drawn procedurally; no WebGL, no assets.
  *
- * Difficulty escalates three ways during a match: the ball gains speed on every
- * return, each new serve starts faster than the last, and Blip's reaction time /
- * paddle speed / aim error rubber-band around the score (he sharpens up when you
- * lead, eases off when he does, and is never perfect either way).
+ * Difficulty escalates three ways during a solo match: the ball gains speed on
+ * every return, each new serve starts faster than the last, and Blip's reaction
+ * time / paddle speed / aim error rubber-band around the score (he sharpens up
+ * when you lead, eases off when he does, and is never perfect either way).
  *
  * Score = points won * 100 + rally bonus (1 per return you make, capped at 99),
  * so a score always reads as "points.rallies" and a win is always >= 500.
+ *
+ * ---------------------------------------------------------------------------
+ * PvP (wave 4 table protocol). game.__matchCtx is set by the lounge before the
+ * minigame mounts: { game, players:[{id,name,color,hat}], youAre, seed }.
+ *  - The side art becomes the OTHER capy: their name, fur colour and hat.
+ *    Blip does not vanish, he steps off the stool and comperes from the mic.
+ *  - Seat 0 is the ball authority. It simulates exactly as the solo game does
+ *    (minus Blip's brain) and pushes {ball:{x,y,vx,vy}, paddle, score:[s0,s1]}
+ *    at 20Hz. Seat 1 sends {paddle} at 20Hz, moves its own paddle with zero
+ *    latency (local prediction) and renders the authoritative ball by carrying
+ *    it forward on its last velocity, then easing out the error when a packet
+ *    lands. Points, serves and the final whistle all follow the wire.
+ *  - Every packet is written in the SENDER's field frame. Both seats draw
+ *    themselves as the coral paddle on the right, so the receiver mirrors x
+ *    (x -> FW - x, vx -> -vx); y needs no mirroring.
+ *  - The run reports once with match-done {winner, score}; the shared verdict
+ *    (including a forfeit when the other capy walks out) arrives as match-end.
+ *  - Quitting mid-match just quits: the server forfeits the leaver.
  */
 
 // ---------------------------------------------------------------------------
@@ -30,8 +48,8 @@ const BOT = FH - WALL;
 const PW = 13;                  // paddle width
 const PH = 64;                  // paddle height
 const BALL_R = 7;
-const AI_X = 34;                // Blip is on the left
-const P_X = FW - 34;            // you are on the right
+const AI_X = 34;                // the opponent (Blip, or the other capy) is left
+const P_X = FW - 34;            // you are on the right, on both cabinets
 
 const WIN_POINTS = 5;
 const SERVE_SPEED = 268;
@@ -47,6 +65,19 @@ const RALLY_BONUS_CAP = 99;
 const WIN_BASE = 40;
 const WIN_STEP = 4;
 const LOSS_COINS = 5;
+
+// ---------------------------------------------------------------------------
+// PvP wire tuning (the protocol allows 25 messages/sec; we spend 20)
+// ---------------------------------------------------------------------------
+const NET_DT = 0.05;            // seconds between sends
+const NET_PADDLE = 20;          // lerp rate for the opponent's wire paddle
+const NET_CORRECT = 14;         // lerp rate for easing out ball position error
+const NET_SNAP = 110;           // px of disagreement we stop easing and teleport
+const NET_HOLD = 0.45;          // how long we stand by a predicted return
+const NET_EDGE = 4;             // px of paddle edge we refuse to predict with
+const NET_GRACE = 6;            // px of "you had it" the wire paddle is given
+const NET_VMAX = 2400;          // sanity clamp on anything that arrives
+const MATCH_BONUS = 30;         // what the den pays the winner (server side)
 
 // ---------------------------------------------------------------------------
 // palette (cove colors, pushed to phosphor brightness on the dark screen)
@@ -65,14 +96,54 @@ const C = {
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const rnd = (a, b) => a + Math.random() * (b - a);
 const pick = (a) => a[(Math.random() * a.length) | 0];
+const r1 = (v) => Math.round(v * 10) / 10;
+
+/** Player names go through innerHTML in the cards: never trust them raw. */
+const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]);
+
+/** A number off the wire, or the fallback if it is nonsense. */
+function fin(v, fallback, lo, hi) {
+  const n = Number(v);
+  return Number.isFinite(n) ? clamp(n, lo, hi) : fallback;
+}
+
+/** Avatar colors travel as numbers (0xb08a5a); portraits want '#rrggbb'. */
+function hexOf(c) {
+  if (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c.trim())) return c.trim().toLowerCase();
+  const n = Number(c);
+  const v = Number.isFinite(n) ? (Math.floor(n) & 0xffffff) : 0xb08a5a;
+  return `#${v.toString(16).padStart(6, '0')}`;
+}
+
+/** k > 0 lightens toward cream, k < 0 darkens. */
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16) || 0;
+  const f = (v) => Math.round(clamp(k < 0 ? v * (1 + k) : v + (255 - v) * k, 0, 255));
+  const out = (f((n >> 16) & 255) << 16) | (f((n >> 8) & 255) << 8) | f(n & 255);
+  return `#${out.toString(16).padStart(6, '0')}`;
+}
+
+/** Shared-seed RNG so both seats agree on the serves. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 // ---------------------------------------------------------------------------
-// Blip: portrait art, same grammar as the smoothie customers (200x200 grid)
+// Capybara portraits, same grammar as the smoothie customers (200x200 grid).
+// Blip wears the house headset; a challenger wears whatever hat they own.
 // ---------------------------------------------------------------------------
 const FUR = '#bb8f5e';
 const FUR_DARK = '#8d6841';
 const MUZZLE = '#dcb586';
 const CUP = '#4fb3e8';
+const BLIP_SKIN = { fur: FUR, dark: FUR_DARK, muzzle: MUZZLE, gear: 'headset', hat: 'none' };
 
 function rr(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -91,13 +162,126 @@ function ink(ctx, w = 5) {
 }
 
 /**
- * expr: idle | thinking | smug | worried | beaten
- * gaze: -1..1, shifts the eyes as Blip follows the ball
+ * Every hat in shared/constants.js, flattened onto the 200x200 portrait grid
+ * (head top sits at y=36). Colours echo the 3D builders in src/player/hats.js
+ * so the capy on the cabinet is recognisably the capy in the den.
  */
-function drawBlip(ctx, size, expr, gaze, blink) {
+function drawHat2D(ctx, hat) {
+  ctx.lineJoin = 'round';
+  if (hat === 'beanie') {
+    ctx.beginPath(); ctx.arc(100, 44, 56, Math.PI, Math.PI * 2);
+    ctx.fillStyle = '#e8657a'; ctx.fill(); ink(ctx, 5);
+    rr(ctx, 42, 34, 116, 20, 10);
+    ctx.fillStyle = '#c94b60'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); ctx.arc(100, -14, 15, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff2d6'; ctx.fill(); ink(ctx, 5);
+  } else if (hat === 'cap') {
+    ctx.beginPath(); ctx.arc(100, 44, 54, Math.PI * 1.02, Math.PI * 1.98); ctx.closePath();
+    ctx.fillStyle = '#4fb3e8'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); ctx.ellipse(148, 44, 46, 13, -0.06, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = '#2f89b8'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); ctx.arc(100, -8, 7, 0, Math.PI * 2);
+    ctx.fillStyle = '#7fd0f5'; ctx.fill(); ink(ctx, 4);
+  } else if (hat === 'flower') {
+    ctx.beginPath(); ctx.moveTo(150, 48); ctx.quadraticCurveTo(158, 36, 152, 26);
+    ctx.lineWidth = 5; ctx.strokeStyle = '#4a8f3c'; ctx.stroke();
+    ctx.fillStyle = '#f2d541';
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.ellipse(152 + Math.cos(a) * 14, 22 + Math.sin(a) * 14, 11, 11, 0, 0, Math.PI * 2);
+      ctx.fill(); ink(ctx, 4);
+    }
+    ctx.beginPath(); ctx.arc(152, 22, 10, 0, Math.PI * 2);
+    ctx.fillStyle = '#8a5a2a'; ctx.fill(); ink(ctx, 4);
+  } else if (hat === 'tophat') {
+    rr(ctx, 44, 32, 112, 16, 8);
+    ctx.fillStyle = '#2a2a33'; ctx.fill(); ink(ctx, 5);
+    rr(ctx, 62, -26, 76, 62, 10);
+    ctx.fillStyle = '#3a3a46'; ctx.fill(); ink(ctx, 5);
+    rr(ctx, 62, 14, 76, 14, 4);
+    ctx.fillStyle = '#c94b60'; ctx.fill();
+  } else if (hat === 'crown') {
+    ctx.beginPath();
+    ctx.moveTo(52, 44); ctx.lineTo(60, -2); ctx.lineTo(78, 22); ctx.lineTo(100, -10);
+    ctx.lineTo(122, 22); ctx.lineTo(140, -2); ctx.lineTo(148, 44);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(52, -10, 148, 44);
+    g.addColorStop(0, '#ffdc82'); g.addColorStop(1, '#e0982a');
+    ctx.fillStyle = g; ctx.fill(); ink(ctx, 5);
+    ctx.fillStyle = '#e8657a';
+    for (const gx of [72, 100, 128]) {
+      ctx.beginPath(); ctx.arc(gx, 32, 6, 0, Math.PI * 2); ctx.fill(); ink(ctx, 3);
+    }
+  } else if (hat === 'chef') {
+    rr(ctx, 56, 24, 88, 22, 8);
+    ctx.fillStyle = '#f6efe0'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath();
+    ctx.arc(72, 6, 22, 0, Math.PI * 2);
+    ctx.arc(100, -6, 26, 0, Math.PI * 2);
+    ctx.arc(128, 6, 22, 0, Math.PI * 2);
+    ctx.fillStyle = '#fffaf0'; ctx.fill(); ink(ctx, 5);
+  } else if (hat === 'viking') {
+    ctx.beginPath(); ctx.arc(100, 44, 50, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = '#8d99ae'; ctx.fill(); ink(ctx, 5);
+    rr(ctx, 48, 34, 104, 14, 6);
+    ctx.fillStyle = '#6d7890'; ctx.fill(); ink(ctx, 4.5);
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(100 + side * 46, 12);
+      ctx.scale(side, 1);
+      ctx.beginPath();
+      ctx.moveTo(-10, 16);
+      ctx.quadraticCurveTo(-18, -16, 2, -26);
+      ctx.quadraticCurveTo(-1, -4, 11, 13);
+      ctx.closePath();
+      ctx.fillStyle = '#fff2d6'; ctx.fill(); ink(ctx, 4.5);
+      ctx.restore();
+    }
+  } else if (hat === 'propeller') {
+    ctx.beginPath(); ctx.ellipse(100, 44, 50, 34, 0, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = '#f2a541'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); ctx.moveTo(100, 12); ctx.lineTo(100, -8);
+    ctx.lineWidth = 5; ctx.strokeStyle = '#8d99ae'; ctx.stroke();
+    rr(ctx, 62, -16, 38, 9, 4);
+    ctx.fillStyle = '#4fb3e8'; ctx.fill(); ink(ctx, 4);
+    rr(ctx, 100, -16, 38, 9, 4);
+    ctx.fillStyle = '#e8657a'; ctx.fill(); ink(ctx, 4);
+    ctx.beginPath(); ctx.arc(100, -11, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff6e3'; ctx.fill(); ink(ctx, 3.5);
+  } else if (hat === 'pirate') {
+    ctx.beginPath(); ctx.ellipse(100, 42, 50, 30, 0, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = '#2a2a33'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath();
+    ctx.moveTo(36, 46);
+    ctx.quadraticCurveTo(100, 4, 164, 46);
+    ctx.quadraticCurveTo(100, 30, 36, 46);
+    ctx.closePath();
+    ctx.fillStyle = '#3a3a46'; ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); ctx.arc(100, 26, 9, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff6e3'; ctx.fill(); ink(ctx, 4);
+  }
+}
+
+/**
+ * Portrait of one capybara.
+ * skin: { fur, dark, muzzle, gear:'headset'|'hat', hat }
+ * expr: idle | thinking | smug | worried | beaten
+ * gaze: -1..1, shifts the eyes as they follow the ball
+ */
+function drawCapy(ctx, size, skin, expr, gaze, blink) {
   const s = size / 200;
+  const fur = skin.fur || FUR;
+  const dark = skin.dark || shade(fur, -0.24);
+  const muzz = skin.muzzle || shade(fur, 0.22);
+  const hat = skin.gear === 'headset' ? 'none' : (skin.hat || 'none');
   ctx.save();
   ctx.scale(s, s);
+  // a hat sits above the 200-grid; shrink and drop the whole capy so the
+  // crown/toque/top hat never gets sliced off by the canvas edge
+  if (hat !== 'none') {
+    ctx.translate(100, 100); ctx.scale(0.84, 0.84); ctx.translate(-100, -80);
+  }
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
 
@@ -106,9 +290,9 @@ function drawBlip(ctx, size, expr, gaze, blink) {
 
   // shoulders
   rr(ctx, 48, 150, 104, 60, 30);
-  ctx.fillStyle = FUR_DARK; ctx.fill(); ink(ctx, 5);
+  ctx.fillStyle = dark; ctx.fill(); ink(ctx, 5);
 
-  // ears (they flop when he is beaten)
+  // ears (they flop when they are beaten)
   for (const side of [-1, 1]) {
     const ex = 100 + side * 54;
     const ey = 48 + droop * 16;
@@ -116,7 +300,7 @@ function drawBlip(ctx, size, expr, gaze, blink) {
     ctx.translate(ex, ey);
     ctx.rotate(side * (-0.3 - droop * 0.5));
     ctx.beginPath(); ctx.ellipse(0, 0, 20, 17, 0, 0, Math.PI * 2);
-    ctx.fillStyle = FUR_DARK; ctx.fill(); ink(ctx, 5);
+    ctx.fillStyle = dark; ctx.fill(); ink(ctx, 5);
     ctx.beginPath(); ctx.ellipse(0, 2, 9, 7, 0, 0, Math.PI * 2);
     ctx.fillStyle = '#e2a3a8'; ctx.fill();
     ctx.restore();
@@ -125,12 +309,12 @@ function drawBlip(ctx, size, expr, gaze, blink) {
   // head
   rr(ctx, 38, 36, 124, 104, 42);
   const g = ctx.createLinearGradient(38, 36, 162, 140);
-  g.addColorStop(0, '#d3aa78'); g.addColorStop(1, FUR);
+  g.addColorStop(0, shade(fur, 0.14)); g.addColorStop(1, fur);
   ctx.fillStyle = g; ctx.fill(); ink(ctx, 5.5);
 
   // muzzle
   rr(ctx, 58, 96, 84, 58, 26);
-  ctx.fillStyle = MUZZLE; ctx.fill(); ink(ctx, 4.5);
+  ctx.fillStyle = muzz; ctx.fill(); ink(ctx, 4.5);
 
   // nostrils
   ctx.fillStyle = INK;
@@ -226,25 +410,29 @@ function drawBlip(ctx, size, expr, gaze, blink) {
     }
   }
 
-  // arcade headset: cream band + sky-blue cups
-  ctx.beginPath();
-  ctx.moveTo(40, 52);
-  ctx.quadraticCurveTo(100, -2, 160, 52);
-  ctx.lineWidth = 11; ctx.strokeStyle = C.cream; ctx.lineCap = 'round'; ctx.stroke();
-  ctx.lineWidth = 3.2; ctx.strokeStyle = INK; ctx.stroke();
-  for (const cx of [36, 164]) {
-    rr(ctx, cx - 13, 56, 26, 34, 12);
-    ctx.fillStyle = CUP; ctx.fill(); ink(ctx, 4.5);
-    ctx.beginPath(); ctx.ellipse(cx, 73, 6, 9, 0, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,246,227,0.45)'; ctx.fill();
+  if (skin.gear === 'headset') {
+    // arcade headset: cream band + sky-blue cups
+    ctx.beginPath();
+    ctx.moveTo(40, 52);
+    ctx.quadraticCurveTo(100, -2, 160, 52);
+    ctx.lineWidth = 11; ctx.strokeStyle = C.cream; ctx.lineCap = 'round'; ctx.stroke();
+    ctx.lineWidth = 3.2; ctx.strokeStyle = INK; ctx.stroke();
+    for (const cx of [36, 164]) {
+      rr(ctx, cx - 13, 56, 26, 34, 12);
+      ctx.fillStyle = CUP; ctx.fill(); ink(ctx, 4.5);
+      ctx.beginPath(); ctx.ellipse(cx, 73, 6, 9, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,246,227,0.45)'; ctx.fill();
+    }
+    // mic boom
+    ctx.beginPath();
+    ctx.moveTo(164, 86); ctx.quadraticCurveTo(168, 112, 146, 120);
+    ctx.lineWidth = 5; ctx.strokeStyle = C.cream; ctx.stroke();
+    ctx.lineWidth = 2.4; ctx.strokeStyle = INK; ctx.stroke();
+    ctx.beginPath(); ctx.arc(144, 121, 6, 0, Math.PI * 2);
+    ctx.fillStyle = C.coral; ctx.fill(); ink(ctx, 3.4);
+  } else {
+    drawHat2D(ctx, hat);
   }
-  // mic boom
-  ctx.beginPath();
-  ctx.moveTo(164, 86); ctx.quadraticCurveTo(168, 112, 146, 120);
-  ctx.lineWidth = 5; ctx.strokeStyle = C.cream; ctx.stroke();
-  ctx.lineWidth = 2.4; ctx.strokeStyle = INK; ctx.stroke();
-  ctx.beginPath(); ctx.arc(144, 121, 6, 0, Math.PI * 2);
-  ctx.fillStyle = C.coral; ctx.fill(); ink(ctx, 3.4);
 
   // paws on the control deck, right one on a little joystick
   for (const px of [46, 120]) {
@@ -312,6 +500,22 @@ const TAUNTS = {
   matchAi: ['match point. no pressure'],
   win: ['still the house champ. barely.'],
   lose: ['good game! rematch whenever'],
+};
+
+/**
+ * PvP: Blip gives up the stool and takes the mic. Same keys as TAUNTS, so one
+ * lookup covers both modes; {n} is swapped for the challenger's name.
+ * 'ai' = the other capy scored, 'you' = you scored, 'win' = they won it.
+ */
+const MC = {
+  start: ['two capys, one cabinet. i love this job', 'a proper challenge match! i will call it fairly. mostly', 'winner keeps the stool, loser buys smoothies'],
+  ai: ['{n} takes that one', 'point to {n}! the crowd goes mild', 'ooh, that had spin on it'],
+  you: ['that one is yours!', 'right in the corner. lovely', '{n} will not have liked that'],
+  rally: ['nobody blink. i am not blinking', 'this rally is getting silly', 'my paws are sweating and i am only watching'],
+  matchYou: ['match point! do not think about it'],
+  matchAi: ['match point for {n}. deep breaths'],
+  win: ['and {n} keeps the cabinet. good match'],
+  lose: ['the cabinet changes paws! what a finish'],
 };
 
 // ---------------------------------------------------------------------------
@@ -464,8 +668,29 @@ const STYLE = `
   text-shadow:0 0 34px rgba(79,179,232,.75);animation:mg-pong-count .6s ease-out;}
 @keyframes mg-pong-count{from{transform:scale(2.1);opacity:0}40%{opacity:1}to{transform:scale(1)}}
 
+/* ---- PvP: the challenger's plate + Blip on the mic ---- */
+.mg-pong-live{display:flex;align-items:center;justify-content:center;gap:6px;font-size:9px;letter-spacing:.16em;
+  font-weight:900;color:rgba(255,246,227,.66);}
+.mg-pong-live i{width:7px;height:7px;border-radius:50%;background:#e8657a;box-shadow:0 0 8px #e8657a;
+  animation:mg-pong-lamp 1.3s ease-in-out infinite;}
+.mg-pong-mc{display:flex;align-items:center;gap:8px;padding:5px 9px 5px 5px;border-radius:15px;
+  background:rgba(13,9,22,.42);border:1px solid rgba(255,246,227,.13);}
+.mg-pong-mcface{display:block;flex:none;width:52px;height:52px;}
+.mg-pong-mctag{text-align:left;font-size:9.5px;font-weight:900;letter-spacing:.12em;color:#fff6e3;line-height:1.4;}
+.mg-pong-mctag span{display:block;font-size:8px;letter-spacing:.14em;color:rgba(255,246,227,.5);}
+.mg-pong-go{margin:2px 0 12px;font-size:11px;letter-spacing:.16em;font-weight:900;color:rgba(255,246,227,.7);}
+.mg-pong-gobar{height:8px;margin-top:7px;border-radius:999px;overflow:hidden;background:rgba(255,246,227,.14);}
+.mg-pong-gobar i{display:block;height:100%;border-radius:999px;transform-origin:left center;
+  background:linear-gradient(90deg,#f2b64a,#e8657a);animation:mg-pong-fill 2.4s linear forwards;}
+@keyframes mg-pong-fill{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+.mg-pong-verdict{min-height:16px;margin:0 0 11px;font-size:10.5px;font-weight:900;letter-spacing:.11em;
+  color:rgba(255,246,227,.55);}
+.mg-pong-verdict.mg-pong-won{color:#f2b64a;text-shadow:0 0 16px rgba(242,182,74,.4);}
+
 /* ---- narrow / short cabinets ---- */
 @media (max-width:900px){
+  .mg-pong-mctag,.mg-pong-live{display:none;}
+  .mg-pong-mc{padding:4px;}
   .mg-pong-mid{flex-direction:column;gap:8px;}
   .mg-pong-side{width:100%;flex-direction:row;align-items:center;justify-content:center;gap:12px;padding:7px 12px;}
   .mg-pong-title{display:none;}
@@ -474,6 +699,9 @@ const STYLE = `
     border-right-color:#fff6e3;border-left:0;}
 }
 @media (max-height:640px){
+  .mg-pong-mcface{width:42px;height:42px;}
+  .mg-pong-go{margin:2px 0 7px;font-size:10px;}
+  .mg-pong-verdict{margin-bottom:7px;font-size:9.5px;}
   .mg-pong-marquee h1{font-size:15px;letter-spacing:.1em;}
   .mg-pong-hint{display:none;}
   .mg-pong-bezel{--mg-pong-sh:56vh;}
@@ -493,8 +721,9 @@ const STYLE = `
   .mg-pong-btn{padding:7px 16px;font-size:12px;}
 }
 @media (prefers-reduced-motion:reduce){
-  .mg-pong-face,.mg-pong-lamp,.mg-pong-sweep,.mg-pong-neon,.mg-pong-ribbon{animation:none;}
+  .mg-pong-face,.mg-pong-lamp,.mg-pong-sweep,.mg-pong-neon,.mg-pong-ribbon,.mg-pong-live i{animation:none;}
   .mg-pong-card,.mg-pong-count{animation-duration:.01ms;}
+  .mg-pong-gobar i{animation:none;transform:scaleX(1);}
 }
 `;
 
@@ -545,17 +774,87 @@ export class PongGame extends Minigame {
     this.faceSize = 140;
     this._faceKey = '';
 
+    // Blip on the mic (PvP only): his own mood, his own blink clock
+    this.mcExpr = 'idle';
+    this.mcBlink = false;
+    this.mcLock = 0;
+    this.mcBlinkAt = 2.6;
+    this.mcSize = 52;
+    this._mcKey = '';
+
+    // ---- PvP (all inert in a solo run) ----
+    this.pvp = false;
+    this.seat = 0;
+    this.sim = true;            // do we own the ball?
+    this.me = { id: '', name: 'You' };
+    this.opp = { id: '', name: 'Blip' };
+    this.oppName = 'Blip';
+    this.oppTag = 'BLIP';
+    this.oppSkin = BLIP_SKIN;
+    this.rng = Math.random;
+    this._ctxRef = null;
+    this.netY = FH / 2;         // last paddle position off the wire
+    this.netSeen = false;
+    this.netLive = false;       // has an authoritative ball landed yet?
+    this.netAcc = 0;
+    this.corr = { x: 0, y: 0 }; // ball error we are still easing out
+    this.pendFlip = 0;          // sign of a bounce we called before seat 0 did
+    this.pendUntil = 0;
+    this.waitT = 0;             // silence on the wire, seconds
+    this._saidWait = false;
+    this.ended = false;         // the server has called the match
+    this.endInfo = null;
+    this._sentDone = false;
+    this._offMove = null;
+    this._offEnd = null;
+
     // what the last finished match was, so coinsForScore stays honest
     this._lastWin = null;
     this._lastOpp = 0;
+    this._lastPts = 0;
+    this._lastForfeit = false;
 
     this._chipRally = -1;
     this._chipSpeed = -1;
   }
 
   // ---- lifecycle ----------------------------------------------------------
+  /**
+   * Reads game.__matchCtx (set by the lounge on 'match-start'). Anything the
+   * least bit malformed falls back to the solo cabinet rather than half a
+   * match: a run against Blip is always better than a broken one.
+   */
+  _readMatch() {
+    const ctx = this.game?.__matchCtx;
+    this._ctxRef = ctx || null;
+    const seats = ctx && Array.isArray(ctx.players) ? ctx.players : null;
+    const ok = !!ctx && (!ctx.game || ctx.game === 'pong')
+      && !!seats && seats.length === 2 && !!seats[0] && !!seats[1]
+      && (ctx.youAre === 0 || ctx.youAre === 1);
+    if (!ok) return;
+
+    this.pvp = true;
+    this.seat = ctx.youAre;
+    this.sim = this.seat === 0;
+    this.me = seats[this.seat];
+    this.opp = seats[1 - this.seat];
+    this.oppName = String(this.opp.name || 'Capy').trim().slice(0, 14) || 'Capy';
+    this.oppTag = this.oppName.toUpperCase().slice(0, 9);
+    const fur = hexOf(this.opp.color);
+    this.oppSkin = {
+      fur,
+      dark: shade(fur, -0.24),
+      muzzle: shade(fur, 0.22),
+      gear: 'hat',
+      hat: typeof this.opp.hat === 'string' ? this.opp.hat : 'none',
+    };
+    const seed = Number(ctx.seed);
+    this.rng = mulberry32(Number.isFinite(seed) ? Math.floor(seed) : 1);
+  }
+
   mount(root) {
     super.mount(root);
+    this._readMatch();
 
     const style = document.createElement('style');
     style.textContent = STYLE;
@@ -573,6 +872,7 @@ export class PongGame extends Minigame {
       canvas: q('[data-el="canvas"]'),
       over: q('[data-el="over"]'),
       face: q('[data-el="face"]'),
+      mcface: q('[data-el="mcface"]'),
       bubble: q('[data-el="bubble"]'),
       rally: q('[data-el="rally"]'),
       best: q('[data-el="best"]'),
@@ -601,6 +901,11 @@ export class PongGame extends Minigame {
     window.addEventListener('blur', this._onBlur);
     window.addEventListener('resize', this._onResize);
 
+    if (this.pvp) {
+      this._offMove = this.game.events.on('match-move', (m) => this._onNetMove(m));
+      this._offEnd = this.game.events.on('match-end', (m) => this._onMatchEnd(m));
+    }
+
     this._resize();
     this._showSplash();
     this._raf = requestAnimationFrame((t) => this._loop(t));
@@ -618,6 +923,22 @@ export class PongGame extends Minigame {
     window.removeEventListener('keyup', this._onKeyUp);
     window.removeEventListener('blur', this._onBlur);
     window.removeEventListener('resize', this._onResize);
+    this._offMove?.();
+    this._offEnd?.();
+    this._offMove = null;
+    this._offEnd = null;
+    // Walking out of a live match is a forfeit and the den has to hear about it,
+    // or the other capy volleys at an empty cabinet until we disconnect. The one
+    // window we stay quiet in is "we reported, the den has not ruled yet":
+    // standing up there would hand away a match we already won. (Harmless if the
+    // lounge sends its own table-leave on the way out: the server no-ops it.)
+    if (this.pvp && !this.ended && !this._sentDone) {
+      this.game?.net?.send?.({ t: 'table-leave' });
+    }
+    // only clear the context we actually consumed: the lounge may already have
+    // parked a fresh one for the next table if this quit was a room change
+    if (this._ctxRef && this.game?.__matchCtx === this._ctxRef) this.game.__matchCtx = null;
+    this._ctxRef = null;
     this.trail.length = 0;
     this.parts.length = 0;
     this.ctx = null;
@@ -629,6 +950,12 @@ export class PongGame extends Minigame {
     const s = Math.max(0, Math.floor(Number(score) || 0));
     // the rally bonus is capped below 100, so score >= 500 means five points won
     const won = this._lastWin === null ? s >= WIN_POINTS * 100 : this._lastWin;
+    // a match nobody finished (the other capy walked out) pays for the points
+    // actually played, never the full trophy: the server's win bonus covers it
+    if (this._lastForfeit) {
+      const pts = clamp(Math.floor(this._lastPts || 0), 0, WIN_POINTS);
+      return Math.min(WIN_BASE, LOSS_COINS + WIN_STEP * pts);
+    }
     if (!won) return LOSS_COINS;
     const opp = clamp(Math.floor(this._lastOpp || 0), 0, WIN_POINTS - 1);
     return WIN_BASE + WIN_STEP * (WIN_POINTS - opp);
@@ -650,6 +977,26 @@ export class PongGame extends Minigame {
 
   // ---- markup -------------------------------------------------------------
   _html() {
+    // PvP: the side art is the challenger, and Blip gets a mic strip under it
+    const side = this.pvp
+      ? `<canvas class="mg-pong-face" data-el="face"></canvas>
+            <div>
+              <div class="mg-pong-plate">${esc(this.oppName)}</div>
+              <div class="mg-pong-title">CHALLENGER</div>
+            </div>
+            <div class="mg-pong-live"><i></i>LIVE MATCH</div>
+            <div class="mg-pong-mc">
+              <canvas class="mg-pong-mcface" data-el="mcface"></canvas>
+              <div class="mg-pong-mctag">BLIP<span>ON THE MIC</span></div>
+            </div>
+            <div class="mg-pong-bubble" data-el="bubble"></div>`
+      : `<canvas class="mg-pong-face" data-el="face"></canvas>
+            <div>
+              <div class="mg-pong-plate">BLIP</div>
+              <div class="mg-pong-title">HOUSE CHAMP</div>
+            </div>
+            <div class="mg-pong-bubble" data-el="bubble"></div>`;
+
     return `
       <div class="mg-pong-hall" data-el="hall"><div class="mg-pong-carpet"></div></div>
 
@@ -662,12 +1009,7 @@ export class PongGame extends Minigame {
 
         <div class="mg-pong-mid">
           <div class="mg-pong-side">
-            <canvas class="mg-pong-face" data-el="face"></canvas>
-            <div>
-              <div class="mg-pong-plate">BLIP</div>
-              <div class="mg-pong-title">HOUSE CHAMP</div>
-            </div>
-            <div class="mg-pong-bubble" data-el="bubble"></div>
+            ${side}
           </div>
 
           <div class="mg-pong-screenwrap">
@@ -690,6 +1032,7 @@ export class PongGame extends Minigame {
             </span>
           </div>
           <div class="mg-pong-chip">BEST <b data-el="best">0</b></div>
+          ${this.pvp ? `<div class="mg-pong-chip">VS <b>${esc(this.oppTag)}</b></div>` : ''}
           <div class="mg-pong-hint">MOUSE or W / S</div>
           <button class="mg-pong-quit" data-el="quit">QUIT</button>
         </div>
@@ -750,7 +1093,8 @@ export class PongGame extends Minigame {
       if (down) this.useMouse = false;
       e.preventDefault();
     } else if (down && (k === ' ' || k === 'Enter')) {
-      if (this.phase === 'splash' || this.phase === 'over') {
+      // a challenge match starts itself on both cabinets: no early birds
+      if (!this.pvp && (this.phase === 'splash' || this.phase === 'over')) {
         e.preventDefault();
         this._countdown();
       }
@@ -780,14 +1124,25 @@ export class PongGame extends Minigame {
     const ph = Math.round(h * dpr);
     if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
 
-    const fs = (window.innerWidth < 900 || window.innerHeight < 640) ? 88 : 140;
+    const small = window.innerWidth < 900 || window.innerHeight < 640;
+    const fs = small ? 88 : 140;
     if (fs !== this.faceSize) {
       this.faceSize = fs;
       this.el.face.style.width = `${fs}px`;
       this.el.face.style.height = `${fs}px`;
       this._faceKey = '';
     }
+    const ms = small ? 42 : 52;
+    if (ms !== this.mcSize || !this._mcKey) {
+      this.mcSize = ms;
+      this._mcKey = '';
+      if (this.el.mcface) {
+        this.el.mcface.style.width = `${ms}px`;
+        this.el.mcface.style.height = `${ms}px`;
+      }
+    }
     this._paintFace();
+    this._paintMc();
   }
 
   // ---- screens ------------------------------------------------------------
@@ -796,8 +1151,32 @@ export class PongGame extends Minigame {
     const best = this.game.state?.bests?.pong || 0;
     const sweep = clampCoinsForGame('pong', WIN_BASE + WIN_STEP * WIN_POINTS);
     const over = this.el.over;
+    const name = esc(this.oppName);
     over.classList.remove('mg-pong-gone');
-    over.innerHTML = `
+    over.innerHTML = this.pvp ? `
+      <div class="mg-pong-card">
+        <h2>CHALLENGE MATCH</h2>
+        <div class="mg-pong-sub">YOU vs ${name.toUpperCase()}</div>
+        <div class="mg-pong-legend">
+          <span><i class="mg-pong-sw mg-pong-them"></i>${name.toUpperCase()}</span>
+          <span><i class="mg-pong-sw mg-pong-ball"></i>BALL</span>
+          <span><i class="mg-pong-sw mg-pong-you"></i>YOU</span>
+        </div>
+        <div class="mg-pong-rules">
+          <div><i>1</i><span>Slide your paddle with the <b>mouse</b>, or <b>W</b>/<b>S</b> (arrows work too). You are the coral paddle on the right.</span></div>
+          <div><i>2</i><span>First to <b>5</b> points wins the cabinet. Every return makes the ball faster.</span></div>
+          <div><i>3</i><span>Hit with the <b>edge</b> of the paddle to bend the ball into the corners.</span></div>
+          <div><i>4</i><span>Walking out now hands ${name} the match, so stay for the whole five.</span></div>
+        </div>
+        <div class="mg-pong-stats">
+          <div class="mg-pong-stat"><b>${best}</b><span>YOUR BEST</span></div>
+          <div class="mg-pong-stat mg-pong-gold"><b>+${MATCH_BONUS}</b><span>COINS FOR THE WIN</span></div>
+        </div>
+        <div class="mg-pong-go">STARTING THE MATCH<div class="mg-pong-gobar"><i></i></div></div>
+        <div class="mg-pong-btns">
+          <button class="mg-pong-btn mg-pong-ghost" data-a="leave">Forfeit and leave</button>
+        </div>
+      </div>` : `
       <div class="mg-pong-card">
         <h2>PADDLE PANIC</h2>
         <div class="mg-pong-sub">BLIP HAS HELD THIS CABINET ALL WEEK</div>
@@ -821,13 +1200,24 @@ export class PongGame extends Minigame {
           <button class="mg-pong-btn mg-pong-ghost" data-a="leave">Back to the den</button>
         </div>
       </div>`;
-    over.querySelector('[data-a="play"]').addEventListener('click', () => this._countdown());
+    over.querySelector('[data-a="play"]')?.addEventListener('click', () => this._countdown());
     over.querySelector('[data-a="leave"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this.quit();
     });
     this._setFace('idle', 0);
-    this._say(pick(TAUNTS.start), 4200);
+    this._say(this._line('start'), 4200);
+    // both cabinets got 'match-start' at the same moment, so both count
+    // themselves in: nobody has to press anything for the other capy
+    if (this.pvp) this._after(2400, () => { if (this.phase === 'splash') this._countdown(); });
+  }
+
+  /** One chatter line, Blip-the-opponent or Blip-the-compere. */
+  _line(kind) {
+    const src = this.pvp ? MC : TAUNTS;
+    const lines = Object.prototype.hasOwnProperty.call(src, kind) ? src[kind] : null;
+    if (!lines || !lines.length) return '';
+    return String(pick(lines)).replace('{n}', this.oppName);
   }
 
   _countdown() {
@@ -838,12 +1228,14 @@ export class PongGame extends Minigame {
     const over = this.el.over;
     const steps = ['3', '2', '1', 'GO!'];
     const show = (i) => {
+      // the wire (or a forfeit) can pull us out mid-count: never repaint over it
+      if (this.phase !== 'countdown') return;
       if (i >= steps.length) {
         over.classList.add('mg-pong-gone');
         over.innerHTML = '';
         this.phase = 'serve';
         this.phaseT = 0.7;
-        this.serveDir = Math.random() < 0.5 ? -1 : 1;
+        this.serveDir = this.rng() < 0.5 ? -1 : 1;
         return;
       }
       over.classList.remove('mg-pong-gone');
@@ -852,6 +1244,15 @@ export class PongGame extends Minigame {
       this._after(i === steps.length - 1 ? 420 : 620, () => show(i + 1));
     };
     show(0);
+  }
+
+  /** The challenger's cabinet joins the rally the instant the wire says so. */
+  _goLive() {
+    if (this.phase === 'splash') this._resetMatch();
+    this.el.over?.classList.add('mg-pong-gone');
+    if (this.el.over) this.el.over.innerHTML = '';
+    this.phase = 'serve';
+    this.phaseT = 0;
   }
 
   _resetMatch() {
@@ -877,34 +1278,65 @@ export class PongGame extends Minigame {
     this._done = false; // every replay reports its own run
     this._lastWin = null;
     this._lastOpp = 0;
+    this._lastPts = 0;
+    this._lastForfeit = false;
+    this.netLive = false;
+    this.netAcc = 0;
+    this.corr.x = 0;
+    this.corr.y = 0;
+    this.pendFlip = 0;
+    this.pendUntil = 0;
+    this.waitT = 0;
+    this._saidWait = false;
+    if (this.pvp && this.netSeen) this.ai.y = this.netY;
     this._setFace('idle', 0);
+    this._setMc('idle', 0);
     this._syncChips(true);
   }
 
   _results() {
+    if (this.phase === 'over') return; // forfeit and the final point can race
     this.phase = 'over';
-    const won = this.pScore >= WIN_POINTS;
+    const forfeit = this.endInfo?.reason === 'forfeit';
+    // the den has the last word on a PvP result; otherwise the scoreboard does
+    const won = this.pvp && this.endInfo?.winner
+      ? this.endInfo.winner === this.me.id
+      : this.pScore >= WIN_POINTS;
     const score = this.pScore * 100 + Math.min(RALLY_BONUS_CAP, this.playerHits);
     this._lastWin = won;
     this._lastOpp = this.aScore;
+    this._lastPts = this.pScore;
+    this._lastForfeit = forfeit;
 
     const prevBest = this.game.state?.bests?.pong || 0;
     const isBest = score > prevBest;
     const coins = this._payout(score);
     this.finish(score);
+    // both cabinets read the same authoritative scoreboard, so both report the
+    // same winner and the den can pay the bonus without arguing
+    if (this.pvp && !this.ended) {
+      this._sendDone(this.pScore >= WIN_POINTS ? this.me.id : this.opp.id, score);
+    }
     const shown = Math.max(prevBest, score);
     this.el.best.textContent = String(shown);
     this.game.audio?.play?.(won ? 'levelup' : 'fail');
     this._setFace(won ? 'beaten' : 'smug', 6);
-    this._say(won ? pick(TAUNTS.lose) : pick(TAUNTS.win), 5200);
+    this._setMc(won ? 'smug' : 'thinking', 6);
+    this._say(won ? this._line('lose') : this._line('win'), 5200);
+
+    const name = esc(this.oppTag);
+    let title;
+    if (forfeit) title = won ? 'MATCH AWARDED' : 'MATCH CALLED OFF';
+    else if (won) title = 'YOU WIN!';
+    else title = this.pvp ? `${name} TAKES IT` : 'BLIP HOLDS THE CABINET';
 
     const over = this.el.over;
     over.classList.remove('mg-pong-gone');
     over.innerHTML = `
       <div class="mg-pong-card">
         ${isBest ? '<div class="mg-pong-ribbon">NEW CABINET RECORD</div>' : ''}
-        <h2>${won ? 'YOU WIN!' : 'BLIP HOLDS THE CABINET'}</h2>
-        <div class="mg-pong-sub">${this._verdict(won)}</div>
+        <h2>${title}</h2>
+        <div class="mg-pong-sub">${this._verdict(won, forfeit)}</div>
         <div class="mg-pong-stats">
           <div class="mg-pong-stat"><b>${this.pScore} - ${this.aScore}</b><span>FINAL</span></div>
           <div class="mg-pong-stat"><b>${score}</b><span>SCORE</span></div>
@@ -915,25 +1347,58 @@ export class PongGame extends Minigame {
           <div class="mg-pong-stat"><b>${this.bestRally}</b><span>LONGEST RALLY</span></div>
           <div class="mg-pong-stat"><b>${Math.min(RALLY_BONUS_CAP, this.playerHits)}</b><span>RALLY BONUS</span></div>
         </div>
+        ${this.pvp ? '<div class="mg-pong-verdict" data-el="verdict"></div>' : ''}
         <div class="mg-pong-btns">
-          <button class="mg-pong-btn" data-a="again">Play again</button>
+          ${this.pvp ? '' : '<button class="mg-pong-btn" data-a="again">Play again</button>'}
           <button class="mg-pong-btn mg-pong-alt" data-a="leave">Back to the den</button>
         </div>
       </div>`;
-    over.querySelector('[data-a="again"]').addEventListener('click', () => this._countdown());
+    over.querySelector('[data-a="again"]')?.addEventListener('click', () => this._countdown());
     over.querySelector('[data-a="leave"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this.exitToRoom();
     });
+    if (this.pvp) this._paintVerdict();
   }
 
-  _verdict(won) {
+  _verdict(won, forfeit) {
+    if (forfeit) {
+      return won
+        ? `${esc(this.oppTag)} WALKED OFF MID-MATCH. THE CABINET IS YOURS.`
+        : 'THE DEN CALLED THIS ONE OFF.';
+    }
+    if (this.pvp) {
+      if (won && this.aScore === 0) return 'A CLEAN SWEEP. THE DEN IS STILL TALKING ABOUT IT.';
+      if (won && this.aScore >= 4) return 'BY ONE POINT. YOUR PAWS ARE SHAKING.';
+      if (won) return 'YOU TOOK THE CABINET OFF ANOTHER CAPY. NICE.';
+      if (this.pScore >= 4) return 'SO CLOSE. ONE MORE RETURN AND THAT WAS YOURS.';
+      if (this.pScore >= 2) return 'YOU FOUND THEIR CORNERS. NOW FIND THEM FASTER.';
+      return 'REMATCH? THE TABLE IS RIGHT THERE.';
+    }
     if (won && this.aScore === 0) return 'A CLEAN SWEEP. THE DEN IS STILL TALKING ABOUT IT.';
     if (won && this.aScore >= 4) return 'BY ONE POINT. YOUR PAWS ARE SHAKING.';
     if (won) return 'THE CHAMP HAS BEEN DETHRONED. FOR NOW.';
     if (this.pScore >= 4) return 'SO CLOSE. ONE MORE RETURN AND THAT WAS YOURS.';
     if (this.pScore >= 2) return 'YOU FOUND HIS CORNERS. NOW FIND THEM FASTER.';
     return 'HE BARELY MOVED. GO AGAIN.';
+  }
+
+  /** The line under the stats that waits for (then reports) the den's ruling. */
+  _paintVerdict() {
+    const el = this.el.over?.querySelector('[data-el="verdict"]');
+    if (!el) return;
+    const info = this.endInfo;
+    if (!info) {
+      el.classList.remove('mg-pong-won');
+      el.textContent = 'WAITING FOR THE DEN TO CALL IT...';
+      return;
+    }
+    const iWon = !!info.winner && info.winner === this.me.id;
+    el.classList.toggle('mg-pong-won', iWon);
+    if (!info.winner) el.textContent = 'THE DEN COULD NOT SPLIT YOU TWO.';
+    else if (info.winner === 'draw') el.textContent = 'THE DEN CALLED IT A DRAW.';
+    else if (iWon) el.textContent = `MATCH WIN CONFIRMED  +${MATCH_BONUS} COINS`;
+    else el.textContent = `${this.oppTag} TAKES THE MATCH.`;
   }
 
   // ---- loop ---------------------------------------------------------------
@@ -962,13 +1427,26 @@ export class PongGame extends Minigame {
 
     if (live) {
       this._movePlayer(dt);
-      this._moveAI(dt);
+      if (this.pvp) this._moveWirePaddle(dt); else this._moveAI(dt);
     }
 
     if (this.phase === 'rally') {
-      this._stepBall(dt);
+      if (this.sim) this._stepBall(dt); else this._stepWireBall(dt);
       this.trail.push({ x: this.ball.x, y: this.ball.y });
       if (this.trail.length > 15) this.trail.shift();
+    } else if (!this.sim) {
+      // the challenger never runs the clock: serves, points and the final
+      // whistle all arrive from seat 0
+      if (this.phase === 'serve' || this.phase === 'point') {
+        this.ball.x = FW / 2;
+        this.ball.y = FH / 2;
+        // ...but a cabinet that just sits there needs to say something
+        this.waitT += dt;
+        if (this.waitT > 6 && !this._saidWait) {
+          this._saidWait = true;
+          this._say(`hmm, ${this.oppName} has gone quiet. hang on`, 5200);
+        }
+      }
     } else if (this.phase === 'point') {
       this.phaseT -= dt;
       if (this.phaseT <= 0) { this.phase = 'serve'; this.phaseT = 0.85; }
@@ -995,6 +1473,7 @@ export class PongGame extends Minigame {
 
     this._faceTick(dt);
     this._syncChips(false);
+    this._netSend(dt);
   }
 
   _movePlayer(dt) {
@@ -1076,9 +1555,232 @@ export class PongGame extends Minigame {
     return lo + (k > span ? 2 * span - k : k);
   }
 
+  // ---- PvP: the wire ------------------------------------------------------
+  /**
+   * The other capy's paddle, eased toward the last position that arrived. The
+   * lerp costs ~50ms of lag, which is exactly the gap between packets, so the
+   * paddle glides instead of stepping. Seat 0 collides against this, which is
+   * fair: it is where the challenger's paddle actually was.
+   */
+  _moveWirePaddle(dt) {
+    const a = this.ai;
+    const lo = TOP + PH / 2;
+    const hi = BOT - PH / 2;
+    const target = clamp(this.netY, lo, hi);
+    const prev = a.y;
+    a.y = clamp(a.y + (target - a.y) * Math.min(1, dt * NET_PADDLE), lo, hi);
+    a.vy = dt > 0 ? (a.y - prev) / dt : 0;
+    a.target = target;
+    // "strain" drives the portrait: how far they are from where the ball is going
+    a.strain = this.phase === 'rally' && this.ball.vx < 0
+      ? Math.abs(this._predictY() - a.y) : 0;
+  }
+
+  /**
+   * The challenger's ball: carry it on its last known velocity, bounce it off
+   * the frame bars and off the paddles locally, then ease out whatever the last
+   * packet disagreed about. Seat 0 still owns the truth; predicting the bounce
+   * is what stops the ball sailing a paddle-width past your own paddle while
+   * the news travels. A predicted bounce is held (see _wireBall) until seat 0
+   * either agrees or the hold times out, so the ball never ping-pongs between
+   * the two versions of events.
+   */
+  _stepWireBall(dt) {
+    const b = this.ball;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.y < TOP + BALL_R && b.vy < 0) { b.y = TOP + BALL_R; b.vy = -b.vy; this._wallHit(); }
+    else if (b.y > BOT - BALL_R && b.vy > 0) { b.y = BOT - BALL_R; b.vy = -b.vy; this._wallHit(); }
+
+    // only predict a comfortable hit: an edge-of-the-paddle scrape is exactly
+    // where our stale copy of their paddle would call it wrong
+    const reach = PH / 2 + BALL_R;
+    if (b.vx > 0 && b.x + BALL_R >= P_X - PW / 2 && b.x - BALL_R <= P_X + PW / 2
+      && Math.abs(b.y - this.player.y) <= reach - NET_EDGE) {
+      this._predictReturn(1);
+    } else if (b.vx < 0 && b.x - BALL_R <= AI_X + PW / 2 && b.x + BALL_R >= AI_X - PW / 2
+      && Math.abs(b.y - this.ai.y) <= reach - NET_EDGE * 2) {
+      this._predictReturn(-1);
+    }
+
+    const k = Math.min(1, dt * NET_CORRECT);
+    b.x += this.corr.x * k; this.corr.x -= this.corr.x * k;
+    b.y += this.corr.y * k; this.corr.y -= this.corr.y * k;
+
+    // if the wire goes quiet mid-rally the ball would sail off forever: park it
+    // (a real point comes back from seat 0 long before this)
+    if (b.x < -150 || b.x > FW + 150) {
+      b.vx = 0; b.vy = 0; b.x = FW / 2; b.y = FH / 2;
+      this.corr.x = 0; this.corr.y = 0;
+      this.pendFlip = 0;
+      this.trail.length = 0;
+      this.phase = 'serve';
+    }
+  }
+
+  /** Same physics seat 0 is about to run, a fraction of a second early. */
+  _predictReturn(side) {
+    this._paddleHit(side);
+    this.pendFlip = Math.sign(this.ball.vx) || 1;
+    this.pendUntil = this.now + NET_HOLD;
+    this.corr.x = 0;
+    this.corr.y = 0;
+  }
+
+  /** 20 sends a second while the match is live; the protocol allows 25. */
+  _netSend(dt) {
+    if (!this.pvp) return;
+    const live = this.phase === 'rally' || this.phase === 'serve' || this.phase === 'point'
+      || this.phase === 'countdown' || this.phase === 'end';
+    if (!live || this.ended) return;
+    this.netAcc += dt;
+    if (this.netAcc < NET_DT) return;
+    this.netAcc = 0;
+    const paddle = r1(this.player.y);
+    // everything is in the sender's own field frame; the receiver mirrors x
+    const data = this.sim
+      ? {
+        ball: { x: r1(this.ball.x), y: r1(this.ball.y), vx: r1(this.ball.vx), vy: r1(this.ball.vy) },
+        paddle,
+        score: [this.pScore, this.aScore], // [seat 0, seat 1]
+      }
+      : { paddle };
+    this.game.net?.send?.({ t: 'match-move', data });
+  }
+
+  /** Once per match, per player: the den pays the bonus when both agree. */
+  _sendDone(winner, score) {
+    if (!this.pvp || this._sentDone) return;
+    this._sentDone = true;
+    this.game.net?.send?.({
+      t: 'match-done',
+      result: { winner, score: Math.max(0, Math.floor(score) || 0) },
+    });
+  }
+
+  _onNetMove(m) {
+    if (this._dead || !this.pvp) return;
+    if (m?.from && this.opp.id && m.from !== this.opp.id) return;
+    const d = m?.data;
+    if (!d || typeof d !== 'object') return;
+
+    if (d.paddle !== undefined) {
+      this.netY = fin(d.paddle, this.netY, TOP + PH / 2, BOT - PH / 2);
+      if (!this.netSeen) { this.netSeen = true; this.ai.y = this.netY; }
+    }
+    this.waitT = 0;                     // they are still there
+    this._saidWait = false;
+    if (this.sim) return;               // seat 0 owns the ball and the scoreboard
+    if (this.phase === 'over') return;
+    if (this.phase === 'splash' || this.phase === 'countdown') this._goLive();
+    if (Array.isArray(d.score) && d.score.length >= 2) this._wireScore(d.score[0], d.score[1]);
+    if (d.ball && typeof d.ball === 'object') this._wireBall(d.ball);
+  }
+
+  /** Scores arrive as [seat 0, seat 1]; a rise on either side is a point. */
+  _wireScore(s0, s1) {
+    const mine = fin(this.seat === 0 ? s0 : s1, this.pScore, 0, WIN_POINTS);
+    const theirs = fin(this.seat === 0 ? s1 : s0, this.aScore, 0, WIN_POINTS);
+    const p = Math.floor(mine);
+    const a = Math.floor(theirs);
+    if (p === this.pScore && a === this.aScore) return;
+    const who = p > this.pScore ? 'player' : a > this.aScore ? 'ai' : null;
+    this.pScore = p;
+    this.aScore = a;
+    if (!who) return;                   // a correction, not a point
+    this.rally = 0;
+    this._pointFx(who, who === 'player' ? 0 : FW, clamp(this.ball.y, TOP, BOT));
+    this._decided();
+  }
+
+  _wireBall(nb) {
+    const b = this.ball;
+    const x = FW - fin(nb.x, FW - b.x, -400, FW + 400);   // mirrored into our frame
+    const y = fin(nb.y, b.y, -400, FH + 400);
+    const vx = -fin(nb.vx, -b.vx, -NET_VMAX, NET_VMAX);
+    const vy = fin(nb.vy, b.vy, -NET_VMAX, NET_VMAX);
+    const moving = Math.abs(vx) > 1 || Math.abs(vy) > 1;
+    let quiet = false;
+
+    if (this.pendFlip) {
+      if (!moving || Math.sign(vx) === this.pendFlip) {
+        this.pendFlip = 0;              // seat 0 saw the same bounce (or a point)
+      } else if (this.now < this.pendUntil) {
+        return;                         // this packet still predates our bounce
+      } else {
+        this.pendFlip = 0;              // we called it wrong: take the truth, quietly
+        quiet = true;
+      }
+    }
+
+    const was = b.vx;
+    // seat 0 never says "returned!" in so many words, but a flip in vx is
+    // exactly that, and a return deserves its pop and its sparks
+    if (!quiet && moving && Math.abs(was) > 1 && this.phase === 'rally') {
+      if (was > 0 && vx < 0) this._wireReturn(1, x, y);
+      else if (was < 0 && vx > 0) this._wireReturn(-1, x, y);
+    }
+
+    b.vx = vx;
+    b.vy = vy;
+    const dx = x - b.x;
+    const dy = y - b.y;
+    if (!this.netLive || !moving || Math.hypot(dx, dy) > NET_SNAP) {
+      b.x = x; b.y = y;
+      this.corr.x = 0; this.corr.y = 0;
+      if (!moving) this.trail.length = 0;
+    } else {
+      this.corr.x = dx;
+      this.corr.y = dy;
+    }
+    this.netLive = true;
+    if (this.phase !== 'end') this.phase = moving ? 'rally' : 'serve';
+  }
+
+  /** side +1: you returned it. side -1: they did. */
+  _wireReturn(side, x, y) {
+    this.rally++;
+    this.bestRally = Math.max(this.bestRally, this.rally);
+    if (side > 0) this.playerHits++;
+    this.shake = Math.max(this.shake, 3 + Math.min(6, this.rally * 0.35));
+    this._spark(x, y, side > 0 ? C.coral : C.sky, 9, side > 0 ? -1 : 1);
+    this.game.audio?.play?.('pop');
+    if (side < 0) this._setFace(this.ai.strain > 62 ? 'worried' : 'thinking', 0.5);
+    if (this.rally === 9) {
+      this._say(this._line('rally'), 2600);
+      this._setMc('thinking', 2.2);
+    }
+  }
+
+  /** The den's ruling: 'done' after both reported, or a forfeit. */
+  _onMatchEnd(m) {
+    if (this._dead || !this.pvp || this.ended) return;
+    this.ended = true;
+    this.endInfo = {
+      reason: m?.reason === 'forfeit' ? 'forfeit' : 'done',
+      winner: m?.winner ?? null,
+    };
+    if (this.phase === 'over') { this._paintVerdict(); return; }
+    if (this.endInfo.reason === 'forfeit') {
+      this.game.audio?.play?.('whoosh');
+      this._results();     // the cabinet stops dead: no ghost rally to watch
+    }
+    // a 'done' ruling that beats our own results screen is impossible (we only
+    // report from _results), but if it ever happens the pending timer paints it
+  }
+
+  /** Five points ends it, whoever is counting. */
+  _decided() {
+    if (this.pScore < WIN_POINTS && this.aScore < WIN_POINTS) return false;
+    this.phase = 'end';
+    this.trail.length = 0;
+    this._after(950, () => this._results());
+    return true;
+  }
+
   _launch() {
     const spd = SERVE_SPEED + Math.min(120, (this.pScore + this.aScore) * 16);
-    const ang = rnd(-0.4, 0.4);
+    const ang = this.rng() * 0.8 - 0.4;
     this.ball.vx = this.serveDir * Math.cos(ang) * spd;
     this.ball.vy = Math.sin(ang) * spd;
     this.trail.length = 0;
@@ -1102,8 +1804,11 @@ export class PongGame extends Minigame {
         b.y = BOT - BALL_R; b.vy = -b.vy; this._wallHit();
       }
 
+      // the far paddle is a wire paddle in a challenge match, i.e. always a
+      // little behind where that capy actually has it: close calls go to them
+      const far = PH / 2 + BALL_R + (this.pvp ? NET_GRACE : 0);
       if (b.vx < 0 && b.x - BALL_R <= AI_X + PW / 2 && b.x + BALL_R >= AI_X - PW / 2
-        && Math.abs(b.y - this.ai.y) <= PH / 2 + BALL_R) {
+        && Math.abs(b.y - this.ai.y) <= far) {
         this._paddleHit(-1);
       } else if (b.vx > 0 && b.x + BALL_R >= P_X - PW / 2 && b.x - BALL_R <= P_X + PW / 2
         && Math.abs(b.y - this.player.y) <= PH / 2 + BALL_R) {
@@ -1159,46 +1864,57 @@ export class PongGame extends Minigame {
     if (side < 0) {
       this._setFace(this.ai.strain > 62 ? 'worried' : 'thinking', 0.5);
     }
-    if (this.rally === 9) this._say(pick(TAUNTS.rally), 2600);
+    if (this.rally === 9) {
+      this._say(this._line('rally'), 2600);
+      this._setMc('thinking', 2.2);
+    }
   }
 
   _point(who) {
     const b = this.ball;
     const edgeX = who === 'player' ? 0 : FW;
+    const edgeY = clamp(b.y, TOP, BOT);
     if (who === 'player') this.pScore++; else this.aScore++;
     this.rally = 0;
-    this.flash = 1;
-    this.shake = 13;
-    this.trail.length = 0;
     b.vx = 0;
     b.vy = 0;
     b.x = FW / 2;
     b.y = FH / 2;
-    this._burst(edgeX, clamp(b.y, TOP, BOT), who === 'player' ? C.coral : C.sky, 22);
+    this._pointFx(who, edgeX, edgeY);
+
+    if (this._decided()) return;
+    this.serveDir = who === 'player' ? -1 : 1; // the ball goes to whoever lost it
+    this.phase = 'point';
+    this.phaseT = 0.55;
+  }
+
+  /** Everything a point looks and sounds like, wherever the point came from. */
+  _pointFx(who, edgeX, edgeY) {
+    this.flash = 1;
+    this.shake = 13;
+    this.trail.length = 0;
+    this._burst(edgeX, edgeY, who === 'player' ? C.coral : C.sky, 22);
 
     if (who === 'player') {
       this.game.audio?.play?.('coin');
       this._setFace('worried', 1.7);
-      this._say(pick(TAUNTS.you), 2400);
+      this._setMc('smug', 1.5);
+      this._say(this._line('you'), 2400);
     } else {
       this.game.audio?.play?.('fail');
       this._setFace('smug', 1.7);
-      this._say(pick(TAUNTS.ai), 2400);
+      this._setMc('thinking', 1.5);
+      this._say(this._line('ai'), 2400);
     }
 
-    if (this.pScore >= WIN_POINTS || this.aScore >= WIN_POINTS) {
-      this.phase = 'end';
-      this._after(950, () => this._results());
-      return;
-    }
+    if (this.pScore >= WIN_POINTS || this.aScore >= WIN_POINTS) return;
     if (this.pScore === WIN_POINTS - 1 && this.aScore < WIN_POINTS - 1) {
-      this._say(pick(TAUNTS.matchYou), 2600);
+      this._say(this._line('matchYou'), 2600);
+      this._setMc('worried', 2.4);
     } else if (this.aScore === WIN_POINTS - 1 && this.pScore < WIN_POINTS - 1) {
-      this._say(pick(TAUNTS.matchAi), 2600);
+      this._say(this._line('matchAi'), 2600);
+      this._setMc('worried', 2.4);
     }
-    this.serveDir = who === 'player' ? -1 : 1; // the ball goes to whoever lost it
-    this.phase = 'point';
-    this.phaseT = 0.55;
   }
 
   // ---- particles ----------------------------------------------------------
@@ -1236,11 +1952,20 @@ export class PongGame extends Minigame {
     }
   }
 
-  // ---- Blip's face + chatter ---------------------------------------------
+  // ---- the side art + chatter --------------------------------------------
+  /** The opponent portrait: Blip solo, the other capy in a challenge match. */
   _setFace(expr, hold) {
     if (this.faceLock > 0 && hold <= 0) return;
     this.faceExpr = expr;
     this.faceLock = hold;
+  }
+
+  /** Blip on the mic (PvP only): he has no stake, so he is mostly delighted. */
+  _setMc(expr, hold) {
+    if (!this.pvp) return;
+    if (this.mcLock > 0 && hold <= 0) return;
+    this.mcExpr = expr;
+    this.mcLock = hold;
   }
 
   _faceTick(dt) {
@@ -1265,6 +1990,19 @@ export class PongGame extends Minigame {
     const target = this.phase === 'rally' ? clamp((this.ball.x - FW / 2) / (FW / 2), -1, 1) : 0;
     this.faceGaze += (target - this.faceGaze) * Math.min(1, dt * 7);
     this._paintFace();
+
+    if (this.pvp) {
+      this.mcLock = Math.max(0, this.mcLock - dt);
+      if (this.mcLock === 0) {
+        this.mcExpr = this.phase === 'rally' && this.rally >= 6 ? 'thinking' : 'idle';
+      }
+      this.mcBlinkAt -= dt;
+      if (this.mcBlinkAt <= 0) {
+        this.mcBlink = !this.mcBlink;
+        this.mcBlinkAt = this.mcBlink ? 0.11 : rnd(1.9, 4.6);
+      }
+      this._paintMc();
+    }
   }
 
   _paintFace() {
@@ -1281,7 +2019,23 @@ export class PongGame extends Minigame {
     const ctx = c.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, s, s);
-    drawBlip(ctx, s, this.faceExpr, gz, this.faceBlink);
+    drawCapy(ctx, s, this.oppSkin, this.faceExpr, gz, this.faceBlink);
+  }
+
+  _paintMc() {
+    const c = this.el.mcface;
+    if (!c) return;
+    const key = `${this.mcExpr}|${this.mcBlink ? 1 : 0}|${this.mcSize}`;
+    if (key === this._mcKey) return;
+    this._mcKey = key;
+    const s = this.mcSize;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const px = Math.round(s * dpr);
+    if (c.width !== px) { c.width = px; c.height = px; }
+    const ctx = c.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, s, s);
+    drawCapy(ctx, s, BLIP_SKIN, this.mcExpr, 0, this.mcBlink);
   }
 
   _say(text, ms) {
@@ -1386,7 +2140,7 @@ export class PongGame extends Minigame {
     ctx.font = '900 12px "Trebuchet MS", "Segoe UI", sans-serif';
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(79,179,232,0.75)';
-    ctx.fillText('BLIP', FW / 2 - 46 - w / 2, 116);
+    ctx.fillText(this.pvp ? this.oppTag : 'BLIP', FW / 2 - 46 - w / 2, 116);
     ctx.fillStyle = 'rgba(232,101,122,0.8)';
     ctx.fillText('YOU', FW / 2 + 46 + w / 2, 116);
     ctx.textAlign = 'left';

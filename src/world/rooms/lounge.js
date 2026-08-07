@@ -1,14 +1,26 @@
 import * as THREE from 'three';
 import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
+import { createAvatar } from '../../player/avatar.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
 
 // ---------------------------------------------------------------------------
-// The Game Den: a warm timber games lodge. Floor plus three walls, the south
-// side open to the camera. The star attraction is the grand stone fireplace on
-// the north wall with a shelf of little gold capy trophies across its mantel,
-// set opposite the door so players walk toward it. Five game stations ring the
-// room, each with a different silhouette and its own painted sign.
+// The Game Den: the warm timber games room INSIDE the Frosty Peak ski lodge.
+// Floor plus three walls, the south side open to the camera; the door leads
+// back out onto the mountain, so every window looks at snow, pines and the far
+// ridges. The star attraction is the grand stone fireplace on the north wall
+// with a shelf of little gold capy trophies across its mantel, set opposite the
+// door so players walk toward it. Five game stations ring the room, each with a
+// different silhouette, its own painted sign and TWO chairs.
+//
+// Those chairs are the multiplayer half of the room (wave 4). Every station is
+// a two-seat table on the server (protocol in CLAUDE.md / src/net/client.js):
+//   out  {t:'table-join', game} {t:'table-leave'}
+//   in   'table' {game, players:[{id,name}]}
+//        'match-start' {game, players, youAre, seed}  -> game.__matchCtx + start
+// Seated capybaras are drawn here from the table roster (their networked body
+// is un-parented while they sit, exactly like the peak race lobby), and each
+// sign carries a live status chip: OPEN / "<name> waits a rival!" / MATCH LIVE.
 //
 // Everything is procedural: canvas textures for signs, boards, felts, rugs and
 // the champion portraits; InstancedMesh batches for the hundreds of small
@@ -56,6 +68,12 @@ const PAL = {
   cocoa: 0x5b3521,
   sky: 0x4fb3e8,
   plum: 0x9b6bd4,
+  // the mountain outside, borrowed straight from Frosty Peak's palette so the
+  // view through the windows matches the room you just walked in from
+  snow: 0xf4f9ff,
+  snowShade: 0xdde8f6,
+  pine: 0x2f6b4f,
+  pineDark: 0x24523d,
 };
 
 // room shell
@@ -78,16 +96,72 @@ const WIN_LO = 2.2, WIN_HI = 4.5;
 const FONT = '"Trebuchet MS", "Segoe UI", system-ui, sans-serif';
 const OUTLINE = '#2d2417';
 
-// Every station in one table so the floor plan is auditable at a glance:
-// where the prop stands, where its prompt fires, where its sign post goes.
-// Sign posts sit off to one side of the approach line, never on it.
+// Every station in one table so the floor plan is auditable at a glance: where
+// the prop stands, where each of its two prompts fires, where its sign post
+// goes, and where its two chairs sit. Sign posts sit off to one side of the
+// approach line, never on it.
+//
+// Layout rules the numbers obey, all of them checked against the obstacle list:
+//   * chairs sit clear of every collider (+0.15) and at least 0.9 from their
+//     own sign post, so nothing grows through a capybara's hat;
+//   * `hs` (sit down) and `aiAt` (play the house) are ~1.5 apart with most of
+//     that in z, because the camera trails 13.5 south: two prompts separated in
+//     x land on top of each other, separated in z they stack neatly;
+//   * neighbouring stations keep their prompts >=2.2 apart, which is as far as
+//     chess and four-in-a-row can get from each other and still face the room.
+// `ai` is the opponent each minigame actually names in its own code.
 const STATIONS = [
-  { id: 'pong', label: 'Play Paddle Panic', name: 'PADDLE PANIC', sub: 'out-volley the house bot', at: [-8.6, -4.8], hs: [-6.9, -4.0], sign: [-8.35, -3.1] },
-  { id: 'shuffle', label: 'Play Shuffle Showdown', name: 'SHUFFLE SHOWDOWN', sub: 'slide it, do not shove it', at: [-9.2, 0.8], hs: [-7.0, 0.8], sign: [-7.95, 2.25] },
-  { id: 'cards', label: 'Play Capy Clash', name: 'CAPY CLASH', sub: 'elements at dawn', at: [-7.4, 5.8], hs: [-5.2, 5.2], sign: [-5.3, 7.1] },
-  { id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS', sub: 'think before you nibble', at: [8.2, -4.8], hs: [6.2, -3.5], sign: [8.05, -2.4] },
-  { id: 'connect4', label: 'Play Four in a Row', name: 'FOUR IN A ROW', sub: 'drop, stack, gloat', at: [9.7, -1.0], hs: [7.4, -1.0], sign: [8.55, 0.4] },
+  {
+    id: 'pong', label: 'Play Paddle Panic', name: 'PADDLE PANIC',
+    sub: 'out-volley the house bot', ai: 'Blip',
+    at: [-8.6, -4.8], hs: [-5.6, -3.4], aiAt: [-5.35, -1.95], sign: [-8.35, -3.1],
+    seats: [[-6.59, -4.74], [-7.27, -3.29]],
+  },
+  {
+    id: 'shuffle', label: 'Play Shuffle Showdown', name: 'SHUFFLE SHOWDOWN',
+    sub: 'slide it, do not shove it', ai: 'Waxwell',
+    at: [-9.2, 0.8], hs: [-7.0, 0.8], aiAt: [-6.7, 2.25], sign: [-7.95, 2.25],
+    seats: [[-9.45, -3.6], [-9.2, 5.25]],
+  },
+  {
+    id: 'cards', label: 'Play Capy Clash', name: 'CAPY CLASH',
+    sub: 'elements at dawn', ai: 'Grandmaster Pebble',
+    at: [-7.4, 5.8], hs: [-5.2, 5.2], aiAt: [-4.8, 3.75], sign: [-5.3, 7.1],
+    seats: [[-6.25, 7.35], [-8.3, 4.35]],
+  },
+  {
+    id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS',
+    sub: 'think before you nibble', ai: 'Grandmaster Pebble',
+    at: [8.2, -4.8], hs: [6.0, -3.3], aiAt: [6.2, -1.85], sign: [8.05, -2.4],
+    seats: [[6.4, -4.55], [8.55, -3.15]],
+  },
+  {
+    id: 'connect4', label: 'Play Four in a Row', name: 'FOUR IN A ROW',
+    sub: 'drop, stack, gloat', ai: 'Dizzy',
+    at: [9.7, -1.0], hs: [6.75, 0.5], aiAt: [7.0, 1.95], sign: [8.7, 1.85],
+    seats: [[8.3, -1.85], [8.3, 0.55]],
+  },
 ];
+const STATION_BY_ID = new Map(STATIONS.map((s) => [s.id, s]));
+
+const TAU = Math.PI * 2;
+// Chair cushions top out at 0.68; a capybara's rear sits 0.12 under its root
+// once the sit pose drops the body, so this parks it on the cushion with a
+// little squish rather than hovering over it.
+const SEAT_Y = 0.74;
+const DEFAULT_FUR = 0xb08a5a; // table payload is id+name only; brown until 'pjoin' knows better
+
+/** Which way a seat looks: always straight at the game it belongs to. */
+function seatYaw(s, i) {
+  const p = s.seats[i];
+  return Math.atan2(s.at[0] - p[0], s.at[1] - p[1]);
+}
+
+/** Long names get elbowed out of a chip that is only so wide. */
+function shortName(n) {
+  const t = String(n || 'Someone');
+  return t.length > 14 ? `${t.slice(0, 13)}…` : t;
+}
 
 const CHAMPIONS = [
   { name: 'Nutmeg', color: 0xb08a5a, hat: 'crown', expr: 'beam' },
@@ -272,54 +346,119 @@ function texRug(kind) {
   });
 }
 
-function texGarden(flip) {
+/** The mountainside past the glass: ridges, pines, drifts, drifting flakes. */
+function texAlps(flip) {
   return canvasTexture(512, 256, (g, w, h) => {
     const sky = g.createLinearGradient(0, 0, 0, h);
-    sky.addColorStop(0, '#8ed2f2');
-    sky.addColorStop(0.5, '#cceaf6');
-    sky.addColorStop(0.62, '#dff0cd');
-    sky.addColorStop(1, '#7fb457');
+    sky.addColorStop(0, '#8fc7ea');
+    sky.addColorStop(0.46, '#cfe6f7');
+    sky.addColorStop(0.6, '#eaf4fb');
+    sky.addColorStop(1, '#f4f9ff');
     g.fillStyle = sky;
     g.fillRect(0, 0, w, h);
-    g.fillStyle = 'rgba(255,255,255,0.88)';
-    for (const [cx, cy, s] of [[90, 44, 1], [250, 30, 0.7], [400, 56, 0.9]]) {
+
+    g.fillStyle = 'rgba(255,255,255,0.8)';
+    for (const [cx, cy, s] of [[96, 40, 1], [268, 26, 0.7], [412, 52, 0.9]]) {
       const x = flip ? w - cx : cx;
       g.beginPath();
-      g.arc(x, cy, 18 * s, 0, 7);
-      g.arc(x + 20 * s, cy + 5 * s, 13 * s, 0, 7);
-      g.arc(x - 19 * s, cy + 6 * s, 12 * s, 0, 7);
+      g.arc(x, cy, 17 * s, 0, 7);
+      g.arc(x + 20 * s, cy + 5 * s, 12 * s, 0, 7);
+      g.arc(x - 18 * s, cy + 6 * s, 11 * s, 0, 7);
       g.fill();
     }
-    g.fillStyle = '#8ec06d';
+
+    // two ridges: the far one hazy blue, the near one rock with snow caps
+    const ridge = (base, peaks, fill, cap) => {
+      g.fillStyle = fill;
+      g.beginPath();
+      g.moveTo(-10, base);
+      for (const [px, py, pw] of peaks) {
+        const x = flip ? w - px : px;
+        g.lineTo(x - pw, base);
+        g.lineTo(x, py);
+        g.lineTo(x + pw, base);
+      }
+      g.lineTo(w + 10, base);
+      g.lineTo(w + 10, h);
+      g.lineTo(-10, h);
+      g.closePath();
+      g.fill();
+      if (!cap) return;
+      g.fillStyle = cap;
+      for (const [px, py, pw] of peaks) {
+        const x = flip ? w - px : px;
+        const k = (base - py) * 0.34;
+        g.beginPath();
+        g.moveTo(x, py);
+        g.lineTo(x + (pw * k) / (base - py) + 8, py + k);
+        g.lineTo(x + 2, py + k * 0.72);
+        g.lineTo(x - 5, py + k);
+        g.lineTo(x - (pw * k) / (base - py) - 7, py + k);
+        g.closePath();
+        g.fill();
+      }
+    };
+    ridge(h * 0.58, [[62, 58, 66], [206, 34, 84], [352, 62, 72], [470, 46, 60]], '#9dbcda', '#e8f3ff');
+    ridge(h * 0.7, [[128, 96, 78], [300, 82, 92], [446, 104, 70]], '#7e8a99', '#f4f9ff');
+
+    // the snowfield, with two soft drift lines
+    g.fillStyle = '#f4f9ff';
     g.beginPath();
-    g.moveTo(0, h * 0.62);
-    for (let x = 0; x <= w; x += 64) g.quadraticCurveTo(x + 32, h * 0.62 - 26, x + 64, h * 0.62);
+    g.moveTo(0, h * 0.69);
+    for (let x = 0; x <= w; x += 64) g.quadraticCurveTo(x + 32, h * 0.69 - 14, x + 64, h * 0.69);
     g.lineTo(w, h);
     g.lineTo(0, h);
     g.fill();
-    for (let i = 0; i < 7; i++) {
-      const x = 34 + i * 72 + (flip ? 20 : 0);
-      const y = h * 0.66 + ((i * 29) % 26);
-      g.strokeStyle = '#6b4f35';
-      g.lineWidth = 7;
+    g.strokeStyle = '#dde8f6';
+    g.lineWidth = 9;
+    for (const dy of [0.8, 0.92]) {
+      g.beginPath();
+      g.moveTo(0, h * dy);
+      for (let x = 0; x <= w; x += 96) g.quadraticCurveTo(x + 48, h * dy - 12, x + 96, h * dy);
+      g.stroke();
+    }
+
+    // pines, snow on every branch
+    for (let i = 0; i < 8; i++) {
+      const x = 30 + i * 64 + (flip ? 22 : 0);
+      const y = h * 0.74 + ((i * 31) % 34);
+      const s = 0.8 + ((i * 37) % 40) / 100;
+      g.strokeStyle = '#6b4a34';
+      g.lineWidth = 7 * s;
       g.beginPath();
       g.moveTo(x, y);
-      g.lineTo(x, y - 30);
+      g.lineTo(x, y - 22 * s);
       g.stroke();
-      g.fillStyle = i % 2 ? '#5f9e42' : '#7ac74f';
+      for (let k = 0; k < 3; k++) {
+        const ty = y - 20 * s - k * 22 * s;
+        const tw = (30 - k * 7) * s;
+        g.fillStyle = k % 2 ? '#2f6b4f' : '#24523d';
+        g.beginPath();
+        g.moveTo(x, ty - 30 * s);
+        g.lineTo(x + tw, ty);
+        g.lineTo(x - tw, ty);
+        g.closePath();
+        g.fill();
+        g.fillStyle = 'rgba(255,255,255,0.85)';
+        g.beginPath();
+        g.moveTo(x, ty - 30 * s);
+        g.lineTo(x + tw * 0.52, ty - 12 * s);
+        g.lineTo(x - tw * 0.52, ty - 12 * s);
+        g.closePath();
+        g.fill();
+      }
+    }
+
+    // flakes hanging in the air, so the view never reads as a still photo
+    g.fillStyle = 'rgba(255,255,255,0.9)';
+    for (let i = 0; i < 34; i++) {
+      const x = (i * 71) % w;
+      const y = 18 + ((i * 53) % (h - 40));
       g.beginPath();
-      g.ellipse(x, y - 44, 26, 24, 0, 0, 7);
+      g.arc(x, y, 2 + (i % 3), 0, 7);
       g.fill();
     }
-    for (let i = 0; i < 26; i++) {
-      const x = (i * 41) % w;
-      const y = h - 12 - ((i * 17) % 26);
-      g.fillStyle = ['#e8657a', '#f2b64a', '#fff6e3'][i % 3];
-      g.beginPath();
-      g.arc(x, y, 5, 0, 7);
-      g.fill();
-    }
-    g.fillStyle = 'rgba(255,246,227,0.16)';
+    g.fillStyle = 'rgba(214,236,255,0.14)';
     g.fillRect(0, 0, w, h);
   });
 }
@@ -357,6 +496,38 @@ function texSign(title, sub, bg = '#f6e3bb', fg = '#5b3a1e', edge = '#a06a30') {
       g.globalAlpha = 1;
     }
   });
+}
+
+/**
+ * The live status chip under a station sign. Repainted into the SAME canvas on
+ * every 'table' frame (one texture per station, forever), like the peak lobby
+ * board. `state` is one of open / waiting / live / solo.
+ */
+const CHIP_W = 384, CHIP_H = 96;
+function paintChip(g, w, h, state, text) {
+  g.clearRect(0, 0, w, h);
+  const fill = state === 'live' ? '#e8657a'
+    : state === 'waiting' ? '#f2b64a'
+      : state === 'solo' ? '#c9b79a' : '#7ac74f';
+  rrect(g, 7, 10, w - 14, h - 20, (h - 20) / 2);
+  g.fillStyle = fill;
+  g.fill();
+  ink(g, 7);
+  // the little lamp: dark when the seat is nobody's business, bright when it is
+  g.beginPath();
+  g.arc(46, h / 2, 13, 0, 7);
+  g.fillStyle = state === 'open' || state === 'live' ? '#fff6e3' : 'rgba(255,246,227,0.55)';
+  g.fill();
+  ink(g, 5);
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  fitFont(g, text, w - 120, 40, '900');
+  g.fillStyle = state === 'waiting' || state === 'solo' ? '#4a3316' : '#fff6e3';
+  g.fillText(text, w / 2 + 20, h / 2 + 2);
+}
+
+function texChip() {
+  return canvasTexture(CHIP_W, CHIP_H, (g, w, h) => paintChip(g, w, h, 'open', 'OPEN'));
 }
 
 function texMarquee() {
@@ -804,8 +975,9 @@ function texCocoa() {
     fitFont(g, 'COCOA BAR', w - 70, 56, '900');
     g.fillText('COCOA BAR', w / 2, h * 0.38);
     g.fillStyle = '#f2b64a';
-    fitFont(g, 'help yourself, marshmallows extra', w - 60, 24, 'normal');
-    g.fillText('help yourself, marshmallows extra', w / 2, h * 0.72);
+    const sub = 'straight off the mountain, marshmallows extra';
+    fitFont(g, sub, w - 60, 24, 'normal');
+    g.fillText(sub, w / 2, h * 0.72);
   });
 }
 
@@ -844,13 +1016,27 @@ export class LoungeRoom extends Room {
   id = 'lounge';
   name = 'The Game Den';
 
-  build(scene) {
+  build(scene, game) {
     this.t = 0;
     this._d = new THREE.Object3D();
     this._col = new THREE.Color();
     this._mA = new THREE.Matrix4();
     this._mB = new THREE.Matrix4();
+    this._v = new THREE.Vector3();
+    this._game = game;
     const rand = rng(70415);
+
+    // --- table state (see the header note for the wire protocol) ------------
+    this._tables = new Map();   // gameId -> [{id,name}, ...] as the server sees it
+    this._seated = new Map();   // playerId -> { avatar, tag, hidden, game, slot }
+    this._chips = new Map();    // gameId -> { tex, mesh, state }
+    this._sitSpots = new Map(); // gameId -> hotspot, so labels can be repainted
+    this._localTable = null;
+    this._localSeat = 0;
+    this._offTable = null;
+    this._offMatchStart = null;
+    this._wasOnline = !!game?.net?.connected;
+    this._reconcileT = 0;
 
     const grad = makeToon(0xffffff).gradientMap;
     this._toonMap = (map, color = 0xffffff, extra = {}) =>
@@ -889,49 +1075,301 @@ export class LoungeRoom extends Room {
     B.cone.build(scene, true, true);
 
     // --- navigation ---------------------------------------------------------
-    // Both spawns sit 3.0 / 2.0 short of the door, outside its 1.9 prompt
-    // radius, so arriving from the plaza does not pop "back to the plaza" over
-    // your head; both look straight up the room at the fireplace.
+    // The den is a room inside the peak's ski lodge, so the only door leads back
+    // out onto the mountain. Both spawns sit 3.0 / 2.0 short of that door,
+    // outside its 1.9 prompt radius, so arriving does not pop "back outside"
+    // over your head; both look straight up the room at the fireplace.
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 5),
-      from_plaza: new THREE.Vector3(0, 0, 6),
+      from_peak: new THREE.Vector3(0, 0, 6),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 10.5, 13.5), lookHeight: 1 };
 
+    // Two prompts per station: sit down at the real table, or play the house.
+    // Solo runs always clear __matchCtx first, so a match that never started
+    // can never turn a later solo run into a phantom duel.
     for (const s of STATIONS) {
+      const sit = {
+        id: `sit-${s.id}`,
+        position: new THREE.Vector3(s.hs[0], 0, s.hs[1]),
+        radius: 1.9,
+        label: this._sitLabel(s),
+        action: (g) => this._onSit(g, s),
+      };
+      this.hotspots.push(sit);
+      this._sitSpots.set(s.id, sit);
       this.hotspots.push({
         id: `play-${s.id}`,
-        position: new THREE.Vector3(s.hs[0], 0, s.hs[1]),
-        radius: 2.2,
-        label: s.label,
-        action: (g) => g.startMinigame(s.id),
+        position: new THREE.Vector3(s.aiAt[0], 0, s.aiAt[1]),
+        radius: 1.6,
+        label: `Play vs ${s.ai}`,
+        action: (g) => { g.__matchCtx = null; g.startMinigame(s.id); },
       });
     }
     this.hotspots.push({
-      id: 'exit-plaza',
+      id: 'exit-peak',
       position: new THREE.Vector3(0, 0, 8),
       radius: 1.9,
-      label: 'Back to Sunny Plaza',
-      action: (g) => g.goToRoom('plaza', 'lounge'),
+      label: 'Back out to Frosty Peak',
+      action: (g) => g.goToRoom('peak', 'lounge'),
     });
+
+    // Live only while this room is: both handles are dropped in dispose().
+    if (game?.events?.on) {
+      this._offTable = game.events.on('table', (m) => this._onTable(m));
+      this._offMatchStart = game.events.on('match-start', (m) => this._onMatchStart(m));
+    }
+    for (const s of STATIONS) this._paintChip(s.id);
+  }
+
+  /* --- tables: prompts ----------------------------------------------------- */
+
+  /** The sit-down prompt reads the table it belongs to. */
+  _sitLabel(s) {
+    if (!this._game?.net?.connected) return s.label; // offline: the house is all there is
+    if (this._localTable === s.id) return 'Stand up';
+    const n = (this._tables?.get(s.id) || []).length;
+    return `Challenge: sit down (${n}/2)`;
+  }
+
+  /**
+   * Push the labels onto the prompts. The engine writes textContent once, when
+   * it spawns the button, so a live label has to patch the element in place.
+   */
+  _refreshLabels() {
+    if (!this._sitSpots) return;
+    for (const s of STATIONS) {
+      const spot = this._sitSpots.get(s.id);
+      if (!spot) continue;
+      const label = this._sitLabel(s);
+      if (label === spot.label) continue;
+      spot.label = label;
+      const el = this._game?.engine?.hotspotEls?.get?.(spot);
+      if (el) el.textContent = label;
+    }
+  }
+
+  /** Sit down, stand up, or (offline) just play the house. */
+  _onSit(g, s) {
+    if (!g?.net?.connected) {
+      g.__matchCtx = null;
+      g.startMinigame(s.id);
+      return;
+    }
+    if (this._localTable === s.id) {
+      g.net.send({ t: 'table-leave' });
+      return;
+    }
+    // the server would drop a join at a full table on the floor, and a prompt
+    // that does nothing at all feels broken
+    if ((this._tables?.get(s.id) || []).length >= s.seats.length) {
+      g.toast?.('Both chairs are taken. Watch the duel, or start one of your own!');
+      return;
+    }
+    // one table at a time, so hopping across the room gives up the old chair
+    // first. Two frames back to back sit well inside the server's social budget.
+    if (this._localTable) g.net.send({ t: 'table-leave' });
+    g.net.send({ t: 'table-join', game: s.id });
+  }
+
+  /* --- tables: server state ------------------------------------------------ */
+
+  /** Server->client 'table': {game, players:[{id,name}]}, one board at a time. */
+  _onTable(m) {
+    if (!m || !this._tables) return;
+    const rows = Array.isArray(m.tables) ? m.tables : [m];
+    for (const row of rows) this._applyTable(row);
+  }
+
+  _applyTable(row) {
+    const s = STATION_BY_ID.get(row?.game);
+    if (!s) return;
+    const players = Array.isArray(row.players) ? row.players.slice(0, s.seats.length) : [];
+    this._tables.set(s.id, players);
+
+    const selfId = this._game?.net?.selfId ?? null;
+    const seen = new Set();
+    let localSeat = null;
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      if (!p || p.id === undefined || p.id === null) continue;
+      if (selfId !== null && p.id === selfId) { localSeat = i; continue; }
+      seen.add(p.id);
+      this._seatRemote(p.id, p.name, s, i);
+    }
+    for (const [id, r] of [...this._seated]) {
+      if (r.game === s.id && !seen.has(id)) this._unseat(id);
+    }
+
+    if (localSeat !== null) this._setLocalTable(s.id, localSeat);
+    else if (this._localTable === s.id) this._setLocalTable(null, 0);
+
+    this._paintChip(s.id);
+    this._refreshLabels();
+  }
+
+  /** Put a remote challenger in their chair. */
+  _seatRemote(id, name, s, slot) {
+    const existing = this._seated.get(id);
+    if (existing) {
+      if (existing.game === s.id && existing.slot === slot) return;
+      this._unseat(id);
+    }
+    const seat = s.seats[slot];
+    if (!seat || !this._seatGroup) return;
+    const game = this._game;
+    const remote = game?.net?.remotes?.get?.(id) || null;
+    const avatar = createAvatar({
+      color: remote?.p?.color ?? DEFAULT_FUR,
+      hat: remote?.p?.hat ?? 'none',
+    });
+    avatar.setAnim('sit');
+    avatar.group.position.set(seat[0], SEAT_Y, seat[1]);
+    avatar.group.rotation.y = seatYaw(s, slot);
+    this._seatGroup.add(avatar.group);
+
+    // The same capybara is also drawn by the net client wherever they happen to
+    // be standing. Park their networked body offscreen while they are seated
+    // here so the room never shows the same player twice; _restoreRemote puts
+    // it (and its name tag, which hides itself once unparented) straight back.
+    let hidden = null;
+    if (remote?.avatar?.group?.parent) {
+      hidden = remote.avatar.group;
+      hidden.parent.remove(hidden);
+    }
+    const tag = game?.engine?.attachNameTag?.(avatar.group, name || 'Capybara') || null;
+    this._seated.set(id, { avatar, tag, hidden, game: s.id, slot });
+    game?.audio?.play?.('pop');
+  }
+
+  _unseat(id) {
+    const r = this._seated.get(id);
+    if (!r) return;
+    this._seated.delete(id);
+    r.tag?.remove?.();
+    this._seatGroup?.remove(r.avatar.group);
+    r.avatar.dispose();
+    this._restoreRemote(id, r.hidden);
+  }
+
+  /** Late-bind seats to their networked record: real fur, real hat, no double. */
+  _reconcileSeats() {
+    const remotes = this._game?.net?.remotes;
+    if (!remotes?.get) return;
+    for (const [id, r] of this._seated) {
+      if (r.hidden) continue;
+      const remote = remotes.get(id);
+      const g = remote?.avatar?.group;
+      if (!g?.parent) continue;
+      r.hidden = g;
+      g.parent.remove(g);
+      if (typeof remote.p?.color === 'number') r.avatar.setColor(remote.p.color);
+      if (remote.p?.hat) r.avatar.setHat(remote.p.hat);
+    }
+  }
+
+  /** Re-parent a networked avatar we hid, but only if it is still that player's. */
+  _restoreRemote(id, group) {
+    if (!group) return;
+    const remote = this._game?.net?.remotes?.get?.(id);
+    const remoteGroup = this._game?.engine?.remoteGroup;
+    if (!remoteGroup || remote?.avatar?.group !== group) return; // they left; net client owns it now
+    if (!group.parent) remoteGroup.add(group);
+  }
+
+  /** Walk the local capybara into (or out of) their chair. */
+  _setLocalTable(id, slot) {
+    if (id === this._localTable && slot === this._localSeat) return;
+    const game = this._game;
+    const engine = game?.engine;
+    const avatar = engine?.playerAvatar;
+    const s = id ? STATION_BY_ID.get(id) : null;
+    const seat = s?.seats[slot];
+    this._localTable = id;
+    this._localSeat = slot;
+    if (seat) {
+      engine?.controller?.setTarget(this._v.set(seat[0], 0, seat[1]));
+      game?.audio?.play?.('whoosh');
+      game?.toast?.(`You take a chair at ${s.name.toLowerCase()}. Waiting for a rival!`);
+    } else if (avatar) {
+      if (avatar.state.anim === 'sit') avatar.setAnim('idle');
+      engine?.snapY?.(avatar.group.position, this);
+      game?.audio?.play?.('click');
+    }
+  }
+
+  /** Server->client 'match-start': stash the ctx, then launch the duel. */
+  _onMatchStart(m) {
+    const game = this._game;
+    if (!game || !m || !STATION_BY_ID.has(m.game)) return;
+    const players = Array.isArray(m.players) ? m.players : [];
+    const selfId = game.net?.selfId ?? null;
+    const mine = this._localTable === m.game
+      || (selfId !== null && players.some((p) => p?.id === selfId));
+    if (!mine) return;
+
+    // Already inside a minigame (a solo run started from the house prompt while
+    // the table filled): startMinigame would no-op and the ctx would sit there
+    // waiting to turn some later solo run into a phantom duel. Bow out loudly
+    // instead, which forfeits and pays the capy who did show up.
+    if (game.activeMinigame) {
+      game.net?.send?.({ t: 'table-leave' });
+      game.toast?.('Your rival sat down while you were mid-game: the table went to them!');
+      return;
+    }
+    game.__matchCtx = {
+      game: m.game,
+      players,
+      youAre: Number(m.youAre) === 1 ? 1 : 0,
+      seed: Number(m.seed) || 0,
+    };
+    const foe = players[Number(m.youAre) === 1 ? 0 : 1];
+    game.toast?.(`${foe?.name || 'A challenger'} sits down opposite you. Play!`);
+    game.startMinigame(m.game);
+  }
+
+  /** Repaint one station's status chip from whatever the server last said. */
+  _paintChip(id) {
+    const c = this._chips?.get(id);
+    const cv = c?.tex?.image;
+    if (!cv?.getContext) return;
+    const players = this._tables?.get(id) || [];
+    let state = 'open', text = 'OPEN';
+    if (!this._game?.net?.connected) { state = 'solo'; text = 'PLAY THE HOUSE'; }
+    else if (players.length >= 2) { state = 'live'; text = 'MATCH LIVE'; }
+    else if (players.length === 1) {
+      state = 'waiting';
+      text = `${shortName(players[0]?.name)} waits a rival!`;
+    }
+    paintChip(cv.getContext('2d'), cv.width, cv.height, state, text);
+    c.tex.needsUpdate = true;
+    c.state = state;
+  }
+
+  /** Empty every chair (the connection went away, or the room is going away). */
+  _clearTables() {
+    for (const id of [...this._seated.keys()]) this._unseat(id);
+    this._tables?.clear();
+    this._setLocalTable(null, 0);
+    this._refreshLabels();
   }
 
   // -------------------------------------------------------------------------
-  // floor, walls, windows, the garden beyond them
+  // floor, walls, windows, the mountainside beyond them
   // -------------------------------------------------------------------------
   _buildShell(scene, B) {
     const { box, boxFlat, cyl, ball, bead, cone } = B;
 
-    // sky and lawn outside, so a peek past a wall never shows the void
+    // pale sky and snowfield outside, so a peek past a wall never shows the void
     const sky = new THREE.Mesh(
       new THREE.SphereGeometry(70, 16, 10),
-      new THREE.MeshBasicMaterial({ color: 0x9ad6f0, side: THREE.BackSide, fog: false }),
+      new THREE.MeshBasicMaterial({ color: 0xc3dcf1, side: THREE.BackSide, fog: false }),
     );
     scene.add(sky);
-    const lawn = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), makeToon(0x7fb457));
-    lawn.rotation.x = -Math.PI / 2;
-    lawn.position.y = -0.06;
-    scene.add(lawn);
+    const snowfield = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), makeToon(PAL.snow));
+    snowfield.rotation.x = -Math.PI / 2;
+    snowfield.position.y = -0.06;
+    scene.add(snowfield);
 
     // the plank floor: the only walkable surface
     const floor = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW, ZS - ZN), this._toonMap(texPlanks()));
@@ -941,9 +1379,10 @@ export class LoungeRoom extends Room {
     scene.add(floor);
     this.groundMeshes = [floor];
 
-    // Decking beyond the door. Not walkable, but it fills the bottom third of
-    // the frame whenever a player heads for the exit, so it gets real boards
-    // and an edge rather than one flat slab of brown.
+    // Decking beyond the door: the lodge's swept porch, snow banked up either
+    // side of it. Not walkable, but it fills the bottom third of the frame
+    // whenever a player heads for the exit, so it gets real boards and an edge
+    // rather than one flat slab of brown.
     const deckTex = texPlanks();
     deckTex.repeat.set(7, 2.4);
     const porch = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW + 3, 7), this._toonMap(deckTex, 0xe0b483));
@@ -953,14 +1392,20 @@ export class LoungeRoom extends Room {
     scene.add(porch);
     box.add(PAL.wood, 0, 0.07, ZS + 0.15, 2 * HW + 3, 0.16, 0.5);
     box.add(PAL.woodMid, 0, 0.05, ZS + 6.7, 2 * HW + 3, 0.14, 0.5);
+    box.add(PAL.snow, 0, 0.12, ZS + 7.3, 2 * HW + 6, 0.34, 1.2);
     for (const sx of [-1, 1]) {
       box.add(PAL.wood, sx * (HW + 1.3), 0.05, ZS + 3.4, 0.4, 0.14, 7);
+      box.add(PAL.snow, sx * (HW + 1.3), 0.14, ZS + 3.4, 0.46, 0.14, 7);
       cyl.add(PAL.wood, sx * (HW + 1.1), 0.7, ZS + 1.2, 0.3, 1.4, 0.3);
       bead.add(0xffd489, sx * (HW + 1.1), 1.5, ZS + 1.2, 0.34, 0.36, 0.34);
+      // snowy pines banked in the drifts either side of the steps
       for (let i = 0; i < 3; i++) {
-        cone.add(i % 2 ? PAL.leaf : PAL.leafDark, sx * (HW + 0.6), 0.6 + i * 0.1, ZS + 3.2 + i * 0.5,
+        cone.add(i % 2 ? PAL.pine : PAL.pineDark, sx * (HW + 0.6), 0.6 + i * 0.1, ZS + 3.2 + i * 0.5,
           0.5, 1.1, 0.5, 0.2, i, 0.15);
+        cone.add(PAL.snow, sx * (HW + 0.6), 0.98 + i * 0.1, ZS + 3.24 + i * 0.5,
+          0.26, 0.4, 0.26, 0.2, i, 0.15);
       }
+      ball.add(PAL.snowShade, sx * (HW + 1.9), 0.16, ZS + 5.2, 2.4, 0.5, 2.0);
     }
 
     // --- walls, with the window openings punched clean through -------------
@@ -1000,9 +1445,9 @@ export class LoungeRoom extends Room {
     east.rotation.y = -Math.PI / 2;
     east.position.set(HW, 0, 0);
 
-    // painted gardens hung just outside
+    // the painted mountainside, hung just outside each run of glass
     for (const s of [-1, 1]) {
-      const v = new THREE.Mesh(new THREE.PlaneGeometry(15, 5.6), this._flat(texGarden(s > 0)));
+      const v = new THREE.Mesh(new THREE.PlaneGeometry(15, 5.6), this._flat(texAlps(s > 0)));
       v.rotation.y = s > 0 ? -Math.PI / 2 : Math.PI / 2;
       v.position.set(s * (HW + 0.8), 3.4, 2.4);
       scene.add(v);
@@ -1343,30 +1788,98 @@ export class LoungeRoom extends Room {
     this._chess(scene, B, STATIONS[3]);
     this._connect4(scene, B, STATIONS[4]);
 
+    // Seated challengers get their own group so dispose() can empty it without
+    // hunting through the scene graph.
+    this._seatGroup = new THREE.Group();
+    scene.add(this._seatGroup);
+
     const { box, cyl, bead } = B;
     for (const s of STATIONS) {
+      // two chairs per station, both looking at the game they belong to
+      for (let i = 0; i < s.seats.length; i++) {
+        this._chair(B, s.seats[i][0], s.seats[i][1], seatYaw(s, i), i ? PAL.leather : PAL.coral);
+      }
+
       // Sign post, turned to face the room camera rather than its own wall.
       // Post, backer and finial ride the shared batches; only the painted face
-      // needs a mesh of its own, because only it carries a unique canvas.
+      // and the live status chip need meshes of their own, because only they
+      // carry a canvas nobody else shares.
       const [sx, sz] = s.sign;
       const yaw = Math.atan2(-sx, 12 - sz);
+      const nx = Math.sin(yaw), nz = Math.cos(yaw);
       cyl.add(PAL.wood, sx, 1.25, sz, 0.18, 2.5, 0.18);
-      box.add(PAL.woodMid, sx, 2.4, sz, 1.86, 0.74, 0.1, 0, yaw, 0);
-      bead.add(PAL.gold, sx, 2.86, sz, 0.22, 0.22, 0.22);
+      box.add(PAL.woodMid, sx, 2.42, sz, 1.86, 0.74, 0.1, 0, yaw, 0);
+      bead.add(PAL.gold, sx, 2.88, sz, 0.22, 0.22, 0.22);
       const face = new THREE.Mesh(new THREE.PlaneGeometry(1.76, 0.66), this._flat(texSign(s.name, s.sub)));
-      face.position.set(sx + Math.sin(yaw) * 0.07, 2.4, sz + Math.cos(yaw) * 0.07);
+      face.position.set(sx + nx * 0.07, 2.42, sz + nz * 0.07);
       face.rotation.y = yaw;
       scene.add(face);
 
-      // glowing ring on the floor where the prompt fires
-      const ring = new THREE.Mesh(
-        new THREE.RingGeometry(0.9, 1.24, 24),
-        new THREE.MeshBasicMaterial({ color: 0xffd489, transparent: true, opacity: 0.42, depthWrite: false }),
+      // the chip hangs off the bottom of the board on two little brass hooks
+      box.add(PAL.woodMid, sx, 1.86, sz, 1.6, 0.44, 0.09, 0, yaw, 0);
+      for (const hx of [-0.62, 0.62]) {
+        bead.add(PAL.brass, sx + Math.cos(yaw) * hx, 2.05, sz - Math.sin(yaw) * hx, 0.1, 0.16, 0.1);
+      }
+      const tex = texChip();
+      const chip = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.5, 0.375),
+        this._flat(tex, { transparent: true, depthWrite: false }),
       );
-      ring.rotation.x = -Math.PI / 2;
-      ring.position.set(s.hs[0], 0.018, s.hs[1]);
-      scene.add(ring);
-      this._rings.push(ring);
+      chip.position.set(sx + nx * 0.075, 1.86, sz + nz * 0.075);
+      chip.rotation.y = yaw;
+      scene.add(chip);
+      this._chips.set(s.id, { tex, mesh: chip, state: 'open' });
+
+      // glowing rings on the floor where each prompt fires: gold for the table
+      // you can sit at, a smaller cool one for the house opponent
+      this._rings.push(this._ring(scene, s.hs, 0.9, 1.24, 0xffd489, 0.42));
+      this._rings.push(this._ring(scene, s.aiAt, 0.5, 0.76, 0x8fd8ff, 0.3));
+    }
+  }
+
+  /** Pulsing prompt marker on the boards. */
+  _ring(scene, at, r0, r1, color, opacity) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(r0, r1, 24),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(at[0], 0.018, at[1]);
+    scene.add(ring);
+    return ring;
+  }
+
+  /**
+   * A station chair: pad, cushion, four splayed legs and a slatted back, all on
+   * the shared batches. Local space is built facing +z and rotated into place,
+   * so `yaw` is the direction the sitter looks. No obstacle circle: a collider
+   * here would shove the local player straight back out of their own seat.
+   */
+  _chair(B, x, z, yaw, cushion) {
+    const { box, cyl, ball } = B;
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const at = (lx, lz) => [x + lx * c + lz * s, z - lx * s + lz * c];
+    const pad = 0.5;
+
+    const [px, pz] = at(0, 0);
+    box.add(PAL.woodLight, px, pad + 0.05, pz, 0.78, 0.1, 0.74, 0, yaw, 0);
+    // cushion tops out at 0.68, which is SEAT_Y minus the 0.06 of squish a
+    // capybara's rear makes when the sit pose drops it onto the pad
+    ball.add(cushion, px, pad + 0.11, pz, 0.72, 0.14, 0.68, 0, yaw, 0);
+    for (const lx of [-0.28, 0.28]) {
+      for (const lz of [-0.26, 0.26]) {
+        const [gx, gz] = at(lx, lz);
+        cyl.add(PAL.wood, gx, pad / 2, gz, 0.1, pad, 0.1);
+      }
+    }
+    // back: two posts and two slats, high enough to frame a seated capy
+    for (const lx of [-0.3, 0.3]) {
+      const [gx, gz] = at(lx, -0.32);
+      cyl.add(PAL.wood, gx, pad + 0.5, gz, 0.11, 1.0, 0.11, 0, yaw, 0);
+    }
+    for (const [ly, h] of [[0.62, 0.2], [0.9, 0.16]]) {
+      const [gx, gz] = at(0, -0.32);
+      box.add(PAL.woodMid, gx, pad + ly, gz, 0.68, h, 0.08, 0, yaw, 0);
     }
   }
 
@@ -1414,7 +1927,7 @@ export class LoungeRoom extends Room {
     g.add(pl);
     this._haloLight = pl;
 
-    this._stool(B, s.at[0] + 1.6, s.at[1] + 2.0, PAL.leather);
+    // seating is the station's own pair of challenger chairs (_buildStations)
     this.obstacles.push({ x: s.at[0], z: s.at[1], r: 1.15 });
   }
 
@@ -1497,9 +2010,6 @@ export class LoungeRoom extends Room {
       cyl.add(col, x + dx, TOP + 0.06, z + dz, 0.3, 0.1, 0.3);
       bead.add(0xfff6e3, x + dx, TOP + 0.12, z + dz, 0.14, 0.04, 0.14);
     }
-    this._stool(B, x + 1.1, z + 1.6, PAL.leather);
-    this._stool(B, x - 1.2, z - 1.5, PAL.coral);
-
     box.add(0x4a3524, x, 3.2, z, 0.06, 1.6, 0.06);
     const shadeMesh = new THREE.Mesh(
       new THREE.ConeGeometry(0.52, 0.44, 12, 1, true),
@@ -1554,8 +2064,6 @@ export class LoungeRoom extends Room {
     // two captured pieces lying on the rim
     cyl.add(light, x + 1.4, TOP + 0.06, z + 0.4, 0.2, 0.12, 0.2, 0.3, 0, 1.3);
     cyl.add(dark, x + 1.4, TOP + 0.06, z - 0.3, 0.2, 0.12, 0.2, 0.2, 0, 1.4);
-    this._stool(B, x - 1.75, z + 0.9, PAL.leatherDark, true);
-    this._stool(B, x + 0.6, z - 1.8, PAL.leatherDark, true);
 
     this.obstacles.push({ x, z, r: 1.5 });
   }
@@ -1635,19 +2143,17 @@ export class LoungeRoom extends Room {
     this.obstacles.push({ x, z, r: 1.35 }, { x, z: z - 1.5, r: 1.0 }, { x, z: z + 1.5, r: 1.0 });
   }
 
-  /** Padded stool, or a low chair with a back when `chair`. */
-  _stool(B, x, z, cushion, chair = false) {
-    const { box, cyl, ball } = B;
-    const h = chair ? 0.5 : 0.62;
-    const n = chair ? 4 : 3;
+  /** Padded three-legged stool: the cocoa bar's seating. */
+  _stool(B, x, z, cushion) {
+    const { cyl, ball } = B;
+    const h = 0.62;
     cyl.add(PAL.woodLight, x, h, z, 0.76, 0.12, 0.76);
     ball.add(cushion, x, h + 0.1, z, 0.7, 0.18, 0.7);
-    for (let l = 0; l < n; l++) {
-      const a = (l / n) * Math.PI * 2 + 0.6;
+    for (let l = 0; l < 3; l++) {
+      const a = (l / 3) * Math.PI * 2 + 0.6;
       cyl.add(PAL.wood, x + Math.cos(a) * 0.2, h / 2, z + Math.sin(a) * 0.2, 0.09, h, 0.09,
         Math.sin(a) * 0.16, 0, -Math.cos(a) * 0.16);
     }
-    if (chair) box.add(PAL.wood, x, h + 0.54, z - 0.34, 0.72, 0.74, 0.1, 0.16, 0, 0);
   }
 
   // -------------------------------------------------------------------------
@@ -1936,7 +2442,7 @@ export class LoungeRoom extends Room {
     // north-facing board only ever shows the camera its back.
     const sign = new THREE.Mesh(
       new THREE.PlaneGeometry(2.3, 0.78),
-      this._flat(texSign('SUNNY PLAZA', 'mind the ducks', '#dff0fb', '#215c86', '#4fb3e8')),
+      this._flat(texSign('FROSTY PEAK', 'boots on, mind the icicles', '#dff0fb', '#215c86', '#4fb3e8')),
     );
     sign.rotation.y = -0.22;
     sign.position.set(-2.95, 2.5, DZ + 0.16);
@@ -1953,11 +2459,25 @@ export class LoungeRoom extends Room {
     scene.add(pool);
     this._exitRing = pool;
 
-    // boots by the door and a coat on a peg
+    // snow boots by the door and a coat on a peg
     for (let i = 0; i < 3; i++) {
       cyl.add(PAL.leatherDark, -3.1 + i * 0.34, 0.24, DZ - 1.15, 0.3, 0.48, 0.3, 0.12, 0, 0);
     }
     bead.add(PAL.coral, 2.55, 2.3, DZ - 0.22, 0.4, 0.5, 0.36);
+
+    // Skis and poles propped against the half wall: the one prop that says
+    // "you are inside the ski lodge" from the arrival spawn, where the door
+    // fills the bottom of the frame.
+    for (let i = 0; i < 2; i++) {
+      const x = 3.9 + i * 0.34;
+      box.add(i ? PAL.sky : PAL.coral, x, 1.0, DZ - 0.5, 0.16, 2.0, 0.06, -0.24, 0, 0.05);
+      box.add(PAL.cream, x, 1.94, DZ - 0.72, 0.16, 0.22, 0.07, -0.24, 0, 0.05);
+    }
+    for (let i = 0; i < 2; i++) {
+      const x = 4.62 + i * 0.2;
+      cyl.add(PAL.steel, x, 0.9, DZ - 0.46, 0.05, 1.8, 0.05, -0.2, 0, 0.04);
+      cyl.add(PAL.gold, x, 0.32, DZ - 0.34, 0.2, 0.05, 0.2, -0.2, 0, 0.04);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2058,18 +2578,90 @@ export class LoungeRoom extends Room {
       zz.material.opacity = Math.max(0, 1 - k) * 0.9;
     }
 
-    // prompt markers breathe
+    // prompt markers breathe. Rings alternate sit / house-opponent, and the
+    // house ring stays the quieter of the two so the real table reads first.
     for (let i = 0; i < this._rings.length; i++) {
       const p = Math.sin(t * 2.1 + i * 1.3);
-      this._rings[i].material.opacity = 0.34 + p * 0.16;
+      const base = i % 2 ? 0.2 : 0.34;
+      this._rings[i].material.opacity = base + p * (i % 2 ? 0.09 : 0.16);
       this._rings[i].scale.setScalar(1 + p * 0.05);
     }
     const q = Math.sin(t * 1.7);
     this._exitRing.material.opacity = 0.14 + q * 0.06;
     this._exitRing.scale.setScalar(1 + q * 0.04);
+
+    this._updateTables(dt, t);
+  }
+
+  // -------------------------------------------------------------------------
+  // tables + matches, per frame
+  // -------------------------------------------------------------------------
+  _updateTables(dt, t) {
+    // seated challengers keep breathing (nothing organic is ever perfectly still)
+    for (const r of this._seated.values()) r.avatar.update(dt);
+
+    // A 'table' frame can beat the 'pjoin' that introduces the same capybara,
+    // so a seat may start out brown and un-deduplicated. Catch up twice a
+    // second: cheap, and it means the chair always ends up wearing their hat.
+    this._reconcileT += dt;
+    if (this._reconcileT > 0.5) {
+      this._reconcileT = 0;
+      if (this._seated.size) this._reconcileSeats();
+    }
+
+    // a chip with somebody waiting on it nudges for attention
+    for (const c of this._chips.values()) {
+      const k = c.state === 'waiting' ? 1 + Math.abs(Math.sin(t * 3.6)) * 0.07 : 1;
+      c.mesh.scale.set(k, k, k);
+    }
+
+    // keep the local capybara settled in their chair while they wait
+    const engine = this._game?.engine;
+    const avatar = engine?.playerAvatar;
+    const st = this._localTable ? STATION_BY_ID.get(this._localTable) : null;
+    const seat = st?.seats[this._localSeat];
+    if (seat && avatar) {
+      const g = avatar.group;
+      const walking = !!engine.controller?.target;
+      if (!walking && Math.hypot(g.position.x - seat[0], g.position.z - seat[1]) < 0.6) {
+        if (avatar.state.anim !== 'sit') avatar.setAnim('sit');
+        g.position.y = SEAT_Y;
+        const yaw = seatYaw(st, this._localSeat);
+        const d = ((((yaw - g.rotation.y) % TAU) + Math.PI * 3) % TAU) - Math.PI;
+        g.rotation.y += d * Math.min(1, dt * 6);
+      }
+    }
+
+    // the prompts have to follow the connection coming and going
+    const online = !!this._game?.net?.connected;
+    if (online !== this._wasOnline) {
+      this._wasOnline = online;
+      if (!online) this._clearTables();
+      else this._refreshLabels();
+      for (const s of STATIONS) this._paintChip(s.id);
+    }
   }
 
   dispose() {
+    // Walking out while seated must not leave a ghost holding a chair. Harmless
+    // if the server already dropped us on the room change.
+    if (this._localTable && this._game?.net?.connected) {
+      this._game.net.send({ t: 'table-leave' });
+    }
+    // seats next: they hold engine-owned name tags and may be sitting on top of
+    // networked avatars we un-parented, which have to go back in the room
+    for (const id of [...this._seated.keys()]) this._unseat(id);
+    this._seated.clear();
+    this._offTable?.();
+    this._offMatchStart?.();
+    this._offTable = null;
+    this._offMatchStart = null;
+    this._localTable = null;
+    this._seatGroup = null;
+    this._sitSpots = null;
+    this._tables = null;
+    this._chips = null; // chip materials are unique; disposeObject frees them
+    this._game = null;
     this._flames = null;
     this._flameData = null;
     this._embers = null;

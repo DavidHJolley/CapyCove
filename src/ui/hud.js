@@ -245,13 +245,14 @@ function popCoins(pill, delta) {
 // so the map costs no assets and scales to any card size.
 // ---------------------------------------------------------------------------
 
-// Painted landmark centres, in fractions of the island box.
+// Painted landmark centres, in fractions of the island box. The Game Den lives
+// inside the ski lodge, so it sits up on the peak's snowfield, not on the grass.
 const ART = {
   plaza: [0.500, 0.465],
   beach: [0.170, 0.570],
   peak: [0.500, 0.195],
   cafe: [0.795, 0.400],
-  lounge: [0.678, 0.518],
+  lounge: [0.362, 0.284],
   club: [0.690, 0.700],
 };
 
@@ -261,14 +262,14 @@ const MAP_SPOTS = [
   { id: 'beach', bx: 24, by: 68 },
   { id: 'peak', bx: 50, by: 32.5 },
   { id: 'cafe', bx: 78, by: 51 },
-  { id: 'lounge', bx: 70, by: 65 },
+  { id: 'lounge', bx: 31.5, by: 41.5 },
   { id: 'club', bx: 66, by: 81.5 },
 ];
 
 // The lodge window and chimney, as offsets from the lounge landmark centre in
 // R() units: the painted layer and the live glow/smoke must agree on them.
-const DEN_WINDOW = [0.021, 0.019];
-const DEN_CHIMNEY = [-0.033, -0.050];
+const DEN_WINDOW = [0.018, 0.019];
+const DEN_CHIMNEY = [-0.024, -0.040];
 
 const MAP_HINT = 'Pick a spot to waddle over. Press M to close the map.';
 
@@ -314,8 +315,10 @@ const SEA_SPARKS = [
   [0.44, 0.04], [0.26, 0.07], [0.13, 0.17], [0.95, 0.87],
 ];
 
+// The two west-slope pines give the den lodge its clearing; the rest are the
+// peak's usual treeline.
 const PINES = [
-  [0.355, 0.290, 1.00], [0.310, 0.340, 0.88], [0.402, 0.348, 0.82], [0.615, 0.292, 1.00],
+  [0.412, 0.232, 0.86], [0.302, 0.348, 0.88], [0.402, 0.348, 0.82], [0.615, 0.292, 1.00],
   [0.663, 0.338, 0.88], [0.575, 0.352, 0.78], [0.440, 0.248, 0.72], [0.560, 0.244, 0.68],
   [0.712, 0.400, 0.84], [0.292, 0.420, 0.80], [0.248, 0.318, 0.70], [0.742, 0.320, 0.72],
 ];
@@ -324,7 +327,7 @@ const TREES = [
   [0.330, 0.600, 1.00], [0.402, 0.662, 0.84], [0.600, 0.618, 0.94], [0.548, 0.702, 0.80],
   [0.752, 0.552, 0.90], [0.700, 0.470, 0.74], [0.262, 0.500, 0.80], [0.470, 0.722, 0.88],
   [0.800, 0.620, 0.78], [0.372, 0.512, 0.68], [0.320, 0.716, 0.86], [0.612, 0.762, 0.78],
-  [0.532, 0.786, 0.70], [0.268, 0.652, 0.74],
+  [0.532, 0.786, 0.70], [0.268, 0.652, 0.74], [0.678, 0.516, 0.90],
 ];
 
 const ROCKS = [
@@ -335,7 +338,7 @@ const ROCKS = [
 const FLOWERS = [
   [0.430, 0.560, C.coral], [0.575, 0.552, C.gold], [0.628, 0.545, C.coral],
   [0.375, 0.560, C.gold], [0.520, 0.620, C.coral], [0.652, 0.610, C.gold],
-  [0.290, 0.560, C.gold], [0.482, 0.352, C.coral],
+  [0.290, 0.560, C.gold], [0.482, 0.352, C.coral], [0.716, 0.520, C.gold],
 ];
 
 // ---- tiny drawing helpers -------------------------------------------------
@@ -526,13 +529,14 @@ function paintBase(c, w, h) {
   c.restore();
 
   // --- paths from the plaza ----------------------------------------------
+  // One per neighbour; the den has no path of its own now that it lives inside
+  // the lodge at the top of the peak track.
   const P = [X(ART.plaza[0]), Y(ART.plaza[1])];
   const routes = [
     [[X(0.53), Y(0.36)], [X(0.500), Y(0.268)]],
     [[X(0.645), Y(0.402)], [X(0.772), Y(0.418)]],
     [[X(0.340), Y(0.492)], [X(0.208), Y(0.560)]],
     [[X(0.600), Y(0.582)], [X(0.664), Y(0.664)]],
-    [[X(0.578), Y(0.500)], [X(0.642), Y(0.524)]],
   ];
   for (const [ctrl, end] of routes) {
     c.beginPath();
@@ -754,14 +758,16 @@ function paintCafe(c, R, X, Y) {
 }
 
 /**
- * The Game Den: a stubby timber lodge on the grass between the plaza and the
- * cafe. Lit window, a die on the gable, a trophy for a weather vane.
+ * The Game Den: the annex of the ski lodge, tucked into the peak's snowfield
+ * where the mountain foot meets the treeline. Snow-loaded roof, one warm
+ * window spilling gold onto the drift, and a coral die up on the ridge where
+ * a weather vane would go, so the mountain still reads as "games in here".
  */
 function paintLounge(c, R, X, Y) {
   const x = X(ART.lounge[0]);
   const y = Y(ART.lounge[1]);
-  const w = R(0.096);
-  const hh = R(0.056);
+  const w = R(0.080);
+  const hh = R(0.046);
   const wx = x + R(DEN_WINDOW[0]);
   const wy = y + R(DEN_WINDOW[1]);
   const apex = y - hh * 0.98;
@@ -769,37 +775,45 @@ function paintLounge(c, R, X, Y) {
 
   c.save();
 
-  // ground shadow
-  circle(c, x, y + hh * 0.70, w * 0.60);
-  c.fillStyle = 'rgba(58,44,28,0.16)';
-  c.fill();
+  // the drift it is bedded into, banked up against the mountain foot
+  blob(c, x + w * 0.05, y + hh * 0.46, w * 0.88, hh * 0.66, 0.07, 3.1);
+  fillStroke(c, C.snow, C.snowShade, R(0.006));
 
-  // lamplight spilling onto the grass (the breathing part is drawn live)
-  const spill = c.createRadialGradient(wx, wy, R(0.004), wx, wy, R(0.072));
+  // squashed ground shadow: this is a slope, not a plinth
+  c.save();
+  c.translate(x, y + hh * 0.76);
+  c.scale(1, 0.44);
+  circle(c, 0, 0, w * 0.54);
+  c.fillStyle = 'rgba(58,44,28,0.15)';
+  c.fill();
+  c.restore();
+
+  // lamplight spilling onto the snow (the breathing part is drawn live)
+  const spill = c.createRadialGradient(wx, wy, R(0.003), wx, wy, R(0.062));
   spill.addColorStop(0, 'rgba(242,182,74,0.42)');
   spill.addColorStop(1, 'rgba(242,182,74,0)');
   c.fillStyle = spill;
-  circle(c, wx, wy, R(0.072));
+  circle(c, wx, wy, R(0.062));
   c.fill();
 
   // chimney first: the roof crops it, so only the stack above the slope shows
-  roundBox(c, x + R(DEN_CHIMNEY[0]) - w * 0.115, y + R(DEN_CHIMNEY[1]), w * 0.23, hh * 1.2, R(0.004));
+  roundBox(c, x + R(DEN_CHIMNEY[0]) - w * 0.13, y + R(DEN_CHIMNEY[1]), w * 0.26, hh * 1.3, R(0.004));
   fillStroke(c, C.rock, C.ink, R(0.006));
-  roundBox(c, x + R(DEN_CHIMNEY[0]) - w * 0.16, y + R(DEN_CHIMNEY[1]) - R(0.007), w * 0.32, R(0.009), R(0.003));
+  roundBox(c, x + R(DEN_CHIMNEY[0]) - w * 0.18, y + R(DEN_CHIMNEY[1]) - R(0.006), w * 0.36, R(0.008), R(0.003));
   fillStroke(c, C.cream, C.ink, R(0.006));
 
   // timber walls
-  roundBox(c, x - w / 2, y - hh * 0.10, w, hh, R(0.007));
-  fillStroke(c, C.wood, C.ink, R(0.009));
+  roundBox(c, x - w / 2, y - hh * 0.10, w, hh, R(0.006));
+  fillStroke(c, C.wood, C.ink, R(0.008));
 
   // stacked log courses and a shaded footing
   c.save();
-  roundBox(c, x - w / 2, y - hh * 0.10, w, hh, R(0.007));
+  roundBox(c, x - w / 2, y - hh * 0.10, w, hh, R(0.006));
   c.clip();
   c.fillStyle = 'rgba(58,44,28,0.15)';
   c.fillRect(x - w / 2, y + hh * 0.72, w, hh * 0.2);
   c.strokeStyle = C.woodDark;
-  c.lineWidth = R(0.0035);
+  c.lineWidth = R(0.003);
   for (let i = 1; i <= 2; i++) {
     const ly = y - hh * 0.10 + (hh / 3) * i;
     c.beginPath();
@@ -810,19 +824,19 @@ function paintLounge(c, R, X, Y) {
   c.restore();
 
   // door with a gold knob
-  roundBox(c, x - w * 0.40, y + hh * 0.12, w * 0.28, hh * 0.78, R(0.005));
+  roundBox(c, x - w * 0.40, y + hh * 0.12, w * 0.30, hh * 0.78, R(0.004));
   fillStroke(c, C.woodDark, C.ink, R(0.006));
-  circle(c, x - w * 0.17, y + hh * 0.52, R(0.0035));
+  circle(c, x - w * 0.14, y + hh * 0.52, R(0.0032));
   c.fillStyle = C.gold;
   c.fill();
 
   // the glowing window
-  const ww = w * 0.36;
-  const wh = hh * 0.48;
-  roundBox(c, wx - ww / 2, wy - wh / 2, ww, wh, R(0.004));
+  const ww = w * 0.34;
+  const wh = hh * 0.46;
+  roundBox(c, wx - ww / 2, wy - wh / 2, ww, wh, R(0.003));
   fillStroke(c, '#ffdb90', C.ink, R(0.006));
   c.strokeStyle = 'rgba(58,44,28,0.55)';
-  c.lineWidth = R(0.0035);
+  c.lineWidth = R(0.003);
   c.beginPath();
   c.moveTo(wx, wy - wh / 2);
   c.lineTo(wx, wy + wh / 2);
@@ -830,59 +844,38 @@ function paintLounge(c, R, X, Y) {
   c.lineTo(wx + ww / 2, wy);
   c.stroke();
 
-  // shingled roof with a shaded east slope
-  poly(c, [[x - w * 0.70, eave], [x, apex], [x + w * 0.70, eave]]);
-  fillStroke(c, C.woodDark, C.ink, R(0.009));
+  // snow-loaded roof with a shaded east slope
+  poly(c, [[x - w * 0.72, eave], [x, apex], [x + w * 0.72, eave]]);
+  fillStroke(c, C.snow, C.ink, R(0.008));
   c.save();
-  poly(c, [[x - w * 0.70, eave], [x, apex], [x + w * 0.70, eave]]);
+  poly(c, [[x - w * 0.72, eave], [x, apex], [x + w * 0.72, eave]]);
   c.clip();
-  c.fillStyle = 'rgba(58,44,28,0.24)';
-  poly(c, [[x, apex], [x + w * 0.70, eave], [x + w * 0.70, eave + hh], [x, eave + hh]]);
+  c.fillStyle = 'rgba(122,170,208,0.22)'; // stays snow, not mountain
+  poly(c, [[x, apex], [x + w * 0.72, eave], [x + w * 0.72, eave + hh], [x, eave + hh]]);
   c.fill();
-  c.strokeStyle = 'rgba(255,246,227,0.30)';
-  c.lineWidth = R(0.0035);
-  for (let i = 1; i <= 2; i++) {
-    const ly = apex + (eave - apex) * (i / 3);
-    c.beginPath();
-    c.moveTo(x - w, ly);
-    c.lineTo(x + w, ly);
-    c.stroke();
-  }
   c.restore();
 
-  // the house die, nailed to the gable
-  const ds = R(0.028);
+  // timber fascia under the eaves, so the roof still reads as a roof
+  roundBox(c, x - w * 0.76, eave - R(0.001), w * 1.52, R(0.008), R(0.003));
+  fillStroke(c, C.woodDark, C.ink, R(0.005));
+
+  // the house die, up on the ridge on a stubby post
+  c.beginPath();
+  c.moveTo(x, apex);
+  c.lineTo(x, apex - R(0.008));
+  outline(c, C.woodDark, R(0.005));
+  const ds = R(0.026);
   c.save();
-  c.translate(x, y - hh * 0.54);
-  c.rotate(0.13);
+  c.translate(x, apex - R(0.008) - ds * 0.48);
+  c.rotate(0.10);
   roundBox(c, -ds / 2, -ds / 2, ds, ds, ds * 0.24);
-  fillStroke(c, C.cream, C.ink, R(0.006));
-  c.fillStyle = C.ink;
+  fillStroke(c, C.coral, C.ink, R(0.006));
+  c.fillStyle = C.cream;
   for (const [px, py] of [[-0.26, -0.26], [0, 0], [0.26, 0.26]]) {
-    circle(c, px * ds, py * ds, ds * 0.13);
+    circle(c, px * ds, py * ds, ds * 0.14);
     c.fill();
   }
   c.restore();
-
-  // trophy weather vane on the ridge
-  roundBox(c, x - R(0.012), apex - R(0.005), R(0.024), R(0.007), R(0.002));
-  fillStroke(c, C.gold, C.ink, R(0.005));
-  c.beginPath();
-  c.moveTo(x, apex - R(0.004));
-  c.lineTo(x, apex - R(0.014));
-  outline(c, C.gold, R(0.005));
-  for (const dir of [-1, 1]) {
-    c.beginPath();
-    c.arc(x + dir * R(0.012), apex - R(0.021), R(0.007), -Math.PI / 2, Math.PI / 2, dir < 0);
-    outline(c, C.gold, R(0.004));
-  }
-  poly(c, [
-    [x - R(0.013), apex - R(0.029)],
-    [x + R(0.013), apex - R(0.029)],
-    [x + R(0.006), apex - R(0.013)],
-    [x - R(0.006), apex - R(0.013)],
-  ]);
-  fillStroke(c, C.gold, C.ink, R(0.005));
 
   c.restore();
 }
@@ -1218,26 +1211,26 @@ function paintLive(c, w, h, t) {
   }
   c.restore();
 
-  // game den: the window breathes and the chimney puffs
+  // game den, up at the peak: the window breathes and the chimney puffs
   const dx = X(ART.lounge[0]);
   const dy = Y(ART.lounge[1]);
   const warm = 0.5 + 0.5 * Math.sin(t * 1.6 + 1.1);
   c.save();
   const wg = c.createRadialGradient(
-    dx + R(DEN_WINDOW[0]), dy + R(DEN_WINDOW[1]), R(0.004),
-    dx + R(DEN_WINDOW[0]), dy + R(DEN_WINDOW[1]), R(0.052 + 0.014 * warm),
+    dx + R(DEN_WINDOW[0]), dy + R(DEN_WINDOW[1]), R(0.003),
+    dx + R(DEN_WINDOW[0]), dy + R(DEN_WINDOW[1]), R(0.044 + 0.012 * warm),
   );
   wg.addColorStop(0, `rgba(255,214,130,${0.28 + 0.22 * warm})`);
   wg.addColorStop(1, 'rgba(242,182,74,0)');
   c.fillStyle = wg;
-  circle(c, dx + R(DEN_WINDOW[0]), dy + R(DEN_WINDOW[1]), R(0.066));
+  circle(c, dx + R(DEN_WINDOW[0]), dy + R(DEN_WINDOW[1]), R(0.058));
   c.fill();
   c.fillStyle = '#fff6e3';
   for (let i = 0; i < 3; i++) {
     const p = (t * 0.32 + i / 3) % 1;
     c.globalAlpha = 0.7 * (1 - p * p);
-    circle(c, dx + R(DEN_CHIMNEY[0]) + Math.sin(t * 1.1 + i * 2.1) * R(0.010),
-      dy + R(DEN_CHIMNEY[1]) - R(0.014) - R(0.080) * p, R(0.007 + 0.009 * p));
+    circle(c, dx + R(DEN_CHIMNEY[0]) + Math.sin(t * 1.1 + i * 2.1) * R(0.009),
+      dy + R(DEN_CHIMNEY[1]) - R(0.012) - R(0.072) * p, R(0.006 + 0.008 * p));
     c.fill();
   }
   c.restore();

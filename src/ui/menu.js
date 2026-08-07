@@ -20,7 +20,7 @@ const HOW_TO = [
   ['Enter', 'Start typing. Chat history opens while the box is focused.'],
   ['Go', 'Walk into an archway or signpost to travel between rooms.'],
   ['Sled', 'Gather 3 capybaras at Frosty Peak for a live sled race.'],
-  ['Den', 'The Game Den has board games and the Capy Clash card duel: beat your rival for coins.'],
+  ['Den', 'The Game Den is inside the ski lodge at Frosty Peak: take a seat at any table to face another player, or the house capybaras.'],
 ];
 
 let openInstance = null;

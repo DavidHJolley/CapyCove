@@ -12,6 +12,21 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
  * Canvas 2D for the table (no WebGL), DOM for HUD/overlays, procedural art
  * everywhere. Waxwell is drawn on a 200x200 grid in the same ink-and-gradient
  * language as the smoothie customers.
+ *
+ * MULTIPLAYER: if `game.__matchCtx` is set at mount time ({game:'shuffle',
+ * players, youAre, seed}) the same table is played against a real capybara.
+ * Nothing about the simulation is streamed: each shot travels as one tiny
+ * `match-move` ({shot:{puck, dirX, dirZ, power}}) and BOTH clients run the
+ * identical physics from it, so the two tables stay bit-for-bit identical.
+ * That costs us three disciplines, all of them local to this file:
+ *   1. a hard fixed 1/120 timestep (no variable remainder step, ever),
+ *   2. only exactly-reproducible float math in the sim: +, -, *, /, Math.sqrt
+ *      and our own `dsin` (Math.sin/hypot are implementation-defined),
+ *   3. every "random" the sim touches (wax roll, wax-grit friction) comes from
+ *      mulberry32 seeded off the shared match seed, never Math.random.
+ * Shots carry a direction vector rather than an angle so no trig sits between
+ * the wire and the sim; both ends normalise the same rounded numbers. Solo runs
+ * against Waxwell take exactly the same code path with `pvp` null.
  */
 
 // ---------------------------------------------------------------------------
@@ -37,12 +52,52 @@ function shade(h, amt) {
 }
 function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-/** Box-Muller, clipped so a freak sample cannot send a puck into orbit. */
+/** Box-Muller, clipped so a freak sample cannot send a puck into orbit.
+ *  Solo only: this is Waxwell's aim wobble, never the shared simulation. */
 function gauss() {
   const u = Math.random() || 1e-6;
   const v = Math.random();
   return clamp(Math.sqrt(-2 * Math.log(u)) * Math.cos(6.283185307 * v), -2.4, 2.4);
 }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+function hexOfInt(n) {
+  return `#${((n >>> 0) & 0xffffff).toString(16).padStart(6, '0')}`;
+}
+
+// --- deterministic math (see the multiplayer note at the top) ---------------
+/** Same generator the sled race uses; integer ops only, identical everywhere. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function rng() {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), 1 | t);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const TAU = 6.283185307179586;
+/**
+ * Sine, computed the same way on every engine. `Math.sin` is only required to
+ * be "an implementation-approximation", and two browsers disagreeing in the
+ * last bit is enough to drift a shared puck across a scoring line over a
+ * four-second slide. Range reduce into [-PI, PI], then Taylor to x^15 (error
+ * under 1e-6, which the wax curve cannot feel) using nothing but + - * /.
+ */
+function dsin(t) {
+  const x = t - TAU * Math.floor(t / TAU + 0.5);
+  const q = x * x;
+  return x * (1 + q * (-1 / 6 + q * (1 / 120 + q * (-1 / 5040 + q * (1 / 362880
+    + q * (-1 / 39916800 + q * (1 / 6227020800 - q / 1307674368000)))))));
+}
+/** Math.hypot is implementation-defined too; sqrt is correctly rounded. */
+function hyp(x, y) { return Math.sqrt(x * x + y * y); }
+/** Trim a wire float to 6 decimals so both ends launch from identical bits. */
+function r6(v) { return Math.round(v * 1e6) / 1e6; }
 
 function rrect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -77,8 +132,13 @@ const Z2 = 284;        // start of the 2 band
 const Z3 = 344;        // start of the 3 band
 const HANG = 404;      // start of the hanger band
 const SPAWN_X = 52;
-const SPAWN_Y = { you: 116, ai: 54 };
+// Lanes are seat-owned, not screen-owned: seat 0 always slides from the near
+// lane on BOTH clients, which is what keeps the two simulations identical.
+const LANE_Y = [116, 54];
+const SPAWN_Y = { you: LANE_Y[0], ai: LANE_Y[1] };
 const SIDE_COL = { you: '#e8657a', ai: '#4fb3e8' };
+const FIXED = 1 / 120;           // physics step; never varies, never remainders
+const SHOT_CLOCK = 30;           // seconds you get on your turn in a real match
 const V_MIN = 180, V_SPAN = 180; // launch speed = V_MIN + power * V_SPAN
 // Drag runs FORWARD from the puck (the shooting end is only 52 units from the
 // left edge, so a pull-back slingshot would run off the canvas at full power).
@@ -95,21 +155,31 @@ function zoneOf(x) {
 const ZONE_NAME = { 0: 'SHORT', 1: 'ONE', 2: 'TWO', 3: 'THREE', 4: 'HANGER' };
 
 // ---------------------------------------------------------------------------
-// Waxwell, the opponent (200x200 grid)
-// expr: idle | thinking | smug | worried | beaten
+// The opponent portrait (200x200 grid): Waxwell in solo, the other capybara in
+// a real match. expr: idle | thinking | smug | worried | beaten
 // ---------------------------------------------------------------------------
 const FUR = '#a8814f';
 const CAP_COL = '#4fb3e8';
+/** Waxwell: house fur, his flat cap, and the bow tie he is very proud of. */
+const WAX_SKIN = { fur: FUR, cap: CAP_COL, capOn: true, bow: true };
+/** A cap tint per hat id, so a real opponent's headwear reads at portrait size. */
+const HAT_TINT = {
+  beanie: '#e8657a', cap: '#4fb3e8', flower: '#f2b64a', tophat: '#4a3d5c',
+  viking: '#c9b28a', crown: '#f2b64a', propeller: '#7ac74f', chef: '#fff6e3',
+  pirate: '#5a4632',
+};
 
-function drawWaxwell(ctx, size, expr) {
+function drawFace(ctx, size, expr, skin) {
+  const sk = skin || WAX_SKIN;
+  const fur = sk.fur || FUR;
   const s = size / 200;
   ctx.save();
   ctx.scale(s, s);
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
 
-  const dark = shade(FUR, -0.24);
-  const muzzle = shade(FUR, 0.22);
+  const dark = shade(fur, -0.24);
+  const muzzle = shade(fur, 0.22);
   const down = expr === 'beaten';
 
   // shoulders
@@ -117,12 +187,14 @@ function drawWaxwell(ctx, size, expr) {
   ctx.fillStyle = dark; ctx.fill(); ink(ctx, 5);
 
   // bow tie
-  ctx.beginPath();
-  ctx.moveTo(100, 166); ctx.lineTo(70, 152); ctx.lineTo(70, 182); ctx.closePath();
-  ctx.moveTo(100, 166); ctx.lineTo(130, 152); ctx.lineTo(130, 182); ctx.closePath();
-  ctx.fillStyle = '#f2b64a'; ctx.fill(); ink(ctx, 4.5);
-  ctx.beginPath(); ctx.arc(100, 166, 9, 0, Math.PI * 2);
-  ctx.fillStyle = shade('#f2b64a', 0.3); ctx.fill(); ink(ctx, 4);
+  if (sk.bow) {
+    ctx.beginPath();
+    ctx.moveTo(100, 166); ctx.lineTo(70, 152); ctx.lineTo(70, 182); ctx.closePath();
+    ctx.moveTo(100, 166); ctx.lineTo(130, 152); ctx.lineTo(130, 182); ctx.closePath();
+    ctx.fillStyle = '#f2b64a'; ctx.fill(); ink(ctx, 4.5);
+    ctx.beginPath(); ctx.arc(100, 166, 9, 0, Math.PI * 2);
+    ctx.fillStyle = shade('#f2b64a', 0.3); ctx.fill(); ink(ctx, 4);
+  }
 
   // ears (they droop when he is beaten)
   for (const [ex, sgn] of [[46, -1], [154, 1]]) {
@@ -138,7 +210,7 @@ function drawWaxwell(ctx, size, expr) {
 
   // head
   rrect(ctx, 38, 36, 124, 104, 42);
-  ctx.fillStyle = lgrad(ctx, 38, 36, 162, 140, shade(FUR, 0.12), FUR);
+  ctx.fillStyle = lgrad(ctx, 38, 36, 162, 140, shade(fur, 0.12), fur);
   ctx.fill(); ink(ctx, 5.5);
 
   // muzzle + nostrils
@@ -221,20 +293,23 @@ function drawWaxwell(ctx, size, expr) {
   }
 
   // flat cap
-  ctx.beginPath();
-  ctx.moveTo(42, 48);
-  ctx.bezierCurveTo(44, 2, 156, 2, 158, 46);
-  ctx.closePath();
-  ctx.fillStyle = lgrad(ctx, 42, 4, 158, 48, shade(CAP_COL, 0.16), CAP_COL);
-  ctx.fill(); ink(ctx, 5);
-  ctx.beginPath();
-  ctx.moveTo(46, 44);
-  ctx.quadraticCurveTo(12, 44, 4, 56);
-  ctx.quadraticCurveTo(28, 62, 52, 54);
-  ctx.closePath();
-  ctx.fillStyle = shade(CAP_COL, -0.24); ctx.fill(); ink(ctx, 4.5);
-  ctx.beginPath(); ctx.arc(100, 8, 8, 0, Math.PI * 2);
-  ctx.fillStyle = shade(CAP_COL, 0.35); ctx.fill(); ink(ctx, 4);
+  if (sk.capOn) {
+    const cap = sk.cap || CAP_COL;
+    ctx.beginPath();
+    ctx.moveTo(42, 48);
+    ctx.bezierCurveTo(44, 2, 156, 2, 158, 46);
+    ctx.closePath();
+    ctx.fillStyle = lgrad(ctx, 42, 4, 158, 48, shade(cap, 0.16), cap);
+    ctx.fill(); ink(ctx, 5);
+    ctx.beginPath();
+    ctx.moveTo(46, 44);
+    ctx.quadraticCurveTo(12, 44, 4, 56);
+    ctx.quadraticCurveTo(28, 62, 52, 54);
+    ctx.closePath();
+    ctx.fillStyle = shade(cap, -0.24); ctx.fill(); ink(ctx, 4.5);
+    ctx.beginPath(); ctx.arc(100, 8, 8, 0, Math.PI * 2);
+    ctx.fillStyle = shade(cap, 0.35); ctx.fill(); ink(ctx, 4);
+  }
 
   // thought bubbles
   if (expr === 'thinking') {
@@ -246,7 +321,7 @@ function drawWaxwell(ctx, size, expr) {
   ctx.restore();
 }
 
-function paintFace(canvas, cssSize, expr) {
+function paintFace(canvas, cssSize, expr, skin) {
   const d = dpr();
   const px = Math.round(cssSize * d);
   if (canvas.width !== px) { canvas.width = px; canvas.height = px; }
@@ -255,7 +330,7 @@ function paintFace(canvas, cssSize, expr) {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(d, 0, 0, d, 0, 0);
   ctx.clearRect(0, 0, cssSize, cssSize);
-  drawWaxwell(ctx, cssSize, expr);
+  drawFace(ctx, cssSize, expr, skin);
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +445,27 @@ const LINES = {
   ],
 };
 
+/**
+ * Real-match commentary. It never speaks FOR the other player (putting words in
+ * a stranger's mouth is the fastest way to make a friendly table feel gross):
+ * the bubble becomes a little table announcer instead, tail and all removed.
+ * %s is the opponent's name.
+ */
+const CALL = {
+  wait: [
+    '%s is lining one up.',
+    '%s is eyeing the near line.',
+    'over to %s.',
+    '%s takes their time.',
+  ],
+  yours: [
+    'your slide. take a breath.',
+    'your puck, your call.',
+    'the lane is yours.',
+    'nice and smooth does it.',
+  ],
+};
+
 // ---------------------------------------------------------------------------
 // stylesheet
 // ---------------------------------------------------------------------------
@@ -437,6 +533,27 @@ const STYLE = `
 .mg-shuffle-turn{background:rgba(255,246,227,.12);border-radius:14px;padding:8px 12px;font-size:12px;
   font-weight:900;letter-spacing:.1em;text-align:center;width:100%;transition:.2s;}
 .mg-shuffle-turn.mg-shuffle-yours{background:#e8657a;box-shadow:0 5px 0 rgba(0,0,0,.3);}
+.mg-shuffle-turn.mg-shuffle-theirs{background:rgba(79,179,232,.3);box-shadow:0 5px 0 rgba(0,0,0,.22);}
+/* whose-turn tell: three drifting dots, quiet enough to ignore mid-aim */
+.mg-shuffle-dots3{display:inline-flex;gap:4px;margin-left:7px;vertical-align:middle;}
+.mg-shuffle-dots3 i{width:6px;height:6px;border-radius:50%;background:#fff6e3;opacity:.3;
+  animation:mg-shuffle-think 1.1s ease-in-out infinite;}
+.mg-shuffle-dots3 i:nth-child(2){animation-delay:.16s;}
+.mg-shuffle-dots3 i:nth-child(3){animation-delay:.32s;}
+@keyframes mg-shuffle-think{0%,100%{opacity:.28;transform:translateY(0)}
+  45%{opacity:1;transform:translateY(-3px)}}
+.mg-shuffle-clock{display:inline-block;margin-left:8px;background:rgba(28,18,12,.5);border-radius:999px;
+  padding:1px 9px;font-size:11.5px;letter-spacing:.04em;}
+.mg-shuffle-turn.mg-shuffle-yours.mg-shuffle-rush{animation:mg-shuffle-rush .9s ease-in-out infinite;}
+@keyframes mg-shuffle-rush{50%{background:#d5405c;transform:scale(1.03)}}
+.mg-shuffle-note{margin-top:5px;font-size:10.5px;font-weight:800;letter-spacing:.04em;opacity:.75;}
+/* in a real match the bubble stops being a mouth and becomes the table's voice */
+.mg-shuffle-bubble.mg-shuffle-log{background:rgba(255,253,246,.9);}
+.mg-shuffle-bubble.mg-shuffle-log::after{display:none;}
+.mg-shuffle-vsline{display:flex;align-items:center;justify-content:center;gap:9px;margin-bottom:6px;
+  font-size:12px;font-weight:900;letter-spacing:.1em;color:#9a8461;}
+.mg-shuffle-swatch{width:15px;height:15px;border-radius:50%;border:3px solid #fff;
+  box-shadow:0 2px 5px rgba(60,34,10,.35);}
 .mg-shuffle-tip{font-size:11.5px;font-weight:700;line-height:1.5;opacity:.72;text-align:center;}
 .mg-shuffle-tip b{color:#f2b64a;}
 @media (max-width:820px){.mg-shuffle-side{width:150px}.mg-shuffle-tip{display:none}}
@@ -568,11 +685,20 @@ export class ShuffleGame extends Minigame {
     this.shot = 0;
     this.flash = null;
     this.clock = 0;
+    this.pvp = null;        // set when game.__matchCtx handed us a real duel
+    this.ctxRef = null;     // the handshake we consumed, so we only clear ours
+    this.subs = [];         // game.events unsubscribers
+    this.skin = WAX_SKIN;   // whose face is in the side panel
+    this._acc = 0;          // fixed-step physics accumulator
+    this._slideSide = 'you';
+    this._pvpScore = 0;
+    this._pvpBest = false;
   }
 
   // ---- lifecycle ----------------------------------------------------------
   mount(root) {
     super.mount(root);
+    this.pvp = this._readMatchCtx();
     const style = document.createElement('style');
     style.textContent = STYLE;
     root.appendChild(style);
@@ -599,9 +725,13 @@ export class ShuffleGame extends Minigame {
       bubble: q('[data-el="bubble"]'),
       turn: q('[data-el="turn"]'),
       over: q('[data-el="over"]'),
+      aiName: q('[data-el="aiName"]'),
+      oppName: q('[data-el="oppName"]'),
+      tip: q('[data-el="tip"]'),
     };
     this.canvas = this.el.canvas;
     this.ctx = this.canvas.getContext('2d');
+    if (this.pvp) this._dressForMatch();
 
     this.canvas.addEventListener('pointerdown', (e) => this._down(e));
     this.canvas.addEventListener('pointermove', (e) => this._move(e));
@@ -619,7 +749,10 @@ export class ShuffleGame extends Minigame {
 
     this._rollWax();
     this._seedSparks();
-    this._say('idle', 'welcome to my table. mind the wax.');
+    this._bindNet();
+    this._say('idle', this.pvp
+      ? 'two rounds, four pucks each. mind the wax.'
+      : 'welcome to my table. mind the wax.');
     this._showSplash();
     this._last = 0;
     this._raf = requestAnimationFrame((t) => this._loop(t));
@@ -638,12 +771,99 @@ export class ShuffleGame extends Minigame {
     }
     this._onKey = null;
     this._onUp = null;
+    for (const off of this.subs) { try { off(); } catch (err) { /* already gone */ } }
+    this.subs.length = 0;
+    const pv = this.pvp;
+    if (pv && (pv.ended || !pv.doneSent)) {
+      // Walking out of a live match is a forfeit and the den should say so, so
+      // the other capybara gets their win instead of watching an empty lane.
+      // The one case we stay silent is "we reported, they have not": leaving
+      // there would hand away a match we already won.
+      this.game.net?.send?.({ t: 'table-leave' });
+    }
+    this.pvp = null;
+    if (this.ctxRef && this.game.__matchCtx === this.ctxRef) this.game.__matchCtx = null;
+    this.ctxRef = null;
     this.pucks = [];
     this.dust = [];
     this.sparks = [];
     this.el = {};
     this.canvas = null;
     this.ctx = null;
+  }
+
+  // ---- match handshake ----------------------------------------------------
+  /**
+   * Read the duel the lounge parked on the game object. Anything malformed
+   * (no seat, no seed, a roster that is not two capybaras) quietly degrades to
+   * a solo run against Waxwell rather than breaking the minigame.
+   */
+  _readMatchCtx() {
+    const ctx = this.game.__matchCtx;
+    if (!ctx || typeof ctx !== 'object') return null;
+    // a handshake stamped for another table is not ours to consume or clear
+    if (ctx.game && ctx.game !== 'shuffle') return null;
+    this.ctxRef = ctx; // ours now: cleared in dispose even if it is unusable
+    const seat = ctx.youAre === 1 ? 1 : 0;
+    const roster = Array.isArray(ctx.players) ? ctx.players : [];
+    const me = roster[seat], foe = roster[1 - seat];
+    if (!me || !foe || !Number.isFinite(ctx.seed)) return null;
+    const name = String(foe.name || 'Capy').slice(0, 16);
+    return {
+      seed: ctx.seed >>> 0,
+      youAre: seat,
+      me: {
+        // the roster carries our id, but fall back to the socket's own view of
+        // us so a thin handshake cannot leave match-done with a null winner
+        id: me.id ?? this.game.net?.selfId ?? null,
+        name: String(me.name || 'You').slice(0, 16),
+      },
+      foe: {
+        id: foe.id ?? null,
+        name,
+        short: name.slice(0, 11),
+        color: Number.isFinite(foe.color) ? foe.color : 0xb08a5a,
+        hat: typeof foe.hat === 'string' ? foe.hat : 'none',
+      },
+      inbox: new Map(),   // shots that arrived before we were ready for them
+      started: false,
+      doneSent: false,
+      ended: false,
+      end: null,
+      clock: SHOT_CLOCK,
+      waitT: 0,
+      shown: -1,
+    };
+  }
+
+  /** Swap Waxwell out for the capybara actually sitting across the table. */
+  _dressForMatch() {
+    const foe = this.pvp.foe;
+    this.skin = {
+      fur: hexOfInt(foe.color),
+      cap: HAT_TINT[foe.hat] || '#e8657a',
+      capOn: foe.hat !== 'none',
+      bow: false,
+    };
+    if (this.el.aiName) this.el.aiName.textContent = foe.short.toUpperCase();
+    if (this.el.oppName) this.el.oppName.textContent = foe.name.toUpperCase();
+    this.el.bubble?.classList.add('mg-shuffle-log');
+    // leaving a live duel costs you the match, so the button should say so
+    const quit = this.el.wrap?.querySelector('[data-el="quit"]');
+    if (quit) quit.textContent = 'FORFEIT';
+    if (this.el.tip) {
+      this.el.tip.innerHTML = 'Drag out from your puck, then let go.<br>'
+        + '<b>&larr; &rarr;</b> aim &middot; <b>&uarr; &darr;</b> power &middot; <b>SPACE</b> slide'
+        + '<br>Their aim stays hidden until they release.';
+    }
+  }
+
+  _bindNet() {
+    if (!this.pvp) return;
+    const ev = this.game.events;
+    if (!ev?.on) return;
+    this.subs.push(ev.on('match-move', (m) => this._onMove(m)));
+    this.subs.push(ev.on('match-end', (m) => this._onEnd(m)));
   }
 
   /** Coins follow the duel result, not the raw score: win big, draw small. */
@@ -674,7 +894,7 @@ export class ShuffleGame extends Minigame {
       <div class="mg-shuffle-hud">
         <div class="mg-shuffle-chip"><small>ROUND</small><b data-el="round">1</b></div>
         <div class="mg-shuffle-chip mg-shuffle-you" data-el="youChip"><small>YOU</small><b data-el="you">0</b></div>
-        <div class="mg-shuffle-chip mg-shuffle-ai" data-el="aiChip"><small>WAXWELL</small><b data-el="ai">0</b></div>
+        <div class="mg-shuffle-chip mg-shuffle-ai" data-el="aiChip"><small data-el="aiName">WAXWELL</small><b data-el="ai">0</b></div>
         <div class="mg-shuffle-chip"><small>PUCKS</small><span class="mg-shuffle-dots" data-el="dots"></span></div>
         <div class="mg-shuffle-spacer"></div>
         <button class="mg-shuffle-quit" data-el="quit">QUIT</button>
@@ -689,9 +909,9 @@ export class ShuffleGame extends Minigame {
         <aside class="mg-shuffle-side">
           <div class="mg-shuffle-bubble" data-el="bubble">...</div>
           <canvas class="mg-shuffle-face" data-el="face"></canvas>
-          <div class="mg-shuffle-name">WAXWELL</div>
+          <div class="mg-shuffle-name" data-el="oppName">WAXWELL</div>
           <div class="mg-shuffle-turn" data-el="turn">WARMING UP</div>
-          <div class="mg-shuffle-tip">Drag out from your puck, then let go.<br>
+          <div class="mg-shuffle-tip" data-el="tip">Drag out from your puck, then let go.<br>
             <b>&larr; &rarr;</b> aim &middot; <b>&uarr; &darr;</b> power &middot; <b>SPACE</b> slide</div>
         </aside>
       </div>
@@ -702,6 +922,7 @@ export class ShuffleGame extends Minigame {
   // ---- screens ------------------------------------------------------------
   _showSplash() {
     this.phase = 'splash';
+    if (this.pvp) { this._showVsSplash(); return; }
     const best = this.game.state?.bests?.shuffle || 0;
     const over = this.el.over;
     over.classList.remove('mg-shuffle-gone');
@@ -730,7 +951,7 @@ export class ShuffleGame extends Minigame {
           <button class="mg-shuffle-btn mg-shuffle-ghost" data-a="leave">Back to the den</button>
         </div>
       </div>`;
-    paintFace(over.querySelector('[data-el="splashFace"]'), 118, 'smug');
+    paintFace(over.querySelector('[data-el="splashFace"]'), 118, 'smug', this.skin);
     over.querySelector('[data-el="legend"]').appendChild(legendCanvas(Math.min(430, 0.8 * (this.el.wrap.clientWidth || 600)), 170));
     over.querySelector('[data-a="play"]').addEventListener('click', () => this._countdown());
     over.querySelector('[data-a="leave"]').addEventListener('click', () => {
@@ -739,14 +960,79 @@ export class ShuffleGame extends Minigame {
     });
   }
 
+  /**
+   * The real-match splash. It auto-starts: the other capybara is sitting there
+   * watching a lane that cannot move until both clients are running, so the
+   * READY button is a shortcut, not a gate. (Anything they slide before we get
+   * here is buffered and replayed, so an early start is safe either way.)
+   */
+  _showVsSplash() {
+    const pv = this.pvp;
+    const best = this.game.state?.bests?.shuffle || 0;
+    const over = this.el.over;
+    over.classList.remove('mg-shuffle-gone');
+    over.innerHTML = `
+      <div class="mg-shuffle-card">
+        <div class="mg-shuffle-hero">
+          <canvas data-el="splashFace"></canvas>
+          <div>
+            <h1>Shuffle Showdown</h1>
+            <div class="mg-shuffle-sub">A REAL DUEL &middot; ${pv.youAre === 0
+    ? 'YOU SLIDE FIRST' : `${esc(pv.foe.name.toUpperCase())} SLIDES FIRST`}</div>
+          </div>
+        </div>
+        <div class="mg-shuffle-vsline">
+          <span class="mg-shuffle-swatch" style="background:#e8657a"></span>YOU
+          <span>vs</span>
+          ${esc(pv.foe.name.toUpperCase())}<span class="mg-shuffle-swatch" style="background:#4fb3e8"></span>
+        </div>
+        <div class="mg-shuffle-legend" data-el="legend"></div>
+        <div class="mg-shuffle-how">
+          <div><i>1</i><span>Take turns. Press your coral puck and <b>drag out down the table</b> to aim and load the meter, then let go. Their aim stays hidden until they slide.</span></div>
+          <div><i>2</i><span>Past the near line scores <b>1</b>, <b>2</b>, <b>3</b> &mdash; a puck hanging over the far lip is a <b>4</b>. Pucks knock pucks, and anything off the table is gone.</span></div>
+          <div><i>3</i><span>Two rounds, four pucks each, one shared wax curve. Highest total takes the table &mdash; and you have <b>${SHOT_CLOCK} seconds</b> a shot, so do not go for tea.</span></div>
+        </div>
+        <div class="mg-shuffle-stats">
+          <div class="mg-shuffle-stat"><b>${best}</b><span>YOUR BEST</span></div>
+        </div>
+        <div class="mg-shuffle-pay">WIN: 45 COINS + 5 PER POINT OF MARGIN &middot; DRAW: 15 &middot; LOSS: 5 &middot; PLUS THE DEN'S MATCH BONUS</div>
+        <div class="mg-shuffle-btns">
+          <button class="mg-shuffle-btn" data-a="play">I'M READY</button>
+          <button class="mg-shuffle-btn mg-shuffle-ghost" data-a="leave">Forfeit &amp; leave</button>
+        </div>
+        <div class="mg-shuffle-pay" data-el="auto">RACKING UP IN 5...</div>
+      </div>`;
+    paintFace(over.querySelector('[data-el="splashFace"]'), 118, 'idle', this.skin);
+    over.querySelector('[data-el="legend"]').appendChild(
+      legendCanvas(Math.min(430, 0.8 * (this.el.wrap.clientWidth || 600)), 170));
+    over.querySelector('[data-a="play"]').addEventListener('click', () => this._countdown());
+    over.querySelector('[data-a="leave"]').addEventListener('click', () => {
+      this.game.audio?.play?.('click');
+      this.quit();
+    });
+    const tickDown = (n) => {
+      if (this.phase !== 'splash' || pv.started) return;
+      const el = over.querySelector('[data-el="auto"]');
+      if (!el) return;
+      if (n <= 0) { this._countdown(); return; }
+      el.textContent = `RACKING UP IN ${n}...`;
+      this._after(1000, () => tickDown(n - 1));
+    };
+    this._after(1000, () => tickDown(4));
+  }
+
   _countdown() {
     if (this.phase !== 'splash' && this.phase !== 'over') return;
+    if (this.pvp && this.pvp.started) return; // a match is played exactly once
+    if (this.pvp) this.pvp.started = true;
     this.game.audio?.play?.('click');
     this._resetRun();
     this.phase = 'countdown';
     const over = this.el.over;
     const steps = ['3', '2', '1', 'SLIDE!'];
     const show = (i) => {
+      // a forfeit can land mid-countdown: never paint over the results card
+      if (this.phase !== 'countdown') return;
       if (i >= steps.length) {
         over.classList.add('mg-shuffle-gone');
         over.innerHTML = '';
@@ -761,6 +1047,7 @@ export class ShuffleGame extends Minigame {
   }
 
   _results() {
+    if (this.pvp) { this._pvpFinish(); return; }
     this.phase = 'over';
     const you = this.banked.you, ai = this.banked.ai;
     const margin = you - ai;
@@ -810,12 +1097,192 @@ export class ShuffleGame extends Minigame {
           <button class="mg-shuffle-btn mg-shuffle-alt" data-a="leave">Back to the den</button>
         </div>
       </div>`;
-    paintFace(over.querySelector('[data-el="endFace"]'), 112, expr);
+    paintFace(over.querySelector('[data-el="endFace"]'), 112, expr, this.skin);
     over.querySelector('[data-a="again"]').addEventListener('click', () => {
       this._done = false; // let the next duel report its own result
       this._result = null;
       this._countdown();
     });
+    over.querySelector('[data-a="leave"]').addEventListener('click', () => {
+      this.game.audio?.play?.('click');
+      this.exitToRoom();
+    });
+  }
+
+  // ---- real match: wire protocol ------------------------------------------
+  /** Absolute shot index across the whole match, 0-15. Doubles as the puck id. */
+  _absShot() { return (this.round - 1) * 8 + this.shot; }
+
+  _sendShot(shot) {
+    this.game.net?.send?.({ t: 'match-move', data: { shot } });
+  }
+
+  /**
+   * {t:'match-move', from, data:{shot}}. Their shot is the ONLY thing we take
+   * from the wire, and it is sanitised to a legal slide before it can touch the
+   * simulation: a peer cannot hand us a puck aimed backwards or at mach three.
+   */
+  _onMove(m) {
+    const pv = this.pvp;
+    if (!pv || pv.ended || this._dead) return;
+    const raw = m?.data?.shot;
+    if (!raw || typeof raw !== 'object') return;
+    if (m.from != null && pv.foe.id != null && m.from !== pv.foe.id) return;
+    const ix = Math.round(Number(raw.puck));
+    const dirX = Number(raw.dirX), dirZ = Number(raw.dirZ), power = Number(raw.power);
+    if (!Number.isFinite(ix) || ix < 0 || ix > 15) return;
+    if (!Number.isFinite(dirX) || !Number.isFinite(dirZ) || !Number.isFinite(power)) return;
+    const shot = { puck: ix, dirX, dirZ, power };
+    if (this.phase === 'wait' && this._absShot() === ix && this._live?.pending) {
+      // let the thinking dots breathe for a beat so the slide is not a jump-cut
+      this._after(300, () => this._playRemote(shot, ix));
+      return;
+    }
+    if (pv.inbox.size < 20) pv.inbox.set(ix, shot);
+  }
+
+  _playRemote(shot, ix) {
+    if (this.phase !== 'wait' || !this._live?.pending) return;
+    if (this._absShot() !== ix) return;
+    this._fire(shot);
+  }
+
+  /** {t:'match-end', game, reason, winner}: the den's official word on it. */
+  _onEnd(m) {
+    const pv = this.pvp;
+    if (!pv || this._dead) return;
+    if (m?.game && m.game !== 'shuffle') return;
+    pv.end = {
+      reason: m?.reason === 'forfeit' ? 'forfeit' : 'done',
+      winner: m?.winner ?? null,
+    };
+    pv.ended = true;
+    if (this.phase === 'over') { this._pvpCard(); return; }
+    this._matchCutShort();
+  }
+
+  // ---- real match: results ------------------------------------------------
+  /** Both capybaras played all eight pucks twice: report and wait for the call. */
+  _pvpFinish() {
+    const pv = this.pvp;
+    this.phase = 'over';
+    this.dragging = false;
+    this._live = null;
+    const you = this.banked.you, ai = this.banked.ai;
+    const margin = you - ai;
+    this._result = { you, ai, margin };
+    const score = Math.max(0, you * 50 + Math.max(0, margin) * 30);
+    this._pvpScore = score;
+    this._pvpBest = score > (this.game.state?.bests?.shuffle || 0);
+    this.finish(score);
+    if (!pv.doneSent) {
+      pv.doneSent = true;
+      const winner = margin > 0 ? pv.me.id : margin < 0 ? pv.foe.id : 'draw';
+      this.game.net?.send?.({ t: 'match-done', result: { winner, score } });
+    }
+    const win = margin > 0, tie = margin === 0;
+    this._say(win ? 'beaten' : tie ? 'worried' : 'smug', win
+      ? `${pv.foe.name} has to hand over the table.`
+      : tie ? 'dead level. nobody blinked.' : `${pv.foe.name} holds the table.`);
+    this.game.audio?.play?.(win ? 'levelup' : tie ? 'ding' : 'fail');
+    this._pvpCard();
+  }
+
+  /**
+   * The den called the match before we finished it (they left, or dropped).
+   * Settle on whatever is actually on the table, letting the server's winner
+   * break a tie: it is the authority on who is owed the win.
+   */
+  _matchCutShort() {
+    const pv = this.pvp;
+    this.phase = 'over';
+    this.dragging = false;
+    this._live = null;
+    this._hideBanner();
+    const t = this._tableScore();
+    let you = this.banked.you + t.you;
+    let ai = this.banked.ai + t.ai;
+    const w = pv.end?.winner;
+    if (w != null && w === pv.me.id && you <= ai) you = ai + 1;
+    if (w != null && w === pv.foe.id && ai <= you) ai = you + 1;
+    // a walkover before a single puck moved pays like a draw, not like a win
+    const played = this.roundLog.length > 0 || this.shot > 0;
+    const margin = played ? you - ai : 0;
+    this._result = { you, ai, margin };
+    const score = played ? Math.max(0, you * 50 + Math.max(0, margin) * 30) : 0;
+    this._pvpScore = score;
+    this._pvpBest = score > (this.game.state?.bests?.shuffle || 0);
+    this.finish(score);
+    pv.doneSent = true; // there is nothing left for us to report
+    this.game.audio?.play?.(margin > 0 ? 'levelup' : margin < 0 ? 'fail' : 'ding');
+    this._say(margin > 0 ? 'beaten' : 'idle', pv.end?.reason === 'forfeit'
+      ? `${pv.foe.name} stepped away from the table.`
+      : 'the den has called it.');
+    this._pvpCard();
+  }
+
+  /** One results card, re-rendered when the official call lands. */
+  _pvpCard() {
+    const pv = this.pvp;
+    const over = this.el.over;
+    if (!pv || !over) return;
+    const r = this._result || { you: 0, ai: 0, margin: 0 };
+    const end = pv.end;
+    const forfeit = end?.reason === 'forfeit';
+    const call = !end ? null
+      : end.winner === 'draw' ? 'tie'
+        : end.winner != null && end.winner === pv.me.id ? 'win'
+          : end.winner != null && end.winner === pv.foe.id ? 'loss' : 'tie';
+    const local = r.margin > 0 ? 'win' : r.margin < 0 ? 'loss' : 'tie';
+    const verdict = call || local;
+    const foe = esc(pv.foe.name);
+    const foeUp = esc(pv.foe.name.toUpperCase());
+    const head = forfeit && verdict === 'win' ? 'They left the table'
+      : verdict === 'win' ? 'You take the table!'
+        : verdict === 'tie' ? 'Dead heat!' : `${foe} takes the table`;
+    const sub = !end ? 'WAITING FOR THE DEN TO CALL IT...'
+      : forfeit ? 'THE DEN AWARDS THE MATCH. A WIN IS A WIN.'
+        : verdict === 'win' ? 'THEY ARE PRETENDING THE WAX DID THAT.'
+          : verdict === 'tie' ? 'NOBODY BLINKED. THE WAX WON.'
+            : 'GOOD DUEL. GO AND PRACTISE THE NEAR LINE.';
+    const expr = verdict === 'win' ? 'beaten' : verdict === 'tie' ? 'worried' : 'smug';
+    const coins = this.coinsForScore(this._pvpScore || 0);
+    const shown = Math.max(this.game.state?.bests?.shuffle || 0, this._pvpScore || 0);
+
+    over.classList.remove('mg-shuffle-gone');
+    over.innerHTML = `
+      <div class="mg-shuffle-card">
+        ${this._pvpBest ? '<div class="mg-shuffle-ribbon">NEW BEST</div>' : ''}
+        <div class="mg-shuffle-hero">
+          <canvas data-el="endFace"></canvas>
+          <div>
+            <h2>${head}</h2>
+            <div class="mg-shuffle-sub">${sub}</div>
+          </div>
+        </div>
+        <div class="mg-shuffle-vsline">
+          <span class="mg-shuffle-swatch" style="background:#e8657a"></span>YOU
+          <span>vs</span>
+          ${foeUp}<span class="mg-shuffle-swatch" style="background:#4fb3e8"></span>
+        </div>
+        <div class="mg-shuffle-stats">
+          <div class="mg-shuffle-stat"><b>${r.you} &ndash; ${r.ai}</b><span>FINAL</span></div>
+          <div class="mg-shuffle-stat"><b>${this._pvpScore || 0}</b><span>SCORE</span></div>
+          <div class="mg-shuffle-stat mg-shuffle-gold"><b>${coins}</b><span>COINS</span></div>
+          <div class="mg-shuffle-stat"><b>${shown}</b><span>BEST</span></div>
+        </div>
+        <div class="mg-shuffle-rounds">
+          ${this.roundLog.map((q, i) => `<span>ROUND ${i + 1} &middot; ${q.you} &ndash; ${q.ai}</span>`).join('')}
+        </div>
+        <div class="mg-shuffle-pay">${end
+    ? (verdict === 'win' ? 'MATCH WIN CONFIRMED BY THE DEN'
+      : verdict === 'tie' ? 'THE DEN CALLED IT A DRAW' : 'THE DEN GAVE THEM THE MATCH')
+    : 'THE MATCH BONUS LANDS WHEN YOU BOTH REPORT'}</div>
+        <div class="mg-shuffle-btns">
+          <button class="mg-shuffle-btn mg-shuffle-alt" data-a="leave">Back to the den</button>
+        </div>
+      </div>`;
+    paintFace(over.querySelector('[data-el="endFace"]'), 112, expr, this.skin);
     over.querySelector('[data-a="leave"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this.exitToRoom();
@@ -835,12 +1302,29 @@ export class ShuffleGame extends Minigame {
     this.shot = 0;
     this.aim = { angle: 0, power: 0.55 };
     this.dragging = false;
+    this._acc = 0;
+    if (this.pvp) {
+      this.pvp.clock = SHOT_CLOCK;
+      this.pvp.waitT = 0;
+      this.pvp.shown = -1;
+    }
     this.el.banner?.classList.add('mg-shuffle-gone');
     if (this.el.fx) this.el.fx.innerHTML = '';
     this._syncHud();
   }
 
+  /** Solo rolls fresh wax from the clock; a match deals both lanes the same
+   *  curve out of the shared seed, or the two tables would not agree. */
   _rollWax() {
+    if (this.pvp) {
+      const rng = mulberry32(this.pvp.seed + this.round * 0x85ebca6b);
+      const amp = 8 + rng() * 10;
+      const flip = rng() < 0.5 ? -1 : 1;
+      const phase = rng() * 6.283;
+      const waves = 0.6 + rng() * 0.6;
+      this.wax = { amp: amp * flip, phase, waves };
+      return;
+    }
     this.wax = {
       amp: (8 + Math.random() * 10) * (Math.random() < 0.5 ? -1 : 1),
       phase: Math.random() * 6.283,
@@ -848,9 +1332,11 @@ export class ShuffleGame extends Minigame {
     };
   }
 
+  /** Sideways pull of the lane at x. `dsin`, not Math.sin: this feeds the
+   *  shared simulation and has to land on the same bits for both players. */
   _bias(x) {
     const w = this.wax;
-    return w.amp * Math.sin(w.phase + (x / TL) * 6.283185 * w.waves);
+    return w.amp * dsin(w.phase + (x / TL) * 6.283185 * w.waves);
   }
 
   _seedSparks() {
@@ -866,6 +1352,7 @@ export class ShuffleGame extends Minigame {
   }
 
   _startRound(n) {
+    if (this.phase === 'over') return; // the match was called while we waited
     this.round = n;
     this.shot = 0;
     this.pucks = [];
@@ -879,6 +1366,15 @@ export class ShuffleGame extends Minigame {
     this._syncHud();
     if (n === 1) {
       this._nextShot();
+    } else if (this.pvp) {
+      const lead = this._shooterAt(0);
+      this._banner('ROUND 2', lead === 'you'
+        ? 'fresh wax, and you lead off' : 'fresh wax, and they lead off');
+      this._say('idle', 'fresh wax on the lane. second round.');
+      this._after(1700, () => {
+        this._hideBanner();
+        this._nextShot();
+      });
     } else {
       this._banner('ROUND 2', 'fresh wax, sharper capybara');
       this._say('smug', 'fresh wax! and i get the first slide. delightful.');
@@ -889,10 +1385,27 @@ export class ShuffleGame extends Minigame {
     }
   }
 
-  /** Round 1 the player leads; round 2 Waxwell leads so you get the last shot. */
+  /**
+   * Solo: round 1 the player leads, round 2 Waxwell leads so you get the last
+   * shot. Match: seat 0 opens the duel, then the lead swaps for round 2 so both
+   * capybaras get one round with the last puck. Returns a screen-relative side,
+   * so the same seat is 'you' on one client and 'ai' on the other.
+   */
   _shooterAt(i) {
+    if (this.pvp) {
+      const lead = this.round === 1 ? 0 : 1;
+      const seat = i % 2 === 0 ? lead : 1 - lead;
+      return seat === this.pvp.youAre ? 'you' : 'ai';
+    }
     const playerFirst = this.round === 1;
     return (i % 2 === 0) === playerFirst ? 'you' : 'ai';
+  }
+
+  /** Which lane a side shoots from. Seat-owned so both clients agree. */
+  _laneY(side) {
+    if (!this.pvp) return SPAWN_Y[side];
+    const seat = side === 'you' ? this.pvp.youAre : 1 - this.pvp.youAre;
+    return LANE_Y[seat];
   }
 
   _nextShot() {
@@ -900,6 +1413,7 @@ export class ShuffleGame extends Minigame {
     if (this.shot >= 8) { this._endRound(); return; }
     const side = this._shooterAt(this.shot);
     if (side === 'you') this._beginPlayerTurn();
+    else if (this.pvp) this._beginRemoteTurn();
     else this._beginAiTurn();
   }
 
@@ -907,7 +1421,7 @@ export class ShuffleGame extends Minigame {
     return {
       side,
       x: SPAWN_X,
-      y: SPAWN_Y[side],
+      y: this._laneY(side),
       vx: 0,
       vy: 0,
       mu: MU,
@@ -926,45 +1440,103 @@ export class ShuffleGame extends Minigame {
     this.pucks.push(this._live);
     this.aim = { angle: 0, power: 0.55 };
     this.dragging = false;
-    this.el.turn.textContent = 'YOUR SHOT';
-    this.el.turn.classList.add('mg-shuffle-yours');
+    if (this.pvp) {
+      this.pvp.clock = SHOT_CLOCK;
+      this.pvp.shown = -1;
+      this.pvp.waitT = 0;
+    }
+    this._paintTurn();
     this._syncHud();
-    if (Math.random() < 0.5) this._say('idle', pick(LINES.idle));
+    if (this.pvp) this._say('idle', pick(CALL.yours));
+    else if (Math.random() < 0.5) this._say('idle', pick(LINES.idle));
   }
 
   _beginAiTurn() {
     this.phase = 'think';
     this._live = this._makePuck('ai');
     this.pucks.push(this._live);
-    this.el.turn.textContent = 'WAXWELL IS THINKING';
-    this.el.turn.classList.remove('mg-shuffle-yours');
+    this._paintTurn();
     this._syncHud();
     this._say('thinking', pick(LINES.think));
     this._after(1150, () => {
       if (this.phase !== 'think' || !this._live) return;
       const plan = this._aiPlan();
-      this._launch(plan.angle, plan.power);
+      this._launchAim(plan.angle, plan.power);
     });
   }
 
-  _launch(angle, power) {
+  /** The other capybara's turn: their aim is theirs alone until they release. */
+  _beginRemoteTurn() {
+    const pv = this.pvp;
+    this.phase = 'wait';
+    this._live = this._makePuck('ai');
+    this.pucks.push(this._live);
+    pv.waitT = 0;
+    this._paintTurn();
+    this._syncHud();
+    this._say('thinking', pick(CALL.wait).replace('%s', pv.foe.name));
+    const ix = this._absShot();
+    const early = pv.inbox.get(ix);
+    if (early) {
+      pv.inbox.delete(ix);
+      this._after(340, () => this._playRemote(early, ix));
+    }
+  }
+
+  /**
+   * Turn an aim into a shot: rounds it to wire precision FIRST so we simulate
+   * exactly the numbers the other client will receive, sends it if this is a
+   * real match, then slides. Every launch in the game funnels through here.
+   */
+  _launchAim(angle, power) {
     const p = this._live;
     if (!p || !p.pending) return;
     const a = clamp(angle, -AIM_LIMIT, AIM_LIMIT);
-    const pw = clamp(power, 0, 1);
+    const shot = {
+      puck: this._absShot(),
+      dirX: r6(Math.cos(a)),
+      dirZ: r6(Math.sin(a)),
+      power: r6(clamp(power, 0, 1)),
+    };
+    if (this.pvp && p.side === 'you') this._sendShot(shot);
+    this._fire(shot);
+  }
+
+  /**
+   * The one place a puck is set moving, on both clients, from wire-safe inputs.
+   * No trig, no Math.random, no engine-defined maths: direction in, velocity
+   * out, friction jitter dealt by the shared seed.
+   */
+  _fire(shot) {
+    const p = this._live;
+    if (!p || !p.pending) return;
+    const pw = clamp(Number(shot.power) || 0, 0, 1);
+    // clamps mirror the aim limits, so a bad packet cannot fire a puck backwards
+    const dx = clamp(Number(shot.dirX) || 0, 0.9, 1);
+    const dz = clamp(Number(shot.dirZ) || 0, -0.45, 0.45);
+    const m = hyp(dx, dz) || 1;
     const v = V_MIN + pw * V_SPAN;
-    p.vx = Math.cos(a) * v;
-    p.vy = Math.sin(a) * v;
-    // a pinch of loose wax: nobody, not even Waxwell, gets a perfect table
-    p.mu = MU * clamp(1 + gauss() * 0.03, 0.92, 1.08);
+    p.vx = (dx / m) * v;
+    p.vy = (dz / m) * v;
+    p.mu = MU * this._grit(shot.puck);
     p.pending = false;
     p.moving = true;
     this.phase = 'slide';
+    this._slideSide = p.side;
     this._slideT = 0;
+    this._acc = 0;
     this._shotOff = [];
-    this.el.turn.textContent = p.side === 'you' ? 'SLIDING...' : 'WAXWELL SLIDES';
-    this.el.turn.classList.remove('mg-shuffle-yours');
+    this._paintTurn();
     this.game.audio?.play?.('slide');
+  }
+
+  /** A pinch of loose wax: nobody gets a perfect table. Seeded in a match so
+   *  both lanes are unfair in precisely the same way. */
+  _grit(ix) {
+    if (!this.pvp) return clamp(1 + gauss() * 0.03, 0.92, 1.08);
+    const rng = mulberry32((this.pvp.seed ^ 0x9e3779b9) + ix * 0x01000193);
+    const a = rng(), b = rng();
+    return 1 + (a + b - 1) * 0.05; // triangular, |grit - 1| <= 0.05
   }
 
   // ---- Waxwell's brain ----------------------------------------------------
@@ -975,7 +1547,7 @@ export class ShuffleGame extends Minigame {
     let vx = Math.cos(angle) * v, vy = Math.sin(angle) * v;
     const dt = 1 / 120;
     for (let i = 0; i < 900; i++) {
-      const sp = Math.hypot(vx, vy);
+      const sp = hyp(vx, vy);
       if (sp < 4) break;
       vy += this._bias(x) * Math.min(1, sp / 200) * dt;
       const k = Math.max(0, sp - MU * dt) / sp;
@@ -990,7 +1562,7 @@ export class ShuffleGame extends Minigame {
   _aiSolve(tx, ty) {
     const sy = SPAWN_Y.ai;
     const dx = tx - SPAWN_X, dy = ty - sy;
-    const dTarget = Math.max(30, Math.hypot(dx, dy));
+    const dTarget = Math.max(30, hyp(dx, dy));
     const aTarget = Math.atan2(dy, dx);
     const naive = {
       angle: aTarget,
@@ -999,7 +1571,7 @@ export class ShuffleGame extends Minigame {
     let angle = naive.angle, power = naive.power;
     for (let it = 0; it < 3; it++) {
       const s = this._simShot(sy, angle, power);
-      const ds = Math.max(20, Math.hypot(s.x - SPAWN_X, s.y - sy));
+      const ds = Math.max(20, hyp(s.x - SPAWN_X, s.y - sy));
       const as = Math.atan2(s.y - sy, s.x - SPAWN_X);
       angle = clamp(angle + (aTarget - as), -AIM_LIMIT, AIM_LIMIT);
       const v = clamp((V_MIN + power * V_SPAN) * Math.sqrt(dTarget / ds), V_MIN, V_MIN + V_SPAN);
@@ -1037,7 +1609,7 @@ export class ShuffleGame extends Minigame {
     if (wantKnock) {
       // aim through the puck so it arrives with something to give
       const dx = target.x - SPAWN_X, dy = target.y - SPAWN_Y.ai;
-      const len = Math.max(1, Math.hypot(dx, dy));
+      const len = Math.max(1, hyp(dx, dy));
       const over = 96;
       const sol = this._aiSolve(target.x + (dx / len) * over, target.y + (dy / len) * over);
       return this._fuzz(sol, 'knock');
@@ -1062,7 +1634,7 @@ export class ShuffleGame extends Minigame {
     for (const b of bands) {
       for (const ly of lanes) {
         let clearance = 1e9;
-        for (const p of others) clearance = Math.min(clearance, Math.hypot(p.x - b.x, p.y - ly));
+        for (const p of others) clearance = Math.min(clearance, hyp(p.x - b.x, p.y - ly));
         // hugging his own pucks is fine, crowding the player's is not
         const crowd = clearance < PR * 2.4 ? -60 : Math.min(clearance, 70) * 0.35;
         const edge = Math.min(ly, TW - ly) < PR * 2 ? -40 : 0;
@@ -1089,10 +1661,10 @@ export class ShuffleGame extends Minigame {
 
     for (const p of this.pucks) {
       if (p.off || p.pending || !p.moving) continue;
-      const sp = Math.hypot(p.vx, p.vy);
+      const sp = hyp(p.vx, p.vy);
       if (sp < 3.2 || this._slideT > 9) { p.vx = 0; p.vy = 0; p.moving = false; continue; }
       p.vy += this._bias(p.x) * Math.min(1, sp / 200) * dt;
-      const sp2 = Math.max(1e-5, Math.hypot(p.vx, p.vy));
+      const sp2 = Math.max(1e-5, hyp(p.vx, p.vy));
       const k = Math.max(0, sp2 - p.mu * dt) / sp2;
       p.vx *= k; p.vy *= k;
       p.x += p.vx * dt;
@@ -1110,8 +1682,8 @@ export class ShuffleGame extends Minigame {
     for (let i = 0; i < live.length; i++) {
       for (let j = i + 1; j < live.length; j++) {
         const a = live[i], b = live[j];
-        let dx = b.x - a.x, dy = b.y - a.y;
-        let d = Math.hypot(dx, dy);
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = hyp(dx, dy);
         if (d >= PR * 2 || d === 0) continue;
         const nx = dx / d, ny = dy / d;
         const overlap = PR * 2 - d;
@@ -1189,19 +1761,27 @@ export class ShuffleGame extends Minigame {
       this.game.audio?.play?.('combo');
     }
 
-    // Waxwell has opinions about all of this
+    // Waxwell has opinions about all of this; a real match gets an announcer
+    // instead, because inventing dialogue for a stranger is not our business.
     const z = shooter && !shooter.off ? zoneOf(shooter.x) : 0;
+    const foe = this.pvp ? this.pvp.foe.name : '';
+    const say = (expr, matchLine, soloLine) => this._say(expr, this.pvp ? matchLine : soloLine);
     if (side === 'you') {
-      if (knockedTheirs) this._say('worried', pick(LINES.worried));
-      else if (z >= 3) this._say('worried', z === 4 ? 'a HANGER? on my table? rude.' : 'oof. that is a good puck.');
-      else if (z === 0 || (shooter && shooter.off)) this._say('smug', pick(LINES.smug));
-      else this._say('idle', pick(LINES.idle));
+      if (knockedTheirs) say('worried', `${foe} loses a puck. ruthless.`, pick(LINES.worried));
+      else if (z >= 3) {
+        say('worried',
+          z === 4 ? 'a hanger! four points on the lip.' : 'that is a three. tidy.',
+          z === 4 ? 'a HANGER? on my table? rude.' : 'oof. that is a good puck.');
+      } else if (z === 0 || (shooter && shooter.off)) {
+        say('smug', 'nothing for that one. shake it off.', pick(LINES.smug));
+      } else say('idle', `on the board. +${z}.`, pick(LINES.idle));
     } else {
-      if (shooter && shooter.off) this._say('worried', pick(LINES.worried));
-      else if (knockedYours) this._say('smug', 'whoops. was that yours? terrible shame.');
-      else if (z >= 3) this._say('smug', pick(LINES.smug));
-      else if (z === 0) this._say('worried', 'i meant to do that. warming up.');
-      else this._say('idle', 'steady does it.');
+      if (shooter && shooter.off) say('worried', `${foe} slid that clean off.`, pick(LINES.worried));
+      else if (knockedYours) say('smug', `${foe} just took one of yours.`, 'whoops. was that yours? terrible shame.');
+      else if (z >= 3) {
+        say('smug', z === 4 ? `${foe} hangs one. four.` : `${foe} parks a three.`, pick(LINES.smug));
+      } else if (z === 0) say('worried', `${foe} came up short.`, 'i meant to do that. warming up.');
+      else say('idle', `${foe} banks a ${z}.`, 'steady does it.');
     }
 
     this.shot++;
@@ -1223,6 +1803,7 @@ export class ShuffleGame extends Minigame {
   }
 
   _endRound() {
+    if (this.phase === 'over') return;
     this.phase = 'between';
     const t = this._tableScore();
     this.banked.you += t.you;
@@ -1232,12 +1813,18 @@ export class ShuffleGame extends Minigame {
     this.roundLog.push({ you: t.you, ai: t.ai });
     this._syncHud();
     const lead = this.banked.you - this.banked.ai;
-    const note = lead > 0 ? 'you are ahead. he has noticed.'
-      : lead < 0 ? 'he is ahead. he will not shut up about it.'
-        : 'all square. tense!';
+    const foe = this.pvp ? this.pvp.foe.name : '';
+    const note = this.pvp
+      ? (lead > 0 ? 'you are ahead. hold it.'
+        : lead < 0 ? `${foe} is ahead. plenty of pucks left.`
+          : 'all square. tense!')
+      : (lead > 0 ? 'you are ahead. he has noticed.'
+        : lead < 0 ? 'he is ahead. he will not shut up about it.'
+          : 'all square. tense!');
     this._banner(`ROUND ${this.round}: ${t.you} - ${t.ai}`, note);
     this.game.audio?.play?.(t.you >= t.ai ? 'success' : 'ding');
     this._after(2000, () => {
+      if (this.phase !== 'between') return; // the den called it while we waited
       this._hideBanner();
       for (const p of this.pucks) {
         if (p.off) continue; // already gone: leave it gone
@@ -1245,6 +1832,7 @@ export class ShuffleGame extends Minigame {
       }
       this.game.audio?.play?.('whoosh');
       this._after(700, () => {
+        if (this.phase !== 'between') return;
         if (this.round >= 2) this._results();
         else this._startRound(2);
       });
@@ -1273,6 +1861,73 @@ export class ShuffleGame extends Minigame {
     }
   }
 
+  /**
+   * The whose-turn tell. Deliberately quiet: a coloured pill, three drifting
+   * dots while somebody is aiming, and a clock that only appears in the last
+   * ten seconds of a real turn.
+   */
+  _paintTurn() {
+    const t = this.el.turn;
+    if (!t) return;
+    const pv = this.pvp;
+    const dots = '<span class="mg-shuffle-dots3"><i></i><i></i><i></i></span>';
+    t.className = 'mg-shuffle-turn';
+    let html = 'WARMING UP';
+    if (this.phase === 'aim') {
+      t.classList.add('mg-shuffle-yours');
+      html = 'YOUR SHOT';
+      if (pv) {
+        const left = Math.max(0, Math.ceil(pv.clock));
+        if (pv.clock <= 10.5) {
+          html += `<span class="mg-shuffle-clock">${left}s</span>`;
+          if (pv.clock <= 5.5) t.classList.add('mg-shuffle-rush');
+        }
+      }
+    } else if (this.phase === 'think') {
+      html = `WAXWELL IS THINKING${dots}`;
+    } else if (this.phase === 'wait') {
+      t.classList.add('mg-shuffle-theirs');
+      html = `${esc(pv.foe.short.toUpperCase())} IS AIMING${dots}`;
+      if (pv.waitT > 20) html += '<div class="mg-shuffle-note">taking their time...</div>';
+    } else if (this.phase === 'slide') {
+      html = this._slideSide === 'you' ? 'SLIDING...'
+        : pv ? `${esc(pv.foe.short.toUpperCase())} SLIDES` : 'WAXWELL SLIDES';
+    }
+    t.innerHTML = html;
+  }
+
+  /** The shot clock only exists in real matches: nobody should be able to sit
+   *  on a turn until the other capybara gives up and walks away. */
+  _tickClock(dt) {
+    const pv = this.pvp;
+    if (!pv || pv.ended) return;
+    if (this.phase === 'aim') {
+      pv.waitT = 0;
+      pv.clock -= dt;
+      if (pv.clock <= 0) {
+        pv.clock = 0;
+        this._autoShot();
+        return;
+      }
+      const s = Math.ceil(pv.clock);
+      if (pv.clock <= 10.5 && s !== pv.shown) { pv.shown = s; this._paintTurn(); }
+    } else if (this.phase === 'wait') {
+      const was = pv.waitT;
+      pv.waitT += dt;
+      if (was <= 20 && pv.waitT > 20) this._paintTurn();
+    }
+  }
+
+  /** Out of time: slide whatever they had loaded rather than stalling the duel. */
+  _autoShot() {
+    if (this.phase !== 'aim' || !this._live?.pending) return;
+    this.dragging = false;
+    this.canvas?.classList.remove('mg-shuffle-drag');
+    this._say('idle', 'time! the table slides it for you.');
+    this.game.audio?.play?.('whoosh');
+    this._launchAim(this.aim.angle, this.aim.power > 0.06 ? this.aim.power : 0.55);
+  }
+
   _bumpChip(chip) {
     if (!chip) return;
     chip.classList.remove('mg-shuffle-bump');
@@ -1282,7 +1937,7 @@ export class ShuffleGame extends Minigame {
 
   _say(expr, line) {
     this.expr = expr;
-    if (this.el.face) paintFace(this.el.face, this._faceSize(), expr);
+    if (this.el.face) paintFace(this.el.face, this._faceSize(), expr, this.skin);
     const b = this.el.bubble;
     if (!b) return;
     b.textContent = line;
@@ -1329,7 +1984,7 @@ export class ShuffleGame extends Minigame {
   _down(e) {
     if (this.phase !== 'aim' || !this._live) return;
     const p = this._toTable(e);
-    const d = Math.hypot(p.x - this._live.x, p.y - this._live.y);
+    const d = hyp(p.x - this._live.x, p.y - this._live.y);
     if (d > 120) return; // must actually grab the puck
     this.dragging = true;
     this.canvas.classList.add('mg-shuffle-drag');
@@ -1346,7 +2001,7 @@ export class ShuffleGame extends Minigame {
   _drag(p) {
     const dx = p.x - this._live.x;
     const dy = p.y - this._live.y;
-    const len = Math.hypot(dx, dy);
+    const len = hyp(dx, dy);
     if (len < 4) { this.aim.power = 0; return; }
     this.aim.angle = clamp(Math.atan2(dy, dx), -AIM_LIMIT, AIM_LIMIT);
     this.aim.power = clamp(len / MAX_DRAG, 0, 1);
@@ -1358,13 +2013,15 @@ export class ShuffleGame extends Minigame {
     this.canvas?.classList.remove('mg-shuffle-drag');
     if (this.phase !== 'aim') return;
     if (this.aim.power < 0.06) { this.aim.power = 0.55; return; }
-    this._launch(this.aim.angle, this.aim.power);
+    this._launchAim(this.aim.angle, this.aim.power);
   }
 
   _key(e) {
     if (e.key === 'Escape') { this.game.audio?.play?.('click'); this.quit(); return; }
     if (this.phase === 'splash' || this.phase === 'over') {
-      if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); this._countdown(); }
+      // a match is one duel: no Space-to-replay once the den has the result
+      const locked = this.pvp && (this.phase === 'over' || this.pvp.started);
+      if ((e.key === ' ' || e.key === 'Enter') && !locked) { e.preventDefault(); this._countdown(); }
       return;
     }
     if (this.phase !== 'aim') return;
@@ -1375,7 +2032,7 @@ export class ShuffleGame extends Minigame {
     else if (e.key === 'ArrowDown') { this.aim.power = clamp(this.aim.power - 0.02 * fine, 0, 1); e.preventDefault(); }
     else if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
-      if (this.aim.power > 0.04) this._launch(this.aim.angle, this.aim.power);
+      if (this.aim.power > 0.04) this._launchAim(this.aim.angle, this.aim.power);
     }
   }
 
@@ -1388,13 +2045,25 @@ export class ShuffleGame extends Minigame {
     this.clock += dt;
 
     if (dt > 0) {
-      // fixed-step physics so a hitchy frame cannot tunnel a puck off the table
-      let acc = dt;
-      while (acc > 0) {
-        const s = Math.min(1 / 120, acc);
-        this._step(s);
-        acc -= s;
+      // Fixed-step physics, and fixed means fixed: the old loop finished each
+      // frame with a short remainder step, which is fine for tunnelling but
+      // makes the trajectory a function of the frame rate. Two clients sharing
+      // a puck have to integrate in identical slices, so leftover time is
+      // carried into the next frame instead of being swallowed by a stub step.
+      if (this.phase === 'slide') {
+        this._acc += dt;
+        let guard = 0;
+        while (this._acc >= FIXED && guard < 400) {
+          this._step(FIXED);
+          this._acc -= FIXED;
+          guard++;
+          if (this.phase !== 'slide') break; // the shot resolved mid-frame
+        }
+        if (guard >= 400) this._acc = 0;
+      } else {
+        this._acc = 0;
       }
+      this._tickClock(dt);
       for (const p of this.pucks) if (p.off) p.offT += dt;
       for (let i = this.dust.length - 1; i >= 0; i--) {
         this.dust[i].t += dt;
@@ -1423,7 +2092,7 @@ export class ShuffleGame extends Minigame {
     if (cv.width !== Math.round(cw * d) || cv.height !== Math.round(ch * d)) {
       cv.width = Math.round(cw * d);
       cv.height = Math.round(ch * d);
-      if (this.el.face) paintFace(this.el.face, this._faceSize(), this.expr);
+      if (this.el.face) paintFace(this.el.face, this._faceSize(), this.expr, this.skin);
     }
     ctx.setTransform(d, 0, 0, d, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
@@ -1443,6 +2112,7 @@ export class ShuffleGame extends Minigame {
     this._drawSparks(ctx);
     this._drawDust(ctx);
     if (this.phase === 'aim' && this._live) this._drawAim(ctx, sc);
+    else if (this.phase === 'wait' && this._live) this._drawWaiting(ctx, sc);
     this._drawPucks(ctx);
     ctx.restore();
 
@@ -1561,6 +2231,29 @@ export class ShuffleGame extends Minigame {
     }
   }
 
+  /**
+   * Their turn, drawn honestly: a breathing ring on their puck and three little
+   * thinking bubbles above it. No aim line, no ghost, no power hint. You find
+   * out where it is going when it goes.
+   */
+  _drawWaiting(ctx, sc) {
+    const p = this._live;
+    const px = 1 / sc;
+    const pulse = 0.5 + 0.5 * dsin(this.clock * 3.1);
+    ctx.strokeStyle = `rgba(155,224,255,${0.2 + pulse * 0.34})`;
+    ctx.lineWidth = 2.4 * px;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, PR + 5 + pulse * 6, 0, Math.PI * 2);
+    ctx.stroke();
+    for (let i = 0; i < 3; i++) {
+      const a = 0.2 + 0.62 * Math.max(0, dsin(this.clock * 3.4 - i * 0.85));
+      ctx.fillStyle = `rgba(255,250,228,${a})`;
+      ctx.beginPath();
+      ctx.arc(p.x + 4 + i * 10, p.y - PR - 12 - i * 3, 2.4 + i * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
   _drawAim(ctx, sc) {
     const p = this._live;
     const px = 1 / sc;
@@ -1582,7 +2275,7 @@ export class ShuffleGame extends Minigame {
     let vx = Math.cos(this.aim.angle) * v, vy = Math.sin(this.aim.angle) * v;
     const dt = 1 / 90;
     for (let i = 0; i < 700; i++) {
-      const sp = Math.hypot(vx, vy);
+      const sp = hyp(vx, vy);
       if (sp < 4) break;
       vy += this._bias(x) * Math.min(1, sp / 200) * dt;
       const k = Math.max(0, sp - MU * dt) / sp;
@@ -1675,7 +2368,8 @@ export class ShuffleGame extends Minigame {
     const y = this.view.oy + TW * sc + 22;
     const w = Math.min(360, cw * 0.5);
     const x = (cw - w) / 2;
-    const showing = this.phase === 'aim' || this.phase === 'slide' || this.phase === 'think';
+    const showing = this.phase === 'aim' || this.phase === 'slide'
+      || this.phase === 'think' || this.phase === 'wait';
     if (!showing) return;
 
     ctx.save();
@@ -1713,8 +2407,12 @@ export class ShuffleGame extends Minigame {
       ctx.textAlign = 'left';
       ctx.fillText('POWER', x + w + 10, y + h / 2);
     } else {
+      const dots = '.'.repeat(1 + (Math.floor(this.clock * 2.2) % 3));
+      const label = this.phase === 'think' ? `WAXWELL IS LINING IT UP${dots}`
+        : this.phase === 'wait' ? `${this.pvp.foe.short.toUpperCase()} IS LINING IT UP${dots}`
+          : 'SLIDING...';
       ctx.fillStyle = 'rgba(255,246,227,.6)';
-      ctx.fillText(this.phase === 'think' ? 'WAXWELL IS LINING IT UP...' : 'SLIDING...', cw / 2, y + 8);
+      ctx.fillText(label, cw / 2, y + 8);
     }
     ctx.restore();
   }

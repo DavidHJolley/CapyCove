@@ -13,6 +13,17 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
  *   win   -> 300 + 10 * empty cells left   (300..650)
  *   draw  -> 120 exactly
  *   loss  -> 20 + empty cells left         (20..55)
+ *
+ * MULTIPLAYER: if `game.__matchCtx` is set at mount time
+ * ({game, players:[{id,name,color,hat}], youAre, seed}) the capy across the
+ * table is a real player instead of Dizzy. Seat 0 always drops first and always
+ * plays the coral discs; every one of our drops goes out as
+ * {t:'match-move', data:{col}} and every remote column is validated and queued
+ * (a disc can land while the opponent's packet is already in flight, so moves
+ * are applied when the board is free, never when they arrive). Both seats send
+ * {t:'match-done'} at the end; the shared verdict arrives as 'match-end' and
+ * the results card is patched with it. No seeded randomness is needed here: the
+ * board is driven entirely by relayed moves, so nothing can drift.
  */
 
 // ---------------------------------------------------------------------------
@@ -43,6 +54,12 @@ function shade(h, amt) {
 }
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+/** Player names reach the results card through innerHTML: never trust them. */
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+  ));
+}
 
 function rrect(ctx, x, y, w, h, r) {
   const rr = Math.min(r, w / 2, h / 2);
@@ -136,6 +153,62 @@ function drawHat(ctx, hat, color) {
     for (const gx of [72, 100, 128]) {
       ctx.beginPath(); ctx.arc(gx, 28, 6, 0, Math.PI * 2); ctx.fill(); ink(ctx, 3);
     }
+  } else if (hat === 'viking') {
+    ctx.beginPath(); ctx.arc(100, 42, 52, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = grad(ctx, 48, -10, 152, 42, shade(color, 0.26), color);
+    ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); rrect(ctx, 44, 28, 112, 20, 8);
+    ctx.fillStyle = shade(color, -0.22); ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); rrect(ctx, 92, 42, 16, 26, 7);
+    ctx.fillStyle = shade(color, -0.1); ctx.fill(); ink(ctx, 4);
+    for (const s of [-1, 1]) {
+      ctx.save();
+      ctx.translate(100 + s * 48, 26); ctx.scale(s, 1);
+      ctx.beginPath();
+      ctx.moveTo(0, 8);
+      ctx.quadraticCurveTo(30, 8, 36, -24);
+      ctx.quadraticCurveTo(18, -8, 0, -10);
+      ctx.closePath();
+      ctx.fillStyle = '#f6efe0'; ctx.fill(); ink(ctx, 5);
+      ctx.restore();
+    }
+  } else if (hat === 'propeller') {
+    ctx.beginPath(); ctx.arc(100, 44, 50, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = color; ctx.fill(); ink(ctx, 5);
+    ctx.save();
+    ctx.beginPath(); ctx.arc(100, 44, 50, Math.PI, Math.PI * 2); ctx.closePath(); ctx.clip();
+    ctx.fillStyle = shade(color, -0.24);
+    ctx.fillRect(76, -12, 22, 56);
+    ctx.fillRect(120, -12, 22, 56);
+    ctx.restore();
+    ctx.beginPath(); rrect(ctx, 46, 34, 108, 16, 7);
+    ctx.fillStyle = shade(color, -0.32); ctx.fill(); ink(ctx, 5);
+    ctx.beginPath(); ctx.moveTo(100, -6); ctx.lineTo(100, -20);
+    ctx.lineWidth = 7; ctx.strokeStyle = OUTLINE; ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(76, -24, 25, 8, -0.16, 0, Math.PI * 2);
+    ctx.fillStyle = '#e8657a'; ctx.fill(); ink(ctx, 4);
+    ctx.beginPath(); ctx.ellipse(124, -24, 25, 8, 0.16, 0, Math.PI * 2);
+    ctx.fillStyle = '#4fb3e8'; ctx.fill(); ink(ctx, 4);
+    ctx.beginPath(); ctx.arc(100, -24, 7, 0, Math.PI * 2);
+    ctx.fillStyle = '#f2b64a'; ctx.fill(); ink(ctx, 4);
+  } else if (hat === 'pirate') {
+    ctx.beginPath();
+    ctx.moveTo(38, 46);
+    ctx.quadraticCurveTo(56, -8, 100, -16);
+    ctx.quadraticCurveTo(144, -8, 162, 46);
+    ctx.quadraticCurveTo(130, 26, 100, 26);
+    ctx.quadraticCurveTo(70, 26, 38, 46);
+    ctx.closePath();
+    ctx.fillStyle = grad(ctx, 38, -16, 162, 46, shade(color, 0.22), color);
+    ctx.fill(); ink(ctx, 5);
+    ctx.beginPath();
+    ctx.moveTo(54, 22); ctx.quadraticCurveTo(100, -6, 146, 22);
+    ctx.lineWidth = 7; ctx.strokeStyle = '#f6efe0'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(100, 8, 10, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff6e3'; ctx.fill(); ink(ctx, 3.5);
+    ctx.fillStyle = OUTLINE;
+    ctx.beginPath(); ctx.arc(96.5, 6, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(103.5, 6, 2.2, 0, Math.PI * 2); ctx.fill();
   } else if (hat === 'visor') {
     ctx.beginPath(); ctx.arc(100, 46, 50, Math.PI * 1.12, Math.PI * 1.88);
     ctx.lineWidth = 16; ctx.strokeStyle = color; ctx.lineCap = 'round'; ctx.stroke();
@@ -315,7 +388,21 @@ const HAT_MAP = {
   chef: ['toque', '#fff6e3'],
   tophat: ['tophat', '#3b3350'],
   crown: ['crown', '#f2b64a'],
+  viking: ['viking', '#b9c3cc'],
+  propeller: ['propeller', '#4fb3e8'],
+  pirate: ['pirate', '#3b3350'],
 };
+
+/** {color, hat} from anywhere (own state, match roster) -> a portrait config. */
+function capyCfg(src, fallback) {
+  const raw = src && src.color;
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  const cfg = { color: Number.isFinite(n) ? hexOf(n) : fallback, hat: 'none', hatColor: '#e8657a' };
+  const key = src && typeof src.hat === 'string' ? src.hat : '';
+  const mapped = Object.prototype.hasOwnProperty.call(HAT_MAP, key) ? HAT_MAP[key] : null;
+  if (mapped) { cfg.hat = mapped[0]; cfg.hatColor = mapped[1]; }
+  return cfg;
+}
 
 // ---------------------------------------------------------------------------
 // board rules + the Dizzy brain
@@ -323,13 +410,19 @@ const HAT_MAP = {
 const COLS = 7;
 const ROWS = 6;
 const CELLS = COLS * ROWS;
-const YOU = 1;
-const DIZ = 2;
+const YOU = 1; // whoever is holding this screen
+const DIZ = 2; // the capy across the table: Dizzy, or a real player in a match
 const WIN_V = 1_000_000;
 // depth 5: beatable by a careful casual player. 7 was measured near-unbeatable
 // and the den pays only on wins, so hard-capped fun beats hard-capped coins.
 const AI_DEPTH = 5;
 const AI_BUDGET_MS = 240; // iterative deepening bails out rather than hitching
+
+// server-side prize for winning a den match (shared contract, wave 4)
+const MATCH_BONUS = 30;
+// seat 0 drops first and plays coral; seat 1 plays gold
+const SEAT_COLORS = [[YOU_C1, YOU_C2], [DIZ_C1, DIZ_C2]];
+const REMOTE_Q_MAX = 8; // a legal game never queues more than one move
 
 // every 4-in-a-line window on the board, precomputed once (69 of them)
 const WINDOWS = (() => {
@@ -592,6 +685,17 @@ const STYLE = `
 .mg-c4-btn:active{transform:translateY(5px);box-shadow:0 2px 0 rgba(50,28,10,.3);}
 .mg-c4-btn.mg-c4-alt{background:#4fb3e8;}
 .mg-c4-btn.mg-c4-ghost{background:transparent;border-color:rgba(58,42,28,.3);color:#7a6748;box-shadow:none;}
+/* ---- match extras (PvP only) ---- */
+.mg-c4-note{background:#fff6e3;border-radius:14px;padding:8px 15px;margin:0 0 10px;
+  font-size:12.5px;font-weight:800;line-height:1.35;color:#7a6748;}
+.mg-c4-note.mg-c4-win{background:#ffeec4;color:#a2700f;}
+.mg-c4-note.mg-c4-wait{opacity:.75;}
+.mg-c4-hint{margin-top:11px;font-size:11px;font-weight:800;letter-spacing:.05em;color:#9a8461;}
+.mg-c4-vs{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:8px;}
+.mg-c4-vs span{font-weight:900;font-size:13px;letter-spacing:.06em;display:flex;align-items:center;gap:7px;}
+.mg-c4-vs u{width:16px;height:16px;border-radius:50%;border:3px solid #3a2a1c;}
+.mg-c4-vs em{font-style:normal;font-weight:900;color:#9a8461;font-size:11.5px;letter-spacing:.16em;}
+
 .mg-c4-count{font-size:clamp(64px,15vw,164px);font-weight:900;color:#fff6e3;
   text-shadow:0 8px 0 rgba(40,20,4,.4);animation:mg-c4-count .6s ease-out;}
 .mg-c4-count.mg-c4-word{font-size:clamp(26px,5.6vw,64px);padding:0 16px;}
@@ -618,6 +722,9 @@ const STYLE = `
   .mg-c4-stat b{font-size:20px;}
   .mg-c4-ribbon{margin-bottom:2px;padding:4px 14px;font-size:11px;}
   .mg-c4-btn{padding:9px 20px;}
+  .mg-c4-note{padding:5px 11px;margin-bottom:6px;font-size:11px;}
+  .mg-c4-vs{margin-bottom:4px;gap:8px;}
+  .mg-c4-hint{display:none;}
 }
 @media (max-height:620px){
   .mg-c4-trophy,.mg-c4-shelf,.mg-c4-lamp{display:none;}
@@ -680,6 +787,7 @@ export class Connect4Game extends Minigame {
     this.lastT = 0;
     this.clock = 0;
 
+    // "dizzy" is whoever sits across the table: the AI, or a real player's capy
     this.dizzy = { color: '#c9a06b', hat: 'capback', hatColor: '#e8657a' };
     this.you = { color: '#b08a5a', hat: 'none', hatColor: '#e8657a' };
     this.dizExpr = 'idle';
@@ -688,6 +796,21 @@ export class Connect4Game extends Minigame {
     this._portraitT = 0;
 
     this.geo = { cell: 48, pad: 9, dropH: 56, w: 360, h: 360 };
+
+    // ---- den match (null = solo vs Dizzy, and everything below is inert) ----
+    this.pvp = null;          // {players, seat, me, them, seed} once validated
+    this.ctxRef = null;       // the exact handshake object we consumed
+    this.seat = 0;            // 0 drops first (coral), 1 second (gold)
+    this.oppName = 'Dizzy';
+    this.cMe = SEAT_COLORS[0];
+    this.cThem = SEAT_COLORS[1];
+    this.subs = [];           // event unsubscribers
+    this.remoteQ = [];        // opponent columns waiting for a free board
+    this.doneSent = false;
+    this.matchOver = false;   // result known, or we bailed out: stop talking
+    this.matchResult = null;  // {reason, iWon, theyWon, drew, disputed}
+    this.noContest = false;   // ended without a fourth disc: no score, no best
+    this._escArm = false;     // Escape asks twice while a match is live
   }
 
   // ---- lifecycle ----------------------------------------------------------
@@ -708,6 +831,7 @@ export class Connect4Game extends Minigame {
       turn: q('[data-el="turn"]'),
       turnChip: q('[data-el="turnChip"]'),
       tally: q('[data-el="tally"]'),
+      tallyLabel: q('[data-el="tallyLabel"]'),
       reward: q('[data-el="reward"]'),
       stage: q('[data-el="stage"]'),
       youSide: q('[data-el="youSide"]'),
@@ -715,6 +839,9 @@ export class Connect4Game extends Minigame {
       youFace: q('[data-el="youFace"]'),
       dizFace: q('[data-el="dizFace"]'),
       youName: q('[data-el="youName"]'),
+      oppName: q('[data-el="oppName"]'),
+      youSwatch: q('[data-el="youSwatch"]'),
+      oppSwatch: q('[data-el="oppSwatch"]'),
       bubble: q('[data-el="bubble"]'),
       youBubble: q('[data-el="youBubble"]'),
       boardWrap: q('[data-el="boardWrap"]'),
@@ -726,11 +853,11 @@ export class Connect4Game extends Minigame {
 
     // the player's own capy sits opposite Dizzy
     const st = this.game.state || {};
-    this.you.color = hexOf(typeof st.color === 'number' ? st.color : 0xb08a5a);
-    const mapped = Object.prototype.hasOwnProperty.call(HAT_MAP, st.hat) ? HAT_MAP[st.hat] : null;
-    this.you.hat = mapped ? mapped[0] : 'none';
-    this.you.hatColor = mapped ? mapped[1] : '#e8657a';
+    this.you = capyCfg(st, hexOf(0xb08a5a));
     this.el.youName.textContent = (st.name || 'You').slice(0, 12);
+
+    // a real opponent replaces Dizzy wholesale: colors, name, seat, turn order
+    this._setupMatch(this._readMatchCtx());
 
     this._buildBackdrop();
 
@@ -759,11 +886,19 @@ export class Connect4Game extends Minigame {
   }
 
   dispose() {
+    // backstop: torn down mid-match by something other than our own buttons
+    // (the game menu, a room warp). Idempotent, so a finished match sends nothing.
+    this._leaveMatch();
     this._dead = true;
     if (this._raf) cancelAnimationFrame(this._raf);
     this._raf = 0;
     for (const id of this._timers) clearTimeout(id);
     this._timers.clear();
+    for (const off of this.subs) { try { off(); } catch { /* already gone */ } }
+    this.subs.length = 0;
+    this.remoteQ.length = 0;
+    if (this.ctxRef && this.game.__matchCtx === this.ctxRef) this.game.__matchCtx = null;
+    this.ctxRef = null;
     if (this._onKey) window.removeEventListener('keydown', this._onKey);
     if (this._onResize) window.removeEventListener('resize', this._onResize);
     this._onKey = null;
@@ -805,7 +940,7 @@ export class Connect4Game extends Minigame {
 
       <div class="mg-c4-hud">
         <div class="mg-c4-chip mg-c4-turn" data-el="turnChip"><small>TURN</small><b data-el="turn">YOU</b></div>
-        <div class="mg-c4-chip mg-c4-tally"><small>MATCH</small><span data-el="tally"></span></div>
+        <div class="mg-c4-chip mg-c4-tally"><small data-el="tallyLabel">MATCH</small><span data-el="tally"></span></div>
         <div class="mg-c4-chip mg-c4-reward"><small>WIN NOW</small><b data-el="reward">+60</b></div>
         <div class="mg-c4-spacer"></div>
         <button class="mg-c4-quit" data-el="quit">QUIT</button>
@@ -815,7 +950,7 @@ export class Connect4Game extends Minigame {
         <div class="mg-c4-side mg-c4-you-side" data-el="youSide">
           <div class="mg-c4-bubble" data-el="youBubble">your turn: pick a column</div>
           <canvas class="mg-c4-portrait" data-el="youFace"></canvas>
-          <div class="mg-c4-nametag"><u style="background:${YOU_C1}"></u><span data-el="youName">You</span></div>
+          <div class="mg-c4-nametag"><u data-el="youSwatch" style="background:${YOU_C1}"></u><span data-el="youName">You</span></div>
         </div>
 
         <div class="mg-c4-boardwrap" data-el="boardWrap">
@@ -827,7 +962,7 @@ export class Connect4Game extends Minigame {
         <div class="mg-c4-side" data-el="dizSide">
           <div class="mg-c4-bubble" data-el="bubble">drop one! drop one!</div>
           <canvas class="mg-c4-portrait" data-el="dizFace"></canvas>
-          <div class="mg-c4-nametag"><u style="background:${DIZ_C1}"></u><span>Dizzy</span></div>
+          <div class="mg-c4-nametag"><u data-el="oppSwatch" style="background:${DIZ_C1}"></u><span data-el="oppName">Dizzy</span></div>
         </div>
       </div>
 
@@ -903,7 +1038,10 @@ export class Connect4Game extends Minigame {
     this.hoverCol = -1;
     this.cursor = 3;
     this.confetti.length = 0;
-    this.turn = this.gameIndex % 2 === 0 ? YOU : DIZ;
+    // in a match the seat decides, not the rematch counter: seat 0 drops first
+    this.turn = this.pvp
+      ? (this.seat === 0 ? YOU : DIZ)
+      : (this.gameIndex % 2 === 0 ? YOU : DIZ);
     this.dizExpr = 'idle';
     this.youExpr = 'idle';
     this._syncHud();
@@ -915,21 +1053,31 @@ export class Connect4Game extends Minigame {
     if (!this.el.turn) return;
     const live = this.phase === 'play' || this.phase === 'count';
     const yours = this.turn === YOU;
-    this.el.turn.textContent = live ? (yours ? 'YOU' : 'DIZZY') : '--';
+    const them = this.pvp ? this.oppName.toUpperCase().slice(0, 10) : 'DIZZY';
+    this.el.turn.textContent = live ? (yours ? 'YOU' : them) : '--';
     this.el.turnChip.classList.toggle('mg-c4-them', !yours);
+    // in a match the seats decide the colors, so the chip follows the discs
+    if (this.pvp) this.el.turn.style.color = yours ? this.cMe[1] : this.cThem[1];
     this.el.turnChip.classList.remove('mg-c4-bump');
     void this.el.turnChip.offsetWidth;
     this.el.turnChip.classList.add('mg-c4-bump');
     this.el.youSide.classList.toggle('mg-c4-active', yours && live);
     this.el.dizSide.classList.toggle('mg-c4-active', !yours && live);
 
-    // counts, not a dot per win: a long rematch streak must not stretch the HUD
-    this.el.tally.innerHTML =
-      `<i class="mg-c4-you"></i>${this.tally.you}<i class="mg-c4-diz"></i>${this.tally.diz}`;
+    if (this.pvp) {
+      // one game per match: a 0-0 tally would be noise, so name the opponent
+      this.el.tally.innerHTML =
+        `<i style="background:${this.cThem[0]}"></i>${esc(this.oppName)}`;
+    } else {
+      // counts, not a dot per win: a long rematch streak must not stretch the HUD
+      this.el.tally.innerHTML =
+        `<i class="mg-c4-you"></i>${this.tally.you}<i class="mg-c4-diz"></i>${this.tally.diz}`;
+    }
 
     // honest live payout: what a win with the very next disc would pay
     const empty = Math.max(0, this._emptyCells() - 1);
-    this.el.reward.textContent = `+${Math.min(60, 40 + 2 * empty)}`;
+    const run = Math.min(60, 40 + 2 * empty);
+    this.el.reward.textContent = `+${run + (this.pvp ? MATCH_BONUS : 0)}`;
   }
 
   _say(who, text) {
@@ -972,6 +1120,15 @@ export class Connect4Game extends Minigame {
     const k = e.key;
     if (k === 'Escape') {
       e.preventDefault();
+      // a stray Escape must not hand a live match away: make them mean it
+      if (this.pvp && !this.matchOver && this.phase !== 'over' && !this._escArm) {
+        this._escArm = true;
+        this.game.audio?.play?.('fail');
+        this._say('you', 'press ESC again to forfeit');
+        this._float('ESC AGAIN TO FORFEIT', this.geo.w / 2, this.geo.dropH * 0.6, 'mg-c4-bad');
+        this._after(2600, () => { this._escArm = false; });
+        return;
+      }
       this.game.audio?.play?.('click');
       this.quit();
       return;
@@ -1024,6 +1181,10 @@ export class Connect4Game extends Minigame {
     this.hoverCol = -1;
     this.game.audio?.play?.('whoosh');
     this.anim = { col, row, idx, who, y: -1.35, vy: 0, squash: 1, bounces: 0, settling: 0 };
+    // the opponent sees the disc the moment we commit to it, not when it lands
+    if (this.pvp && who === YOU && !this.matchOver) {
+      this.game.net?.send?.({ t: 'match-move', data: { col } });
+    }
   }
 
   _land() {
@@ -1042,26 +1203,37 @@ export class Connect4Game extends Minigame {
     }
     this.turn = a.who === YOU ? DIZ : YOU;
     this._syncHud();
-    this._reactAfterMove(a.who);
-    if (this.turn === DIZ) this._dizzyTurn();
+    this._reactAfterMove(a.who, a.col);
+    if (this.pvp) this._pumpRemote();
+    else if (this.turn === DIZ) this._dizzyTurn();
   }
 
-  /** Dizzy's face and chatter follow the position, not the dice. */
-  _reactAfterMove(who) {
+  /** The face across the table follows the position, not the dice. */
+  _reactAfterMove(who, col = -1) {
     const youThreat = this._threatCols(YOU).length > 0;
     const dizThreat = this._threatCols(DIZ).length > 0;
     if (youThreat) {
-      this.dizExpr = 'worried';
+      this.dizExpr = this.pvp && this.turn === DIZ ? 'thinking' : 'worried';
       this.youExpr = 'idle';
-      if (who === YOU) this._say('diz', pick(LINES.worry));
+      if (who === YOU && !this.pvp) this._say('diz', pick(LINES.worry));
     } else if (dizThreat) {
-      this.dizExpr = 'smug';
+      this.dizExpr = this.pvp && this.turn === DIZ ? 'thinking' : 'smug';
       this.youExpr = 'worried';
-      if (who === DIZ) this._say('diz', pick(LINES.smug));
+      if (who === DIZ && !this.pvp) this._say('diz', pick(LINES.smug));
     } else {
-      this.dizExpr = 'idle';
+      this.dizExpr = this.pvp && this.turn === DIZ ? 'thinking' : 'idle';
       this.youExpr = 'idle';
-      if (who === YOU && Math.random() < 0.45) this._say('diz', pick(LINES.chill));
+      if (who === YOU && !this.pvp && Math.random() < 0.45) this._say('diz', pick(LINES.chill));
+    }
+    if (this.pvp) {
+      // never put words in a real player's mouth: their bubble reports facts
+      this._say('diz', this.turn === DIZ
+        ? `${this.oppName} is choosing...`
+        : `dropped column ${col + 1}`);
+      this._say('you', this.turn === YOU
+        ? 'your turn: pick a column'
+        : `waiting for ${this.oppName}...`);
+      return;
     }
     this._say('you', this.turn === YOU ? 'your turn: pick a column' : 'watching Dizzy...');
   }
@@ -1156,6 +1328,148 @@ export class Connect4Game extends Minigame {
     return best;
   }
 
+  // ---- den match (PvP) ----------------------------------------------------
+  /**
+   * Read the handshake the lounge left for us. Anything malformed (or a client
+   * with no socket) falls back to a normal solo game against Dizzy rather than
+   * dropping the player into a dead board.
+   */
+  _readMatchCtx() {
+    const ctx = this.game.__matchCtx;
+    this.ctxRef = ctx || null; // only ever clear the handshake we consumed
+    if (!ctx || typeof ctx !== 'object' || ctx.game !== 'connect4') return null;
+    if (!Array.isArray(ctx.players) || ctx.players.length < 2) return null;
+    const seat = ctx.youAre === 0 ? 0 : ctx.youAre === 1 ? 1 : -1;
+    if (seat < 0) return null;
+    const me = ctx.players[seat];
+    const them = ctx.players[1 - seat];
+    if (!me || !them || me.id == null || them.id == null) return null;
+    if (!this.game.net) return null;
+    return { players: ctx.players, seat, me, them, seed: Number(ctx.seed) || 0 };
+  }
+
+  /** Dress the table for a real opponent and start listening to the relay. */
+  _setupMatch(m) {
+    if (!m) return;
+    this.pvp = m;
+    this.seat = m.seat;
+    this.oppName = String(m.them.name || '').slice(0, 12) || 'Rival';
+    this.cMe = SEAT_COLORS[m.seat];
+    this.cThem = SEAT_COLORS[1 - m.seat];
+    this.dizzy = capyCfg(m.them, '#c9a06b'); // their capy takes Dizzy's chair
+    const el = this.el;
+    if (el.oppName) el.oppName.textContent = this.oppName;
+    if (el.oppSwatch) el.oppSwatch.style.background = this.cThem[0];
+    if (el.youSwatch) el.youSwatch.style.background = this.cMe[0];
+    if (el.tallyLabel) el.tallyLabel.textContent = 'VS';
+    // leaving a live match is a forfeit, so the button says what it does
+    const bail = el.wrap && el.wrap.querySelector('[data-el="quit"]');
+    if (bail) bail.textContent = 'FORFEIT';
+    const ev = this.game.events;
+    if (ev?.on) {
+      this.subs.push(ev.on('match-move', (msg) => this._onRemoteMove(msg)));
+      this.subs.push(ev.on('match-end', (msg) => this._onMatchEnd(msg)));
+    }
+  }
+
+  /** {t:'match-move', from, data:{col}} : validated, then queued. */
+  _onRemoteMove(msg) {
+    if (!this.pvp || this._dead || this.matchOver) return;
+    const from = msg && msg.from;
+    if (from != null && from !== this.pvp.them.id) return; // not our opponent
+    const col = Number(msg && msg.data && msg.data.col);
+    if (!Number.isInteger(col) || col < 0 || col >= COLS) return;
+    if (this.remoteQ.length >= REMOTE_Q_MAX) return; // spam, not a game
+    this.remoteQ.push(col);
+    this._pumpRemote();
+  }
+
+  /**
+   * Apply queued opponent columns when the board can take them. Packets arrive
+   * while our own disc is still bouncing, so arrival order decides nothing:
+   * the queue does.
+   */
+  _pumpRemote() {
+    if (!this.pvp || this._dead) return;
+    if (this.phase !== 'play' || this.anim || this.winner || this.turn !== DIZ) return;
+    while (this.remoteQ.length) {
+      const col = this.remoteQ.shift();
+      if (this.heights[col] < ROWS) { this._drop(col, DIZ); return; }
+      // a column that filled up meanwhile: the move is stale, skip it
+    }
+  }
+
+  /** Report our verdict once. The server pays only when both seats agree. */
+  _sendMatchDone(winner) {
+    if (!this.pvp || this.doneSent || this.matchOver) return;
+    this.doneSent = true;
+    const id = winner === YOU ? this.pvp.me.id
+      : winner === DIZ ? this.pvp.them.id
+        : 'draw';
+    this.game.net?.send?.({ t: 'match-done', result: { winner: id, score: this._score() } });
+  }
+
+  /** {t:'match-end', game, reason, winner}: the shared, final word. */
+  _onMatchEnd(msg) {
+    if (!this.pvp || this._dead || this.matchResult) return;
+    if (msg && msg.game && msg.game !== 'connect4') return;
+    const w = msg && msg.winner != null ? msg.winner : null;
+    const res = {
+      reason: msg && msg.reason === 'forfeit' ? 'forfeit' : 'done',
+      iWon: w != null && w === this.pvp.me.id,
+      theyWon: w != null && w === this.pvp.them.id,
+      drew: w === 'draw',
+      disputed: w == null,
+    };
+    this.matchResult = res;
+    this.matchOver = true;
+    this.remoteQ.length = 0;
+    if (this.phase === 'over') { this._paintMatchResult(); return; }
+    this._endByMatch(res);
+  }
+
+  /** The match ended before the board did (forfeit, disconnect, room change). */
+  _endByMatch(res) {
+    if (this.phase === 'end') return; // our own ending is already playing out
+    this.phase = 'end';
+    this.winner = res.iWon ? YOU : res.theyWon ? DIZ : 0;
+    this.winLine = null;
+    this.anim = null;
+    this.hoverCol = -1;
+    this.noContest = true; // no fourth disc: no score, no best, no run coins
+    this.dizExpr = res.iWon ? 'beaten' : 'idle';
+    this.youExpr = res.iWon ? 'cheer' : 'idle';
+    const left = res.reason === 'forfeit';
+    this._say('diz', left ? `${this.oppName} left the table` : 'match over');
+    this._say('you', res.iWon ? 'the table is yours' : 'match over');
+    this.game.audio?.play?.(res.iWon ? 'success' : 'ding');
+    if (res.iWon) { this.shake = 9; this._burst(YOU); }
+    this._float(left ? 'TABLE ABANDONED' : 'MATCH OVER',
+      this.geo.w / 2, this.geo.dropH + this.geo.cell * 2, 'mg-c4-small');
+    this._syncHud();
+    this._after(1200, () => this._results());
+  }
+
+  /**
+   * Walking out mid-match is a forfeit, not a stalemate: tell the table so the
+   * opponent is paid and released instead of staring at our empty chair.
+   */
+  _leaveMatch() {
+    if (!this.pvp || this.matchOver || this.doneSent) return;
+    this.matchOver = true;
+    this.game.net?.send?.({ t: 'table-leave' });
+  }
+
+  quit() {
+    this._leaveMatch();
+    super.quit();
+  }
+
+  exitToRoom() {
+    this._leaveMatch();
+    super.exitToRoom();
+  }
+
   // ---- end of a game ------------------------------------------------------
   _endGame(winner, cells) {
     this.phase = 'end'; // locks input for the draw case too, where winner is 0
@@ -1164,12 +1478,14 @@ export class Connect4Game extends Minigame {
     this.winT = 0;
     this.hoverCol = -1;
     this._syncHud();
+    this._sendMatchDone(winner); // reads this.winner, which is already set
 
+    const them = this.pvp ? this.oppName : 'Dizzy';
     if (winner === YOU) {
       this.tally.you++;
       this.dizExpr = 'beaten';
       this.youExpr = 'cheer';
-      this._say('diz', pick(LINES.youWin));
+      this._say('diz', this.pvp ? 'nice line.' : pick(LINES.youWin));
       this._say('you', 'FOUR IN A ROW!');
       this.game.audio?.play?.('success');
       this.shake = 13;
@@ -1179,16 +1495,17 @@ export class Connect4Game extends Minigame {
       this.tally.diz++;
       this.dizExpr = 'cheer';
       this.youExpr = 'worried';
-      this._say('diz', pick(LINES.dizWin));
+      this._say('diz', this.pvp ? 'four in a row!' : pick(LINES.dizWin));
       this._say('you', 'ouch. rematch?');
       this.game.audio?.play?.('fail');
       this.shake = 10;
       this._burst(DIZ);
-      this._float('DIZZY GETS FOUR', this.geo.w / 2, this.geo.dropH + this.geo.cell * 2, 'mg-c4-bad');
+      this._float(`${them.toUpperCase()} GETS FOUR`,
+        this.geo.w / 2, this.geo.dropH + this.geo.cell * 2, 'mg-c4-bad');
     } else {
       this.dizExpr = 'idle';
       this.youExpr = 'idle';
-      this._say('diz', pick(LINES.draw));
+      this._say('diz', this.pvp ? 'a tie!' : pick(LINES.draw));
       this._say('you', 'not one square left!');
       this.game.audio?.play?.('ding');
       this._float('BOARD FULL', this.geo.w / 2, this.geo.dropH + this.geo.cell * 2, 'mg-c4-small');
@@ -1198,6 +1515,7 @@ export class Connect4Game extends Minigame {
   }
 
   _score() {
+    if (this.noContest) return 0; // the board never finished: nothing to bank
     const empty = this._emptyCells();
     if (this.winner === YOU) return 300 + 10 * empty;
     if (this.winner === DIZ) return 20 + empty;
@@ -1207,6 +1525,7 @@ export class Connect4Game extends Minigame {
   // ---- screens ------------------------------------------------------------
   _showSplash() {
     this.phase = 'splash';
+    if (this.pvp) { this._showMatchSplash(); return; }
     const best = this.game.state?.bests?.connect4 || 0;
     const over = this.el.over;
     over.classList.remove('mg-c4-gone');
@@ -1243,25 +1562,85 @@ export class Connect4Game extends Minigame {
     });
   }
 
+  /**
+   * The match splash: both capys, both colors, who drops first, and the fact
+   * that walking out now is a forfeit. It starts itself, because the other
+   * player is already sitting at the same table waiting for the first disc.
+   */
+  _showMatchSplash() {
+    const best = this.game.state?.bests?.connect4 || 0;
+    const name = esc(this.oppName);
+    const NAME = esc(this.oppName.toUpperCase());
+    const mine = esc(String(this.game.state?.name || 'You').slice(0, 12));
+    const over = this.el.over;
+    over.classList.remove('mg-c4-gone');
+    over.innerHTML = `
+      <div class="mg-c4-card">
+        <canvas class="mg-c4-face" data-el="splashFace"></canvas>
+        <h1>Table match</h1>
+        <div class="mg-c4-sub">FOUR IN A ROW, ONE BOARD, NO TAKE-BACKS.</div>
+        <div class="mg-c4-vs">
+          <span><u style="background:${this.cMe[0]}"></u>${mine}</span>
+          <em>VS</em>
+          <span><u style="background:${this.cThem[0]}"></u>${name}</span>
+        </div>
+        <div class="mg-c4-how">
+          <div><i>1</i><span>${this.seat === 0
+            ? 'You drop first.'
+            : `${NAME} drops first.`} Click a column (or <b>&larr; &rarr;</b> then <b>Space</b>, or keys <b>1</b>&ndash;<b>7</b>).</span></div>
+          <div><i>2</i><span>Four in a row wins: across, up, or slanted. Discs stack from the bottom.</span></div>
+          <div><i>3</i><span>Win the match for <b>+${MATCH_BONUS}</b> coins on top of the usual run payout.</span></div>
+        </div>
+        <div class="mg-c4-note mg-c4-wait">the board opens by itself in a moment. leaving before it ends hands ${name} the win.</div>
+        <div class="mg-c4-stats">
+          <div class="mg-c4-stat"><b>${best}</b><span>YOUR BEST</span></div>
+          <div class="mg-c4-stat mg-c4-gold"><b>${this._payout(best)}</b><span>COINS THEN</span></div>
+        </div>
+        <div class="mg-c4-btns">
+          <button class="mg-c4-btn" data-a="play">I&rsquo;M READY</button>
+          <button class="mg-c4-btn mg-c4-ghost" data-a="leave">Forfeit &amp; leave</button>
+        </div>
+      </div>`;
+    const face = over.querySelector('[data-el="splashFace"]');
+    if (face) paintCapy(face, 128, this.dizzy, 'idle', 0);
+    over.querySelector('[data-a="play"]').addEventListener('click', () => this._countdown());
+    over.querySelector('[data-a="leave"]').addEventListener('click', () => {
+      this.game.audio?.play?.('click');
+      this.quit();
+    });
+    // both seats start on their own clock; early moves simply queue up
+    this._after(4200, () => { if (this.phase === 'splash') this._countdown(); });
+  }
+
   _countdown() {
     if (this.phase !== 'splash' && this.phase !== 'over') return;
+    if (this.pvp && this.matchOver) return; // the table is already closed
     this.game.audio?.play?.('click');
     this._resetBoard();
     this._layout();
     this.phase = 'count';
-    this._say('diz', pick(LINES.hello));
+    this._say('diz', this.pvp ? `${this.oppName} is at the table` : pick(LINES.hello));
     this._say('you', 'here we go');
-    const first = this.turn === YOU ? 'YOU DROP FIRST!' : 'DIZZY DROPS FIRST!';
+    const them = this.pvp ? esc(this.oppName.toUpperCase()) : 'DIZZY';
+    const first = this.turn === YOU ? 'YOU DROP FIRST!' : `${them} DROPS FIRST!`;
     const steps = ['3', '2', '1', first];
     const over = this.el.over;
     over.classList.remove('mg-c4-gone');
     const show = (i) => {
+      // a forfeit can land mid-countdown: never claw the results screen back
+      if (this._dead || this.phase !== 'count') return;
       if (i >= steps.length) {
         over.classList.add('mg-c4-gone');
         over.innerHTML = '';
         this.phase = 'play';
         this._syncHud();
-        if (this.turn === DIZ) this._dizzyTurn();
+        if (this.pvp) {
+          const mine = this.turn === YOU;
+          this.dizExpr = mine ? 'idle' : 'thinking';
+          this._say('diz', mine ? 'good luck!' : `${this.oppName} is choosing...`);
+          this._say('you', mine ? 'your turn: pick a column' : `waiting for ${this.oppName}...`);
+          this._pumpRemote();
+        } else if (this.turn === DIZ) this._dizzyTurn();
         return;
       }
       const last = i === steps.length - 1;
@@ -1281,6 +1660,7 @@ export class Connect4Game extends Minigame {
     this.finish(score);
     const shown = Math.max(prevBest, score);
     this.game.audio?.play?.(this.winner === YOU ? 'success' : 'ding');
+    if (this.pvp) { this._matchCard(score, coins, shown, isBest); return; }
 
     const won = this.winner === YOU;
     const drew = this.winner === 0;
@@ -1326,6 +1706,136 @@ export class Connect4Game extends Minigame {
     });
   }
 
+  _resFaceExpr() {
+    if (this.winner === YOU) return 'beaten';
+    if (this.winner === DIZ) return 'cheer';
+    return 'idle';
+  }
+
+  /**
+   * Every line of the match result in one place, so the card can be rendered
+   * before 'match-end' lands (provisional) and patched the moment it does.
+   */
+  _matchTexts() {
+    const name = esc(this.oppName);
+    const NAME = esc(this.oppName.toUpperCase());
+    const r = this.matchResult;
+    const won = this.winner === YOU;
+    const drew = this.winner === 0 && !this.noContest;
+    let title, sub;
+    if (this.noContest) {
+      const left = r && r.reason === 'forfeit';
+      title = won ? 'The table is yours' : 'Match over';
+      sub = left && won
+        ? `${NAME} STEPPED AWAY BEFORE THE FOURTH DISC.`
+        : left
+          ? 'THE MATCH ENDED WITHOUT A FOURTH DISC.'
+          : 'NOBODY GOT TO FOUR.';
+    } else if (won) {
+      title = 'You got four!';
+      sub = `HOLES STILL EMPTY WHEN IT LANDED: ${this._emptyCells()}.`;
+    } else if (drew) {
+      title = 'Dead heat!';
+      sub = 'NOT ONE EMPTY HOLE LEFT. NOBODY WINS, EVERYBODY SNACKS.';
+    } else {
+      title = `${name} got four.`;
+      sub = `${NAME} IS ALREADY TELLING THE WHOLE DEN ABOUT IT.`;
+    }
+    let status, bonus, good = false;
+    if (!r) {
+      status = 'confirming the result with the table...';
+      bonus = '?';
+    } else if (r.iWon) {
+      status = r.reason === 'forfeit'
+        ? `${name} left the table, so the win is yours: +${MATCH_BONUS} coins.`
+        : `match won: +${MATCH_BONUS} coins on top of the run.`;
+      bonus = `+${MATCH_BONUS}`;
+      good = true;
+    } else if (r.theyWon) {
+      status = r.reason === 'forfeit'
+        ? 'you stepped away, so the table went to your opponent.'
+        : `${name} takes the match.`;
+      bonus = '0';
+    } else if (r.drew) {
+      status = 'a proper draw: no bonus, no hard feelings.';
+      bonus = '0';
+    } else {
+      status = 'the two boards did not agree, so no bonus was paid.';
+      bonus = '0';
+    }
+    return { title, sub, status, bonus, good };
+  }
+
+  /** PvP results: shared verdict, match bonus, and back to the den either way. */
+  _matchCard(score, coins, shown, isBest) {
+    const t = this._matchTexts();
+    const over = this.el.over;
+    over.classList.remove('mg-c4-gone');
+    over.innerHTML = `
+      <div class="mg-c4-card">
+        <canvas class="mg-c4-face" data-el="resFace"></canvas>
+        ${isBest ? '<div class="mg-c4-ribbon">NEW BEST</div>' : ''}
+        <h2 data-el="resTitle">${t.title}</h2>
+        <div class="mg-c4-sub" data-el="resSub">${t.sub}</div>
+        <div class="mg-c4-note ${t.good ? 'mg-c4-win' : 'mg-c4-wait'}" data-el="resStatus">${t.status}</div>
+        <div class="mg-c4-stats">
+          <div class="mg-c4-stat"><b>${score}</b><span>SCORE</span></div>
+          <div class="mg-c4-stat mg-c4-gold"><b>${coins}</b><span>RUN COINS</span></div>
+          <div class="mg-c4-stat mg-c4-gold"><b data-el="resBonus">${t.bonus}</b><span>MATCH BONUS</span></div>
+        </div>
+        <div class="mg-c4-stats">
+          <div class="mg-c4-stat"><b>${shown}</b><span>BEST</span></div>
+          <div class="mg-c4-stat"><b>${this.filled}</b><span>DISCS DROPPED</span></div>
+        </div>
+        <div class="mg-c4-btns">
+          <button class="mg-c4-btn" data-a="again">Rematch</button>
+          <button class="mg-c4-btn mg-c4-alt" data-a="leave">Back to the den</button>
+        </div>
+        <div class="mg-c4-hint">tables clear after every match: take a seat again for the rematch</div>
+      </div>`;
+    const face = over.querySelector('[data-el="resFace"]');
+    if (face) paintCapy(face, 122, this.dizzy, this._resFaceExpr(), 0);
+    // both buttons walk back to the den: the table cycles, it never restarts here
+    for (const a of ['again', 'leave']) {
+      over.querySelector(`[data-a="${a}"]`).addEventListener('click', () => {
+        this.game.audio?.play?.('click');
+        this.exitToRoom();
+      });
+    }
+    // never leave "confirming..." spinning forever if the table goes quiet
+    if (!this.matchResult) {
+      this._after(7000, () => {
+        if (this.matchResult || this.phase !== 'over') return;
+        const node = this.el.over?.querySelector('[data-el="resStatus"]');
+        if (node) node.textContent = 'no word back from the table: any bonus lands on its own.';
+      });
+    }
+  }
+
+  /** 'match-end' arrived after the card was already up: swap the words. */
+  _paintMatchResult() {
+    const over = this.el.over;
+    if (!over) return;
+    const t = this._matchTexts();
+    for (const [sel, html] of [
+      ['[data-el="resTitle"]', t.title],
+      ['[data-el="resSub"]', t.sub],
+      ['[data-el="resStatus"]', t.status],
+      ['[data-el="resBonus"]', t.bonus],
+    ]) {
+      const node = over.querySelector(sel);
+      if (node) node.innerHTML = html;
+    }
+    const note = over.querySelector('[data-el="resStatus"]');
+    if (note) {
+      note.classList.remove('mg-c4-wait');
+      note.classList.toggle('mg-c4-win', t.good);
+    }
+    const face = over.querySelector('[data-el="resFace"]');
+    if (face) paintCapy(face, 122, this.dizzy, this._resFaceExpr(), 0);
+    if (t.good) this.game.audio?.play?.('coin');
+  }
+
   // ---- fx -----------------------------------------------------------------
   /** x,y are canvas-space; converted to the fx layer's box. */
   _float(text, x, y, cls) {
@@ -1343,9 +1853,10 @@ export class Connect4Game extends Minigame {
   }
 
   _burst(who) {
+    const [c1, c2] = this._discColors(who);
     const cols = who === YOU
-      ? ['#f5869a', '#e8657a', '#ffd06a', '#fff6e3', '#7ac74f']
-      : ['#ffd06a', '#f2b64a', '#fff6e3', '#c9a06b'];
+      ? [c1, c2, '#ffd06a', '#fff6e3', '#7ac74f']
+      : [c1, c2, '#fff6e3', '#c9a06b'];
     const cx = this.geo.w / 2, cy = this.geo.dropH + this.geo.cell * 2;
     for (let i = 0; i < 90; i++) {
       const a = Math.random() * Math.PI * 2;
@@ -1441,8 +1952,9 @@ export class Connect4Game extends Minigame {
     this._painted.you = this.youExpr;
   }
 
+  /** Seat colors, not player colors: seat 0 is always coral, seat 1 gold. */
   _discColors(who) {
-    return who === YOU ? [YOU_C1, YOU_C2] : [DIZ_C1, DIZ_C2];
+    return who === YOU ? this.cMe : this.cThem;
   }
 
   _drawDisc(ctx, x, y, r, who, sq = 1, alpha = 1) {

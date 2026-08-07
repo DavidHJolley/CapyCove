@@ -12,6 +12,22 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
  *
  *   node --input-type=module -e "const m = await import('file:///D:/projects/ClubNotPenguin/src/minigames/games/cards.js'); console.log(m.simulateDuels(200));"
  *
+ * Two ways to play:
+ *  - Solo: the full tutorial + Grandmaster Pebble, exactly as before.
+ *  - Den PvP: the lounge sets `game.__matchCtx = {game, players, youAre, seed}`
+ *    before startMinigame('cards'). Both clients build the SAME duel from the
+ *    shared seed (seat 0's deck from `seed`, seat 1's from `seed + 1`) and then
+ *    only exchange intents over 'match-move':
+ *      {a:'play',   hand:<index in the actor's hand>, slot:<0-3>|null,
+ *                   target:{side:<seat>, slot:<0-3>}|null}   // target: spells
+ *      {a:'attack', from:<my slot>, target:'face'|<enemy slot>}
+ *      {a:'end'} | {a:'resign'} | {a:'desync'}
+ *    Every remote intent goes through the same rules core as a local one and is
+ *    rejected the same way; a rejection freezes the duel (see _desync) instead
+ *    of letting the two boards quietly tell different stories.
+ *    The seat mirror is deliberate: the opponent's HAND is never rendered or
+ *    inspected from it, only its count. Their cards become visible when played.
+ *
  * Deviations from the spec (all noted where they happen):
  *  - The card table in docs/CARDGAME.md sums to 24 cards, not the 20 quoted in
  *    the prose. The per-card x1/x2 counts are the authoritative content, so the
@@ -27,6 +43,9 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
  *  - Healing never exceeds the 25 HP a capy starts with.
  *  - Damage spells cannot hit face at all (the cards say "to any critter"), so
  *    the AI's "spell for lethal" branch can never fire.
+ *  - A den win by walkout pays 25 + damage dealt (never more than the normal
+ *    win). The spec's HP formula would hand a full purse to someone whose
+ *    opponent left on turn one, which is a coin farm, not a duel.
  */
 
 // ---------------------------------------------------------------------------
@@ -50,6 +69,18 @@ function mixHex(a, b, t) {
 /** amt > 0 lightens toward cream, amt < 0 darkens toward the outline ink. */
 function shade(h, amt) {
   return amt >= 0 ? mixHex(h, '#fff3dc', amt) : mixHex(h, OUTLINE, -amt);
+}
+/** Player names come off the wire; they never go into innerHTML raw. */
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+/** A wire colour (0xrrggbb or '#rrggbb') as a css hex, with a cosy fallback. */
+function bodyHex(c) {
+  if (typeof c === 'number' && Number.isFinite(c)) return hexOf(c & 0xffffff);
+  if (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c)) return c.toLowerCase();
+  return '#b08a5a';
 }
 function rrect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -250,17 +281,42 @@ function mkSide(deck) {
   };
 }
 
-/** side 0 is the human (always first), side 1 is the AI. */
-export function newDuel(rng = Math.random) {
+/**
+ * Seat 0 always moves first; seat 1 draws the compensation card. Solo puts the
+ * human in seat 0 and Pebble in seat 1; a den match seats whoever the server
+ * says (`youAre`), so nothing below may assume "0 is me".
+ *
+ * `opts.decks` supplies both draw piles already shuffled (PvP: identical on
+ * both clients); otherwise they are shuffled from `rng` in seat order.
+ */
+export function newDuel(rng = Math.random, opts = {}) {
+  const decks = Array.isArray(opts.decks) && opts.decks.length === 2
+    ? opts.decks
+    : [shuffle(starterDeck(), rng), shuffle(starterDeck(), rng)];
   const S = {
     rng, uid: 1, turn: 0, active: 0, winner: null, fx: [],
-    sides: [mkSide(shuffle(starterDeck(), rng)), mkSide(shuffle(starterDeck(), rng))],
+    sides: [mkSide(decks[0]), mkSide(decks[1])],
   };
   for (let i = 0; i < START_HAND; i++) { drawCards(S, 0, 1); drawCards(S, 1, 1); }
   drawCards(S, 1, 1); // second-player compensation
   S.fx.length = 0;
   beginTurn(S, 0);
   return S;
+}
+
+/** The two draw piles a den match uses: seat 0 from `seed`, seat 1 from seed+1. */
+export function pvpDecks(seed) {
+  const s = seed >>> 0;
+  return [
+    shuffle(starterDeck(), makeRng(s)),
+    shuffle(starterDeck(), makeRng((s + 1) >>> 0)),
+  ];
+}
+
+/** Same seed in, same duel out, on both sides of the table. */
+export function newPvpDuel(seed) {
+  const s = seed >>> 0;
+  return newDuel(makeRng((s ^ 0x9e3779b9) >>> 0), { decks: pvpDecks(s) });
 }
 
 export function unitsOf(side) {
@@ -1445,6 +1501,31 @@ const STYLE = `
 .mg-cards-quit{border:0;background:rgba(28,18,10,.65);color:#fff6e3;font-family:inherit;font-weight:900;
   font-size:12px;letter-spacing:.1em;padding:8px 16px;border-radius:999px;cursor:pointer;transition:.14s;}
 .mg-cards-quit:hover{background:#c94a3e;transform:scale(1.06);}
+.mg-cards-quit.mg-cards-armed{background:#c94a3e;animation:mg-cards-pulse .9s ease-in-out infinite;}
+.mg-cards-hide{display:none !important;}
+.mg-cards-clock b{font-variant-numeric:tabular-nums;min-width:34px;text-align:center;}
+.mg-cards-clock.mg-cards-low{background:#c94a3e;color:#fff6e3;animation:mg-cards-pulse .9s ease-in-out infinite;}
+.mg-cards-clock.mg-cards-low small{opacity:.85;}
+.mg-cards-live{background:#4fb3e8;color:#fffdf6;letter-spacing:.12em;}
+.mg-cards-live::before{content:"";width:8px;height:8px;border-radius:50%;background:#fffdf6;
+  animation:mg-cards-blip 1.4s ease-in-out infinite;}
+/* The two match chips must never push the HUD onto a second row: that row is
+   stolen from the hand, which is the one thing a duellist cannot play without. */
+@media (max-width:820px){
+  /* the title and the DEN TABLE badge are decoration; the turn, the clock and
+     the way out are not. Drop the decoration before the HUD takes a second row */
+  .mg-cards-title,.mg-cards-live,.mg-cards-clock small{display:none;}
+  .mg-cards-chip{padding:5px 10px;}
+  .mg-cards-tri{padding:4px 8px;gap:3px;}
+  .mg-cards-tri canvas{width:16px;height:16px;}
+  .mg-cards-arrow{font-size:12px;}
+  .mg-cards-quit{padding:7px 12px;}
+}
+@media (max-height:560px){
+  .mg-cards-hud{padding:5px 10px;gap:6px;}
+  .mg-cards-chip{padding:4px 11px;font-size:13px;}
+}
+@keyframes mg-cards-blip{50%{opacity:.25;transform:scale(.7)}}
 
 /* ---- table ---- */
 .mg-cards-table{position:relative;z-index:5;flex:1;min-height:0;display:flex;flex-direction:column;
@@ -1627,6 +1708,16 @@ const STYLE = `
 .mg-cards-trirink{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap;}
 .mg-cards-trirink canvas{display:block;}
 .mg-cards-winner{display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:6px;}
+.mg-cards-vs{display:flex;align-items:center;justify-content:center;gap:clamp(10px,2.6vw,26px);
+  margin:12px 0 8px;}
+.mg-cards-vscap{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0;}
+.mg-cards-vscap canvas{display:block;filter:drop-shadow(0 6px 9px rgba(60,34,10,.32));
+  animation:mg-cards-breathe 3.2s ease-in-out infinite;}
+.mg-cards-vscap b{font-size:clamp(13px,1.9vw,18px);color:#3a2a1c;max-width:38vw;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;}
+.mg-cards-vscap span{font-size:10px;font-weight:900;letter-spacing:.13em;color:#9a8461;}
+.mg-cards-vsx{font-size:clamp(22px,3.4vw,34px);font-weight:900;color:#e8657a;letter-spacing:.05em;
+  animation:mg-cards-pulse 1.1s ease-in-out infinite;}
 .mg-cards-endcap{flex:1;display:flex;align-items:center;gap:10px;min-width:0;}
 .mg-cards-endcap.mg-cards-right{justify-content:flex-end;}
 @media (max-height:640px){
@@ -1653,6 +1744,8 @@ const STYLE = `
   .mg-cards-stat span{font-size:9px;}
   .mg-cards-ribbon{font-size:10.5px;padding:4px 14px;margin-bottom:4px;}
   .mg-cards-winner{margin-bottom:4px;}
+  .mg-cards-vs{margin:6px 0 4px;gap:12px;}
+  .mg-cards-vscap b{font-size:12.5px;}
   .mg-cards-btns{margin-top:2px;gap:8px;}
   .mg-cards-btn{padding:7px 17px;font-size:12.5px;border-width:3px;}
 }
@@ -1665,6 +1758,10 @@ const BOARD_PAINT = 220;
 const HAND_PAINT = 260;
 const FOE_FACE = 92;
 const MY_FACE = 66;
+/** PvP only: how long a duelist gets before their own client passes the turn. */
+const TURN_MS = 90000;
+/** PvP only: how long past the clock a silent opponent earns a gentle hint. */
+const STALL_MS = 20000;
 const HAT_COLORS = ['#e8657a', '#4fb3e8', '#7ac74f', '#f2b64a', '#9b6bd4', '#42d6c8'];
 
 function paintCard(cv, W, def, live) {
@@ -1718,6 +1815,22 @@ export class CardsGame extends Minigame {
     this._warnUntil = 0;
     this._foeHold = 0;
     this._myHold = 0;
+    // ---- den PvP (all null/solo defaults for a run against Pebble) ----------
+    this.mp = null; // {players, seed, myId, oppId} once seated at a den table
+    this.me = 0; // my seat in the rules core
+    this.foe = 1; // the other seat
+    this.foeName = AI_NAME;
+    this.foeTag = 'PEBBLE';
+    this._offs = []; // event unsubscribers
+    this._rq = []; // opponent intents waiting their turn on screen
+    this._frozen = false; // desync/offline: stop rather than diverge quietly
+    this._matchDoneSent = false;
+    this._matchEnd = null; // the server's shared verdict
+    this._forfeitBy = null; // 'them' | 'me'
+    this._clockTurn = -1;
+    this._clockUntil = 0;
+    this._stallNoted = false;
+    this._quitArmed = 0;
   }
 
   // ---- lifecycle ----------------------------------------------------------
@@ -1760,13 +1873,33 @@ export class CardsGame extends Minigame {
       inspect: q('[data-el="inspect"]'),
       fx: q('[data-el="fx"]'),
       over: q('[data-el="over"]'),
+      foeName: q('[data-el="foeName"]'),
+      clock: q('[data-el="clock"]'),
+      clockWho: q('[data-el="clockWho"]'),
+      clockNum: q('[data-el="clockNum"]'),
+      live: q('[data-el="live"]'),
+      quit: q('[data-el="quit"]'),
     };
 
-    this._buildTriangleBadge();
-    this.el.foeSlots = this._buildSlots(this.el.foeBoard, 1);
-    this.el.mySlots = this._buildSlots(this.el.myBoard, 0);
+    // seats first: every row, click and highlight below is addressed by seat
+    const ctx = this.game.__matchCtx;
+    if (ctx && ctx.game === 'cards') this._readMatchCtx(ctx);
 
-    this.foeCfg = { color: '#8a6642', hat: 'tophat', hatColor: '#4fb3e8', monocle: true };
+    this._buildTriangleBadge();
+    this.el.foeSlots = this._buildSlots(this.el.foeBoard, this.foe);
+    this.el.mySlots = this._buildSlots(this.el.myBoard, this.me);
+
+    const opp = this.mp ? this.mp.players[this.foe] : null;
+    if (opp) {
+      const oppBody = bodyHex(opp.color);
+      this.foeCfg = {
+        color: oppBody,
+        hat: typeof opp.hat === 'string' ? opp.hat : 'none',
+        hatColor: pickHatColor(oppBody, this.foeName.length),
+      };
+    } else {
+      this.foeCfg = { color: '#8a6642', hat: 'tophat', hatColor: '#4fb3e8', monocle: true };
+    }
     const body = hexOf(this.game.state?.color ?? 0xb08a5a);
     this.myCfg = {
       color: body,
@@ -1774,15 +1907,17 @@ export class CardsGame extends Minigame {
       hatColor: pickHatColor(body, (this.game.state?.name || 'capy').length),
     };
     this.el.myName.textContent = (this.game.state?.name || 'You').slice(0, 14);
+    this.el.foeName.textContent = this.foeName;
+    if (this.mp) {
+      this.el.live.classList.remove('mg-cards-hide');
+      this.el.quit.textContent = 'FORFEIT';
+    }
     paintFace(this.el.foeFace, FOE_FACE, this.foeCfg, 'idle');
     paintFace(this.el.myFace, MY_FACE, this.myCfg, 'idle');
 
     this.el.end.addEventListener('click', () => this._endTurnClick());
     this.el.foeCapy.addEventListener('click', () => this._clickFace());
-    wrap.querySelector('[data-el="quit"]').addEventListener('click', () => {
-      this.game.audio?.play?.('click');
-      this.quit();
-    });
+    this.el.quit.addEventListener('click', () => this._quitClick());
     wrap.addEventListener('click', (e) => {
       if (e.target === wrap || e.target.classList?.contains('mg-cards-table')) this._deselect();
     });
@@ -1791,11 +1926,27 @@ export class CardsGame extends Minigame {
     window.addEventListener('keydown', this._onKey);
 
     this._blinkLoop();
-    this._showSplash();
+    if (this.mp) {
+      // a real capy is sitting opposite: no tutorial, straight to the table
+      this._clockLoop();
+      this._showVersus();
+    } else {
+      this._showSplash();
+    }
   }
 
   dispose() {
+    // walking away from a live duel is a concession, not a vanishing act: tell
+    // the opponent's board and the server before the wiring comes down
+    if (this.mp && this.S && this.S.winner === null && !this._matchDoneSent && !this._frozen) {
+      this._sendMove({ a: 'resign' }, true);
+      this._reportMatch(this.mp.oppId);
+    }
     this._dead = true;
+    for (const off of this._offs) { try { off(); } catch { /* emitter already dropped it */ } }
+    this._offs.length = 0;
+    this._rq.length = 0;
+    if (this.game.__matchCtx) this.game.__matchCtx = null;
     for (const id of this._timers) clearTimeout(id);
     this._timers.clear();
     if (this._onKey) window.removeEventListener('keydown', this._onKey);
@@ -1817,7 +1968,13 @@ export class CardsGame extends Minigame {
   coinsForScore() {
     const r = this._result;
     if (!r) return 0;
-    if (r.win) return 70 + Math.floor(r.myHp / 2);
+    if (r.win) {
+      const full = 70 + Math.floor(r.myHp / 2);
+      // A duel nobody fought is not worth a duel's pay: a win by walkout pays
+      // for the cards that actually hit the table (and a near-finished duel
+      // still pays like the win it was about to be).
+      return r.forfeit ? Math.min(full, 25 + Math.round(r.dealt || 0)) : full;
+    }
     if (r.draw) return 20; // draws are all but unreachable; never leave a run unpaid
     return r.foeHp < 10 ? 10 : 5;
   }
@@ -1834,8 +1991,11 @@ export class CardsGame extends Minigame {
 
       <div class="mg-cards-hud">
         <div class="mg-cards-chip mg-cards-title">CAPY CLASH</div>
+        <div class="mg-cards-chip mg-cards-live mg-cards-hide" data-el="live">DEN TABLE</div>
         <div class="mg-cards-chip"><small>TURN</small><b data-el="turnNo">1</b>
           <small data-el="turnWho">YOU</small></div>
+        <div class="mg-cards-chip mg-cards-clock mg-cards-hide" data-el="clock">
+          <small data-el="clockWho">YOUR TURN</small><b data-el="clockNum">1:30</b></div>
         <div class="mg-cards-chip mg-cards-tri" data-el="tri"></div>
         <div class="mg-cards-spacer"></div>
         <button class="mg-cards-quit" data-el="quit">QUIT</button>
@@ -1850,7 +2010,7 @@ export class CardsGame extends Minigame {
           <div class="mg-cards-capy" data-el="foeCapy">
             <canvas data-el="foeFace"></canvas>
             <div>
-              <b>${AI_NAME}</b>
+              <b data-el="foeName">${AI_NAME}</b>
               <div class="mg-cards-hp"><i data-el="foeHpFill"></i><span data-el="foeHpText">25</span></div>
             </div>
           </div>
@@ -1956,8 +2116,8 @@ export class CardsGame extends Minigame {
   // ---- render -------------------------------------------------------------
   _render() {
     if (this._dead || !this.S) return;
-    this._renderRow(this.el.foeSlots, 1);
-    this._renderRow(this.el.mySlots, 0);
+    this._renderRow(this.el.foeSlots, this.foe);
+    this._renderRow(this.el.mySlots, this.me);
     this._renderHand();
     this._renderBacks();
     this._renderStatus();
@@ -1975,7 +2135,7 @@ export class CardsGame extends Minigame {
       }
       if (want) {
         if (want.parentNode !== slot) slot.appendChild(want);
-        const canSwing = side === 0 && this.S.active === 0 && c.ready && dmgOf(c) > 0
+        const canSwing = side === this.me && this.S.active === this.me && c.ready && dmgOf(c) > 0
           && this.S.winner === null && this.phase === 'play';
         want.classList.toggle('mg-cards-ready', !!canSwing);
       }
@@ -1983,12 +2143,12 @@ export class CardsGame extends Minigame {
   }
 
   _renderHand() {
-    const hand = this.S.sides[0].hand;
+    const hand = this.S.sides[this.me].hand;
     const host = this.el.myHand;
     const wanted = [];
     for (const card of hand) {
       const n = this._cardNode(card.uid, CARDS[card.id], null, 'hand');
-      n.classList.toggle('mg-cards-poor', CARDS[card.id].cost > this.S.sides[0].energy);
+      n.classList.toggle('mg-cards-poor', CARDS[card.id].cost > this.S.sides[this.me].energy);
       wanted.push(n);
     }
     for (const child of [...host.children]) {
@@ -2008,8 +2168,9 @@ export class CardsGame extends Minigame {
     }
   }
 
+  /** Their hand is a count and nothing else: backs only, never a peek. */
   _renderBacks() {
-    const n = this.S.sides[1].hand.length;
+    const n = this.S.sides[this.foe].hand.length;
     const host = this.el.foeHand;
     while (host.children.length > n) host.lastChild.remove();
     while (host.children.length < n) host.appendChild(document.createElement('i'));
@@ -2035,14 +2196,14 @@ export class CardsGame extends Minigame {
       fill.style.background = p > 0.55 ? '#7ac74f' : p > 0.28 ? '#f2b64a' : '#e04a4a';
       text.textContent = `${Math.max(0, s.hp)} / ${s.maxHp}`;
     };
-    setHp(this.el.foeHpFill, this.el.foeHpText, 1);
-    setHp(this.el.myHpFill, this.el.myHpText, 0);
-    this._pips(this.el.foePips, 1);
-    this._pips(this.el.myPips, 0);
-    this.el.foeDeck.textContent = String(S.sides[1].deck.length);
-    this.el.myDeck.textContent = String(S.sides[0].deck.length);
+    setHp(this.el.foeHpFill, this.el.foeHpText, this.foe);
+    setHp(this.el.myHpFill, this.el.myHpText, this.me);
+    this._pips(this.el.foePips, this.foe);
+    this._pips(this.el.myPips, this.me);
+    this.el.foeDeck.textContent = String(S.sides[this.foe].deck.length);
+    this.el.myDeck.textContent = String(S.sides[this.me].deck.length);
     this.el.turnNo.textContent = String(Math.ceil(S.turn / 2));
-    this.el.turnWho.textContent = S.active === 0 ? 'YOU' : 'PEBBLE';
+    this.el.turnWho.textContent = S.active === this.me ? 'YOU' : this.foeTag;
     const mine = this._myTurn();
     this.el.end.disabled = !mine;
     this.el.end.classList.toggle('mg-cards-nudge', mine && !this._anythingToDo());
@@ -2060,39 +2221,39 @@ export class CardsGame extends Minigame {
     if (node) node.classList.add('mg-cards-sel');
 
     if (sel.kind === 'hand') {
-      const card = this.S.sides[0].hand.find((c) => c.uid === sel.uid);
+      const card = this.S.sides[this.me].hand.find((c) => c.uid === sel.uid);
       if (!card) return;
       const d = CARDS[card.id];
       if (d.type === 'critter') {
-        this.S.sides[0].board.forEach((c, i) => {
+        this.S.sides[this.me].board.forEach((c, i) => {
           if (!c) this.el.mySlots[i].classList.add('mg-cards-can');
         });
       } else if (d.target) {
-        for (const t of spellTargets(this.S, 0, d)) {
-          (t.side === 0 ? this.el.mySlots : this.el.foeSlots)[t.slot].classList.add('mg-cards-can');
+        for (const t of spellTargets(this.S, this.me, d)) {
+          (t.side === this.me ? this.el.mySlots : this.el.foeSlots)[t.slot].classList.add('mg-cards-can');
         }
       }
       return;
     }
     // an attacker is picked: every legal victim lights up
-    for (const u of unitsOf(this.S.sides[1])) this.el.foeSlots[u.i].classList.add('mg-cards-can');
-    if (!guardsUp(this.S, 1)) this.el.foeCapy.classList.add('mg-cards-can');
+    for (const u of unitsOf(this.S.sides[this.foe])) this.el.foeSlots[u.i].classList.add('mg-cards-can');
+    if (!guardsUp(this.S, this.foe)) this.el.foeCapy.classList.add('mg-cards-can');
   }
 
   // ---- prompt line --------------------------------------------------------
   _myTurn() {
-    return !!this.S && this.phase === 'play' && this.S.active === 0
-      && this.S.winner === null && !this.busy;
+    return !!this.S && this.phase === 'play' && this.S.active === this.me
+      && this.S.winner === null && !this.busy && !this._frozen;
   }
 
   _anythingToDo() {
-    const S = this.S, s = S.sides[0];
+    const S = this.S, s = S.sides[this.me];
     for (const card of s.hand) {
       const d = CARDS[card.id];
       if (d.cost > s.energy) continue;
       if (d.type === 'critter') { if (s.board.indexOf(null) >= 0) return true; }
       else if (!d.target) return true;
-      else if (spellTargets(S, 0, d).length) return true;
+      else if (spellTargets(S, this.me, d).length) return true;
     }
     for (const u of unitsOf(s)) if (u.c.ready && dmgOf(u.c) > 0) return true;
     return false;
@@ -2107,15 +2268,19 @@ export class CardsGame extends Minigame {
     let msg;
     if (!S) msg = '';
     else if (S.winner !== null) {
-      msg = S.winner === 0 ? 'The duel is yours!' : S.winner === 1 ? `${AI_NAME} takes the duel.` : 'A perfectly even duel.';
-    } else if (S.active === 1) msg = `<em>${AI_NAME}</em> is thinking it over...`;
-    else if (this.busy) msg = '...';
+      msg = S.winner === this.me ? 'The duel is yours!'
+        : S.winner === this.foe ? `${esc(this.foeName)} takes the duel.` : 'A perfectly even duel.';
+    } else if (S.active === this.foe) {
+      msg = this.mp
+        ? `<em>${esc(this.foeName)}</em> is taking their turn...`
+        : `<em>${AI_NAME}</em> is thinking it over...`;
+    } else if (this.busy) msg = '...';
     else if (!this.sel) {
       msg = this._anythingToDo()
         ? 'Play cards, swing with rested critters, then <em>End Turn</em>.'
         : 'Nothing left to do this turn: hit <em>End Turn</em>.';
     } else if (this.sel.kind === 'hand') {
-      const card = S.sides[0].hand.find((c) => c.uid === this.sel.uid);
+      const card = S.sides[this.me].hand.find((c) => c.uid === this.sel.uid);
       const d = card ? CARDS[card.id] : null;
       const dot = d && /[!?.]$/.test(d.name) ? '' : '.'; // "Splash!." reads badly
       if (!d) msg = '';
@@ -2123,10 +2288,10 @@ export class CardsGame extends Minigame {
       else if (d.target) msg = `Pick a target for <em>${d.name}</em>${dot}`;
       else msg = `Click <em>${d.name}</em> again to cast it.`;
     } else {
-      const u = unitsOf(S.sides[0]).find((x) => x.c.uid === this.sel.uid);
+      const u = unitsOf(S.sides[this.me]).find((x) => x.c.uid === this.sel.uid);
       const nm = u ? CARDS[u.c.id].name : 'that critter';
       msg = `Pick who <em>${nm}</em> swings at.`;
-      if (guardsUp(S, 1)) msg += ' Guards block the way to the capy.';
+      if (guardsUp(S, this.foe)) msg += ' Guards block the way to the capy.';
     }
     p.innerHTML = msg;
   }
@@ -2166,7 +2331,7 @@ export class CardsGame extends Minigame {
     const t = performance.now();
     if (t - this._hoverAt > 90) { this._hoverAt = t; this.game.audio?.play?.('hover'); }
     let def = null, live = null;
-    const card = S.sides[0].hand.find((c) => c.uid === uid);
+    const card = S.sides[this.me].hand.find((c) => c.uid === uid);
     if (card) def = CARDS[card.id];
     else {
       for (const side of [0, 1]) {
@@ -2201,22 +2366,24 @@ export class CardsGame extends Minigame {
   _clickCard(uid) {
     if (!this.S) return;
     if (!this._myTurn()) {
-      // mid-animation clicks are just early, not wrong: only nag on the AI's turn
-      if (this.S.active !== 0 && this.S.winner === null) this._warn('Wait for your turn.');
+      // mid-animation clicks are just early, not wrong: only nag on their turn
+      if (this.S.active !== this.me && this.S.winner === null && !this._frozen) {
+        this._warn(this.mp ? `Hold on: it is ${esc(this.foeName)}'s turn.` : 'Wait for your turn.');
+      }
       return;
     }
     const S = this.S;
-    const card = S.sides[0].hand.find((c) => c.uid === uid);
+    const card = S.sides[this.me].hand.find((c) => c.uid === uid);
     if (card) return this._clickHandCard(card);
-    const mine = unitsOf(S.sides[0]).find((u) => u.c.uid === uid);
+    const mine = unitsOf(S.sides[this.me]).find((u) => u.c.uid === uid);
     if (mine) return this._clickMyUnit(mine);
-    const foe = unitsOf(S.sides[1]).find((u) => u.c.uid === uid);
+    const foe = unitsOf(S.sides[this.foe]).find((u) => u.c.uid === uid);
     if (foe) return this._clickFoeUnit(foe);
   }
 
   _clickHandCard(card) {
     const d = CARDS[card.id];
-    const s = this.S.sides[0];
+    const s = this.S.sides[this.me];
     if (this.sel && this.sel.kind === 'hand' && this.sel.uid === card.uid) {
       if (d.type === 'spell' && !d.target) return this._play(card.uid, {});
       return this._deselect();
@@ -2225,7 +2392,7 @@ export class CardsGame extends Minigame {
     if (d.type === 'critter' && s.board.indexOf(null) < 0) {
       return this._nope(card.uid, 'All four of your slots are busy.');
     }
-    if (d.type === 'spell' && d.target && !spellTargets(this.S, 0, d).length) {
+    if (d.type === 'spell' && d.target && !spellTargets(this.S, this.me, d).length) {
       return this._nope(card.uid, 'There is nothing to aim that at.');
     }
     this.sel = { kind: 'hand', uid: card.uid };
@@ -2237,11 +2404,11 @@ export class CardsGame extends Minigame {
   _clickMyUnit(u) {
     const sel = this.sel;
     if (sel && sel.kind === 'hand') {
-      const card = this.S.sides[0].hand.find((c) => c.uid === sel.uid);
+      const card = this.S.sides[this.me].hand.find((c) => c.uid === sel.uid);
       const d = card ? CARDS[card.id] : null;
       if (d && d.type === 'spell' && d.target
-        && spellTargetOk(this.S, 0, d, { side: 0, slot: u.i })) {
-        return this._play(sel.uid, { target: { side: 0, slot: u.i } });
+        && spellTargetOk(this.S, this.me, d, { side: this.me, slot: u.i })) {
+        return this._play(sel.uid, { target: { side: this.me, slot: u.i } });
       }
       if (d && d.type === 'spell' && d.target) {
         return this._nope(sel.uid, 'That critter cannot be targeted.');
@@ -2260,15 +2427,15 @@ export class CardsGame extends Minigame {
     const sel = this.sel;
     if (!sel) { this.game.audio?.play?.('hover'); return; }
     if (sel.kind === 'hand') {
-      const card = this.S.sides[0].hand.find((c) => c.uid === sel.uid);
+      const card = this.S.sides[this.me].hand.find((c) => c.uid === sel.uid);
       const d = card ? CARDS[card.id] : null;
       if (d && d.type === 'spell' && d.target
-        && spellTargetOk(this.S, 0, d, { side: 1, slot: u.i })) {
-        return this._play(sel.uid, { target: { side: 1, slot: u.i } });
+        && spellTargetOk(this.S, this.me, d, { side: this.foe, slot: u.i })) {
+        return this._play(sel.uid, { target: { side: this.foe, slot: u.i } });
       }
       return this._nope(sel.uid, d && d.type === 'critter' ? 'Critters go in your own empty slots.' : 'Not a legal target.');
     }
-    const from = unitsOf(this.S.sides[0]).find((x) => x.c.uid === sel.uid);
+    const from = unitsOf(this.S.sides[this.me]).find((x) => x.c.uid === sel.uid);
     if (!from) return this._deselect();
     this._doAttack(from.i, { slot: u.i });
   }
@@ -2277,8 +2444,8 @@ export class CardsGame extends Minigame {
     if (!this._myTurn()) return;
     const sel = this.sel;
     if (!sel) return;
-    if (sel.kind === 'hand' && side === 0 && !this.S.sides[0].board[i]) {
-      const card = this.S.sides[0].hand.find((c) => c.uid === sel.uid);
+    if (sel.kind === 'hand' && side === this.me && !this.S.sides[this.me].board[i]) {
+      const card = this.S.sides[this.me].hand.find((c) => c.uid === sel.uid);
       const d = card ? CARDS[card.id] : null;
       if (d && d.type === 'critter') return this._play(sel.uid, { slot: i });
     }
@@ -2287,9 +2454,9 @@ export class CardsGame extends Minigame {
 
   _clickFace() {
     if (!this._myTurn() || !this.sel || this.sel.kind !== 'unit') return;
-    const from = unitsOf(this.S.sides[0]).find((x) => x.c.uid === this.sel.uid);
+    const from = unitsOf(this.S.sides[this.me]).find((x) => x.c.uid === this.sel.uid);
     if (!from) return this._deselect();
-    if (guardsUp(this.S, 1)) {
+    if (guardsUp(this.S, this.foe)) {
       this.game.audio?.play?.('fail');
       this._warn('Guards first! Knock the Guard critters out before the capy.');
       return;
@@ -2301,10 +2468,10 @@ export class CardsGame extends Minigame {
     if (this._dead) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     const k = e.key;
-    if (this.phase === 'splash' || this.phase === 'over') {
+    if (this.phase === 'splash' || this.phase === 'over' || this.phase === 'frozen') {
       if (k === ' ' || k === 'Enter') {
         e.preventDefault();
-        this.el.over?.querySelector('[data-a="go"],[data-a="again"]')?.click();
+        this.el.over?.querySelector('[data-a="go"],[data-a="again"],[data-a="leave"]')?.click();
       }
       return;
     }
@@ -2313,18 +2480,26 @@ export class CardsGame extends Minigame {
     if (k === 'Enter') { e.preventDefault(); this._endTurnClick(); return; }
     const idx = '12345678'.indexOf(k);
     if (idx >= 0) {
-      const card = this.S.sides[0].hand[idx];
+      const card = this.S.sides[this.me].hand[idx];
       if (card) { e.preventDefault(); this._clickHandCard(card); }
     }
   }
 
   // ---- acting -------------------------------------------------------------
   _play(uid, opts) {
-    const card = this.S.sides[0].hand.find((c) => c.uid === uid);
-    const d = card ? CARDS[card.id] : null;
+    const hand = this.S.sides[this.me].hand;
+    // the wire carries the hand INDEX, so read it before the card leaves
+    const hi = hand.findIndex((c) => c.uid === uid);
+    const d = hi >= 0 ? CARDS[hand[hi].id] : null;
     if (!d) return;
     this._flyOut(uid, d);
-    if (!playCard(this.S, 0, uid, opts)) { this._warn('That play is not legal.'); return; }
+    if (!playCard(this.S, this.me, uid, opts)) { this._warn('That play is not legal.'); return; }
+    this._sendMove({
+      a: 'play',
+      hand: hi,
+      slot: Number.isInteger(opts?.slot) ? opts.slot : null,
+      target: opts?.target || null,
+    });
     this.sel = null;
     this.game.audio?.play?.(d.type === 'critter' ? 'pop' : 'sparkle');
     this._afterAction();
@@ -2352,8 +2527,11 @@ export class CardsGame extends Minigame {
   }
 
   _doAttack(slot, target) {
-    if (!canAttack(this.S, 0, slot, target)) { this._warn('That swing is not legal.'); return; }
-    const a = this.S.sides[0].board[slot];
+    if (!canAttack(this.S, this.me, slot, target)) { this._warn('That swing is not legal.'); return; }
+    const a = this.S.sides[this.me].board[slot];
+    // a swing they never hear about would put the two boards in different
+    // duels, so a dead socket stops the swing before it lands
+    if (!this._sendMove({ a: 'attack', from: slot, target: target === 'face' ? 'face' : target.slot })) return;
     this.busy = true;
     this.sel = null;
     this._renderHighlights();
@@ -2365,8 +2543,8 @@ export class CardsGame extends Minigame {
     }
     this.game.audio?.play?.('whoosh');
     this._after(170, () => {
-      if (this._dead || !this.S) return;
-      attack(this.S, 0, slot, target);
+      if (this._dead || !this.S || this._frozen) return;
+      attack(this.S, this.me, slot, target);
       this.busy = false;
       this._afterAction();
       if (node) node.classList.remove('mg-cards-lungeUp');
@@ -2377,6 +2555,7 @@ export class CardsGame extends Minigame {
     if (!this._myTurn()) return;
     this.game.audio?.play?.('click');
     this.sel = null;
+    if (this.mp) { this._passTurn(); return; }
     this.busy = true;
     endTurn(this.S);
     this._afterAction();
@@ -2390,10 +2569,17 @@ export class CardsGame extends Minigame {
     for (const fn of post) fn();
     this._syncExpr();
     this._checkEnd();
+    if (this.mp) {
+      this._syncClock();
+      // whatever just finished animating may have been holding the queue back;
+      // let their moves land at a readable pace rather than all at once
+      if (this._rq.length) this._pumpLater(300);
+    }
   }
 
-  // ---- AI turn ------------------------------------------------------------
+  // ---- AI turn (solo only; a den match drives the other seat over the wire) -
   _aiTurn() {
+    if (this.mp) return;
     this.busy = true;
     this._syncExpr();
     this._render();
@@ -2465,6 +2651,390 @@ export class CardsGame extends Minigame {
     this._after(1100, () => d.remove());
   }
 
+  // ---- den PvP ------------------------------------------------------------
+  /**
+   * Take our seat at a den table. Anything malformed in the context is not
+   * worth guessing about: fall back to a normal solo duel against Pebble.
+   */
+  _readMatchCtx(ctx) {
+    const ps = Array.isArray(ctx.players) ? ctx.players : null;
+    const seat = ctx.youAre;
+    if (!ps || ps.length !== 2 || (seat !== 0 && seat !== 1) || !Number.isFinite(ctx.seed)) {
+      console.warn('[cards] match context looks wrong, dealing a solo duel instead');
+      return;
+    }
+    this.me = seat;
+    this.foe = 1 - seat;
+    this.mp = {
+      players: ps,
+      seed: ctx.seed >>> 0,
+      myId: ps[seat] ? ps[seat].id : null,
+      oppId: ps[1 - seat] ? ps[1 - seat].id : null,
+    };
+    this.foeName = String((ps[this.foe] && ps[this.foe].name) || 'Rival').slice(0, 14);
+    this.foeTag = this.foeName.toUpperCase().slice(0, 9);
+    this._bindMatch();
+  }
+
+  _bindMatch() {
+    const ev = this.game.events;
+    this._offs.push(ev.on('match-move', (m) => this._onMatchMove(m)));
+    this._offs.push(ev.on('match-end', (m) => this._onMatchEnd(m)));
+    this._offs.push(ev.on('net', (s) => {
+      if (s === 'offline') {
+        this._freeze('The cove went quiet',
+          'The connection dropped mid-duel, so the board stops here rather than drifting.');
+      }
+    }));
+  }
+
+  /** Post one intent to the opponent's board. Returns false if it never left. */
+  _sendMove(data, quiet = false) {
+    if (!this.mp) return true;
+    const net = this.game.net;
+    if (!net || !net.connected) {
+      if (!quiet) {
+        this._freeze('The cove went quiet',
+          'That move never made it across the table, so the duel stops here.');
+      }
+      return false;
+    }
+    net.send({ t: 'match-move', data });
+    return true;
+  }
+
+  /** Damage dealt, plus the win bonus, exactly like the solo score. */
+  _matchScore() {
+    if (!this.S) return 0;
+    return Math.round(this.S.sides[this.me].dealt) + (this.S.winner === this.me ? 50 : 0);
+  }
+
+  /** One verdict per player per match; the server pays if both agree. */
+  _reportMatch(winnerId) {
+    if (!this.mp || this._matchDoneSent) return;
+    this._matchDoneSent = true;
+    this.game.net?.send({
+      t: 'match-done',
+      result: { winner: winnerId || 'draw', score: this._matchScore() },
+    });
+  }
+
+  _onMatchMove(m) {
+    if (!this.mp || this._dead || this._frozen) return;
+    if (this.mp.oppId && m && m.from && m.from !== this.mp.oppId) return; // not our table
+    const a = m && m.data;
+    if (!a || typeof a !== 'object') return;
+    if (this._rq.length > 64) { this._desync('their moves piled up'); return; }
+    this._rq.push(a);
+    this._pump();
+  }
+
+  /** One opponent intent at a time, so their turn reads like Pebble's does. */
+  _pump() {
+    if (this._dead || this._frozen || !this.mp) return;
+    if (!this.S || this.phase !== 'play' || this.S.winner !== null) return;
+    if (this.busy || !this._rq.length) return;
+    this._applyRemote(this._rq.shift());
+  }
+
+  _pumpLater(ms) { this._after(ms, () => this._pump()); }
+
+  /** Their intent, replayed through the same rules that judge my own clicks. */
+  _applyRemote(a) {
+    const S = this.S;
+    const foe = this.foe;
+    if (a.a === 'resign') { this._oppResigned(); return; }
+    if (a.a === 'desync') {
+      this._freeze('The boards drifted apart',
+        `${this.foeName}'s table stopped agreeing with yours, so the duel is called here.`);
+      return;
+    }
+    if (S.active !== foe) { this._desync('a move out of turn'); return; }
+
+    if (a.a === 'end') {
+      endTurn(S);
+      this.busy = false;
+      this.game.audio?.play?.('ding');
+      this._afterAction();
+      return;
+    }
+
+    if (a.a === 'play') {
+      const hand = S.sides[foe].hand;
+      const card = Number.isInteger(a.hand) && a.hand >= 0 && a.hand < hand.length ? hand[a.hand] : null;
+      const def = card ? CARDS[card.id] : null;
+      if (!def) { this._desync('a card that is not in their hand'); return; }
+      const opts = {
+        slot: Number.isInteger(a.slot) ? a.slot : undefined,
+        target: this._remoteTarget(a.target),
+      };
+      this.busy = true;
+      this._reveal(def); // played cards are public: this is the only reveal
+      this.game.audio?.play?.('slide');
+      this._after(560, () => {
+        if (this._dead || !this.S || this._frozen) return;
+        this.busy = false;
+        if (!playCard(this.S, foe, card.uid, opts)) { this._desync('a play the rules refused'); return; }
+        this.game.audio?.play?.(def.type === 'critter' ? 'pop' : 'sparkle');
+        this._afterAction();
+      });
+      return;
+    }
+
+    if (a.a === 'attack') {
+      const target = a.target === 'face' ? 'face'
+        : (Number.isInteger(a.target) ? { slot: a.target } : null);
+      if (!Number.isInteger(a.from) || !target || !canAttack(S, foe, a.from, target)) {
+        this._desync('a swing the rules refused');
+        return;
+      }
+      const c = S.sides[foe].board[a.from];
+      const node = c ? this._nodes.get(c.uid) : null;
+      if (node) {
+        node.classList.remove('mg-cards-lungeDown');
+        void node.offsetWidth;
+        node.classList.add('mg-cards-lungeDown');
+      }
+      this.busy = true;
+      this.game.audio?.play?.('whoosh');
+      this._after(190, () => {
+        if (this._dead || !this.S || this._frozen) return;
+        this.busy = false;
+        if (!attack(this.S, foe, a.from, target)) { this._desync('a swing the rules refused'); return; }
+        if (node) node.classList.remove('mg-cards-lungeDown');
+        this._afterAction();
+      });
+      return;
+    }
+    this._desync('a move nobody recognises');
+  }
+
+  /** Spell targets travel as absolute seats so both boards read them alike. */
+  _remoteTarget(t) {
+    if (!t || typeof t !== 'object') return undefined;
+    const { side, slot } = t;
+    if ((side !== 0 && side !== 1) || !Number.isInteger(slot) || slot < 0 || slot >= BOARD_SLOTS) {
+      return undefined;
+    }
+    return { side, slot };
+  }
+
+  /** PvP end-of-turn: tell them first, then let our own board move on. */
+  _passTurn() {
+    if (!this.S || this.S.active !== this.me || this.S.winner !== null || this.phase !== 'play') return;
+    this.sel = null;
+    if (!this._sendMove({ a: 'end' })) return;
+    endTurn(this.S);
+    this._afterAction();
+  }
+
+  _oppResigned() {
+    if (!this.S || this.S.winner !== null || this.phase !== 'play') return;
+    this._forfeitBy = 'them';
+    this._rq.length = 0;
+    this.busy = false;
+    this.S.winner = this.me;
+    this.game.toast?.(`${this.foeName} left the table`);
+    this._afterAction();
+  }
+
+  /** The server's shared verdict: a forfeit can also arrive mid-board. */
+  _onMatchEnd(m) {
+    if (!this.mp || this._dead) return;
+    if (m && m.game && m.game !== 'cards') return;
+    this._matchEnd = m || null;
+    this._matchDoneSent = true; // the match is closed; nothing left to report
+    if (!this._frozen && m && m.reason === 'forfeit'
+      && this.S && this.S.winner === null && this.phase === 'play') {
+      const iWon = !!this.mp.myId && m.winner === this.mp.myId;
+      this._forfeitBy = iWon ? 'them' : 'me';
+      this._rq.length = 0;
+      this.busy = false;
+      this.S.winner = iWon ? this.me : this.foe;
+      this.game.toast?.(iWon ? `${this.foeName} left the table` : 'You left the table');
+      this._afterAction();
+      return;
+    }
+    // a forfeit before the first card: there is no duel to award, just a card
+    if (!this._frozen && m && m.reason === 'forfeit'
+      && this.phase !== 'over' && this.phase !== 'end'
+      && (!this.S || this.S.winner === null)) {
+      this._frozen = true;
+      this.phase = 'frozen';
+      this.busy = true;
+      this._rq.length = 0;
+      this.game.audio?.play?.('fail');
+      this.game.toast?.(`${this.foeName} left the table`);
+      this._endCard('The table emptied',
+        `${this.foeName} stepped away before the first card. Sit down again and the den will find you another duel.`);
+      return;
+    }
+    this._paintMatchBadge();
+  }
+
+  /** The den's +30 for a match both boards agreed on, once the server says so. */
+  _paintMatchBadge() {
+    if (!this.mp || this.phase !== 'over' || !this._matchEnd) return;
+    if (!this.mp.myId || this._matchEnd.winner !== this.mp.myId) return;
+    const row = this.el.over?.querySelector('[data-el="payrow"]');
+    if (!row || row.querySelector('[data-el="bonus"]')) return;
+    const d = document.createElement('div');
+    d.className = 'mg-cards-stat mg-cards-gold';
+    d.dataset.el = 'bonus';
+    d.innerHTML = '<b>+30</b><span>DEN MATCH BONUS</span>';
+    row.appendChild(d);
+    this.game.audio?.play?.('coin');
+  }
+
+  /** Never diverge silently: stop the board and say so, on both screens. */
+  _desync(why) {
+    console.warn('[cards] match desync:', why);
+    this._sendMove({ a: 'desync' }, true);
+    this._freeze('The boards drifted apart',
+      `Your table and ${this.foeName}'s stopped telling the same story, so the duel is called here. No hard feelings.`);
+  }
+
+  _freeze(title, sub) {
+    if (this._frozen || this._dead || !this.mp) return;
+    // a finished duel has already told its story; leave the results card alone
+    if (this.phase === 'over' || this.phase === 'end') return;
+    if (this.S && this.S.winner !== null) return;
+    this._frozen = true;
+    this.phase = 'frozen';
+    this.busy = true;
+    this.sel = null;
+    this._rq.length = 0;
+    if (this.S) this._render(); // the board stops offering moves it will not take
+    this.game.audio?.play?.('fail');
+    this.game.toast?.('The duel was called off');
+    // pay the half-played run out honestly and call it a draw, so neither
+    // board is left waiting on a verdict that is never coming
+    if (this.S) {
+      this._result = {
+        win: false, draw: true,
+        myHp: Math.max(0, this.S.sides[this.me].hp),
+        foeHp: Math.max(0, this.S.sides[this.foe].hp),
+      };
+      this.finish(Math.round(this.S.sides[this.me].dealt));
+    }
+    this._reportMatch('draw');
+    this._endCard(title, sub);
+  }
+
+  /** A plain "the duel stopped" card: no score theatre, one way out. */
+  _endCard(title, sub) {
+    const over = this.el.over;
+    if (!over) return;
+    over.classList.remove('mg-cards-gone');
+    over.innerHTML = `
+      <div class="mg-cards-modal">
+        <h2>${esc(title)}</h2>
+        <div class="mg-cards-sub">${esc(sub)}</div>
+        <div class="mg-cards-btns">
+          <button class="mg-cards-btn mg-cards-alt" data-a="leave">Back to the den</button>
+        </div>
+      </div>`;
+    over.querySelector('[data-a="leave"]').addEventListener('click', () => {
+      this.game.audio?.play?.('click');
+      this.exitToRoom();
+    });
+  }
+
+  // ---- turn clock (PvP only) ----------------------------------------------
+  _syncClock() {
+    if (!this.mp || !this.S) return;
+    if (this.S.turn !== this._clockTurn) {
+      this._clockTurn = this.S.turn;
+      this._clockUntil = performance.now() + TURN_MS;
+      this._stallNoted = false;
+    }
+  }
+
+  _clockLoop() {
+    if (this._dead) return;
+    this._after(250, () => {
+      this._tickClock();
+      this._clockLoop();
+    });
+  }
+
+  _tickClock() {
+    const el = this.el.clock;
+    if (!el || !this.mp) return;
+    const live = !!this.S && this.phase === 'play' && this.S.winner === null && !this._frozen;
+    el.classList.toggle('mg-cards-hide', !live);
+    if (!live) return;
+    const mine = this.S.active === this.me;
+    const left = Math.max(0, this._clockUntil - performance.now());
+    const secs = Math.ceil(left / 1000);
+    this.el.clockNum.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+    this.el.clockWho.textContent = mine ? 'YOUR TURN' : 'THEIR TURN';
+    el.classList.toggle('mg-cards-low', secs <= 15);
+    if (left > 0) return;
+    if (mine) {
+      if (this.busy || this._rq.length) return; // let the board settle first
+      this.game.audio?.play?.('fail');
+      this._float('TIME!', this._facePoint(this.me), 'mg-cards-note');
+      this.game.toast?.('Time! Your turn passes.');
+      this._passTurn();
+    } else if (!this._stallNoted && performance.now() - this._clockUntil > STALL_MS) {
+      this._stallNoted = true;
+      this._warn(`${esc(this.foeName)} has gone very quiet. FORFEIT hands them the duel if you need to go.`);
+    }
+  }
+
+  _quitClick() {
+    this.game.audio?.play?.('click');
+    const live = !!this.mp && this.phase === 'play' && !!this.S && this.S.winner === null;
+    if (!live) { this.quit(); return; }
+    // one click away from handing someone the duel is one click too few
+    if (performance.now() < this._quitArmed) { this.quit(); return; }
+    this._quitArmed = performance.now() + 3200;
+    const btn = this.el.quit;
+    btn.textContent = 'SURE?';
+    btn.classList.add('mg-cards-armed');
+    this._after(3200, () => {
+      if (this._dead || !this.el.quit) return;
+      this.el.quit.textContent = 'FORFEIT';
+      this.el.quit.classList.remove('mg-cards-armed');
+    });
+  }
+
+  /** PvP opening: who you drew, who moves first, then straight into 3-2-1. */
+  _showVersus() {
+    this.phase = 'splash';
+    const over = this.el.over;
+    over.classList.remove('mg-cards-gone');
+    const first = this.me === 0;
+    const meName = esc((this.game.state?.name || 'You').slice(0, 14));
+    const foeName = esc(this.foeName);
+    over.innerHTML = `
+      <div class="mg-cards-modal">
+        <h1>Capy Clash</h1>
+        <div class="mg-cards-sub">DEN TABLE &middot; 25 HP EACH &middot; WINNER TAKES THE POT</div>
+        <div class="mg-cards-vs">
+          <div class="mg-cards-vscap" data-el="vsMe">
+            <b>${meName}</b><span>${first ? 'MOVES FIRST' : 'BONUS CARD'}</span>
+          </div>
+          <div class="mg-cards-vsx">VS</div>
+          <div class="mg-cards-vscap" data-el="vsFoe">
+            <b>${foeName}</b><span>${first ? 'BONUS CARD' : 'MOVES FIRST'}</span>
+          </div>
+        </div>
+        <div class="mg-cards-sub">${first
+          ? 'You have the opening move, so they draw an extra card.'
+          : `${foeName} opens, so you start with an extra card.`}</div>
+      </div>`;
+    const mine = document.createElement('canvas');
+    paintFace(mine, 96, this.myCfg, 'idle');
+    over.querySelector('[data-el="vsMe"]').prepend(mine);
+    const theirs = document.createElement('canvas');
+    paintFace(theirs, 96, this.foeCfg, 'smug');
+    over.querySelector('[data-el="vsFoe"]').prepend(theirs);
+    this.game.audio?.play?.('open');
+    this._after(2000, () => this._countdown());
+  }
+
   // ---- fx -----------------------------------------------------------------
   _pointOf(el) {
     const r = el.getBoundingClientRect();
@@ -2473,11 +3043,11 @@ export class CardsGame extends Minigame {
   }
 
   _slotPoint(side, slot) {
-    const slots = side === 0 ? this.el.mySlots : this.el.foeSlots;
+    const slots = side === this.me ? this.el.mySlots : this.el.foeSlots;
     return this._pointOf(slots[slot]);
   }
 
-  _facePoint(side) { return this._pointOf(side === 0 ? this.el.myCapy : this.el.foeCapy); }
+  _facePoint(side) { return this._pointOf(side === this.me ? this.el.myCapy : this.el.foeCapy); }
 
   _float(text, p, cls) {
     if (!this.el.fx) return;
@@ -2543,11 +3113,10 @@ export class CardsGame extends Minigame {
       } else if (e.k === 'face') {
         const p = this._facePoint(e.side);
         this._float(`-${e.amount}`, p, 'mg-cards-dmg');
-        this._shake(e.side === 0 ? this.el.myCapy : this.el.foeCapy);
+        this._shake(e.side === this.me ? this.el.myCapy : this.el.foeCapy);
         this._shake(this.el.wrap, 'mg-cards-quake');
         if (e.src === 'fatigue') this._float('SLEEPY!', { x: p.x, y: p.y - 34 }, 'mg-cards-note');
-        if (e.side === 1) this._setExpr(1, 'hurt', 900);
-        else this._setExpr(0, 'hurt', 900);
+        this._setExpr(e.side, 'hurt', 900);
         sfx.add('thud');
       } else if (e.k === 'heal') {
         if (e.amount > 0) {
@@ -2574,7 +3143,7 @@ export class CardsGame extends Minigame {
       } else if (e.k === 'lastsplash') {
         this._float('LAST SPLASH', this._slotPoint(e.side, e.slot), 'mg-cards-note');
       } else if (e.k === 'burn') {
-        this._float('HAND FULL', this._pointOf(e.side === 0 ? this.el.myDeck : this.el.foeDeck), 'mg-cards-note');
+        this._float('HAND FULL', this._pointOf(e.side === this.me ? this.el.myDeck : this.el.foeDeck), 'mg-cards-note');
       } else if (e.k === 'draw') {
         drewFor = e.side;
       } else if (e.k === 'summon') {
@@ -2589,7 +3158,7 @@ export class CardsGame extends Minigame {
       }
     }
     if (drewFor >= 0) {
-      const deck = drewFor === 0 ? this.el.myDeck : this.el.foeDeck;
+      const deck = drewFor === this.me ? this.el.myDeck : this.el.foeDeck;
       this._shake(deck, 'mg-cards-drawpop');
       this.game.audio?.play?.('tick');
     }
@@ -2603,8 +3172,9 @@ export class CardsGame extends Minigame {
   }
 
   // ---- expressions --------------------------------------------------------
+  /** `side` is a rules seat; the top portrait is whichever seat is not mine. */
   _setExpr(side, expr, holdMs) {
-    if (side === 1) {
+    if (side === this.foe) {
       if (this.foeExpr !== expr) {
         this.foeExpr = expr;
         paintFace(this.el.foeFace, FOE_FACE, this.foeCfg, expr);
@@ -2631,19 +3201,19 @@ export class CardsGame extends Minigame {
     const now = performance.now();
     if (!(this._foeHold > now)) {
       let e = 'idle';
-      if (S.winner === 1) e = 'smug';
-      else if (S.winner === 0) e = 'beaten';
-      else if (S.sides[1].hp <= 8) e = 'worried';
-      else if (S.sides[0].hp <= 9 && S.sides[1].hp >= 16) e = 'smug';
-      else if (S.active === 1) e = 'thinking';
-      this._setExpr(1, e);
+      if (S.winner === this.foe) e = 'smug';
+      else if (S.winner === this.me) e = 'beaten';
+      else if (S.sides[this.foe].hp <= 8) e = 'worried';
+      else if (S.sides[this.me].hp <= 9 && S.sides[this.foe].hp >= 16) e = 'smug';
+      else if (S.active === this.foe) e = 'thinking';
+      this._setExpr(this.foe, e);
     }
     if (!(this._myHold > now)) {
       let m = 'idle';
-      if (S.winner === 0) m = 'beam';
-      else if (S.winner === 1) m = 'beaten';
-      else if (S.sides[0].hp <= 8) m = 'worried';
-      this._setExpr(0, m);
+      if (S.winner === this.me) m = 'beam';
+      else if (S.winner === this.foe) m = 'beaten';
+      else if (S.sides[this.me].hp <= 8) m = 'worried';
+      this._setExpr(this.me, m);
     }
   }
 
@@ -2652,10 +3222,13 @@ export class CardsGame extends Minigame {
     this._after(2200 + Math.random() * 3400, () => {
       const calm = (x) => x === 'idle' || x === 'thinking';
       const foeWas = this.foeExpr, myWas = this.myExpr;
-      if (calm(foeWas)) { this._setExpr(1, 'blink'); this._after(140, () => this._setExpr(1, foeWas)); }
+      if (calm(foeWas)) {
+        this._setExpr(this.foe, 'blink');
+        this._after(140, () => this._setExpr(this.foe, foeWas));
+      }
       if (calm(myWas) && Math.random() < 0.7) {
-        this._setExpr(0, 'blink');
-        this._after(150, () => this._setExpr(0, myWas));
+        this._setExpr(this.me, 'blink');
+        this._after(150, () => this._setExpr(this.me, myWas));
       }
       this._blinkLoop();
     });
@@ -2778,12 +3351,13 @@ export class CardsGame extends Minigame {
   }
 
   _countdown() {
+    if (this._dead || this._frozen) return;
     this.phase = 'countdown';
     const over = this.el.over;
     over.classList.remove('mg-cards-gone');
     const steps = ['3', '2', '1', 'DUEL!'];
     const show = (i) => {
-      if (this._dead) return;
+      if (this._dead || this._frozen) return;
       if (i >= steps.length) {
         over.classList.add('mg-cards-gone');
         over.innerHTML = '';
@@ -2809,11 +3383,17 @@ export class CardsGame extends Minigame {
     this._myHold = 0;
     this._result = null;
     this.phase = 'play';
-    this.S = newDuel();
+    // PvP: same seed, same shuffle, same duel on both sides of the table
+    this.S = this.mp ? newPvpDuel(this.mp.seed) : newDuel();
     this._consumeFx();
     this._render();
     this._syncExpr();
     this.game.audio?.play?.('open');
+    if (this.mp) {
+      this._clockTurn = -1;
+      this._syncClock();
+      this._pump(); // their opening move may already be waiting on us
+    }
   }
 
   _checkEnd() {
@@ -2821,8 +3401,9 @@ export class CardsGame extends Minigame {
     this.phase = 'end';
     this.busy = true;
     this.sel = null;
+    this._rq.length = 0;
     this._renderHighlights();
-    this.game.audio?.play?.(this.S.winner === 0 ? 'success' : 'fail');
+    this.game.audio?.play?.(this.S.winner === this.me ? 'success' : 'fail');
     this._after(1100, () => this._results());
   }
 
@@ -2830,15 +3411,18 @@ export class CardsGame extends Minigame {
     if (this._dead || !this.S) return;
     this.phase = 'over';
     const S = this.S;
-    const win = S.winner === 0;
+    const win = S.winner === this.me;
     const draw = S.winner === 'draw';
-    const dealt = Math.round(S.sides[0].dealt);
+    const dealt = Math.round(S.sides[this.me].dealt);
     const score = dealt + (win ? 50 : 0);
     this._result = {
-      win, draw,
-      myHp: Math.max(0, S.sides[0].hp),
-      foeHp: Math.max(0, S.sides[1].hp),
+      win, draw, dealt,
+      forfeit: this._forfeitBy === 'them',
+      myHp: Math.max(0, S.sides[this.me].hp),
+      foeHp: Math.max(0, S.sides[this.foe].hp),
     };
+    // the den only pays the match bonus when both boards name the same winner
+    if (this.mp) this._reportMatch(draw ? 'draw' : (win ? this.mp.myId : this.mp.oppId));
     const prevBest = this.game.state?.bests?.cards || 0;
     const isBest = score > prevBest;
     const coins = this._payout();
@@ -2856,9 +3440,9 @@ export class CardsGame extends Minigame {
       <div class="mg-cards-modal">
         ${isBest ? '<div class="mg-cards-ribbon">NEW PERSONAL BEST</div>' : ''}
         <div class="mg-cards-winner" data-el="winface"></div>
-        <h2>${win ? 'You win the duel!' : draw ? 'A dead heat!' : `${AI_NAME} wins`}</h2>
+        <h2>${win ? 'You win the duel!' : draw ? 'A dead heat!' : `${esc(this.foeName)} wins`}</h2>
         <div class="mg-cards-sub">${this._verdict(win, draw)}</div>
-        <div class="mg-cards-stats">
+        <div class="mg-cards-stats" data-el="payrow">
           <div class="mg-cards-stat"><b>${score}</b><span>SCORE</span></div>
           <div class="mg-cards-stat mg-cards-gold"><b>${coins}</b><span>COINS</span></div>
           <div class="mg-cards-stat"><b>${shown}</b><span>BEST</span></div>
@@ -2869,12 +3453,12 @@ export class CardsGame extends Minigame {
           <div class="mg-cards-stat"><b>${Math.ceil(S.turn / 2)}</b><span>TURNS</span></div>
         </div>
         <div class="mg-cards-btns">
-          <button class="mg-cards-btn" data-a="again">Play again</button>
+          ${this.mp ? '' : '<button class="mg-cards-btn" data-a="again">Play again</button>'}
           <button class="mg-cards-btn mg-cards-alt" data-a="leave">Back to the den</button>
         </div>
       </div>`;
     over.querySelector('[data-el="winface"]').appendChild(face);
-    over.querySelector('[data-a="again"]').addEventListener('click', () => {
+    over.querySelector('[data-a="again"]')?.addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this._done = false; // let the next duel report its own score
       this._countdown();
@@ -2883,10 +3467,23 @@ export class CardsGame extends Minigame {
       this.game.audio?.play?.('click');
       this.exitToRoom();
     });
+    this._paintMatchBadge();
   }
 
   _verdict(win, draw) {
     const r = this._result;
+    if (this.mp) {
+      const who = esc(this.foeName.toUpperCase());
+      if (this._forfeitBy === 'them') return `${who} LEFT THE TABLE. THE DEN AWARDS YOU THE DUEL.`;
+      if (this._forfeitBy === 'me') return 'YOU STEPPED AWAY FROM THE TABLE.';
+      if (draw) return 'BOTH CAPYS FLOPPED OVER AT ONCE. THE DEN IS BAFFLED.';
+      if (win && r.myHp >= 20) return `${who} NEVER GOT COMFORTABLE. MASTERFUL.`;
+      if (win && r.myHp >= 10) return 'A PROPER DUEL. THE WHOLE DEN IS TALKING ABOUT IT.';
+      if (win) return 'ONE HP FROM DISASTER, AND YOU TOOK IT ANYWAY.';
+      if (r.foeHp < 6) return `SO CLOSE. ${who} WAS ONE SWING FROM THE FLOOR.`;
+      if (r.foeHp < 16) return 'A REAL SCRAP. SIT BACK DOWN AND RUN IT AGAIN.';
+      return `${who} HAD AN ANSWER FOR EVERYTHING TODAY. REMATCH?`;
+    }
     if (draw) return 'BOTH CAPYS FLOPPED OVER AT ONCE. THE DEN IS BAFFLED.';
     if (win && r.myHp >= 20) return 'PEBBLE BARELY GOT A CARD DOWN. MASTERFUL.';
     if (win && r.myHp >= 10) return 'A PROPER DUEL. THE DEN IS TALKING ABOUT IT.';

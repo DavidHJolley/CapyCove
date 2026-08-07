@@ -22,6 +22,7 @@ export class NetClient {
     this.connected = false;
     this.selfId = null;
     this.remotes = new Map(); // id -> {p, avatar, tag, target:{x,z,rot}, anim}
+    this.lastTables = new Map(); // game id -> latest 'table' frame (lounge chips)
     this.sendTimer = 0;
     this.lastSent = { x: NaN, z: NaN, rot: NaN, anim: '' };
     this.backoff = 1000;
@@ -148,6 +149,14 @@ export class NetClient {
           try { this._addRemote(p); } catch (e) { console.warn('[net] bad player record', p?.id, e); }
         }
         game.events.emit('population', m.players.length);
+        // the lounge builds ~220ms after this frame; replay the cached table
+        // boards once it exists so the station chips start correct
+        if (m.room === 'lounge' && this.lastTables.size) {
+          setTimeout(() => {
+            if (game.roomId !== 'lounge') return;
+            for (const t of this.lastTables.values()) game.events.emit('table', t);
+          }, 1200);
+        }
         break;
       }
       case 'pjoin':
@@ -241,6 +250,9 @@ export class NetClient {
         break;
       // ---- den tables / PvP matches (wave 4) -------------------------------
       case 'table':
+        // cache the latest board per game: the join-time snapshot lands ~200ms
+        // before the lounge finishes building, so the room re-reads these
+        this.lastTables.set(m.game, m);
         game.events.emit('table', m);
         break;
       case 'match-start':

@@ -34,6 +34,13 @@ const RACE_STATE_MS = 200; // ghost relay cadence (~5Hz)
 const RACE_MAX_MS = 150_000; // hard stop, so one rage-quit cannot hang a race
 const RACE_WIN_COINS = 30;
 
+const LOUNGE_ROOM = 'lounge';
+const TABLE_SEATS = 2; // every den game is a duel
+const MATCH_START_MS = 1_000; // table fills -> both seats read the roster -> go
+const MATCH_MOVE_LIMIT = 25; // relayed moves per second, per player
+const MATCH_MOVE_MAX = 2_048; // bytes of JSON in one relayed move
+const MATCH_WIN_COINS = 30;
+
 const USERNAME_RE = new RegExp(`^[a-zA-Z0-9_]{${NAME_MIN_LEN},${NAME_MAX_LEN}}$`);
 
 const PORT = process.env.PORT || 3001;
@@ -159,6 +166,9 @@ function joinRoom(p, roomId) {
   // walking away from the mountain gives up your spot on the sled queue (and
   // forfeits a run in progress); the lobby must never list someone who left
   if (p.room === SLED_ROOM) exitSled(p);
+  // same deal for the den: leaving the room stands you up from your table, and
+  // walking out mid-duel hands the win (and the coins) to whoever stayed
+  if (p.room === LOUNGE_ROOM) exitTable(p);
   if (p.room) leaveRoomSet(p);
   p.room = roomId;
   world.rooms.get(roomId).add(p.id);
@@ -167,10 +177,13 @@ function joinRoom(p, roomId) {
   // the lobby only broadcasts on change, so a late arrival would stare at an
   // empty sign-up board until someone else joined or left
   if (roomId === SLED_ROOM) sendTo(p, lobbyPayload());
+  // and the den's five boards, for the same reason
+  if (roomId === LOUNGE_ROOM) sendTables(p);
 }
 
 function leaveWorld(p) {
   exitSled(p);
+  exitTable(p);
   if (p.room) leaveRoomSet(p);
   world.players.delete(p.id);
 }
@@ -528,6 +541,157 @@ function exitSled(p) {
   if ([...race.racers.values()].every((x) => x.done)) endRace(race);
 }
 
+// ---------- den tables + PvP matches ----------
+// One two-seat table per den game, global like the sled board and tied to the
+// lounge. Two capys sit down, the server picks the seed so both sides deal the
+// same cards and bounce the same ball, and every move is relayed to the
+// opponent and nobody else. A table stays occupied for the whole match, so the
+// third capy in the queue waits for a seat that is really free.
+
+const TABLE_GAMES = Object.keys(MINIGAMES).filter((g) => MINIGAMES[g].room === LOUNGE_ROOM);
+const tables = new Map(TABLE_GAMES.map((g) => [g, { game: g, seats: [], timer: null }]));
+
+function tablePayload(game) {
+  const table = tables.get(game);
+  const players = [];
+  for (const id of table ? table.seats : []) {
+    const seated = world.players.get(id);
+    if (seated) players.push({ id: seated.id, name: seated.name });
+  }
+  return { t: 'table', game, players };
+}
+
+function broadcastTable(game) {
+  broadcastToRoom(LOUNGE_ROOM, tablePayload(game));
+}
+
+/** Every board at once, for someone who just walked into the den. */
+function sendTables(p) {
+  for (const game of TABLE_GAMES) sendTo(p, tablePayload(game));
+}
+
+/** The player id in the other seat, or null once they are gone. */
+function otherSeat(match, id) {
+  return match.seats.find((x) => x !== id) || null;
+}
+
+function joinTable(p, game) {
+  if (typeof game !== 'string' || !tables.has(game)) return;
+  // the tables are furniture in the den: you cannot sign up for one from the
+  // beach, mid-sled-race, or while you are already playing a match
+  if (p.room !== LOUNGE_ROOM || p.race || p.match || p.table) return;
+  const table = tables.get(game);
+  if (table.seats.length >= TABLE_SEATS || table.seats.includes(p.id)) return;
+  table.seats.push(p.id);
+  p.table = game;
+  broadcastTable(game);
+  if (table.seats.length >= TABLE_SEATS) {
+    if (table.timer) clearTimeout(table.timer);
+    table.timer = setTimeout(() => {
+      try { startMatch(table); } catch (e) { console.error('[table] start failed:', e?.message || e); }
+    }, MATCH_START_MS);
+  }
+}
+
+/** Stand up from whatever table p is sitting at. True if they were sitting. */
+function leaveTable(p) {
+  const game = p.table;
+  p.table = null;
+  const table = game ? tables.get(game) : null;
+  if (!table) return false;
+  const i = table.seats.indexOf(p.id);
+  if (i < 0) return false;
+  table.seats.splice(i, 1);
+  // a match only ever starts at a full table: a seat opening during the
+  // countdown cancels it rather than dealing a hand to one lonely capy
+  if (table.timer) { clearTimeout(table.timer); table.timer = null; }
+  broadcastTable(game);
+  return true;
+}
+
+/** Free both seats once a match is over, so the next pair can sit down. */
+function clearTable(game, ids) {
+  const table = tables.get(game);
+  if (!table) return;
+  let changed = false;
+  for (const id of ids) {
+    const i = table.seats.indexOf(id);
+    if (i >= 0) { table.seats.splice(i, 1); changed = true; }
+    const seated = world.players.get(id);
+    if (seated && seated.table === game) seated.table = null;
+  }
+  if (table.timer) { clearTimeout(table.timer); table.timer = null; }
+  if (changed) broadcastTable(game);
+}
+
+function startMatch(table) {
+  table.timer = null;
+  const members = table.seats
+    .map((id) => world.players.get(id))
+    .filter((p) => p && p.room === LOUNGE_ROOM && p.table === table.game && !p.match && !p.race);
+  if (members.length < TABLE_SEATS) {
+    // somebody blinked out between sitting down and the deal; drop every seat
+    // that no longer resolves so a ghost cannot wedge a table at "full" for good
+    for (let i = table.seats.length - 1; i >= 0; i--) {
+      const seated = world.players.get(table.seats[i]);
+      if (members.includes(seated)) continue;
+      table.seats.splice(i, 1);
+      if (seated && seated.table === table.game) seated.table = null;
+    }
+    broadcastTable(table.game);
+    return;
+  }
+  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
+  const roster = members.map((p) => ({ id: p.id, name: p.name, color: p.color, hat: p.hat }));
+  const match = {
+    game: table.game, seed, ended: false,
+    seats: members.map((p) => p.id),
+    reports: new Map(), // playerId -> { winner, score }
+  };
+  for (const p of members) p.match = match;
+  // youAre is the index into the roster both sides received: player 0 is the
+  // authority wherever a den game needs one (ball physics, who moves first)
+  members.forEach((p, i) => sendTo(p, { t: 'match-start', game: match.game, players: roster, youAre: i, seed }));
+}
+
+/**
+ * The one way out of a match. 'done' pays only when both sides name the same
+ * winner, so a client that lies about winning simply disagrees with its
+ * opponent and nobody is paid; a forfeit pays whoever stayed at the table.
+ */
+function endMatch(match, reason, forfeitWinner = null) {
+  if (match.ended) return;
+  match.ended = true;
+  let winner = null;
+  if (reason === 'forfeit') {
+    winner = forfeitWinner;
+  } else {
+    const ra = match.reports.get(match.seats[0]);
+    const rb = match.reports.get(match.seats[1]);
+    if (ra && rb && ra.winner && ra.winner === rb.winner) winner = ra.winner;
+  }
+  const seated = [];
+  for (const id of match.seats) {
+    const p = world.players.get(id);
+    if (p && p.match === match) { p.match = null; seated.push(p); }
+  }
+  clearTable(match.game, match.seats);
+  for (const p of seated) sendTo(p, { t: 'match-end', game: match.game, reason, winner });
+  // 'draw' is an agreement, not a capy: it ends the match and pays nobody.
+  // Paid after the results so the coin pop lands on top of the win screen.
+  if (winner && winner !== 'draw') {
+    const champ = world.players.get(winner);
+    if (champ) grantCoins(champ, MATCH_WIN_COINS, 'match win');
+  }
+}
+
+/** Give up a seat and/or a match in progress (leaving the den, or the world). */
+function exitTable(p) {
+  const match = p.match;
+  if (match && !match.ended) endMatch(match, 'forfeit', otherSeat(match, p.id));
+  leaveTable(p);
+}
+
 // ---------- websocket ----------
 // maxPayload: nothing the protocol carries comes close; the ws default is 100MiB.
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
@@ -598,6 +762,7 @@ wss.on('connection', (ws) => {
             ownedHats: profile.ownedHats, bests: profile.bests,
             lastChat: 0, joinWindow: 0, joinCount: 0, run: null, earned: [],
             socialWindow: 0, socialCount: 0, race: null,
+            table: null, match: null, matchWindow: 0, matchCount: 0,
           };
           world.players.set(p.id, p);
           sendTo(p, { t: 'welcome', id: p.id, profile: { ...profile, registered: p.registered } });
@@ -873,6 +1038,47 @@ wss.on('connection', (ws) => {
           r.done = true;
           broadcastRaceState(race); // the others see them cross immediately
           if ([...race.racers.values()].every((x) => x.done)) endRace(race);
+          break;
+        }
+
+        // ---- den tables + PvP matches ---------------------------------------
+        case 'table-join':
+          if (socialLimited(p, t0)) break;
+          joinTable(p, m.game);
+          break;
+        case 'table-leave':
+          if (socialLimited(p, t0)) break;
+          exitTable(p);
+          break;
+        case 'match-move': {
+          // hot path: a paddle sends one of these most frames, so it gets its
+          // own budget rather than the social one, and nothing it carries is
+          // read here or seen by anyone but the opponent
+          const match = p.match;
+          if (!match || match.ended) break;
+          if (t0 - p.matchWindow > 1000) { p.matchWindow = t0; p.matchCount = 0; }
+          if (++p.matchCount > MATCH_MOVE_LIMIT) break;
+          if (m.data === undefined) break;
+          let size = 0;
+          try { size = JSON.stringify(m.data).length; } catch { break; }
+          if (!size || size > MATCH_MOVE_MAX) break;
+          const other = world.players.get(otherSeat(match, p.id));
+          if (other && other.match === match) sendTo(other, { t: 'match-move', from: p.id, data: m.data });
+          break;
+        }
+        case 'match-done': {
+          const match = p.match;
+          if (!match || match.ended) break;
+          if (match.reports.has(p.id)) break; // one report per capy per match
+          const result = m.result;
+          if (!result || typeof result !== 'object' || Array.isArray(result)) break;
+          // a winner who is not sitting at this table is nobody: the report
+          // still lands, so the match can end, but it agrees with no one
+          const claimed = result.winner;
+          const winner = claimed === 'draw' || match.seats.includes(claimed) ? claimed : null;
+          const score = Math.max(0, Math.min(10_000_000, Math.floor(Number(result.score) || 0)));
+          match.reports.set(p.id, { winner, score });
+          if (match.seats.every((id) => match.reports.has(id))) endMatch(match, 'done');
           break;
         }
       }

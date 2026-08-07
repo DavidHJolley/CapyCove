@@ -14,6 +14,17 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
  * Board and pieces are drawn procedurally on a 2D canvas; the portrait uses the
  * same face language as the Smoothie Shack customers.
  *
+ * TABLE MATCHES: if `game.__matchCtx` is set at mount ({game, players, youAre,
+ * seed}) the very same board becomes a two-capy duel instead. Seat 0 plays the
+ * cream pieces and moves first; seat 1 gets the board flipped so their own
+ * capys are at the bottom. Our moves go out as {move:{from,to,promo}} and every
+ * move that comes back in is replayed through this file's own legal-move
+ * generator, so an illegal or out-of-turn packet freezes the board with an
+ * apology instead of quietly desyncing the two games. Draw offers, resignations
+ * and the shared result ride the same channel. No clocks (this is a cozy den):
+ * the board just pulses gold when it is your move. Solo play against
+ * Grandmaster Pebble is untouched by any of it.
+ *
  * ===========================================================================
  * PART 1 - the chess engine (pure functions, no DOM, unit-testable in node)
  * ===========================================================================
@@ -1124,6 +1135,12 @@ const STYLE = `
 .mg-chess-board.mg-chess-quake{animation:mg-chess-quake .38s ease;}
 @keyframes mg-chess-quake{0%,100%{transform:translate(0,0)}25%{transform:translate(-7px,4px)}
   55%{transform:translate(6px,-4px)}80%{transform:translate(-3px,2px)}}
+/* no clocks in a match, so the board itself does the nudging: a slow warm halo
+   that only breathes while the move is yours */
+.mg-chess-board.mg-chess-nudge{animation:mg-chess-nudge 2.8s ease-in-out infinite;}
+@keyframes mg-chess-nudge{
+  0%,100%{box-shadow:0 12px 0 rgba(30,16,4,.45),0 22px 44px rgba(0,0,0,.45),0 0 0 0 rgba(242,182,74,0)}
+  50%{box-shadow:0 12px 0 rgba(30,16,4,.45),0 22px 44px rgba(0,0,0,.45),0 0 0 7px rgba(242,182,74,.34)}}
 .mg-chess-canvas{display:block;border-radius:16px;cursor:pointer;touch-action:none;}
 .mg-chess-fx{position:absolute;inset:0;pointer-events:none;overflow:visible;}
 .mg-chess-float{position:absolute;transform:translate(-50%,-50%);font-weight:900;white-space:nowrap;
@@ -1151,6 +1168,10 @@ const STYLE = `
   box-shadow:0 5px 0 rgba(30,16,4,.4);transition:.12s;}
 .mg-chess-resign:hover{background:#c94a3e;transform:translateY(-2px);}
 .mg-chess-resign:active{transform:translateY(3px);box-shadow:0 2px 0 rgba(30,16,4,.4);}
+.mg-chess-offer{background:#4f8fb0;}
+.mg-chess-offer:hover{background:#4fb3e8;}
+.mg-chess-offer:disabled{background:#9c8f7c;opacity:.55;cursor:default;transform:none;}
+.mg-chess-offer[hidden]{display:none;}
 
 /* ---- overlays ---- */
 .mg-chess-over{position:absolute;inset:0;z-index:12;display:flex;align-items:center;justify-content:center;
@@ -1277,6 +1298,35 @@ const STYLE = `
 
 const WIN_BONUS = 500;
 const COINS = { win: 85, draw: 25, loss: 5 };
+/** What the server pays the agreed winner of a table match, for the copy only. */
+const MATCH_BONUS = 30;
+
+const WIN_KINDS = new Set(['mate-win', 'resign-win', 'forfeit-win', 'match-win']);
+const LOSS_KINDS = new Set(['mate-loss', 'resign-loss', 'forfeit-loss', 'match-loss']);
+
+/** Anything from the wire that lands in innerHTML goes through here first. */
+const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]);
+
+/** Shared seed -> shared flavour: both seats read the same greeting. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const MATCH_GREETS = [
+  'sat down opposite you and set out the pieces.',
+  'cracks their knuckles. all four of them.',
+  'has brought a mug of something warm to the table.',
+  'is here for a nice long think.',
+  'shakes your paw across the board.',
+];
 
 const LINES = {
   greet: [
@@ -1311,6 +1361,11 @@ export class ChessGame extends Minigame {
     this._onKey = null;
     this._onResize = null;
     this._ro = null;
+    this.subs = [];        // game.events unsubscribers (match wiring)
+    this.match = null;     // set when game.__matchCtx handed us an opponent
+    this.matchRef = null;  // the exact handshake object we consumed
+    this.myColor = 0;      // 0 = cream (white), 1 = cocoa (black)
+    this.flip = false;     // draw the board from the cocoa side
     this.phase = 'splash';
     this.el = {};
     this.st = fromFen(START_FEN);
@@ -1328,11 +1383,16 @@ export class ChessGame extends Minigame {
     this.expr = 'idle';
     this.blinkIn = 3;
     this._outcome = null;
+    this._lastTurnMine = null;
   }
 
   // ---- lifecycle -----------------------------------------------------------
   mount(root) {
     super.mount(root);
+    this.match = this._readMatchCtx();
+    this.myColor = this.match ? this.match.youAre : 0;
+    this.flip = this.myColor === 1;
+
     const style = document.createElement('style');
     style.textContent = STYLE;
     root.appendChild(style);
@@ -1361,17 +1421,20 @@ export class ChessGame extends Minigame {
       mood: q('[data-el="mood"]'),
       bubble: q('[data-el="bubble"]'),
       yourname: q('[data-el="yourname"]'),
+      pname: q('[data-el="pname"]'),
       trayPebble: q('[data-el="trayPebble"]'),
       trayYou: q('[data-el="trayYou"]'),
       leadPebble: q('[data-el="leadPebble"]'),
       leadYou: q('[data-el="leadYou"]'),
       moves: q('[data-el="moves"]'),
       resign: q('[data-el="resign"]'),
+      offer: q('[data-el="offer"]'),
       over: q('[data-el="over"]'),
     };
 
-    this.el.yourname.textContent = `${this.game.state?.name || 'You'} (cream)`;
+    this._applyIdentity();
     this.el.resign.addEventListener('click', () => this._confirmResign());
+    this.el.offer.addEventListener('click', () => this._offerDraw());
     q('[data-el="quit"]').addEventListener('click', () => this._confirmQuit());
 
     const cv = this.el.canvas;
@@ -1389,6 +1452,7 @@ export class ChessGame extends Minigame {
       this._ro.observe(this.el.boardWrap);
     }
 
+    this._bindMatch();
     this._newGame();
     this._resize();
     this._paintPortraits();
@@ -1405,9 +1469,13 @@ export class ChessGame extends Minigame {
     if (this._onKey) window.removeEventListener('keydown', this._onKey);
     if (this._onResize) window.removeEventListener('resize', this._onResize);
     this._ro?.disconnect?.();
+    for (const off of this.subs) { try { off(); } catch { /* already gone */ } }
+    this.subs.length = 0;
     this._onKey = null;
     this._onResize = null;
     this._ro = null;
+    this.match = null;
+    this._clearCtx(); // never leak a finished match into the next mount
     this.sprites = null;
     this.parts.length = 0;
     this.el = {};
@@ -1426,6 +1494,304 @@ export class ChessGame extends Minigame {
     }, ms);
     this._timers.add(id);
     return id;
+  }
+
+  // ---- table match ---------------------------------------------------------
+  /**
+   * Read the handshake the lounge parked on the game object. Anything malformed
+   * (wrong game, no seat, no opponent, no socket) degrades to a solo game
+   * against Pebble rather than half-starting a match nobody can finish.
+   */
+  _readMatchCtx() {
+    const ctx = this.game.__matchCtx;
+    this.matchRef = ctx && typeof ctx === 'object' ? ctx : null;
+    if (!this.matchRef) return null;
+    if (ctx.game && ctx.game !== 'chess') return null;
+    if (ctx.youAre !== 0 && ctx.youAre !== 1) return null;
+    if (typeof this.game.net?.send !== 'function') return null;
+    const players = Array.isArray(ctx.players)
+      ? ctx.players.filter((p) => p && typeof p === 'object') : [];
+    if (players.length < 2) return null;
+
+    const youAre = ctx.youAre;
+    const me = players[youAre] || {};
+    const foe = players[youAre ^ 1] || {};
+    const seed = (Number(ctx.seed) >>> 0) || 1;
+    const rng = mulberry32(seed);
+    const name = String(foe.name || 'Capy').slice(0, 16);
+    return {
+      youAre,
+      seed,
+      myId: me.id ?? this.game.net?.selfId ?? null,
+      foeId: foe.id ?? null,
+      foeName: name,
+      foeShort: name.slice(0, 12),
+      foeColor: Number.isFinite(foe.color) ? foe.color : 0xb08a5a,
+      greeting: MATCH_GREETS[Math.floor(rng() * MATCH_GREETS.length)],
+      queue: [],      // remote packets waiting for a quiet moment
+      ended: false,   // the server has called it
+      frozen: false,  // the two boards disagreed: no more play
+      doneSent: false,
+      offered: false, // our draw offer is on the table
+    };
+  }
+
+  /** Drop the handshake we consumed, without stomping a newer one. */
+  _clearCtx() {
+    if (this.matchRef && this.game.__matchCtx === this.matchRef) this.game.__matchCtx = null;
+    this.matchRef = null;
+  }
+
+  _bindMatch() {
+    if (!this.match) return;
+    const ev = this.game.events;
+    if (!ev?.on) return;
+    this.subs.push(ev.on('match-move', (m) => this._onMatchMove(m)));
+    this.subs.push(ev.on('match-end', (m) => this._onMatchEnd(m)));
+  }
+
+  /** Leave match mode but stay in the minigame (results screen "Play Pebble"). */
+  _leaveMatch() {
+    if (!this.match) return;
+    for (const off of this.subs) { try { off(); } catch { /* already gone */ } }
+    this.subs.length = 0;
+    this.match = null;
+    this._clearCtx();
+    this.myColor = 0;
+    this.flip = false;
+    this.el.board?.classList.remove('mg-chess-nudge');
+    this._applyIdentity();
+  }
+
+  _sendData(data) {
+    const M = this.match;
+    if (!M || M.ended) return;
+    this.game.net?.send?.({ t: 'match-move', data });
+  }
+
+  /** One match-done per player per match: winner is an id, or 'draw'. */
+  _sendDone(winner, score) {
+    const M = this.match;
+    if (!M || M.ended || M.doneSent) return;
+    if (winner !== 'draw' && (winner === null || winner === undefined)) return;
+    M.doneSent = true;
+    this.game.net?.send?.({
+      t: 'match-done',
+      result: { winner, score: Math.max(0, Math.round(score) || 0) },
+    });
+  }
+
+  _reportMatch(kind, score) {
+    const M = this.match;
+    if (!M) return;
+    if (WIN_KINDS.has(kind)) this._sendDone(M.myId, score);
+    else if (LOSS_KINDS.has(kind)) this._sendDone(M.foeId, score);
+    else this._sendDone('draw', score);
+  }
+
+  /** {t:'match-move', from, data}: queue it, the pump plays it when we are idle. */
+  _onMatchMove(m) {
+    const M = this.match;
+    if (!M || this._dead || M.ended || M.frozen) return;
+    if (this.phase === 'over') return; // the game is decided; nothing left to play
+    const data = m?.data;
+    if (!data || typeof data !== 'object') return;
+    // relays only ever come from the other seat, but never trust that blindly
+    if (m.from != null && M.foeId != null && String(m.from) !== String(M.foeId)) return;
+    if (M.queue.length > 8) { this._desync('too many moves arrived at once'); return; }
+    M.queue.push(data);
+    this._pumpRemote();
+  }
+
+  /** {t:'match-end', reason, winner}: the server has the final word. */
+  _onMatchEnd(m) {
+    const M = this.match;
+    if (!M || this._dead) return;
+    M.ended = true;
+    M.queue.length = 0;
+    if (this.el.board) this.el.board.classList.remove('mg-chess-nudge');
+    if (this.phase === 'over' || M.frozen) return; // we already showed the result
+
+    const winner = m?.winner;
+    const forfeit = m?.reason === 'forfeit';
+    const mine = winner != null && M.myId != null && String(winner) === String(M.myId);
+    const theirs = winner != null && M.foeId != null && String(winner) === String(M.foeId);
+    if (mine) this._endGame(forfeit ? 'forfeit-win' : 'match-win');
+    else if (theirs) this._endGame(forfeit ? 'forfeit-loss' : 'match-loss');
+    else this._endGame('draw-agreed');
+  }
+
+  /** Play one queued remote packet, but only while the board is sitting still. */
+  _pumpRemote() {
+    const M = this.match;
+    if (!M || this._dead || M.ended || M.frozen || !M.queue.length) return;
+    if (this.phase !== 'play' || this.busy || this.anim) return;
+    while (M.queue.length) {
+      const d = M.queue.shift();
+      if (d.move && typeof d.move === 'object') { this._applyRemoteMove(d.move); return; }
+      if (d.resign) { this._oppResigned(); return; }
+      if (d.draw === 'offer') { this._drawOffered(); return; }
+      if (d.draw === 'accept') { this._drawAccepted(); return; }
+      if (d.draw === 'decline') { this._drawDeclined(); continue; }
+    }
+  }
+
+  /**
+   * Replay the opponent's move through our own generator. Anything that is not
+   * exactly one legal move for the side to move stops the match: two boards
+   * that disagree are worse than no board at all.
+   */
+  _applyRemoteMove(mv) {
+    const from = Number(mv.from), to = Number(mv.to);
+    const promo = mv.promo == null ? 0 : Number(mv.promo);
+    const okPromo = promo === 0 || (Number.isInteger(promo) && promo >= KNIGHT && promo <= QUEEN);
+    const bad = !Number.isInteger(from) || from < 0 || from > 63
+      || !Number.isInteger(to) || to < 0 || to > 63 || !okPromo;
+    if (bad) { this._desync('a move arrived that is not on this board'); return; }
+    if (this.st.turn === this.myColor) { this._desync('a move arrived out of turn'); return; }
+
+    const opts = this.legal.filter((m) => mFrom(m) === from && mTo(m) === to);
+    if (!opts.length) { this._desync(`${sqName(from)}-${sqName(to)} is not legal here`); return; }
+    const wantsPromo = mPromo(opts[0]) !== 0;
+    const m = wantsPromo ? opts.find((x) => mPromo(x) === promo) : (promo === 0 ? opts[0] : undefined);
+    if (m === undefined) { this._desync('that promotion did not add up'); return; }
+    this._applyMove(m, true);
+  }
+
+  /** The two boards drifted: freeze, apologise, and let them bow out cleanly. */
+  _desync(why) {
+    const M = this.match;
+    if (!M || M.frozen || M.ended) return;
+    M.frozen = true;
+    M.queue.length = 0;
+    this.busy = true;
+    this.sel = -1;
+    this.drag = null;
+    this.el.board?.classList.remove('mg-chess-nudge');
+    this.phase = 'confirm';
+    this.game.audio?.play?.('fail');
+    this.game.toast?.(`Chess match out of step: ${why}.`);
+    const card = this._showOver(`
+      <h2>The boards drifted apart</h2>
+      <div class="mg-chess-sub">${esc(String(why).toUpperCase())}. RATHER THAN PLAY TWO
+        DIFFERENT GAMES, THE MATCH STOPS HERE.</div>
+      <div class="mg-chess-btns">
+        <button class="mg-chess-btn" data-a="leave">Back to the den</button>
+      </div>`);
+    card.querySelector('[data-a="leave"]').addEventListener('click', () => this._forfeitAndQuit());
+  }
+
+  // ---- draw offers, resignation, forfeit -----------------------------------
+  _offerDraw() {
+    const M = this.match;
+    if (!M || M.ended || M.frozen || M.offered || this.phase !== 'play') return;
+    M.offered = true;
+    if (this.el.offer) this.el.offer.disabled = true;
+    this.game.audio?.play?.('click');
+    this._sendData({ draw: 'offer' });
+    this.game.toast?.('Draw offered. Waiting for an answer.');
+  }
+
+  _drawOffered() {
+    const M = this.match;
+    if (!M || M.ended || M.frozen) return;
+    this.game.audio?.play?.('open');
+    this._setExpr('idle', 'offers a draw');
+    this._say('shall we call it even?');
+    this.phase = 'confirm';
+    const card = this._showOver(`
+      <h2>Draw offer</h2>
+      <div class="mg-chess-sub">${esc(M.foeName.toUpperCase())} OFFERS TO SHAKE PAWS
+        AND CALL IT EVEN.</div>
+      <div class="mg-chess-btns">
+        <button class="mg-chess-btn" data-a="no">Play on</button>
+        <button class="mg-chess-btn mg-chess-alt" data-a="yes">Accept the draw (${COINS.draw} coins)</button>
+      </div>`);
+    card.querySelector('[data-a="no"]').addEventListener('click', () => {
+      this.game.audio?.play?.('click');
+      this._hideOver();
+      this.phase = 'play';
+      this._sendData({ draw: 'decline' });
+      this._setExpr(this.st.turn === this.myColor ? 'idle' : 'think', 'play on then');
+      this._syncTurn();
+      this._pumpRemote();
+    });
+    card.querySelector('[data-a="yes"]').addEventListener('click', () => {
+      this.game.audio?.play?.('ding');
+      this._hideOver();
+      this.phase = 'play';
+      this._sendData({ draw: 'accept' });
+      this._endGame('draw-agreed');
+    });
+  }
+
+  _drawAccepted() {
+    const M = this.match;
+    if (!M || !M.offered || M.ended || M.frozen) return;
+    this._say('a draw it is.');
+    this._endGame('draw-agreed');
+  }
+
+  _drawDeclined() {
+    const M = this.match;
+    if (!M) return;
+    M.offered = false;
+    this._say('not today, thank you.');
+    this.game.audio?.play?.('close');
+    this._after(8000, () => {
+      if (this._dead || !this.match || this.match.ended) return;
+      if (this.el.offer && !this.match.offered) this.el.offer.disabled = false;
+    });
+  }
+
+  _oppResigned() {
+    const M = this.match;
+    if (!M || M.ended || M.frozen) return;
+    this._setExpr('beaten', 'resigned');
+    this._endGame('resign-win');
+  }
+
+  /** Walking away from a live match hands the win (and the bonus) over. */
+  _forfeitAndQuit() {
+    const M = this.match;
+    if (M && !M.ended && !M.doneSent) {
+      this._sendData({ resign: true });
+      this._sendDone(M.foeId, 0);
+    }
+    this.quit();
+  }
+
+  /** Whose faces and names sit on the two cards: Pebble, or a real capybara. */
+  _applyIdentity() {
+    const M = this.match;
+    const myName = this.game.state?.name || 'You';
+    if (this.el.yourname) {
+      this.el.yourname.textContent = `${myName} (${this.myColor === 0 ? 'cream' : 'cocoa'})`;
+    }
+    if (this.el.pname) {
+      const plays = M ? (this.myColor === 0 ? 'plays cocoa' : 'plays cream') : 'plays cocoa';
+      this.el.pname.textContent = '';
+      this.el.pname.appendChild(document.createTextNode(M ? M.foeName : 'Grandmaster Pebble'));
+      this.el.pname.appendChild(document.createElement('br'));
+      const small = document.createElement('span');
+      small.style.cssText = 'font-weight:700;font-size:10.5px;color:#9a8461';
+      small.textContent = plays;
+      this.el.pname.appendChild(small);
+    }
+    if (this.el.offer) {
+      this.el.offer.hidden = !M;
+      this.el.offer.disabled = !M || !!M.offered;
+    }
+    this._paintPortraits();
+  }
+
+  /** Material balance from OUR side of the board, in pawns-and-pieces points. */
+  _myLead() {
+    return materialLead(this.st) * (this.myColor === 0 ? 1 : -1);
+  }
+
+  _scoreFor(kind) {
+    return Math.max(0, this._myLead()) * 10 + (WIN_KINDS.has(kind) ? WIN_BONUS : 0);
   }
 
   // ---- markup --------------------------------------------------------------
@@ -1448,7 +1814,7 @@ export class ChessGame extends Minigame {
           <div class="mg-chess-card mg-chess-pcard" data-el="pcard">
             <div class="mg-chess-bubble" data-el="bubble"></div>
             <canvas class="mg-chess-face" data-el="portrait"></canvas>
-            <div class="mg-chess-pname">Grandmaster Pebble<br><span style="font-weight:700;font-size:10.5px;color:#9a8461">plays cocoa</span></div>
+            <div class="mg-chess-pname" data-el="pname">Grandmaster Pebble<br><span style="font-weight:700;font-size:10.5px;color:#9a8461">plays cocoa</span></div>
             <div class="mg-chess-mood" data-el="mood">polishing monocle</div>
             <div class="mg-chess-tray" data-el="trayPebble"></div>
             <div class="mg-chess-lead" data-el="leadPebble"></div>
@@ -1473,6 +1839,7 @@ export class ChessGame extends Minigame {
             <h4>MOVE LIST</h4>
             <ol data-el="moves"></ol>
           </div>
+          <button class="mg-chess-resign mg-chess-offer" data-el="offer" hidden>OFFER DRAW</button>
           <button class="mg-chess-resign" data-el="resign">RESIGN</button>
         </div>
       </div>
@@ -1523,8 +1890,12 @@ export class ChessGame extends Minigame {
   }
 
   _paintPortraits() {
+    if (!this.el.portrait || !this.el.you) return;
     const size = 108;
-    paintCanvas(this.el.portrait, size, size, (ctx) => drawPebble(ctx, size, this.expr));
+    // in a match the top card is a real capybara: their colour, no monocle
+    const foe = this.match
+      ? { color: hexOf(this.match.foeColor), monocle: false, bowtie: false } : {};
+    paintCanvas(this.el.portrait, size, size, (ctx) => drawPebble(ctx, size, this.expr, foe));
     const mine = hexOf(this.game.state?.color ?? 0xb08a5a);
     paintCanvas(this.el.you, 72, 72, (ctx) => drawPebble(ctx, 72, this._myExpr || 'idle', {
       color: mine, monocle: false, bowtie: false,
@@ -1561,10 +1932,24 @@ export class ChessGame extends Minigame {
 
   _showSplash() {
     this.phase = 'splash';
+    const M = this.match;
     const best = this.game.state?.bests?.chess || 0;
     const legend = [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING].map((t) => `
       <div data-piece="${t}"><b>${PIECE_LORE[t].name}</b><span>${PIECE_LORE[t].how}</span></div>`).join('');
-    const card = this._showOver(`
+    const white = this.myColor === 0;
+    const mySide = white ? 'CREAM' : 'COCOA';
+    const first = M ? (white ? 'YOU MOVE FIRST' : `${esc(M.foeShort.toUpperCase())} MOVES FIRST`)
+      : 'CREAM MOVES FIRST';
+
+    const head = M ? `
+      <h1>Table Match</h1>
+      <div class="mg-chess-hero">
+        <canvas data-el="heroFace"></canvas>
+        <div>
+          <b>${esc(M.foeName)}</b>
+          <span>${esc(M.greeting)}</span>
+        </div>
+      </div>` : `
       <h1>Grand Capy Chess</h1>
       <div class="mg-chess-hero">
         <canvas data-el="heroFace"></canvas>
@@ -1572,31 +1957,41 @@ export class ChessGame extends Minigame {
           <b>Grandmaster Pebble</b>
           <span>undefeated back-table champion of the Game Den. probably.</span>
         </div>
-      </div>
-      <div class="mg-chess-sub">YOU PLAY THE CREAM CAPYS. CREAM MOVES FIRST.</div>
+      </div>`;
+
+    const rules = M ? `
+      <div><i>1</i><span>Click a piece then click where it goes, or just drag it. Dots show every legal square.</span></div>
+      <div><i>2</i><span>Real chess, all of it: castling, en passant, promotion, stalemate, the lot. No takebacks.</span></div>
+      <div><i>3</i><span>No clocks. Think as long as you like: the board glows gold when the move is yours.</span></div>
+      <div><i>4</i><span>Win for <b>${COINS.win} coins</b> plus a <b>${MATCH_BONUS} coin</b> match bonus. Draw ${COINS.draw}, loss ${COINS.loss}. Leaving the table hands them the win.</span></div>`
+      : `
+      <div><i>1</i><span>Click a piece then click where it goes, or just drag it. Dots show every legal square.</span></div>
+      <div><i>2</i><span>Real chess, all of it: castling, en passant, promotion, stalemate, the lot. No takebacks.</span></div>
+      <div><i>3</i><span>Beat Pebble for <b>${COINS.win} coins</b>. A draw is worth ${COINS.draw}, a loss ${COINS.loss}. Resigning counts as a loss.</span></div>
+      <div><i>4</i><span>He warms up for the first few moves. After that he stops being polite.</span></div>`;
+
+    const card = this._showOver(`
+      ${head}
+      <div class="mg-chess-sub">YOU PLAY THE ${mySide} CAPYS. ${first}.</div>
       <div class="mg-chess-legend">${legend}</div>
-      <div class="mg-chess-rules">
-        <div><i>1</i><span>Click a piece then click where it goes, or just drag it. Dots show every legal square.</span></div>
-        <div><i>2</i><span>Real chess, all of it: castling, en passant, promotion, stalemate, the lot. No takebacks.</span></div>
-        <div><i>3</i><span>Beat Pebble for <b>${COINS.win} coins</b>. A draw is worth ${COINS.draw}, a loss ${COINS.loss}. Resigning counts as a loss.</span></div>
-        <div><i>4</i><span>He warms up for the first few moves. After that he stops being polite.</span></div>
-      </div>
+      <div class="mg-chess-rules">${rules}</div>
       <div class="mg-chess-stats">
         <div class="mg-chess-stat"><b>${best}</b><span>YOUR BEST</span></div>
-        <div class="mg-chess-stat mg-chess-gold"><b>${COINS.win}</b><span>COINS TO WIN</span></div>
+        <div class="mg-chess-stat mg-chess-gold"><b>${M ? `${COINS.win}+${MATCH_BONUS}` : COINS.win}</b><span>COINS TO WIN</span></div>
       </div>
       <div class="mg-chess-btns">
-        <button class="mg-chess-btn" data-a="play">TAKE A SEAT</button>
-        <button class="mg-chess-btn mg-chess-ghost" data-a="leave">Back to the den</button>
+        <button class="mg-chess-btn" data-a="play">${M ? 'START THE MATCH' : 'TAKE A SEAT'}</button>
+        ${M ? '' : '<button class="mg-chess-btn mg-chess-ghost" data-a="leave">Back to the den</button>'}
       </div>`);
 
     const hero = card.querySelector('[data-el="heroFace"]');
-    paintCanvas(hero, 88, 88, (ctx) => drawPebble(ctx, 88, 'smug'));
+    const heroCfg = M ? { color: hexOf(M.foeColor), monocle: false, bowtie: false } : {};
+    paintCanvas(hero, 88, 88, (ctx) => drawPebble(ctx, 88, M ? 'idle' : 'smug', heroCfg));
     for (const div of card.querySelectorAll('[data-piece]')) {
-      div.insertBefore(pieceCanvas(Number(div.dataset.piece), false, 32), div.firstChild);
+      div.insertBefore(pieceCanvas(Number(div.dataset.piece), this.myColor === 1, 32), div.firstChild);
     }
     card.querySelector('[data-a="play"]').addEventListener('click', () => this._countdown());
-    card.querySelector('[data-a="leave"]').addEventListener('click', () => {
+    card.querySelector('[data-a="leave"]')?.addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this.quit();
     });
@@ -1613,8 +2008,16 @@ export class ChessGame extends Minigame {
         this._hideOver();
         this.phase = 'play';
         this.busy = false;
-        this._setExpr('idle', 'your move', pick(LINES.greet));
-        this._syncTurn();
+        if (this.match) {
+          const mine = this.st.turn === this.myColor;
+          if (this.el.offer) this.el.offer.disabled = !!this.match.offered;
+          this._setExpr(mine ? 'idle' : 'think', mine ? 'your move' : 'thinking');
+          this._syncTurn();
+          this._pumpRemote(); // a move may have landed while we read the rules
+        } else {
+          this._setExpr('idle', 'your move', pick(LINES.greet));
+          this._syncTurn();
+        }
         return;
       }
       const over = this.el.over;
@@ -1627,12 +2030,15 @@ export class ChessGame extends Minigame {
   }
 
   _confirmResign() {
-    if (this.phase !== 'play') return;
+    if (this.phase !== 'play' || this.match?.frozen) return;
     this.phase = 'confirm';
     this.game.audio?.play?.('click');
+    const M = this.match;
     const card = this._showOver(`
-      <h2>Resign the game?</h2>
-      <div class="mg-chess-sub">PEBBLE WILL BE VERY GRACIOUS ABOUT IT. FOR HOURS.</div>
+      <h2>Resign the ${M ? 'match' : 'game'}?</h2>
+      <div class="mg-chess-sub">${M
+        ? `${esc(M.foeName.toUpperCase())} TAKES THE WIN AND THE ${MATCH_BONUS} COIN BONUS.`
+        : 'PEBBLE WILL BE VERY GRACIOUS ABOUT IT. FOR HOURS.'}</div>
       <div class="mg-chess-btns">
         <button class="mg-chess-btn" data-a="no">Keep playing</button>
         <button class="mg-chess-btn mg-chess-alt" data-a="yes">Resign (${COINS.loss} coins)</button>
@@ -1641,32 +2047,41 @@ export class ChessGame extends Minigame {
       this.game.audio?.play?.('click');
       this.phase = 'play';
       this._hideOver();
+      this._pumpRemote();
     });
     card.querySelector('[data-a="yes"]').addEventListener('click', () => {
       this.phase = 'play';
       this._hideOver();
+      if (M) this._sendData({ resign: true });
       this._endGame('resign-loss');
     });
   }
 
   _confirmQuit() {
     this.game.audio?.play?.('click');
-    if (this.phase !== 'play' && this.phase !== 'think') { this.quit(); return; }
+    const live = !!this.match && !this.match.ended && this.phase !== 'over';
+    if (!live && this.phase !== 'play' && this.phase !== 'think') { this.quit(); return; }
     const prev = this.phase;
     this.phase = 'confirm';
     const card = this._showOver(`
       <h2>Leave the table?</h2>
-      <div class="mg-chess-sub">THE GAME IS ABANDONED AND NOBODY GETS PAID.</div>
+      <div class="mg-chess-sub">${live
+        ? `THE MATCH IS FORFEIT: ${esc(this.match.foeName.toUpperCase())} WINS IT.`
+        : 'THE GAME IS ABANDONED AND NOBODY GETS PAID.'}</div>
       <div class="mg-chess-btns">
         <button class="mg-chess-btn" data-a="no">Stay</button>
-        <button class="mg-chess-btn mg-chess-alt" data-a="yes">Back to the den</button>
+        <button class="mg-chess-btn mg-chess-alt" data-a="yes">${live ? 'Forfeit and leave' : 'Back to the den'}</button>
       </div>`);
     card.querySelector('[data-a="no"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this.phase = prev;
       this._hideOver();
+      this._pumpRemote();
     });
-    card.querySelector('[data-a="yes"]').addEventListener('click', () => this.quit());
+    card.querySelector('[data-a="yes"]').addEventListener('click', () => {
+      if (live) this._forfeitAndQuit();
+      else this.quit();
+    });
   }
 
   /** The player pushed a pup to the far shore: let them choose what it becomes. */
@@ -1687,11 +2102,12 @@ export class ChessGame extends Minigame {
       this.sel = from;
       this._cancelPromo = null;
       this.game.audio?.play?.('close');
+      this._pumpRemote();
     };
     card.querySelector('[data-a="cancel"]').addEventListener('click', () => this._cancelPromo?.());
     for (const btn of card.querySelectorAll('[data-t]')) {
       const t = Number(btn.dataset.t);
-      btn.insertBefore(pieceCanvas(t, false, 54), btn.firstChild);
+      btn.insertBefore(pieceCanvas(t, this.myColor === 1, 54), btn.firstChild);
       btn.addEventListener('click', () => {
         const m = this.legal.find((x) => mFrom(x) === from && mTo(x) === to && mPromo(x) === t);
         this._hideOver();
@@ -1708,12 +2124,13 @@ export class ChessGame extends Minigame {
 
   _results(kind) {
     this.phase = 'over';
-    const win = kind === 'mate-win' || kind === 'resign-win';
-    const loss = kind === 'mate-loss' || kind === 'resign-loss';
+    const M = this.match;
+    const win = WIN_KINDS.has(kind);
+    const loss = LOSS_KINDS.has(kind);
     this._outcome = win ? 'win' : loss ? 'loss' : 'draw';
 
-    const lead = materialLead(this.st);
-    const score = Math.max(0, lead) * 10 + (win ? WIN_BONUS : 0);
+    const lead = this._myLead();
+    const score = this._scoreFor(kind);
     const prevBest = this.game.state?.bests?.chess || 0;
     const isBest = score > prevBest;
     const coins = this.coinsForScore(score);
@@ -1730,12 +2147,32 @@ export class ChessGame extends Minigame {
       threefold: ['Draw: threefold.', 'THE SAME POSITION THREE TIMES. YOU ARE BOTH VERY STUBBORN.'],
       dead: ['Draw: dead position.', 'NOT ENOUGH PIECES LEFT ON THE POND TO MATE ANYONE.'],
     };
+    if (M) {
+      const foe = esc(M.foeName.toUpperCase());
+      Object.assign(HEAD, {
+        'mate-win': ['Checkmate!', `${foe} HAS NOWHERE LEFT TO GO. THE TABLE IS YOURS.`],
+        'mate-loss': ['Checkmate.', `${foe} FOLDS THEIR PAWS AND LOOKS VERY PLEASED INDEED.`],
+        'resign-win': [`${esc(M.foeName)} resigns!`, 'THEY TIP THE CROWNED ELDER OVER AND SHAKE YOUR PAW.'],
+        'resign-loss': ['You resigned.', 'YOU TIP YOUR ELDER OVER. THE PIECES GO BACK IN THE BOX.'],
+        'forfeit-win': ['They left the table!', `${foe} WANDERED OFF MID-GAME. THE WIN IS YOURS.`],
+        'forfeit-loss': ['Match forfeited.', 'THE TABLE WAS EMPTY ON YOUR SIDE, SO THE MATCH WENT THE OTHER WAY.'],
+        'match-win': ['You win!', `${foe} SETS THE PIECES BACK UP WITH GREAT DIGNITY.`],
+        'match-loss': ['You lose.', `${foe} WINS THIS ONE. THE BACK TABLE IS ALWAYS FREE.`],
+        'draw-agreed': ['Draw agreed.', 'PAWS SHAKEN OVER THE BOARD. VERY CIVIL, VERY COZY.'],
+      });
+    }
     const [title, sub] = HEAD[kind] || ['Game over', 'THE PIECES GO BACK IN THE BOX.'];
-    const leadText = lead > 0 ? `+${lead} you` : lead < 0 ? `+${-lead} Pebble` : 'even';
+    const them = M ? esc(M.foeShort) : 'Pebble';
+    const leadText = lead > 0 ? `+${lead} you` : lead < 0 ? `+${-lead} ${them}` : 'even';
 
     this.game.audio?.play?.(win ? 'success' : loss ? 'fail' : 'ding');
-    this._setExpr(win ? 'beaten' : loss ? 'smug' : 'idle',
-      win ? 'defeated' : loss ? 'insufferable' : 'a fair result');
+    if (M) {
+      this._setExpr(win ? 'beaten' : loss ? 'smug' : 'idle',
+        win ? 'well played' : loss ? 'good game' : 'a fair result');
+    } else {
+      this._setExpr(win ? 'beaten' : loss ? 'smug' : 'idle',
+        win ? 'defeated' : loss ? 'insufferable' : 'a fair result');
+    }
 
     const card = this._showOver(`
       ${isBest && score > 0 ? '<div class="mg-chess-ribbon">NEW PERSONAL BEST</div>' : ''}
@@ -1749,13 +2186,22 @@ export class ChessGame extends Minigame {
       <div class="mg-chess-stats">
         <div class="mg-chess-stat"><b>${leadText}</b><span>MATERIAL</span></div>
         <div class="mg-chess-stat"><b>${Math.ceil(this.history.length / 2)}</b><span>MOVES</span></div>
+        ${M && win ? `<div class="mg-chess-stat mg-chess-gold"><b>+${MATCH_BONUS}</b><span>MATCH BONUS</span></div>` : ''}
       </div>
       <div class="mg-chess-btns">
-        <button class="mg-chess-btn" data-a="again">Play again</button>
-        <button class="mg-chess-btn mg-chess-alt" data-a="leave">Back to the den</button>
+        ${M ? '<button class="mg-chess-btn" data-a="leave">Back to the den</button>'
+    + '<button class="mg-chess-btn mg-chess-alt" data-a="pebble">Play Pebble</button>'
+    : '<button class="mg-chess-btn" data-a="again">Play again</button>'
+    + '<button class="mg-chess-btn mg-chess-alt" data-a="leave">Back to the den</button>'}
       </div>`);
-    card.querySelector('[data-a="again"]').addEventListener('click', () => {
+    card.querySelector('[data-a="again"]')?.addEventListener('click', () => {
       this._done = false; // let the next game report its own result
+      this._outcome = null;
+      this._countdown();
+    });
+    card.querySelector('[data-a="pebble"]')?.addEventListener('click', () => {
+      this._leaveMatch();
+      this._done = false;
       this._outcome = null;
       this._countdown();
     });
@@ -1788,29 +2234,44 @@ export class ChessGame extends Minigame {
     if (this.el.trayPebble) this.el.trayPebble.innerHTML = '';
     if (this.el.trayYou) this.el.trayYou.innerHTML = '';
     if (this.el.fx) this.el.fx.innerHTML = '';
-    this._setExpr('idle', 'polishing monocle');
+    this._setExpr('idle', this.match ? 'ready when you are' : 'polishing monocle');
     this._syncTurn();
   }
 
   _syncTurn() {
-    const mine = this.st.turn === 0;
-    this.el.turn.textContent = mine ? 'You' : 'Pebble';
+    const M = this.match;
+    const mine = this.st.turn === this.myColor;
+    this.el.turn.textContent = mine ? 'You' : (M ? M.foeShort : 'Pebble');
     this.el.turnChip.classList.toggle('mg-chess-theirs', !mine);
     this.el.movenum.textContent = String(this.st.full);
-    const lead = materialLead(this.st);
+    const lead = this._myLead();
     this.el.lead.textContent = lead > 0 ? `+${lead}` : lead < 0 ? `${lead}` : 'even';
     this.el.leadChip.classList.toggle('mg-chess-theirs', lead < 0);
     this.el.leadYou.textContent = lead > 0 ? `+${lead}` : '';
     this.el.leadPebble.textContent = lead < 0 ? `+${-lead}` : '';
     this.el.pcard.classList.toggle('mg-chess-active', !mine && this.phase !== 'over');
     this.el.ycard.classList.toggle('mg-chess-active', mine && this.phase !== 'over');
+
+    // no clocks in a match: the board pulses instead, and the turn chip bumps
+    // once (with a ding) the moment the move comes back to us
+    const live = !!M && !M.ended && !M.frozen && this.phase === 'play';
+    if (this.el.board) this.el.board.classList.toggle('mg-chess-nudge', live && mine);
+    if (live && mine && this._lastTurnMine === false) {
+      this.game.audio?.play?.('ding');
+      const chip = this.el.turnChip;
+      chip.classList.remove('mg-chess-bump');
+      void chip.offsetWidth;
+      chip.classList.add('mg-chess-bump');
+      this._after(360, () => chip.classList.remove('mg-chess-bump'));
+    }
+    this._lastTurnMine = M ? mine : null;
   }
 
-  _pushMove(san, byPebble) {
+  _pushMove(san, byWhite) {
     const list = this.el.moves;
     const prev = list.querySelector('.mg-chess-latest');
     if (prev) prev.classList.remove('mg-chess-latest');
-    if (!byPebble) {
+    if (byWhite) {
       const li = document.createElement('li');
       li.className = 'mg-chess-latest mg-chess-half';
       li.innerHTML = `<i>${Math.floor(this.history.length / 2) + 1}.</i><span></span><span></span>`;
@@ -1831,14 +2292,14 @@ export class ChessGame extends Minigame {
     list.scrollTop = list.scrollHeight;
   }
 
-  _addCapture(piece, byPebble) {
-    const tray = byPebble ? this.el.trayPebble : this.el.trayYou;
+  _addCapture(piece, byOpp) {
+    const tray = byOpp ? this.el.trayPebble : this.el.trayYou;
     tray.appendChild(pieceCanvas(typeOf(piece), colorOf(piece) === 1, 20));
   }
 
   _status() {
     if (!this.legal.length) {
-      if (inCheck(this.st)) return this.st.turn === 1 ? 'mate-win' : 'mate-loss';
+      if (inCheck(this.st)) return this.st.turn === this.myColor ? 'mate-loss' : 'mate-win';
       return 'stalemate';
     }
     if (this.st.half >= 100) return 'fifty';
@@ -1848,7 +2309,7 @@ export class ChessGame extends Minigame {
   }
 
   /** Play a move on the board and start its animation. */
-  _applyMove(m, byPebble) {
+  _applyMove(m, byOpp) {
     const st = this.st;
     const from = mFrom(m), to = mTo(m), flag = mFlag(m), promo = mPromo(m);
     const mover = st.b[from];
@@ -1857,11 +2318,14 @@ export class ChessGame extends Minigame {
     const capSq = flag === FLAG_EP ? to + (us === 0 ? 8 : -8) : (st.b[to] ? to : -1);
     const capPiece = capSq >= 0 ? st.b[capSq] : 0;
 
+    // our own move goes out before we animate it: they see it as soon as possible
+    if (this.match && !byOpp) this._sendData({ move: promo ? { from, to, promo } : { from, to } });
+
     makeMove(st, m);
     this.legal = legalMoves(st);
     this.curKey = posKey(st);
     this.keys.set(this.curKey, (this.keys.get(this.curKey) || 0) + 1);
-    this._pushMove(san, byPebble);
+    this._pushMove(san, us === 0);
     this.lastMove = { from, to };
     this.sel = -1;
     this.drag = null;
@@ -1876,7 +2340,7 @@ export class ChessGame extends Minigame {
     }
     this.anim = {
       t: 0,
-      dur: byPebble ? 0.26 : 0.18,
+      dur: byOpp ? 0.26 : 0.18,
       pieces,
       hide,
       cap: capPiece ? { piece: capPiece, sq: capSq } : null,
@@ -1886,51 +2350,69 @@ export class ChessGame extends Minigame {
     const audio = this.game.audio;
     if (capPiece) {
       audio?.play?.('pop');
-      this._addCapture(capPiece, byPebble);
+      this._addCapture(capPiece, byOpp);
       this._puff(capSq, colorOf(capPiece) === 1 ? '#8a6642' : '#fff4dc');
       const worth = POINTS[typeOf(capPiece)];
       if (worth >= 3) this._shake();
-      if (!byPebble) this._float(`+${worth}`, to, 'mg-chess-good');
+      if (!byOpp) this._float(`+${worth}`, to, 'mg-chess-good');
       if (flag === FLAG_EP) this._float('EN PASSANT!', to, 'mg-chess-good');
     } else {
       audio?.play?.(flag === FLAG_CASTLE ? 'slide' : 'thud');
     }
-    if (flag === FLAG_CASTLE && !byPebble) this._float('CASTLES!', to, '');
+    if (flag === FLAG_CASTLE && !byOpp) this._float('CASTLES!', to, '');
     this._syncTurn();
-    this._animDone = () => this._afterMove(byPebble, capPiece, flag, promo);
+    this._animDone = () => this._afterMove(byOpp, capPiece, flag, promo);
   }
 
-  _afterMove(byPebble, capPiece, flag, promo) {
+  _afterMove(byOpp, capPiece, flag, promo) {
     if (this._dead) return;
     this.anim = null;
     const st = this.st;
     const check = inCheck(st);
     const status = this._status();
 
-    if (check && !status) {
+    // the portrait belongs to whoever is sitting opposite: Pebble has opinions,
+    // a real capybara just gets a face that mirrors how the board is going
+    if (this.match) {
+      if (check && !status) {
+        this.game.audio?.play?.('ding');
+        this._float('CHECK!', st.k[st.turn], 'mg-chess-warn');
+        this._setExpr(byOpp ? 'smug' : 'worried', byOpp ? 'you are in check' : 'check!');
+      } else if (capPiece) {
+        this._setExpr(byOpp ? 'smug' : 'worried', byOpp ? 'they took one' : 'you took one');
+      } else if (promo) {
+        this._setExpr(byOpp ? 'smug' : 'worried', 'promotion');
+      }
+    } else if (check && !status) {
       this.game.audio?.play?.('ding');
       this._float('CHECK!', st.k[st.turn], 'mg-chess-warn');
-      if (byPebble) this._setExpr('smug', 'check!', pick(LINES.theirCheck));
+      if (byOpp) this._setExpr('smug', 'check!', pick(LINES.theirCheck));
       else this._setExpr('worried', 'in check', pick(LINES.myCheck));
-    } else if (!byPebble && capPiece) {
+    } else if (!byOpp && capPiece) {
       this._setExpr('worried', 'that stung', pick(LINES.iTake));
-    } else if (byPebble && capPiece) {
+    } else if (byOpp && capPiece) {
       this._setExpr('smug', 'thank you', pick(LINES.theyTake));
-    } else if (byPebble && flag === FLAG_CASTLE) {
+    } else if (byOpp && flag === FLAG_CASTLE) {
       this._setExpr('idle', 'tucked in', pick(LINES.castle));
     } else if (promo) {
-      this._setExpr(byPebble ? 'smug' : 'worried', 'promotion', pick(LINES.promo));
+      this._setExpr(byOpp ? 'smug' : 'worried', 'promotion', pick(LINES.promo));
     }
 
     if (status) { this._endGame(status); return; }
 
     this.busy = false;
-    if (st.turn === 1) this._pebbleTurn();
+    if (this.match) {
+      const mine = st.turn === this.myColor;
+      if (!check && !capPiece && !promo) this._setExpr(mine ? 'idle' : 'think', mine ? 'your move' : 'thinking');
+      this._syncTurn();
+      this._pumpRemote();
+    } else if (st.turn === 1) this._pebbleTurn();
     else this._syncTurn();
   }
 
+  /** Solo only: Pebble never runs during a table match. */
   _pebbleTurn() {
-    if (this.phase === 'over' || this._dead) return;
+    if (this.phase === 'over' || this._dead || this.match) return;
     this.busy = true;
     const played = this.history.length;
     const warming = played < 8;
@@ -1974,11 +2456,19 @@ export class ChessGame extends Minigame {
     this.phase = 'over';
     this.sel = -1;
     this.drag = null;
-    this.el.pcard.classList.remove('mg-chess-active');
-    this.el.ycard.classList.remove('mg-chess-active');
+    this.el.pcard?.classList.remove('mg-chess-active');
+    this.el.ycard?.classList.remove('mg-chess-active');
+    this.el.board?.classList.remove('mg-chess-nudge');
+    if (this.el.offer) this.el.offer.disabled = true;
 
-    const win = kind === 'mate-win' || kind === 'resign-win';
-    const loss = kind === 'mate-loss' || kind === 'resign-loss';
+    const win = WIN_KINDS.has(kind);
+    const loss = LOSS_KINDS.has(kind);
+    // report to the server before the results screen: both seats agree on the
+    // winner because both ran the same rules over the same move list
+    if (this.match) {
+      this.match.queue.length = 0;
+      this._reportMatch(kind, this._scoreFor(kind));
+    }
     if (kind === 'mate-win' || kind === 'mate-loss') {
       this._float('CHECKMATE!', this.st.k[this.st.turn], win ? 'mg-chess-good' : 'mg-chess-warn');
       this._shake();
@@ -1986,13 +2476,19 @@ export class ChessGame extends Minigame {
     } else if (!win && !loss) {
       this._float('DRAW', 36, '');
     }
-    this._after(kind === 'resign-loss' ? 260 : 900, () => this._results(kind));
+    const quick = kind === 'resign-loss' || kind === 'forfeit-loss' || kind === 'forfeit-win';
+    this._after(quick ? 320 : 900, () => this._results(kind));
   }
 
   // ---- input ---------------------------------------------------------------
   _playable() {
-    return this.phase === 'play' && this.st.turn === 0 && !this.busy && !this.anim;
+    if (this.match && (this.match.frozen || this.match.ended)) return false;
+    return this.phase === 'play' && this.st.turn === this.myColor && !this.busy && !this.anim;
   }
+
+  /** Board square <-> screen cell. Seat 1 sees the board from the other end,
+   *  and the mapping is its own inverse, so one helper covers both ways. */
+  _disp(sq) { return this.flip ? 63 - sq : sq; }
 
   _sqAt(e) {
     const rect = this.el.canvas.getBoundingClientRect();
@@ -2000,7 +2496,7 @@ export class ChessGame extends Minigame {
     if (x < 0 || y < 0 || x >= rect.width || y >= rect.height) return -1;
     const f = Math.floor((x / rect.width) * 8);
     const r = Math.floor((y / rect.height) * 8);
-    return r * 8 + f;
+    return this._disp(r * 8 + f);
   }
 
   _movesFrom(sq) {
@@ -2013,7 +2509,7 @@ export class ChessGame extends Minigame {
     if (sq < 0) return;
     this.cursor = -1;
     const p = this.st.b[sq];
-    if (p && colorOf(p) === 0) {
+    if (p && colorOf(p) === this.myColor) {
       if (this._movesFrom(sq).length === 0) {
         this.game.audio?.play?.('close');
         this._float('stuck!', sq, 'mg-chess-warn');
@@ -2051,7 +2547,7 @@ export class ChessGame extends Minigame {
     const options = this.legal.filter((m) => mFrom(m) === from && mTo(m) === to);
     if (!options.length) {
       const p = this.st.b[to];
-      if (p && colorOf(p) === 0) { this.sel = to; this.game.audio?.play?.('click'); }
+      if (p && colorOf(p) === this.myColor) { this.sel = to; this.game.audio?.play?.('click'); }
       else { this.sel = -1; this.game.audio?.play?.('close'); }
       return;
     }
@@ -2076,12 +2572,14 @@ export class ChessGame extends Minigame {
     const ARROWS = { ArrowUp: -8, ArrowDown: 8, ArrowLeft: -1, ArrowRight: 1 };
     if (Object.prototype.hasOwnProperty.call(ARROWS, e.key)) {
       e.preventDefault();
-      if (this.cursor < 0) this.cursor = this.sel >= 0 ? this.sel : 60;
+      // arrows walk the board as it LOOKS, so up is always up the screen
+      if (this.cursor < 0) this.cursor = this.sel >= 0 ? this.sel : (this.myColor === 0 ? 60 : 4);
       else {
         const d = ARROWS[e.key];
-        const f = (this.cursor & 7) + (d === -1 ? -1 : d === 1 ? 1 : 0);
-        const r = (this.cursor >> 3) + (d === -8 ? -1 : d === 8 ? 1 : 0);
-        if (f >= 0 && f < 8 && r >= 0 && r < 8) this.cursor = r * 8 + f;
+        const cur = this._disp(this.cursor);
+        const f = (cur & 7) + (d === -1 ? -1 : d === 1 ? 1 : 0);
+        const r = (cur >> 3) + (d === -8 ? -1 : d === 8 ? 1 : 0);
+        if (f >= 0 && f < 8 && r >= 0 && r < 8) this.cursor = this._disp(r * 8 + f);
       }
       this.game.audio?.play?.('hover');
       return;
@@ -2090,7 +2588,7 @@ export class ChessGame extends Minigame {
       e.preventDefault();
       const p = this.st.b[this.cursor];
       if (this.sel >= 0 && this.sel !== this.cursor) this._tryMove(this.sel, this.cursor);
-      else if (p && colorOf(p) === 0 && this._movesFrom(this.cursor).length) {
+      else if (p && colorOf(p) === this.myColor && this._movesFrom(this.cursor).length) {
         this.sel = this.cursor;
         this.game.audio?.play?.('click');
       }
@@ -2099,7 +2597,14 @@ export class ChessGame extends Minigame {
 
   // ---- effects -------------------------------------------------------------
   _center(sq) {
-    return { x: ((sq & 7) + 0.5) * this.cell, y: ((sq >> 3) + 0.5) * this.cell };
+    const d = this._disp(sq);
+    return { x: ((d & 7) + 0.5) * this.cell, y: ((d >> 3) + 0.5) * this.cell };
+  }
+
+  /** Top-left corner of a board square in canvas pixels. */
+  _corner(sq) {
+    const d = this._disp(sq);
+    return { x: (d & 7) * this.cell, y: (d >> 3) * this.cell };
   }
 
   _float(text, sq, cls = '') {
@@ -2159,6 +2664,8 @@ export class ChessGame extends Minigame {
         if (done) done();
       }
     }
+    // a packet can land in any frame: drain it as soon as the board is calm
+    if (this.match?.queue.length) this._pumpRemote();
 
     for (let i = this.parts.length - 1; i >= 0; i--) {
       const p = this.parts[i];
@@ -2200,8 +2707,9 @@ export class ChessGame extends Minigame {
     ctx.restore();
 
     const fill = (sq, style) => {
+      const p = this._corner(sq);
       ctx.fillStyle = style;
-      ctx.fillRect((sq & 7) * cell, (sq >> 3) * cell, cell, cell);
+      ctx.fillRect(p.x, p.y, cell, cell);
     };
     if (this.lastMove) {
       fill(this.lastMove.from, 'rgba(242,182,74,.42)');
@@ -2209,19 +2717,21 @@ export class ChessGame extends Minigame {
     }
     if (this.sel >= 0) fill(this.sel, 'rgba(232,101,122,.45)');
     if (this.cursor >= 0) {
+      const p = this._corner(this.cursor);
       ctx.strokeStyle = '#4fb3e8';
       ctx.lineWidth = Math.max(2, cell * 0.06);
-      ctx.strokeRect((this.cursor & 7) * cell + 2, (this.cursor >> 3) * cell + 2, cell - 4, cell - 4);
+      ctx.strokeRect(p.x + 2, p.y + 2, cell - 4, cell - 4);
     }
     if (inCheck(st)) {
       const k = st.k[st.turn];
       const c = this._center(k);
+      const p = this._corner(k);
       const pulse = 0.55 + Math.sin(this._time * 7) * 0.2;
       const g = ctx.createRadialGradient(c.x, c.y, cell * 0.1, c.x, c.y, cell * 0.62);
       g.addColorStop(0, `rgba(232,80,100,${pulse})`);
       g.addColorStop(1, 'rgba(232,80,100,0)');
       ctx.fillStyle = g;
-      ctx.fillRect((k & 7) * cell, (k >> 3) * cell, cell, cell);
+      ctx.fillRect(p.x, p.y, cell, cell);
     }
 
     // legal move hints for the selected piece
@@ -2266,7 +2776,8 @@ export class ChessGame extends Minigame {
       if (!p) continue;
       if (anim && anim.hide.has(sq)) continue;
       if (this.drag && this.drag.moved && this.drag.from === sq) continue;
-      ctx.drawImage(sprite(p), (sq & 7) * cell, (sq >> 3) * cell, cell, cell);
+      const at = this._corner(sq);
+      ctx.drawImage(sprite(p), at.x, at.y, cell, cell);
     }
 
     if (anim) {
@@ -2310,9 +2821,9 @@ export class ChessGame extends Minigame {
     ctx.textBaseline = 'top';
     for (let i = 0; i < 8; i++) {
       ctx.fillStyle = (i & 1) ? 'rgba(45,36,23,.42)' : 'rgba(255,246,227,.62)';
-      ctx.fillText(`${8 - i}`, 3, i * cell + 3);
+      ctx.fillText(this.flip ? `${i + 1}` : `${8 - i}`, 3, i * cell + 3);
       ctx.fillStyle = (i & 1) ? 'rgba(255,246,227,.62)' : 'rgba(45,36,23,.42)';
-      ctx.fillText('abcdefgh'[i], i * cell + cell - cell * 0.22, size - cell * 0.24);
+      ctx.fillText('abcdefgh'[this.flip ? 7 - i : i], i * cell + cell - cell * 0.22, size - cell * 0.24);
     }
   }
 }
