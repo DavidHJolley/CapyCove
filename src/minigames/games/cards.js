@@ -1,11 +1,52 @@
+import * as THREE from 'three';
 import { Minigame } from '../minigame.js';
+import { makeToon, makeGlow, canvasTexture, disposeObject } from '../../core/materials.js';
+import { buildHat } from '../../player/hats.js';
+import { buildCritter } from './critters.js';
 import { clampCoinsForGame } from '../../../shared/constants.js';
 
 /**
  * Capy Clash : the Game Den's flagship 1v1 card duel (docs/CARDGAME.md).
  *
- * Pure DOM + 2D canvas (no WebGL). Every card face, capybara portrait and
- * element icon is drawn procedurally on a canvas; the table is CSS art.
+ * v2 SPECTACLE (docs/CARDGAME.md section 10). The rules, the AI, the coins and
+ * the PvP wire protocol are EXACTLY what shipped in v1: everything added here
+ * is a presentation layer that reads the rules core's own `S.fx` event log and
+ * puts on a show. The hand stays 2D DOM (readability first); the board is a 3D
+ * battle diorama rendered by one WebGLRenderer behind the DOM.
+ *
+ * How the show is wired (the rules for the rules of the show):
+ *  - `_consumeFx()` is the ONLY bridge. It splices the rules core's event log
+ *    and turns it into stage beats. The stage never writes to `S`.
+ *  - An action event (summon / swing / cast) claims the events that follow it
+ *    in the same batch and replays their juice at the dramatic moment (the slam,
+ *    the impact, the spell payload). State is already applied by then: only the
+ *    pixels are late.
+ *  - Nothing in here touches `_sendMove`, `_onMatchMove` or the `busy` windows
+ *    that pace remote intents, so a den match runs at exactly the timings it
+ *    ran at before. Animations are local; the queue plays over the authoritative
+ *    state and is reconciled against the board every render (`_syncStage`).
+ *  - Input is blocked only during hit-stop (<=90ms) and the finish cam (<=1.5s).
+ *    A 'fast mode' toggle on the splash halves every duration constant, and
+ *    prefers-reduced-motion collapses shakes and flashes into fades.
+ *
+ * The 3D critter models come from ./critters.js. Contract consumed here:
+ *    buildCritter(cardId) -> { group, update(dtSeconds), play(name)->seconds,
+ *                              dispose(), id, name, el, height, tris, speed }
+ *    play(name): 'attack' | 'hurt' | 'ko' | 'cheer'; overlays pose the rig
+ *    around its own origin and the STAGE moves the group across the board.
+ *    `speed` is a rate (2 = twice as fast), so fast mode sets 1 / this.speed.
+ * That module also exports `buildElementBurst` and `CRITTER_IDS`; neither is
+ * used here on purpose. Section 10 asks for ONE pooled instanced particle
+ * system for the whole diorama, and this file already owns it, so every burst,
+ * mote and shatter comes out of that pool instead. The rig's own contact-shadow
+ * blob is hidden for the same reason (the stage draws the slot's shadow).
+ * If a build ever throws, `buildFallbackCritter` in this file covers all 14 from
+ * the same `look` data the 2D card art uses, so the duel always has a cast.
+ *
+ * DOM geometry drives the diorama, never the other way round: the slot divs,
+ * the two capy chips and the table area are measured and unprojected onto the
+ * arena plane, so every 3D critter stands exactly under its own hit zone at any
+ * window size. That keeps clicking, highlights and `_slotPoint` untouched.
  *
  * The rules live in a DOM-free core near the top of this file so the AI can be
  * played against itself headlessly for balance work:
@@ -1455,6 +1496,1705 @@ function paintFace(cv, size, cfg, expr) {
   drawDuelistFace(ctx, size, cfg, expr);
 }
 
+/**
+ * The board no longer shows a whole card: the critter itself is standing there
+ * in 3D, so the slot only carries what a spectator has to read at a glance -
+ * attack, health, and whether it is guarding or still napping. The name and the
+ * rules text live on the card in hand and in the hover panel.
+ */
+function drawPlaque(ctx, def, live) {
+  const E = ELEMENTS[def.el] || ELEMENTS.neutral;
+  const atk = live ? live.atk : def.atk;
+  const hp = live ? live.hp : def.hp;
+  const buffed = live && live.atk > def.atk;
+  const hurt = live && live.hp < def.hp;
+  const guard = live ? live.guard : has(def, 'guard');
+  const resting = !!(live && live.resting);
+
+  ctx.save();
+  // a soft plate behind the pips so they read against any colour of moss
+  rrect(ctx, 26, 14, 148, 40, 20);
+  ctx.fillStyle = 'rgba(20,13,7,.62)';
+  ctx.fill();
+
+  const pip = (x, fill, value, glow) => {
+    if (glow) {
+      ctx.beginPath();
+      ctx.arc(x, 34, 32, 0, Math.PI * 2);
+      ctx.fillStyle = glow;
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(x, 34, 25, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ink(ctx, 5);
+    ctx.fillStyle = '#fffdf6';
+    ctx.font = '900 32px "Trebuchet MS", "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(value), x, 36);
+  };
+  pip(32, buffed ? '#7ac74f' : '#f2b64a', atk, buffed ? 'rgba(122,199,79,.5)' : null);
+  pip(168, hurt ? '#e04a4a' : '#e8657a', hp, hurt ? 'rgba(224,74,74,.45)' : null);
+
+  // element dot in the middle, with the state badge stacked under it
+  ctx.beginPath();
+  ctx.arc(100, 30, 13, 0, Math.PI * 2);
+  ctx.fillStyle = E.c1;
+  ctx.fill();
+  ink(ctx, 4, shade(E.deep, -0.1));
+  if (guard) {
+    ctx.beginPath();
+    ctx.moveTo(100, 22);
+    ctx.lineTo(108, 26);
+    ctx.lineTo(108, 33);
+    ctx.quadraticCurveTo(108, 39, 100, 42);
+    ctx.quadraticCurveTo(92, 39, 92, 33);
+    ctx.lineTo(92, 26);
+    ctx.closePath();
+    ctx.fillStyle = '#dff3ff';
+    ctx.fill();
+    ink(ctx, 3.4);
+  }
+  if (resting) {
+    ctx.fillStyle = '#ffeec9';
+    ctx.font = '900 17px "Trebuchet MS", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('z z', 100, 60);
+  }
+  ctx.restore();
+}
+
+function paintPlaque(cv, W, def, live) {
+  const H = Math.round(W * 0.34);
+  if (cv.width !== W) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext('2d');
+  const k = W / 200;
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.clearRect(0, 0, 200, 68);
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  drawPlaque(ctx, def, live);
+}
+
+// ===========================================================================
+// THE BATTLE DIORAMA : one WebGLRenderer, procedural everything.
+//
+// Layout rule: the DOM is the source of truth. Every anchor (slot, capy bust,
+// table footprint) is measured off its DOM box and unprojected onto the arena
+// plane, so the 3D show always lines up with the hit zones and highlight rings
+// that the v1 board already had. Nothing in here reads or writes duel state.
+// ===========================================================================
+
+/** Element palette in 3D. `mote` is what a thing shatters into. */
+const EL3 = {
+  sun: { light: 0xffd070, deep: 0xe07f16, mote: 0xffe6a8, rim: 0xffc46a },
+  sea: { light: 0x7fd0f0, deep: 0x2478b8, mote: 0xd8f2ff, rim: 0x5fc6f0 },
+  snow: { light: 0xeaf6ff, deep: 0x8fb6d8, mote: 0xffffff, rim: 0xbfe2ff },
+  neutral: { light: 0xe6cfa4, deep: 0x9c7c4e, mote: 0xf7e6c4, rim: 0xdcc094 },
+};
+const TRI_CALL = { sun: 'MELTED!', snow: 'FROSTED!', sea: 'SOAKED!' };
+
+/** Every timing the show runs on, in ms. Fast mode halves the lot (see `d()`). */
+const DUR = {
+  fly: 300, slam: 110, beam: 190, grow: 250,
+  crouch: 150, leap: 240, hitstop: 90, hop: 200,
+  koCrack: 200, koPause: 90, koShatter: 340,
+  spell: 1100, banner: 900, finish: 950, white: 340,
+};
+
+function numOf(cssHex) { return parseInt(String(cssHex).slice(1), 16) || 0; }
+/** shade() for 0xrrggbb numbers: >0 lifts toward cream, <0 sinks toward ink. */
+function shadeNum(n, amt) { return numOf(shade(hexOf(n), amt)); }
+/** The cove's ink, as a 3D colour (never pure black: see DESIGN.md). */
+const INK3 = 0x2d2417;
+
+// --- geometry merging: one critter = one draw call ---------------------------
+const _mQ = new THREE.Quaternion();
+const _mE = new THREE.Euler();
+const _mV = new THREE.Vector3();
+const _mS = new THREE.Vector3();
+
+/** Push a primitive into a parts list with a local transform + flat colour. */
+function part(list, geo, color, pos, rot, scale) {
+  const m = new THREE.Matrix4();
+  _mE.set(rot ? rot[0] : 0, rot ? rot[1] : 0, rot ? rot[2] : 0);
+  _mQ.setFromEuler(_mE);
+  _mV.set(pos ? pos[0] : 0, pos ? pos[1] : 0, pos ? pos[2] : 0);
+  if (typeof scale === 'number') _mS.setScalar(scale);
+  else _mS.set(scale ? scale[0] : 1, scale ? scale[1] : 1, scale ? scale[2] : 1);
+  m.compose(_mV, _mQ, _mS);
+  list.push({ geo, color, m });
+}
+
+/**
+ * Bake a parts list into one vertex-coloured BufferGeometry and dispose the
+ * sources. Handles indexed and non-indexed primitives (polyhedra are the
+ * non-indexed ones), so a whole critter renders in a single draw call.
+ */
+function mergeParts(parts) {
+  if (!parts.length) return null;
+  let vTotal = 0, iTotal = 0;
+  for (const p of parts) {
+    const pos = p.geo.attributes.position;
+    vTotal += pos.count;
+    iTotal += p.geo.index ? p.geo.index.count : pos.count;
+  }
+  const position = new Float32Array(vTotal * 3);
+  const normal = new Float32Array(vTotal * 3);
+  const color = new Float32Array(vTotal * 3);
+  const index = vTotal > 65535 ? new Uint32Array(iTotal) : new Uint16Array(iTotal);
+  const nm = new THREE.Matrix3();
+  const v = new THREE.Vector3();
+  const c = new THREE.Color();
+  let vo = 0, io = 0;
+  for (const p of parts) {
+    const g = p.geo;
+    const gp = g.attributes.position;
+    const gn = g.attributes.normal;
+    nm.getNormalMatrix(p.m);
+    c.set(p.color);
+    for (let i = 0; i < gp.count; i++) {
+      v.fromBufferAttribute(gp, i).applyMatrix4(p.m);
+      position[(vo + i) * 3] = v.x;
+      position[(vo + i) * 3 + 1] = v.y;
+      position[(vo + i) * 3 + 2] = v.z;
+      if (gn) v.fromBufferAttribute(gn, i).applyMatrix3(nm).normalize();
+      else v.set(0, 1, 0);
+      normal[(vo + i) * 3] = v.x;
+      normal[(vo + i) * 3 + 1] = v.y;
+      normal[(vo + i) * 3 + 2] = v.z;
+      color[(vo + i) * 3] = c.r;
+      color[(vo + i) * 3 + 1] = c.g;
+      color[(vo + i) * 3 + 2] = c.b;
+    }
+    const gi = g.index;
+    const n = gi ? gi.count : gp.count;
+    for (let i = 0; i < n; i++) index[io + i] = (gi ? gi.getX(i) : i) + vo;
+    vo += gp.count;
+    io += n;
+    g.dispose();
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(position, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
+  out.setAttribute('color', new THREE.BufferAttribute(color, 3));
+  out.setIndex(new THREE.BufferAttribute(index, 1));
+  out.computeBoundingSphere();
+  return out;
+}
+
+/** Wrap a parts list into a Group: one toon mesh + one unlit glow mesh. */
+function bakeModel(solid, glow) {
+  const g = new THREE.Group();
+  const owned = { geos: [], mats: [] };
+  const sg = mergeParts(solid);
+  if (sg) {
+    const mat = makeToon(0xffffff, { unique: true, vertexColors: true });
+    const mesh = new THREE.Mesh(sg, mat);
+    g.add(mesh);
+    owned.geos.push(sg);
+    owned.mats.push(mat);
+    g.userData.solid = mesh;
+  }
+  const gg = mergeParts(glow);
+  if (gg) {
+    const mat = makeGlow(0xffffff, { unique: true });
+    mat.vertexColors = true;
+    mat.transparent = true;
+    const mesh = new THREE.Mesh(gg, mat);
+    g.add(mesh);
+    owned.geos.push(gg);
+    owned.mats.push(mat);
+    g.userData.glow = mesh;
+  }
+  g.userData.owned = owned;
+  return g;
+}
+
+function freeModel(g) {
+  if (!g) return;
+  const owned = g.userData && g.userData.owned;
+  if (owned) {
+    for (const geo of owned.geos) geo.dispose();
+    for (const m of owned.mats) m.dispose();
+  } else {
+    disposeObject(g);
+  }
+  g.clear();
+}
+
+// --- the fallback cast -------------------------------------------------------
+// Used until (or instead of) ./critters.js resolves. One chibi capy rig driven
+// by the same `look` data the 2D card art uses, so all 14 read differently.
+
+function buildFallbackCritter(cardId) {
+  const def = CARDS[cardId] || CARDS.pebble_pal;
+  const look = def.look || {};
+  const el = EL3[def.el] || EL3.neutral;
+  const fur = numOf(look.fur || '#b08a5a');
+  const furDark = numOf(shade(look.fur || '#b08a5a', -0.3));
+  const solid = [];
+  const glow = [];
+
+  // feet
+  for (const sx of [-1, 1]) {
+    part(solid, new THREE.BoxGeometry(0.16, 0.1, 0.24), furDark, [sx * 0.15, 0.05, 0.1]);
+  }
+  // body: Pebble Pal is literally a rock doing its best
+  if (look.prop === 'pebble') {
+    part(solid, new THREE.IcosahedronGeometry(0.3, 0), 0xa9a79c, [0, 0.3, 0], [0.3, 0.6, 0.1], [1, 0.92, 0.9]);
+  } else {
+    part(solid, new THREE.SphereGeometry(0.26, 8, 6), fur, [0, 0.32, 0], null, [1.06, 0.98, 0.92]);
+  }
+  // head + face
+  part(solid, new THREE.SphereGeometry(0.24, 8, 6), fur, [0, 0.72, 0.02], null, [1.12, 1, 1]);
+  part(solid, new THREE.SphereGeometry(0.13, 7, 5), numOf(shade(look.fur || '#b08a5a', 0.18)), [0, 0.665, 0.19], null, [0.95, 0.62, 0.62]);
+  part(solid, new THREE.BoxGeometry(0.09, 0.055, 0.05), INK3, [0, 0.71, 0.27]);
+  for (const sx of [-1, 1]) {
+    part(solid, new THREE.SphereGeometry(0.075, 6, 5), furDark, [sx * 0.2, 0.89, -0.02], null, [1, 1, 0.6]);
+    part(solid, new THREE.SphereGeometry(0.04, 6, 5), INK3, [sx * 0.1, 0.785, 0.19]);
+  }
+  part(solid, new THREE.SphereGeometry(0.06, 6, 5), furDark, [0, 0.3, -0.26]);
+
+  switch (look.prop) {
+    case 'shades':
+      part(solid, new THREE.BoxGeometry(0.34, 0.085, 0.05), 0x2a2a33, [0, 0.795, 0.2]);
+      for (const sx of [-1, 1]) {
+        part(glow, new THREE.BoxGeometry(0.13, 0.07, 0.02), 0x8fd8ff, [sx * 0.09, 0.795, 0.235]);
+      }
+      break;
+    case 'board':
+      part(solid, new THREE.SphereGeometry(0.3, 7, 5), 0xfff6e3, [-0.3, 0.44, -0.06], [0, 0, 0.55], [0.36, 0.11, 1]);
+      part(solid, new THREE.SphereGeometry(0.3, 6, 4), 0xe8657a, [-0.3, 0.46, -0.06], [0, 0, 0.55], [0.1, 0.1, 0.98]);
+      break;
+    case 'scarf':
+      part(solid, new THREE.TorusGeometry(0.2, 0.06, 6, 12), 0xe8657a, [0, 0.55, 0.02], [Math.PI / 2, 0, 0]);
+      part(solid, new THREE.BoxGeometry(0.1, 0.24, 0.06), 0xd44f66, [0.16, 0.42, 0.14], [0, 0, 0.35]);
+      break;
+    case 'ring':
+      part(solid, new THREE.TorusGeometry(0.3, 0.085, 6, 14), 0xfff6e3, [0, 0.3, 0], [Math.PI / 2, 0, 0]);
+      part(solid, new THREE.TorusGeometry(0.3, 0.088, 4, 6), 0x4fb3e8, [0, 0.3, 0], [Math.PI / 2, 0.4, 0]);
+      break;
+    case 'earmuffs':
+      part(solid, new THREE.TorusGeometry(0.24, 0.035, 5, 10, Math.PI), 0x6b4f35, [0, 0.9, 0], [0, 0, 0]);
+      for (const sx of [-1, 1]) {
+        part(solid, new THREE.SphereGeometry(0.1, 7, 5), 0xfff6e3, [sx * 0.24, 0.87, 0], null, [0.8, 1, 1]);
+      }
+      break;
+    case 'mug':
+      part(solid, new THREE.CylinderGeometry(0.1, 0.09, 0.15, 8), 0xfff6e3, [0.3, 0.44, 0.14]);
+      part(solid, new THREE.TorusGeometry(0.06, 0.02, 4, 8), 0xfff6e3, [0.39, 0.44, 0.14], [0, Math.PI / 2, 0]);
+      part(glow, new THREE.CylinderGeometry(0.085, 0.085, 0.02, 8), 0x8a5a2a, [0.3, 0.52, 0.14]);
+      break;
+    case 'crown':
+      part(solid, new THREE.CylinderGeometry(0.17, 0.19, 0.09, 8, 1, true), 0xf2c744, [0, 0.95, 0]);
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2;
+        part(solid, new THREE.ConeGeometry(0.04, 0.11, 4), 0xf2c744, [Math.cos(a) * 0.18, 1.02, Math.sin(a) * 0.18]);
+      }
+      break;
+    case 'moss':
+      for (const [px, py, pz] of [[-0.18, 0.48, -0.16], [0.14, 0.52, -0.2], [0.02, 0.36, -0.26]]) {
+        part(solid, new THREE.SphereGeometry(0.11, 6, 4), 0x6f9c4a, [px, py, pz], null, [1, 0.6, 1]);
+      }
+      break;
+    case 'kelp':
+      for (const sx of [-1, 1]) {
+        part(solid, new THREE.ConeGeometry(0.07, 0.34, 5), 0x4a8f5c, [sx * 0.24, 0.5, -0.1], [0.2, 0, sx * -0.35]);
+      }
+      break;
+    default:
+      break;
+  }
+  if (look.towel) {
+    part(solid, new THREE.BoxGeometry(0.62, 0.05, 0.42), 0xe8657a, [0, 0.025, 0.02]);
+    for (const i of [-1, 0, 1]) {
+      part(solid, new THREE.BoxGeometry(0.09, 0.06, 0.42), 0xfff6e3, [i * 0.19, 0.028, 0.02]);
+    }
+  }
+  if (look.spiky) {
+    for (let i = -2; i <= 2; i++) {
+      part(glow, new THREE.ConeGeometry(0.045, 0.24, 4), 0xffd070, [i * 0.11, 1.0, -0.02], [0, 0, i * 0.34]);
+    }
+  }
+
+  // element accents: sun halo, snow breath puffs, sea drips
+  if (def.el === 'sun') {
+    part(glow, new THREE.TorusGeometry(0.25, 0.022, 4, 14), el.light, [0, 1.06, -0.02], [Math.PI / 2 - 0.35, 0, 0]);
+  } else if (def.el === 'snow') {
+    for (const [px, py, pz] of [[0.12, 0.62, 0.34], [0.2, 0.7, 0.42], [0.28, 0.6, 0.5]]) {
+      part(glow, new THREE.SphereGeometry(0.045, 5, 4), 0xffffff, [px, py, pz]);
+    }
+  } else if (def.el === 'sea') {
+    for (const [px, py] of [[-0.3, 0.5], [0.31, 0.42], [-0.24, 0.24]]) {
+      part(glow, new THREE.SphereGeometry(0.04, 5, 4), el.light, [px, py, 0.08]);
+    }
+  } else {
+    part(glow, new THREE.SphereGeometry(0.045, 5, 4), el.light, [0, 1.0, 0.06]);
+  }
+
+  const model = bakeModel(solid, glow);
+  if (look.big) model.scale.setScalar(1.2);
+  return model;
+}
+
+/** A duellist bust: shoulders + a head that can tilt, blink and glare. */
+function buildBust(cfg) {
+  const fur = numOf(bodyHex(cfg.color));
+  const furDark = numOf(shade(bodyHex(cfg.color), -0.3));
+  const furLit = numOf(shade(bodyHex(cfg.color), 0.18));
+  const g = new THREE.Group();
+
+  const bodyParts = [];
+  part(bodyParts, new THREE.CylinderGeometry(0.5, 0.58, 0.16, 12), 0x8a8578, [0, 0.08, 0]);
+  part(bodyParts, new THREE.CylinderGeometry(0.42, 0.48, 0.1, 12), 0x6f6a5e, [0, 0.19, 0]);
+  part(bodyParts, new THREE.SphereGeometry(0.46, 9, 6), fur, [0, 0.42, 0.02], null, [1.2, 0.62, 0.86]);
+  part(bodyParts, new THREE.CylinderGeometry(0.18, 0.22, 0.2, 8), fur, [0, 0.64, 0.03]);
+  const body = bakeModel(bodyParts, []);
+  g.add(body);
+
+  const headPivot = new THREE.Group();
+  headPivot.position.set(0, 0.78, 0);
+  // the play camera looks down at ~50 degrees: without this the faces are all
+  // forehead, so the whole bust leans back and the head tips up to meet it
+  headPivot.rotation.x = 0.42;
+  g.add(headPivot);
+
+  const headParts = [];
+  part(headParts, new THREE.SphereGeometry(0.36, 10, 7), fur, [0, 0.02, 0], null, [1.12, 1, 1]);
+  part(headParts, new THREE.SphereGeometry(0.2, 8, 6), furLit, [0, -0.07, 0.29], null, [0.98, 0.62, 0.6]);
+  part(headParts, new THREE.BoxGeometry(0.13, 0.08, 0.06), INK3, [0, -0.02, 0.42]);
+  for (const sx of [-1, 1]) {
+    part(headParts, new THREE.SphereGeometry(0.11, 7, 5), furDark, [sx * 0.3, 0.24, -0.03], null, [1, 1, 0.6]);
+  }
+  const head = bakeModel(headParts, []);
+  headPivot.add(head);
+
+  const eyeParts = [];
+  for (const sx of [-1, 1]) part(eyeParts, new THREE.SphereGeometry(0.058, 7, 5), INK3, [sx * 0.16, 0.07, 0.3]);
+  const eyes = bakeModel(eyeParts, []);
+  headPivot.add(eyes);
+
+  const browParts = [];
+  for (const sx of [-1, 1]) {
+    part(browParts, new THREE.BoxGeometry(0.15, 0.035, 0.04), INK3, [sx * 0.17, 0.2, 0.3], [0, 0, sx * 0.2]);
+  }
+  const brows = bakeModel(browParts, []);
+  headPivot.add(brows);
+
+  const hatAnchor = new THREE.Group();
+  hatAnchor.position.set(0, 0.36, 0);
+  hatAnchor.scale.setScalar(1.16);
+  headPivot.add(hatAnchor);
+
+  g.userData = { body, head, headPivot, eyes, brows, hatAnchor, height: 1.5 };
+  return g;
+}
+
+function freeBust(g) {
+  const u = g.userData || {};
+  for (const m of [u.body, u.head, u.eyes, u.brows]) freeModel(m);
+  if (u.hatAnchor) disposeObject(u.hatAnchor);
+  g.clear();
+}
+
+/** Bust poses. Everything is lerped, so these are targets, not snapshots. */
+const BUST_POSE = {
+  idle: { brow: 0, browY: 0, eye: 1, tilt: 0, nod: 0 },
+  blink: { brow: 0, browY: 0, eye: 0.12, tilt: 0, nod: 0 },
+  thinking: { brow: 0.3, browY: 0.01, eye: 0.8, tilt: 0.16, nod: -0.06 },
+  worried: { brow: -0.42, browY: 0.05, eye: 1.15, tilt: -0.05, nod: -0.16 },
+  hurt: { brow: -0.5, browY: 0.02, eye: 0.35, tilt: 0.1, nod: -0.24 },
+  smug: { brow: 0.45, browY: -0.03, eye: 0.55, tilt: -0.1, nod: 0.16 },
+  beam: { brow: 0.1, browY: 0.06, eye: 0.22, tilt: 0, nod: 0.2 },
+  beaten: { brow: -0.6, browY: -0.02, eye: 0.16, tilt: 0.24, nod: -0.42 },
+};
+
+// ---------------------------------------------------------------------------
+// Diorama: the 3D stage. Owns exactly one WebGLRenderer, one instanced particle
+// pool, a handful of pooled effect meshes and the two duellist busts.
+// ---------------------------------------------------------------------------
+const PMAX = 340;
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
+
+class Diorama {
+  constructor(host, opts = {}) {
+    this.host = host;
+    this.sfx = opts.sfx || (() => {});
+    this.reduced = !!opts.reduced;
+    this.speed = 1;
+    this.ok = false;
+    this.now = 0; // stage clock: stops dead during hit-stop
+    this.hitStopUntil = 0;
+    this.slowUntil = 0;
+    this.shakeMag = 0;
+    this.shakeT = 0;
+    this.crit = new Map();
+    this.anchors = new Map(); // 's0_2' | 'b1' -> {p:Vector3, px:number, scale:number}
+    this.busts = { 0: null, 1: null };
+    this.rings = [];
+    this.beams = [];
+    this.fx = [];
+    this.mood = new THREE.Color(0x9fd0f5);
+    this.moodWant = new THREE.Color(0x9fd0f5);
+    this.finishRun = null;
+    this.pinBusts = true;
+    this._geos = [];
+    this._mats = [];
+    this._texs = [];
+    this._tmpA = new THREE.Vector3();
+    this._tmpB = new THREE.Vector3();
+    this._tmpC = new THREE.Vector3();
+    this._m4 = new THREE.Matrix4();
+    this._quat = new THREE.Quaternion();
+    this._scl = new THREE.Vector3();
+    this._col = new THREE.Color();
+    this._plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    this._ray = new THREE.Raycaster();
+    this._ndc = new THREE.Vector2();
+    this._build();
+  }
+
+  /** Fast mode halves every duration constant; `d()` is the only reader. */
+  setSpeed(mult) {
+    this.speed = mult;
+    for (const e of this.crit.values()) if (e.rig) e.rig.speed = 1 / (mult || 1);
+  }
+  d(ms) { return ms * this.speed; }
+
+  // ---- construction -------------------------------------------------------
+  _build() {
+    let renderer = null;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    } catch (e) {
+      // no WebGL: the duel still plays, it just plays on the flat board
+      console.warn('[cards] no WebGL context, falling back to the flat board', e);
+      return;
+    }
+    this.renderer = renderer;
+    renderer.setPixelRatio(Math.min((typeof devicePixelRatio === 'number' ? devicePixelRatio : 1), 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x000000, 0);
+    const cv = renderer.domElement;
+    cv.className = 'mg-cards-stage';
+    this.host.appendChild(cv);
+
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(28, 1, 1, 240);
+    this.camHome = new THREE.Vector3(0, 19, 14.5);
+    this.lookHome = new THREE.Vector3(0, 0, -1);
+    this.camera.position.copy(this.camHome);
+    this.camera.lookAt(this.lookHome);
+
+    this.scene.add(new THREE.HemisphereLight(0xfff1d4, 0x22301f, 0.72));
+    const key = new THREE.DirectionalLight(0xfff4de, 1.55);
+    key.position.set(7, 14, 9);
+    this.scene.add(key);
+    this.rim = new THREE.DirectionalLight(0x9fd0f5, 0.95);
+    this.rim.position.set(-8, 7, -12);
+    this.scene.add(this.rim);
+    this.lamp = new THREE.PointLight(0xffe2a0, 0.55, 46, 1.6);
+    this.lamp.position.set(0, 9, 2);
+    this.scene.add(this.lamp);
+
+    this._buildTable();
+    this._buildSlotMarks();
+    this._buildParticles();
+    this._buildPools();
+    this.ok = true;
+  }
+
+  _tex(w, h, draw) {
+    const t = canvasTexture(w, h, draw);
+    this._texs.push(t);
+    return t;
+  }
+
+  _keep(geo, mat) {
+    if (geo) this._geos.push(geo);
+    if (mat) this._mats.push(mat);
+  }
+
+  _buildTable() {
+    this.tableMesh = new THREE.Mesh(new THREE.BufferGeometry(), makeToon(0xffffff, { unique: true, vertexColors: true }));
+    this.tableMesh.frustumCulled = false;
+    this.scene.add(this.tableMesh);
+    this._mats.push(this.tableMesh.material);
+  }
+
+  /** Rebuild the arena slab so it covers the board rows with a rim to spare. */
+  _fitTable(rect) {
+    if (!this.tableMesh || !this.vw) return;
+    const r = rect || this.board || { x: 0, y: 0, w: this.vw, h: this.vh };
+    this.board = r;
+    const x0 = r.x - r.w * 0.06, x1 = r.x + r.w * 1.06;
+    const y0 = r.y - r.h * 0.06, y1 = r.y + r.h * 1.04;
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const [px, py] of [[x0, y0], [x1, y0], [x0, y1], [x1, y1], [(x0 + x1) / 2, y1]]) {
+      const p = this.worldAt(px, py, this._tmpA);
+      if (!p) continue;
+      minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+      minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+    }
+    if (!Number.isFinite(minX)) return;
+    const pad = 0.9;
+    const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+    const sw = Math.max(6, (maxX - minX) + pad * 2);
+    const sd = Math.max(6, (maxZ - minZ) + pad * 2);
+    this.tableSize = { cx, cz, w: sw, d: sd };
+
+    const parts = [];
+    const stone = 0x8e8878, stoneDark = 0x625d51, moss = 0x3d5c36, mossLit = 0x4a6d40;
+    part(parts, new THREE.BoxGeometry(sw, 1.4, sd), stoneDark, [cx, -0.78, cz]);
+    part(parts, new THREE.BoxGeometry(sw - 0.5, 0.4, sd - 0.5), stone, [cx, -0.26, cz]);
+    // the felt: two mossy layers with a hair of clearance so they never z-fight
+    part(parts, new THREE.BoxGeometry(sw - 2.2, 0.12, sd - 2.2), moss, [cx, -0.075, cz]);
+    part(parts, new THREE.BoxGeometry(sw - 4.4, 0.08, sd - 3.4), mossLit, [cx, -0.04, cz]);
+    // a carved centre line so the two halves of the arena read apart
+    part(parts, new THREE.BoxGeometry(sw - 5.6, 0.05, 0.2), stone, [cx, -0.005, cz]);
+    // rim stones: chunky blocks around the lip, so the table reads as carved
+    const nx = Math.max(4, Math.round(sw / 2.6));
+    for (let i = 0; i < nx; i++) {
+      const x = cx - sw / 2 + (i + 0.5) * (sw / nx);
+      for (const zs of [-1, 1]) {
+        part(parts, new THREE.BoxGeometry(sw / nx - 0.18, 0.26, 0.9), i % 2 ? stone : stoneDark,
+          [x, 0.06, cz + zs * (sd / 2 - 0.55)]);
+      }
+    }
+    const nz = Math.max(3, Math.round(sd / 2.6));
+    for (let i = 0; i < nz; i++) {
+      const z = cz - sd / 2 + (i + 0.5) * (sd / nz);
+      for (const xs of [-1, 1]) {
+        part(parts, new THREE.BoxGeometry(0.9, 0.26, sd / nz - 0.18), i % 2 ? stoneDark : stone,
+          [cx + xs * (sw / 2 - 0.55), 0.06, z]);
+      }
+    }
+    // moss tufts on the rim
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2 + 0.4;
+      part(parts, new THREE.SphereGeometry(0.3, 6, 4), i % 2 ? moss : mossLit,
+        [cx + Math.cos(a) * (sw / 2 - 0.6), 0.2, cz + Math.sin(a) * (sd / 2 - 0.6)], null, [1, 0.42, 1]);
+    }
+    // the element triangle inlaid into the flanks, so the table teaches it too
+    const SIGILS = [0xe8b24a, 0xcfe3f2, 0x4f9ac8];
+    const flank = Math.min(sw / 2 - 1.9, sw * 0.27);
+    for (const xs of [-1, 1]) {
+      for (let i = 0; i < 3; i++) {
+        const col = SIGILS[i];
+        const z = cz + (i - 1) * Math.min(2.4, sd * 0.22);
+        part(parts, new THREE.CylinderGeometry(0.46, 0.46, 0.05, 16), col, [cx + xs * flank, -0.01, z]);
+        part(parts, new THREE.CylinderGeometry(0.34, 0.34, 0.06, 16), shadeNum(col, -0.25), [cx + xs * flank, -0.005, z]);
+      }
+    }
+    // corner lanterns: warm anchors in the four corners of the arena
+    for (const xs of [-1, 1]) {
+      for (const zs of [-1, 1]) {
+        const lx = cx + xs * Math.min(sw / 2 - 1.4, sw * 0.33), lz = cz + zs * (sd / 2 - 1.2);
+        part(parts, new THREE.CylinderGeometry(0.26, 0.34, 0.5, 8), stoneDark, [lx, 0.25, lz]);
+        part(parts, new THREE.SphereGeometry(0.28, 8, 6), 0xffe2a0, [lx, 0.68, lz]);
+        part(parts, new THREE.CylinderGeometry(0.16, 0.2, 0.12, 8), stone, [lx, 0.9, lz]);
+      }
+    }
+    // a scatter of pebbles so the felt is never a blank sheet
+    for (let i = 0; i < 9; i++) {
+      const a = i * 2.399;
+      const rr = 0.32 + ((i * 37) % 100) / 100 * 0.4;
+      part(parts, new THREE.IcosahedronGeometry(0.16 + (i % 3) * 0.05, 0), stone,
+        [cx + Math.cos(a) * (sw / 2 - 1.1) * rr * 1.6, 0.04, cz + Math.sin(a) * (sd / 2 - 1) * rr],
+        [0.4, a, 0.2], [1, 0.6, 1]);
+    }
+    const geo = mergeParts(parts);
+    this.tableMesh.geometry.dispose();
+    this.tableMesh.geometry = geo;
+  }
+
+  _buildSlotMarks() {
+    const shadowTex = this._tex(96, 96, (c, w2, h2) => {
+      const g = c.createRadialGradient(w2 / 2, h2 / 2, 2, w2 / 2, h2 / 2, w2 / 2);
+      g.addColorStop(0, 'rgba(10,18,10,.55)');
+      g.addColorStop(0.6, 'rgba(10,18,10,.22)');
+      g.addColorStop(1, 'rgba(10,18,10,0)');
+      c.fillStyle = g;
+      c.fillRect(0, 0, w2, h2);
+    });
+    const shadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false });
+    const disc = new THREE.PlaneGeometry(1, 1);
+    disc.rotateX(-Math.PI / 2);
+    this.shadowIM = new THREE.InstancedMesh(disc, shadowMat, 8);
+    this.shadowIM.frustumCulled = false;
+    this.shadowIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.scene.add(this.shadowIM);
+    this._keep(disc, shadowMat);
+
+    const ringGeo = new THREE.RingGeometry(0.62, 0.82, 26);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0.85, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    this.ringIM = new THREE.InstancedMesh(ringGeo, ringMat, 8);
+    this.ringIM.frustumCulled = false;
+    this.ringIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.scene.add(this.ringIM);
+    this._keep(ringGeo, ringMat);
+    this.ringGlow = new Float32Array(8); // 0..1 highlight, driven from the DOM
+    this.ringFlash = new Float32Array(8);
+    this.ringFlashCol = new Array(8).fill(0xffffff);
+    for (let i = 0; i < 8; i++) {
+      this.ringIM.setColorAt(i, this._col.setHex(0x6a5a38));
+      this.shadowIM.setColorAt(i, this._col.setHex(0xffffff));
+    }
+  }
+
+  _buildParticles() {
+    this.pPos = new Float32Array(PMAX * 3);
+    this.pVel = new Float32Array(PMAX * 3);
+    this.pLife = new Float32Array(PMAX);
+    this.pTtl = new Float32Array(PMAX);
+    this.pSize = new Float32Array(PMAX);
+    this.pStretch = new Float32Array(PMAX);
+    this.pGrav = new Float32Array(PMAX);
+    this.pNext = 0;
+    this.pLive = 0;
+    const geo = new THREE.IcosahedronGeometry(0.5, 0);
+    const mat = new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0.95, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    this.parts = new THREE.InstancedMesh(geo, mat, PMAX);
+    this.parts.frustumCulled = false;
+    this.parts.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.parts.visible = false;
+    this.scene.add(this.parts);
+    this._keep(geo, mat);
+    for (let i = 0; i < PMAX; i++) {
+      this._m4.makeScale(0, 0, 0);
+      this.parts.setMatrixAt(i, this._m4);
+      this.parts.setColorAt(i, this._col.setHex(0xffffff));
+    }
+  }
+
+  _buildPools() {
+    // dust / shock rings
+    const ringTex = this._tex(128, 128, (c, w, h) => {
+      const g = c.createRadialGradient(w / 2, h / 2, w * 0.28, w / 2, h / 2, w / 2);
+      g.addColorStop(0, 'rgba(255,255,255,0)');
+      g.addColorStop(0.55, 'rgba(255,255,255,.95)');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      c.fillStyle = g;
+      c.fillRect(0, 0, w, h);
+    });
+    const ringGeo = new THREE.PlaneGeometry(1, 1);
+    ringGeo.rotateX(-Math.PI / 2);
+    this._keep(ringGeo, null);
+    for (let i = 0; i < 5; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        map: ringTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0,
+      });
+      const m = new THREE.Mesh(ringGeo, mat);
+      m.visible = false;
+      m.frustumCulled = false;
+      this.scene.add(m);
+      this._mats.push(mat);
+      this.rings.push({ m, t: 0, ttl: 0, r0: 1, r1: 4 });
+    }
+
+    // summon beams
+    const beamGeo = new THREE.CylinderGeometry(1, 0.34, 1, 16, 1, true);
+    this._keep(beamGeo, null);
+    for (let i = 0; i < 2; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0, side: THREE.DoubleSide,
+      });
+      const m = new THREE.Mesh(beamGeo, mat);
+      m.visible = false;
+      m.frustumCulled = false;
+      this.scene.add(m);
+      this._mats.push(mat);
+      this.beams.push({ m, t: 0, ttl: 0, h: 6, r: 1 });
+    }
+
+    // spell silhouettes: one mesh per shape, hidden until a spell needs it
+    const flareTex = this._tex(128, 128, (c, w, h) => {
+      const g = c.createRadialGradient(w / 2, h * 0.72, 4, w / 2, h * 0.72, w * 0.62);
+      g.addColorStop(0, 'rgba(255,255,255,1)');
+      g.addColorStop(0.4, 'rgba(255,240,200,.6)');
+      g.addColorStop(1, 'rgba(255,220,150,0)');
+      c.fillStyle = g;
+      c.fillRect(0, 0, w, h);
+    });
+    const bandTex = this._tex(128, 64, (c, w, h) => {
+      c.fillStyle = 'rgba(255,255,255,0)';
+      c.fillRect(0, 0, w, h);
+      for (let i = 0; i < 26; i++) {
+        const x = (i / 26) * w;
+        c.globalAlpha = 0.25 + Math.random() * 0.55;
+        c.fillStyle = '#ffffff';
+        c.fillRect(x, Math.random() * h * 0.7, 2 + Math.random() * 5, h * 0.3);
+      }
+      c.globalAlpha = 0.55;
+      const g = c.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, 'rgba(255,255,255,0)');
+      g.addColorStop(0.5, 'rgba(230,246,255,.9)');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      c.fillStyle = g;
+      c.fillRect(0, 0, w, h);
+    });
+    const quad = new THREE.PlaneGeometry(1, 1);
+    quad.rotateX(-Math.PI / 2);
+    this._keep(quad, null);
+    this.fxFlare = this._fxMesh(quad, flareTex, THREE.AdditiveBlending);
+    this.fxBand = this._fxMesh(quad, bandTex, THREE.AdditiveBlending);
+
+    // tidal wave: a plane with a baked crest, so it reads as a wall of water
+    const waveGeo = new THREE.PlaneGeometry(1, 1, 18, 4);
+    const wp = waveGeo.attributes.position;
+    for (let i = 0; i < wp.count; i++) {
+      const u = wp.getX(i) + 0.5, v = wp.getY(i) + 0.5;
+      wp.setZ(i, Math.sin(u * Math.PI) * 0.22 + v * 0.06);
+    }
+    waveGeo.computeVertexNormals();
+    this._keep(waveGeo, null);
+    const waveMat = new THREE.MeshBasicMaterial({
+      color: 0x7fd0f0, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide,
+    });
+    this.fxWave = new THREE.Mesh(waveGeo, waveMat);
+    this.fxWave.visible = false;
+    this.fxWave.frustumCulled = false;
+    this.scene.add(this.fxWave);
+    this._mats.push(waveMat);
+
+    const pillarGeo = new THREE.CylinderGeometry(1, 1, 1, 16, 1, true);
+    this._keep(pillarGeo, null);
+    const pillarMat = new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    });
+    this.fxPillar = new THREE.Mesh(pillarGeo, pillarMat);
+    this.fxPillar.visible = false;
+    this.fxPillar.frustumCulled = false;
+    this.scene.add(this.fxPillar);
+    this._mats.push(pillarMat);
+  }
+
+  _fxMesh(geo, tex, blending) {
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0, depthWrite: false, blending });
+    const m = new THREE.Mesh(geo, mat);
+    m.visible = false;
+    m.frustumCulled = false;
+    this.scene.add(m);
+    this._mats.push(mat);
+    return m;
+  }
+
+  // ---- layout -------------------------------------------------------------
+  resize(w, h) {
+    if (!this.ok || w < 4 || h < 4) return;
+    this.vw = w;
+    this.vh = h;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h, false);
+    this._homeCamera();
+    this._fitTable();
+  }
+
+  /** Park the camera at its resting pose: every anchor is measured from there,
+   *  so shake and the finish cam never drag the layout around with them. */
+  _homeCamera() {
+    this.camera.position.copy(this.camHome);
+    this.camera.lookAt(this.lookHome);
+    this.camera.updateMatrixWorld(true);
+  }
+
+  /** Screen pixel -> the point on the arena plane under it. */
+  worldAt(x, y, out) {
+    if (!this.vw || !this.vh) return null;
+    this._ndc.set((x / this.vw) * 2 - 1, -(y / this.vh) * 2 + 1);
+    this._ray.setFromCamera(this._ndc, this.camera);
+    return this._ray.ray.intersectPlane(this._plane, out || new THREE.Vector3());
+  }
+
+  /** World units per screen pixel at a point (for pixel-exact model sizing). */
+  pxScale(p) {
+    this.camera.getWorldDirection(this._tmpC);
+    const dist = Math.max(1, this._tmpB.copy(p).sub(this.camera.position).dot(this._tmpC));
+    return (2 * Math.tan((this.camera.fov * Math.PI) / 360) * dist) / this.vh;
+  }
+
+  /**
+   * Re-measure every anchor off its DOM box. The bottom edge of a box is where
+   * the model's feet go, and the box height is how tall it should look, so the
+   * diorama tracks the responsive board instead of guessing at it.
+   */
+  measure(refs, wrapRect) {
+    if (!this.ok || !this.vw || this.finishRun) return;
+    this._homeCamera();
+    const put = (key, el, fill, foot = 1) => {
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      const cx = r.left - wrapRect.left + r.width / 2;
+      const by = r.top - wrapRect.top + r.height * foot;
+      const p = this.worldAt(cx, by, new THREE.Vector3());
+      if (!p) return;
+      const prev = this.anchors.get(key);
+      const px = r.height * fill;
+      if (prev) { prev.p.copy(p); prev.px = px; prev.scale = this.pxScale(p) * px; prev.w = r.width; }
+      else this.anchors.set(key, { p, px, scale: this.pxScale(p) * px, w: r.width });
+    };
+    for (const side of [0, 1]) {
+      const list = refs.slotEls[side] || [];
+      for (let i = 0; i < BOARD_SLOTS; i++) put(`s${side}_${i}`, list[i], 1.02);
+      put(`b${side}`, refs.bustEls[side], 1.15, 0.66);
+    }
+  }
+
+  /** The board region the arena slab has to cover (CSS px, wrap-relative). */
+  setBoard(rect) {
+    const b = this.board;
+    if (b && Math.abs(b.y - rect.y) < 2 && Math.abs(b.h - rect.h) < 2
+      && Math.abs(b.w - rect.w) < 2) return;
+    this._homeCamera();
+    this._fitTable(rect);
+  }
+
+  anchor(key) { return this.anchors.get(key); }
+  slotAnchor(side, slot) { return this.anchors.get(`s${side}_${slot}`); }
+  bustAnchor(side) { return this.anchors.get(`b${side}`); }
+
+  // ---- busts --------------------------------------------------------------
+  addBust(side, cfg) {
+    if (!this.ok) return;
+    const g = buildBust(cfg);
+    const hat = buildHat(cfg && cfg.hat);
+    if (hat) g.userData.hatAnchor.add(hat);
+    g.userData.pose = { ...BUST_POSE.idle };
+    g.userData.want = { ...BUST_POSE.idle };
+    g.userData.flinch = 0;
+    g.userData.cheer = 0;
+    g.userData.hpFrac = 1;
+    g.userData.seed = Math.random() * 9;
+    this.scene.add(g);
+    if (this.busts[side]) { this.scene.remove(this.busts[side]); freeBust(this.busts[side]); }
+    this.busts[side] = g;
+  }
+
+  setBustExpr(side, expr) {
+    const b = this.busts[side];
+    if (!b) return;
+    const pose = BUST_POSE[expr] || BUST_POSE.idle;
+    b.userData.want = pose;
+  }
+
+  setBustHp(side, frac) {
+    const b = this.busts[side];
+    if (b) b.userData.hpFrac = Math.max(0, Math.min(1, frac));
+  }
+
+  flinchBust(side, power) {
+    const b = this.busts[side];
+    if (!b) return;
+    b.userData.flinch = Math.min(1, 0.35 + power * 0.09);
+  }
+
+  cheerBust(side) {
+    const b = this.busts[side];
+    if (b) b.userData.cheer = 2600;
+  }
+
+  // ---- critters -----------------------------------------------------------
+  spawn(uid, cardId, side, slot, instant) {
+    if (!this.ok || this.crit.has(uid)) return null;
+    const def = CARDS[cardId] || CARDS.pebble_pal;
+    let rig = null;
+    try {
+      const c = buildCritter(cardId);
+      if (c && c.group && c.group.isObject3D && typeof c.update === 'function') rig = c;
+    } catch (err) {
+      console.warn('[cards] critter build failed, using the local cast for', cardId, err);
+    }
+    const model = rig ? rig.group : buildFallbackCritter(cardId);
+    if (rig) {
+      rig.speed = 1 / (this.speed || 1);
+      // the stage already draws a shadow under every slot: two would just smudge
+      const blob = model.getObjectByName('blob');
+      if (blob) blob.visible = false;
+    }
+    const group = new THREE.Group();
+    group.add(model);
+    this.scene.add(group);
+    const e = {
+      uid, id: cardId, side, slot, el: def.el, group, model, rig,
+      // rigged models keep their authored size relative to a 1.3-unit reference,
+      // so the Great Ancient really does tower over a Sunny Pup
+      ref: rig ? 1.16 : 0.95,
+      phase: instant ? 'idle' : 'spawn', t: 0, bob: Math.random() * 7,
+      hurtT: 0, tint: 0, atk: null, cheer: 0, scale: 1, koMs: 0,
+    };
+    this.crit.set(uid, e);
+    this._placeCritter(e, true);
+    if (!instant) {
+      const a = this.slotAnchor(side, slot);
+      if (a) {
+        this.beam(a.p, EL3[def.el].light, a.scale * 2.6);
+        this.ring(a.p, EL3[def.el].light, this.d(420), 0.6, 3.2);
+        this.emit(a.p, EL3[def.el].mote, 22, { speed: 3.4, up: 3.4, ttl: 620, size: 0.16, gravity: 5 });
+      }
+      group.scale.setScalar(0.001);
+    }
+    return e;
+  }
+
+  slam(side, slot) {
+    const a = this.slotAnchor(side, slot);
+    if (!a) return;
+    this.ring(a.p, 0xd9c9a4, this.d(340), 0.4, 2.6);
+    this.emit(a.p, 0xd9c9a4, 14, { speed: 4.2, up: 1.2, ttl: 460, size: 0.14, gravity: 7, flat: true });
+    this.kick(0.5);
+  }
+
+  moveTo(uid, side, slot) {
+    const e = this.crit.get(uid);
+    if (e) { e.side = side; e.slot = slot; }
+  }
+
+  crouch(uid) {
+    const e = this.crit.get(uid);
+    if (!e || e.phase === 'ko') return;
+    if (e.phase === 'spawn') return;
+    e.phase = 'crouch';
+    e.t = 0;
+  }
+
+  /** Leap at a target. `onImpact` fires on the frame the blow lands. */
+  strike(uid, targetPos, onImpact, onDone) {
+    const e = this.crit.get(uid);
+    if (!e) { if (onImpact) onImpact(); if (onDone) onDone(); return 0; }
+    const home = this._homeOf(e);
+    const to = this._tmpA.copy(targetPos).sub(home);
+    const len = to.length() || 1;
+    // stop a full body-width short: 0.9 landed the attacker ON the victim
+    to.multiplyScalar(Math.max(0, (len - e.scale * 1.35)) / len);
+    e.atk = {
+      from: home.clone(),
+      to: home.clone().add(to),
+      arc: Math.max(1, len * 0.22) + e.scale * 0.5,
+      yaw: Math.atan2(to.x, to.z),
+      onImpact, onDone, fired: false,
+    };
+    e.phase = 'leap';
+    e.t = 0;
+    if (e.rig) { try { e.rig.play('attack'); } catch { /* the rig can sit this one out */ } }
+    return this.d(DUR.crouch + DUR.leap);
+  }
+
+  hurtCritter(uid, power) {
+    const e = this.crit.get(uid);
+    if (!e || e.phase === 'ko') return;
+    e.hurtT = 1;
+    // the rig's fur material is shared across every critter, so only the local
+    // fallback (which owns its material) gets the red flush
+    if (!e.rig) e.tint = Math.min(1, 0.5 + power * 0.08);
+    else { try { e.rig.play('hurt'); } catch { /* pose optional */ } }
+    const a = this.slotAnchor(e.side, e.slot);
+    if (a) this.emit(this._tmpA.copy(a.p).setY(a.p.y + e.scale * 0.5), 0xff9a7a, 8, { speed: 3, up: 2.4, ttl: 380, size: 0.13, gravity: 6 });
+  }
+
+  koCritter(uid) {
+    const e = this.crit.get(uid);
+    if (!e || e.phase === 'ko') return 0;
+    e.phase = 'ko';
+    e.t = 0;
+    e.atk = null;
+    let ms = this.d(DUR.koCrack + DUR.koPause + DUR.koShatter);
+    if (e.rig) {
+      try {
+        const secs = e.rig.play('ko');
+        if (secs > 0) ms = secs * 1000;
+      } catch { /* fall back to the stage's own collapse */ }
+    }
+    e.koMs = ms;
+    return ms;
+  }
+
+  removeCritter(uid) {
+    const e = this.crit.get(uid);
+    if (!e) return;
+    this.crit.delete(uid);
+    this.scene.remove(e.group);
+    if (e.rig) { try { e.rig.dispose(); } catch { /* the factory refcounts its own bundles */ } }
+    else if (e.model) freeModel(e.model);
+    e.group.clear();
+  }
+
+  has(uid) { return this.crit.has(uid); }
+
+  cheerAll(side) {
+    for (const e of this.crit.values()) {
+      if (e.side !== side || e.phase === 'ko') continue;
+      e.cheer = 2600;
+      if (e.rig) { try { e.rig.play('cheer'); } catch { /* optional */ } }
+    }
+  }
+
+  // ---- effects ------------------------------------------------------------
+  ring(p, color, ttl, r0, r1) {
+    if (!this.ok) return;
+    const slot = this.rings.find((r) => !r.m.visible) || this.rings[0];
+    slot.m.visible = true;
+    slot.m.position.copy(p);
+    slot.m.position.y += 0.06;
+    slot.m.material.color.setHex(color);
+    slot.t = 0;
+    slot.ttl = ttl;
+    slot.r0 = r0;
+    slot.r1 = r1;
+  }
+
+  beam(p, color, height) {
+    if (!this.ok) return;
+    const slot = this.beams.find((b) => !b.m.visible) || this.beams[0];
+    slot.m.visible = true;
+    slot.m.material.color.setHex(color);
+    slot.m.position.copy(p);
+    slot.h = height;
+    slot.t = 0;
+    slot.ttl = this.d(DUR.beam + DUR.grow);
+  }
+
+  kick(mag) {
+    if (this.reduced) return;
+    this.shakeMag = Math.max(this.shakeMag, mag);
+    this.shakeT = 0;
+  }
+
+  hitStop(ms) {
+    if (this.reduced) return;
+    this.hitStopUntil = Math.max(this.hitStopUntil, performance.now() + ms);
+  }
+
+  setMood(el) {
+    const c = EL3[el] || EL3.neutral;
+    this.moodWant.setHex(c.rim);
+  }
+
+  flashSlot(side, slot, color) {
+    const i = side * 4 + slot;
+    if (i < 0 || i > 7 || !this.ringFlash) return;
+    this.ringFlash[i] = 1;
+    this.ringFlashCol[i] = color;
+  }
+
+  setSlotGlow(side, slot, on) {
+    const i = side * 4 + slot;
+    if (i >= 0 && i < 8 && this.ringGlow) this.ringGlow[i] = on ? 1 : 0;
+  }
+
+  emit(p, color, n, opts = {}) {
+    if (!this.ok) return;
+    const speed = opts.speed ?? 3;
+    const up = opts.up ?? 2;
+    const ttl = this.d(opts.ttl ?? 600);
+    const size = opts.size ?? 0.14;
+    const grav = opts.gravity ?? 6;
+    this._col.setHex(color);
+    for (let k = 0; k < n; k++) {
+      const i = this.pNext;
+      this.pNext = (this.pNext + 1) % PMAX;
+      const a = Math.random() * Math.PI * 2;
+      const r = Math.random();
+      this.pPos[i * 3] = p.x + Math.cos(a) * r * (opts.spread ?? 0.3);
+      this.pPos[i * 3 + 1] = p.y + (opts.y0 ?? 0.2) + (opts.flat ? 0 : Math.random() * 0.4);
+      this.pPos[i * 3 + 2] = p.z + Math.sin(a) * r * (opts.spread ?? 0.3);
+      this.pVel[i * 3] = Math.cos(a) * speed * (0.4 + Math.random() * 0.8);
+      this.pVel[i * 3 + 1] = up * (0.35 + Math.random());
+      this.pVel[i * 3 + 2] = Math.sin(a) * speed * (0.4 + Math.random() * 0.8);
+      this.pLife[i] = 0;
+      this.pTtl[i] = ttl * (0.7 + Math.random() * 0.6);
+      this.pSize[i] = size * (0.7 + Math.random() * 0.7);
+      this.pStretch[i] = opts.stretch ?? 1;
+      this.pGrav[i] = grav;
+      this.parts.setColorAt(i, this._col);
+    }
+    if (this.parts.instanceColor) this.parts.instanceColor.needsUpdate = true;
+    this.pLive = Math.min(PMAX, this.pLive + n);
+    this.parts.visible = true;
+  }
+
+  /**
+   * One readable silhouette per spell shape. Everything here is <= 1.2s and
+   * lives entirely on pooled meshes, so a spell costs no allocations.
+   */
+  spell(kind, el, at) {
+    if (!this.ok) return this.d(DUR.spell);
+    const c = EL3[el] || EL3.neutral;
+    const T = this.tableSize || { cx: 0, cz: 0, w: 20, d: 16 };
+    this.setMood(el);
+    if (kind === 'flare') {
+      this.fx.push({ m: this.fxFlare, kind, t: 0, ttl: this.d(DUR.spell), T });
+      this.fxFlare.visible = true;
+      this.fxFlare.material.color.setHex(c.light);
+      this.fxFlare.scale.set(T.w * 0.75, 1, T.d * 1.15);
+      this.emit(new THREE.Vector3(T.cx, 0.2, T.cz), c.mote, 26, { speed: 5, up: 3.6, ttl: 900, size: 0.16, gravity: 2, spread: 6 });
+    } else if (kind === 'blizzard') {
+      this.fx.push({ m: this.fxBand, kind, t: 0, ttl: this.d(DUR.spell), T });
+      this.fxBand.visible = true;
+      this.fxBand.material.color.setHex(c.light);
+      this.fxBand.scale.set(T.w * 1.05, 1, T.d * 0.34);
+    } else if (kind === 'wave') {
+      this.fx.push({ m: this.fxWave, kind, t: 0, ttl: this.d(DUR.spell), T });
+      this.fxWave.visible = true;
+      this.fxWave.material.color.setHex(c.light);
+      this.fxWave.scale.set(T.w * 1.05, 3.2, 1);
+      this.fxWave.rotation.set(-0.35, 0, 0);
+    } else {
+      const p = at || new THREE.Vector3(T.cx, 0, T.cz);
+      this.fx.push({ m: this.fxPillar, kind: 'pillar', t: 0, ttl: this.d(DUR.spell * 0.8), T, p: p.clone() });
+      this.fxPillar.visible = true;
+      this.fxPillar.material.color.setHex(c.light);
+      this.emit(p, c.mote, 20, { speed: 1.1, up: 5.2, ttl: 820, size: 0.15, gravity: -1.2, spread: 0.7 });
+    }
+    return this.d(DUR.spell);
+  }
+
+  /** Snow spells drop icicles into the slots they are about to hit. */
+  icicles(points) {
+    for (const p of points) {
+      this.emit(this._tmpA.copy(p).setY(p.y + 3.4), 0xdff3ff, 5,
+        { speed: 0.3, up: -7, ttl: 420, size: 0.2, gravity: 12, stretch: 3.2, spread: 0.35, y0: 0 });
+    }
+  }
+
+  finishCam(loserSide, ms) {
+    if (!this.ok) return;
+    const b = this.busts[loserSide];
+    this.pinBusts = false;
+    const to = new THREE.Vector3();
+    if (b) to.copy(b.position);
+    else to.set(0, 1, 0);
+    const eye = to.clone();
+    eye.y += 1.8;
+    eye.z += 4.6;
+    eye.x += 1.2;
+    this.finishRun = {
+      t: 0, ttl: ms,
+      from: this.camera.position.clone(), to: eye,
+      lookFrom: this.lookHome.clone(), lookTo: to.clone().setY(to.y + 0.9),
+    };
+    this.kick(1);
+  }
+
+  // ---- per-frame ----------------------------------------------------------
+  _homeOf(e) {
+    const a = this.slotAnchor(e.side, e.slot);
+    return a ? a.p : this._tmpB.set(0, 0, 0);
+  }
+
+  _placeCritter(e, snap) {
+    const a = this.slotAnchor(e.side, e.slot);
+    if (!a) return;
+    e.scale = a.scale / e.ref;
+    if (snap) {
+      e.group.position.copy(a.p);
+      e.group.scale.setScalar(e.scale);
+    }
+  }
+
+  update(dtReal) {
+    if (!this.ok) return;
+    const nowReal = performance.now();
+    const frozen = nowReal < this.hitStopUntil;
+    const slow = this.finishRun ? 0.38 : 1;
+    const dt = frozen ? 0 : Math.min(64, dtReal) * slow;
+    this.now += dt;
+    const s = dt / 1000;
+
+    this.mood.lerp(this.moodWant, Math.min(1, s * 3));
+    if (this.rim) this.rim.color.copy(this.mood);
+
+    this._updateCritters(dt, s);
+    this._updateBusts(dt, s);
+    this._updateRings(dt);
+    this._updateBeams(dt);
+    this._updateSpells(dt);
+    this._updateParticles(s);
+    this._updateSlots(dt);
+    this._updateCamera(dtReal, s);
+  }
+
+  _updateCritters(dt, s) {
+    for (const e of [...this.crit.values()]) {
+      const a = this.slotAnchor(e.side, e.slot);
+      if (a) e.scale = a.scale / e.ref;
+      const home = a ? a.p : e.group.position;
+      e.t += dt;
+      // the factory's rig animates itself every frame, overlay or not
+      if (e.rig) { try { e.rig.update(s); } catch { e.rig = null; } }
+      if (e.phase !== 'ko') {
+        e.tint = Math.max(0, e.tint - dt / 240);
+        this._tintModel(e);
+      }
+      let sc = e.scale;
+      let y = 0;
+      const bobT = this.now / 1000 + e.bob;
+
+      if (e.phase === 'spawn') {
+        const wait = this.d(DUR.beam);
+        const gr = this.d(DUR.grow);
+        if (e.t < wait) {
+          sc = 0.001;
+        } else {
+          const p = Math.min(1, (e.t - wait) / gr);
+          const k = p < 0.7 ? (p / 0.7) * 1.18 : 1.18 - ((p - 0.7) / 0.3) * 0.18;
+          sc = e.scale * k;
+          e.group.rotation.y = (1 - p) * 1.4;
+          if (p >= 1) { e.phase = 'idle'; e.t = 0; e.group.rotation.y = 0; }
+        }
+        e.group.position.copy(home);
+      } else if (e.phase === 'crouch') {
+        e.group.position.copy(home);
+        const p = Math.min(1, e.t / this.d(DUR.crouch));
+        y = -0.06 * e.scale * p;
+        if (e.rig) e.group.scale.setScalar(e.scale);
+        else e.group.scale.set(e.scale * (1 + 0.12 * p), e.scale * (1 - 0.14 * p), e.scale * (1 + 0.12 * p));
+        e.group.position.y = home.y + y;
+        continue;
+      } else if (e.phase === 'leap' && e.atk) {
+        const cd = this.d(DUR.crouch), ld = this.d(DUR.leap);
+        if (e.t < cd) {
+          const p = e.t / cd;
+          e.group.position.copy(e.atk.from);
+          e.group.position.y += -0.08 * e.scale * p;
+          if (e.rig) e.group.scale.setScalar(e.scale);
+          else e.group.scale.set(e.scale * (1 + 0.14 * p), e.scale * (1 - 0.16 * p), e.scale * (1 + 0.14 * p));
+          e.group.rotation.y = e.atk.yaw * p * 0.5;
+          continue;
+        }
+        const p = Math.min(1, (e.t - cd) / ld);
+        e.group.position.lerpVectors(e.atk.from, e.atk.to, p);
+        e.group.position.y += Math.sin(p * Math.PI) * e.atk.arc;
+        e.group.rotation.y = e.atk.yaw;
+        e.group.scale.setScalar(e.scale * (1 + 0.1 * Math.sin(p * Math.PI)));
+        if (p >= 1) {
+          if (!e.atk.fired) {
+            e.atk.fired = true;
+            if (e.atk.onImpact) { const f = e.atk.onImpact; e.atk.onImpact = null; f(); }
+          }
+          e.phase = 'return';
+          e.t = 0;
+        }
+        continue;
+      } else if (e.phase === 'return' && e.atk) {
+        const p = Math.min(1, e.t / this.d(DUR.hop));
+        e.group.position.lerpVectors(e.atk.to, home, p);
+        e.group.position.y += Math.sin(p * Math.PI) * e.atk.arc * 0.35;
+        e.group.rotation.y = e.atk.yaw * (1 - p);
+        e.group.scale.setScalar(e.scale);
+        if (p >= 1) {
+          const done = e.atk.onDone;
+          e.atk = null;
+          e.phase = 'idle';
+          e.t = 0;
+          if (done) done();
+        }
+        continue;
+      } else if (e.phase === 'ko') {
+        const total = e.koMs || this.d(DUR.koCrack + DUR.koPause + DUR.koShatter);
+        const p = Math.min(1, e.t / total);
+        e.group.position.copy(home);
+        e.group.rotation.y = 0;
+        if (e.rig) {
+          // the rig cracks, trembles and collapses on its own clock
+          e.group.scale.setScalar(e.scale);
+        } else {
+          const c1 = this.d(DUR.koCrack), c2 = this.d(DUR.koPause);
+          if (e.t < c1) {
+            e.tint = 1;
+            const j = this.reduced ? 0 : (1 - e.t / c1) * 0.09 * e.scale;
+            e.group.position.set(home.x + (Math.random() - 0.5) * j * 4, home.y, home.z + (Math.random() - 0.5) * j * 4);
+            e.group.scale.setScalar(e.scale * (1 - (e.t / c1) * 0.06));
+          } else if (e.t < c1 + c2) {
+            e.group.scale.setScalar(e.scale * 0.94);
+          } else {
+            const q = Math.min(1, (e.t - c1 - c2) / this.d(DUR.koShatter));
+            e.group.position.y += q * e.scale * 0.5;
+            e.group.scale.setScalar(e.scale * (1 - q) * (1 - q));
+            e.group.rotation.y = q * 2.4;
+          }
+          this._tintModel(e);
+        }
+        // the shatter is the stage's: one pooled particle system, element motes
+        if (!e.burst && p >= (e.rig ? 0.62 : 0.42)) {
+          e.burst = true;
+          const col = EL3[e.el] || EL3.neutral;
+          this.emit(this._tmpA.copy(home).setY(home.y + e.scale * 0.5), col.mote, 26,
+            { speed: 2.6, up: 4.2, ttl: 900, size: 0.17, gravity: -0.8, spread: 0.5 });
+          this.ring(home, col.light, this.d(420), 0.5, 3);
+          this.sfx('splash');
+        }
+        if (p >= 1) { this.removeCritter(e.uid); }
+        continue;
+      }
+
+      // idle life: breathe, bob, shuffle, and cheer when the duel is won
+      if (e.phase === 'idle' || e.phase === 'spawn') {
+        e.group.position.copy(home);
+        if (e.cheer > 0) {
+          e.cheer -= dt;
+          const hop = Math.abs(Math.sin(bobT * 7));
+          y = hop * e.scale * 0.34;
+          e.group.rotation.y = Math.sin(bobT * 5) * 0.35;
+          sc = e.scale * (1 + 0.06 * Math.sin(bobT * 14));
+        } else if (e.phase === 'idle') {
+          y = Math.sin(bobT * 1.9) * e.scale * 0.03;
+          e.group.rotation.y = Math.sin(bobT * 0.7) * 0.14;
+          sc = e.scale * (1 + 0.014 * Math.sin(bobT * 3.1));
+        }
+        if (e.hurtT > 0) {
+          e.hurtT = Math.max(0, e.hurtT - dt / 260);
+          const k = e.hurtT;
+          e.group.position.z += (e.side === 0 ? 1 : -1) * k * e.scale * 0.22;
+          if (!this.reduced) e.group.position.x += Math.sin(this.now * 0.08) * k * e.scale * 0.1;
+        }
+      }
+      e.group.position.y = home.y + y;
+      if (typeof sc === 'number') e.group.scale.setScalar(sc);
+    }
+  }
+
+  _tintModel(e) {
+    const mesh = e.model && e.model.userData && e.model.userData.solid;
+    if (!mesh || !mesh.material || !mesh.material.color) return;
+    const k = Math.min(1, e.tint);
+    // a knockout blows out to white (it cracks); a hit flushes red
+    if (e.phase === 'ko') mesh.material.color.setRGB(1 + k * 0.9, 1 + k * 0.8, 1 + k * 0.7);
+    else mesh.material.color.setRGB(1 + k * 0.7, 1 - k * 0.45, 1 - k * 0.5);
+  }
+
+  _updateBusts(dt, s) {
+    for (const side of [0, 1]) {
+      const b = this.busts[side];
+      if (!b) continue;
+      const a = this.bustAnchor(side);
+      if (a && this.pinBusts) {
+        b.position.copy(a.p);
+        b.scale.setScalar(a.scale / (b.userData.height || 1.5));
+      }
+      const u = b.userData;
+      const k = Math.min(1, s * 9);
+      for (const key of ['brow', 'browY', 'eye', 'tilt', 'nod']) {
+        u.pose[key] += ((u.want[key] ?? 0) - u.pose[key]) * k;
+      }
+      u.flinch = Math.max(0, u.flinch - dt / 320);
+      const droop = (1 - u.hpFrac) * 0.34;
+      const t = this.now / 1000 + u.seed;
+      let bounce = 0;
+      if (u.cheer > 0) {
+        u.cheer -= dt;
+        bounce = Math.abs(Math.sin(t * 6.5)) * 0.16;
+      }
+      const breathe = Math.sin(t * 1.6) * 0.012;
+      b.userData.headPivot.rotation.set(
+        0.42 + u.pose.nod - droop + (this.reduced ? 0 : -u.flinch * 0.4) + bounce * 0.5,
+        u.pose.tilt * 0.6,
+        u.pose.tilt * 0.5,
+      );
+      b.userData.headPivot.position.y = 0.78 + breathe + bounce - droop * 0.1;
+      b.userData.eyes.scale.set(1, Math.max(0.08, u.pose.eye), 1);
+      b.userData.brows.rotation.z = u.pose.brow;
+      b.userData.brows.position.y = u.pose.browY;
+      b.userData.body.scale.set(1 + u.flinch * 0.05, 1 - u.flinch * 0.07 - droop * 0.08, 1 + u.flinch * 0.05);
+      if (!this.reduced && this.pinBusts) {
+        b.position.z += u.flinch * 0.24 * (side === 0 ? 1 : -1) * (a ? a.scale * 0.12 : 0.1);
+      }
+    }
+  }
+
+  _updateRings(dt) {
+    for (const r of this.rings) {
+      if (!r.m.visible) continue;
+      r.t += dt;
+      const p = Math.min(1, r.t / r.ttl);
+      const sc = r.r0 + (r.r1 - r.r0) * p;
+      r.m.scale.set(sc, 1, sc);
+      r.m.material.opacity = (1 - p) * 0.9;
+      if (p >= 1) { r.m.visible = false; r.m.material.opacity = 0; }
+    }
+  }
+
+  _updateBeams(dt) {
+    for (const b of this.beams) {
+      if (!b.m.visible) continue;
+      b.t += dt;
+      const p = Math.min(1, b.t / b.ttl);
+      const grow = Math.min(1, p / 0.35);
+      b.m.scale.set(0.5 + 0.3 * (1 - grow), b.h * grow, 0.5 + 0.3 * (1 - grow));
+      b.m.position.y = (b.h * grow) / 2;
+      b.m.material.opacity = p < 0.35 ? 0.85 * grow : 0.85 * (1 - (p - 0.35) / 0.65);
+      if (p >= 1) { b.m.visible = false; b.m.material.opacity = 0; }
+    }
+  }
+
+  _updateSpells(dt) {
+    for (let i = this.fx.length - 1; i >= 0; i--) {
+      const f = this.fx[i];
+      f.t += dt;
+      const p = Math.min(1, f.t / f.ttl);
+      const fade = p < 0.18 ? p / 0.18 : (p > 0.72 ? (1 - p) / 0.28 : 1);
+      const T = f.T;
+      if (f.kind === 'flare') {
+        f.m.position.set(T.cx, 0.12, T.cz + T.d * (0.55 - p * 1.3));
+        f.m.material.opacity = fade * 0.9;
+      } else if (f.kind === 'blizzard') {
+        f.m.position.set(T.cx, 0.16, T.cz + T.d * (0.6 - p * 1.35));
+        f.m.material.opacity = fade * 0.95;
+      } else if (f.kind === 'wave') {
+        const z = T.cz + T.d * (0.62 - p * 1.32);
+        f.m.position.set(T.cx, 0.9, z);
+        f.m.material.opacity = fade * 0.72;
+      } else {
+        const h = 7 * Math.min(1, p / 0.3);
+        f.m.position.copy(f.p);
+        f.m.position.y += h / 2;
+        f.m.scale.set(1.1, h, 1.1);
+        f.m.material.opacity = fade * 0.7;
+      }
+      if (p >= 1) {
+        f.m.visible = false;
+        f.m.material.opacity = 0;
+        this.fx.splice(i, 1);
+      }
+    }
+  }
+
+  _updateParticles(s) {
+    if (!this.pLive) { if (this.parts.visible) this.parts.visible = false; return; }
+    let live = 0;
+    for (let i = 0; i < PMAX; i++) {
+      if (this.pTtl[i] <= 0) continue;
+      this.pLife[i] += s * 1000;
+      const p = this.pLife[i] / this.pTtl[i];
+      if (p >= 1) {
+        this.pTtl[i] = 0;
+        this._m4.makeScale(0, 0, 0);
+        this.parts.setMatrixAt(i, this._m4);
+        continue;
+      }
+      live += 1;
+      this.pVel[i * 3 + 1] -= this.pGrav[i] * s;
+      this.pPos[i * 3] += this.pVel[i * 3] * s;
+      this.pPos[i * 3 + 1] += this.pVel[i * 3 + 1] * s;
+      this.pPos[i * 3 + 2] += this.pVel[i * 3 + 2] * s;
+      const sc = this.pSize[i] * (1 - p * p);
+      this._tmpA.set(this.pPos[i * 3], this.pPos[i * 3 + 1], this.pPos[i * 3 + 2]);
+      this._scl.set(sc, sc * this.pStretch[i], sc);
+      this._quat.setFromAxisAngle(UP_AXIS, this.pLife[i] * 0.004);
+      this._m4.compose(this._tmpA, this._quat, this._scl);
+      this.parts.setMatrixAt(i, this._m4);
+    }
+    this.pLive = live;
+    this.parts.instanceMatrix.needsUpdate = true;
+    this.parts.visible = live > 0;
+  }
+
+  _updateSlots(dt) {
+    if (!this.ringIM) return;
+    for (let i = 0; i < 8; i++) {
+      const side = i >> 2, slot = i & 3;
+      const a = this.slotAnchor(side, slot);
+      if (!a) {
+        this._m4.makeScale(0, 0, 0);
+        this.ringIM.setMatrixAt(i, this._m4);
+        this.shadowIM.setMatrixAt(i, this._m4);
+        continue;
+      }
+      this.ringFlash[i] = Math.max(0, this.ringFlash[i] - dt / 320);
+      const base = a.scale * 0.44;
+      const pulse = this.ringGlow[i] ? 1 + Math.sin(this.now / 190) * 0.05 : 1;
+      this._tmpA.copy(a.p).setY(a.p.y + 0.035);
+      this._quat.identity();
+      this._scl.set(base * pulse, 1, base * pulse);
+      this._m4.compose(this._tmpA, this._quat, this._scl);
+      this.ringIM.setMatrixAt(i, this._m4);
+      this._tmpA.setY(a.p.y + 0.02);
+      this._scl.set(base * 1.9, 1, base * 1.9);
+      this._m4.compose(this._tmpA, this._quat, this._scl);
+      this.shadowIM.setMatrixAt(i, this._m4);
+      const f = this.ringFlash[i];
+      if (f > 0) this._col.setHex(this.ringFlashCol[i]).multiplyScalar(0.4 + f);
+      else if (this.ringGlow[i]) this._col.setHex(0xf2b64a).multiplyScalar(0.95);
+      else this._col.setHex(0x6a5a38);
+      this.ringIM.setColorAt(i, this._col);
+    }
+    this.ringIM.instanceMatrix.needsUpdate = true;
+    this.shadowIM.instanceMatrix.needsUpdate = true;
+    if (this.ringIM.instanceColor) this.ringIM.instanceColor.needsUpdate = true;
+  }
+
+  _updateCamera(dtReal, s) {
+    if (this.finishRun) {
+      const f = this.finishRun;
+      f.t += dtReal;
+      const p = Math.min(1, f.t / f.ttl);
+      const k = 1 - Math.pow(1 - p, 3);
+      this.camera.position.lerpVectors(f.from, f.to, k);
+      this._tmpA.lerpVectors(f.lookFrom, f.lookTo, k);
+      this.camera.lookAt(this._tmpA);
+      return;
+    }
+    this.camera.position.copy(this.camHome);
+    if (this.shakeMag > 0.001 && !this.reduced) {
+      this.shakeT += dtReal;
+      const decay = Math.max(0, 1 - this.shakeT / 320);
+      this.shakeMag *= Math.max(0, 1 - s * 3.6);
+      const m = this.shakeMag * decay * 0.55;
+      this.camera.position.x += Math.sin(this.shakeT * 0.09) * m;
+      this.camera.position.y += Math.sin(this.shakeT * 0.14 + 1.2) * m * 0.7;
+      if (decay <= 0) this.shakeMag = 0;
+    }
+    this.camera.lookAt(this.lookHome);
+  }
+
+  render() {
+    if (!this.ok) return;
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /** Debug/verification helper: draw calls in the last frame. */
+  drawCalls() { return this.ok ? this.renderer.info.render.calls : 0; }
+
+  dispose() {
+    if (!this.renderer) return;
+    for (const uid of [...this.crit.keys()]) this.removeCritter(uid);
+    for (const side of [0, 1]) {
+      if (this.busts[side]) { this.scene.remove(this.busts[side]); freeBust(this.busts[side]); this.busts[side] = null; }
+    }
+    if (this.tableMesh) this.tableMesh.geometry.dispose();
+    for (const g of this._geos) g.dispose();
+    for (const m of this._mats) m.dispose();
+    for (const t of this._texs) t.dispose();
+    this._geos.length = 0;
+    this._mats.length = 0;
+    this._texs.length = 0;
+    this.scene.clear();
+    this.renderer.dispose();
+    try { this.renderer.forceContextLoss(); } catch { /* not every context supports it */ }
+    this.renderer.domElement?.remove();
+    this.renderer = null;
+    this.ok = false;
+    this.crit.clear();
+    this.anchors.clear();
+    this.rings.length = 0;
+    this.beams.length = 0;
+    this.fx.length = 0;
+  }
+}
+
+/**
+ * The show's own little synth. The shared sfx bank (src/core/audio.js) covers
+ * clicks, thuds and sparkles; what a Yu-Gi-Oh moment needs on top of that is a
+ * summon stinger, an element-tinted impact and a finish sting, so those are
+ * built here from a handful of oscillators. Created lazily on the first sound
+ * (i.e. after a click, so no autoplay warning) and closed on unmount.
+ */
+class Stinger {
+  constructor(game) {
+    this.game = game;
+    this.ctx = null;
+    this.master = null;
+    this.live = new Set();
+  }
+
+  _ctx() {
+    if (this.ctx) return this.ctx;
+    const AC = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+    if (!AC) return null;
+    try { this.ctx = new AC(); } catch { return null; }
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.16;
+    this.master.connect(this.ctx.destination);
+    return this.ctx;
+  }
+
+  _tone({ type = 'sine', f0, f1, dur = 0.2, vol = 0.2, delay = 0, attack = 0.008 }) {
+    const ctx = this._ctx();
+    if (!ctx || !this.master) return;
+    if (ctx.state === 'suspended') { try { ctx.resume(); } catch { /* it will wake on the next gesture */ } }
+    const t = ctx.currentTime + delay;
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(Math.max(20, f0), t);
+    if (f1 && f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0004, vol), t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(g);
+    g.connect(this.master);
+    osc.start(t);
+    osc.stop(t + dur + 0.03);
+    this.live.add(osc);
+    osc.onended = () => {
+      this.live.delete(osc);
+      try { osc.disconnect(); g.disconnect(); } catch { /* already torn down */ }
+    };
+  }
+
+  /** Sun is bright and major, snow is glassy and high, sea is round and low. */
+  _root(el) {
+    return el === 'sun' ? 392 : el === 'snow' ? 587 : el === 'sea' ? 261 : 330;
+  }
+
+  play(kind, el, power = 1) {
+    if (this.game?.audio?.muted) return;
+    const r = this._root(el);
+    if (kind === 'summon') {
+      this._tone({ type: 'triangle', f0: r * 0.5, f1: r, dur: 0.16, vol: 0.16 });
+      this._tone({ type: 'triangle', f0: r, f1: r * 1.5, dur: 0.2, vol: 0.14, delay: 0.09 });
+      this._tone({ type: 'sine', f0: r * 2, f1: r * 3, dur: 0.34, vol: 0.09, delay: 0.17 });
+    } else if (kind === 'slam') {
+      this._tone({ type: 'sine', f0: 150, f1: 42, dur: 0.19, vol: 0.34, attack: 0.004 });
+      this._tone({ type: 'square', f0: 90, f1: 38, dur: 0.09, vol: 0.09, attack: 0.003 });
+    } else if (kind === 'impact') {
+      const punch = Math.min(1.6, 0.7 + power * 0.11);
+      this._tone({ type: 'square', f0: r * 1.5, f1: r * 0.55, dur: 0.075, vol: 0.11 * punch, attack: 0.002 });
+      this._tone({ type: 'sine', f0: 190, f1: 46, dur: 0.16 * punch, vol: 0.3, attack: 0.003 });
+    } else if (kind === 'tri') {
+      this._tone({ type: 'triangle', f0: r, dur: 0.1, vol: 0.16 });
+      this._tone({ type: 'triangle', f0: r * 1.26, dur: 0.1, vol: 0.15, delay: 0.07 });
+      this._tone({ type: 'triangle', f0: r * 1.5, f1: r * 2, dur: 0.3, vol: 0.15, delay: 0.14 });
+    } else if (kind === 'spell') {
+      if (el === 'sea') {
+        this._tone({ type: 'sine', f0: r * 2.2, f1: r * 0.7, dur: 0.6, vol: 0.14, attack: 0.09 });
+      } else if (el === 'snow') {
+        this._tone({ type: 'sine', f0: r * 2, f1: r * 2.6, dur: 0.45, vol: 0.08, attack: 0.05 });
+        this._tone({ type: 'triangle', f0: r * 3, f1: r * 3.9, dur: 0.4, vol: 0.05, delay: 0.08 });
+      } else {
+        this._tone({ type: 'triangle', f0: r * 0.75, f1: r * 2, dur: 0.42, vol: 0.13, attack: 0.02 });
+      }
+    } else if (kind === 'finish') {
+      const win = el === 'sun';
+      const base = win ? 262 : 220;
+      const steps = win ? [1, 1.26, 1.5, 2] : [1, 0.84, 0.75, 0.5];
+      steps.forEach((k, i) => this._tone({
+        type: 'triangle', f0: base * k, dur: i === steps.length - 1 ? 0.75 : 0.19,
+        vol: 0.17, delay: i * 0.13,
+      }));
+    }
+  }
+
+  dispose() {
+    for (const osc of this.live) { try { osc.stop(); osc.disconnect(); } catch { /* already stopped */ } }
+    this.live.clear();
+    try { this.master?.disconnect(); } catch { /* already gone */ }
+    this.master = null;
+    if (this.ctx) { try { this.ctx.close(); } catch { /* closing twice is fine */ } }
+    this.ctx = null;
+  }
+}
+
 // ===========================================================================
 // STYLE
 // ===========================================================================
@@ -1462,10 +3202,13 @@ const STYLE = `
 .mg-cards-root{position:absolute;inset:0;overflow:hidden;display:flex;flex-direction:column;
   font-family:"Trebuchet MS","Segoe UI",system-ui,sans-serif;color:#3a2a1c;user-select:none;
   -webkit-user-select:none;cursor:default;
-  --bw:clamp(60px,10.2vh,116px);--bh:calc(var(--bw)*1.38);
+  --bw:clamp(66px,12.4vh,142px);--bh:calc(var(--bw)*1.34);
   --hw:clamp(70px,12.2vh,138px);--hh:calc(var(--hw)*1.38);}
 .mg-cards-root *{box-sizing:border-box;}
 .mg-cards-root.mg-cards-quake{animation:mg-cards-quake .4s ease;}
+.mg-cards-root.mg-cards-calm .mg-cards-card,.mg-cards-root.mg-cards-calm .mg-cards-capy{animation:none !important;}
+/* the diorama sits under every piece of board furniture and over the backdrop */
+.mg-cards-stage{position:absolute;inset:0;z-index:2;display:block;pointer-events:none;}
 @keyframes mg-cards-quake{0%,100%{transform:translate(0,0)}20%{transform:translate(-8px,4px)}
   40%{transform:translate(7px,-5px)}60%{transform:translate(-5px,-3px)}80%{transform:translate(4px,3px)}}
 
@@ -1475,13 +3218,20 @@ const STYLE = `
     radial-gradient(ellipse 55% 40% at 50% 8%, rgba(255,232,178,.34), rgba(255,232,178,0) 72%),
     repeating-linear-gradient(90deg, rgba(60,34,10,.16) 0 4px, rgba(0,0,0,0) 4px 96px),
     linear-gradient(180deg,#7d5233 0%,#5d3b23 60%,#452b19 100%);}
-.mg-cards-felt{position:absolute;inset:clamp(6px,1.3vh,16px);border-radius:26px;
+.mg-cards-felt{position:absolute;inset:0;z-index:3;pointer-events:none;
+  background:radial-gradient(ellipse 78% 66% at 50% 52%, rgba(0,0,0,0) 42%, rgba(12,8,4,.5) 100%);}
+/* No WebGL context: the diorama cannot run, so the v1 felt board comes back and
+   the duel plays on exactly as it always did, minus the show. */
+.mg-cards-root.mg-cards-flat .mg-cards-felt{inset:clamp(6px,1.3vh,16px);z-index:1;border-radius:26px;
   border:clamp(6px,1vh,11px) solid #7a4a29;
-  background:
-    radial-gradient(ellipse 70% 55% at 50% 46%, #4b7c57 0%, #3a6144 58%, #2c4a35 100%);
+  background:radial-gradient(ellipse 70% 55% at 50% 46%, #4b7c57 0%, #3a6144 58%, #2c4a35 100%);
   box-shadow:inset 0 0 70px rgba(12,26,16,.55),0 12px 30px rgba(0,0,0,.4);}
-.mg-cards-felt::after{content:"";position:absolute;inset:10px;border-radius:18px;
-  border:2px dashed rgba(255,246,227,.16);}
+.mg-cards-root.mg-cards-flat .mg-cards-bust{display:none;}
+.mg-cards-root.mg-cards-flat .mg-cards-slot{background:rgba(16,32,22,.34);border-radius:12px;
+  box-shadow:inset 0 0 0 2px rgba(255,246,227,.14);}
+.mg-cards-root.mg-cards-flat .mg-cards-slot.mg-cards-can{background:rgba(242,182,74,.22);
+  box-shadow:inset 0 0 0 3px #f2b64a,0 0 16px rgba(242,182,74,.45);}
+.mg-cards-root.mg-cards-flat .mg-cards-slot::before{display:none;}
 .mg-cards-lamp{position:absolute;top:-6%;left:50%;width:46%;height:34%;transform:translateX(-50%);
   background:radial-gradient(ellipse 50% 60% at 50% 0%, rgba(255,226,150,.35), rgba(255,226,150,0) 70%);
   pointer-events:none;}
@@ -1531,11 +3281,18 @@ const STYLE = `
 .mg-cards-table{position:relative;z-index:5;flex:1;min-height:0;display:flex;flex-direction:column;
   align-items:center;justify-content:space-between;padding:0 clamp(8px,2vw,26px) clamp(6px,1.4vh,14px);gap:clamp(2px,.7vh,8px);}
 .mg-cards-bar{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;}
-.mg-cards-capy{display:flex;align-items:center;gap:9px;padding:5px 12px 5px 6px;border-radius:999px;
-  background:rgba(30,20,12,.42);box-shadow:inset 0 0 0 2px rgba(255,246,227,.16);transition:.16s;}
-.mg-cards-capy canvas{display:block;filter:drop-shadow(0 4px 6px rgba(0,0,0,.35));
-  animation:mg-cards-breathe 3.2s ease-in-out infinite;}
+.mg-cards-capy{display:flex;align-items:flex-end;gap:4px;transition:.16s;}
 @keyframes mg-cards-breathe{50%{transform:translateY(-3px) scale(1.02)}}
+/* the bust itself is drawn in the diorama: this box only reserves its footprint
+   and is what the stage measures to place and size it */
+.mg-cards-bust{position:relative;flex:none;}
+.mg-cards-bustfoe{width:clamp(64px,11vh,120px);height:clamp(72px,12.5vh,134px);}
+.mg-cards-bustme{width:clamp(64px,11vh,120px);height:clamp(72px,12.5vh,134px);}
+.mg-cards-bust::after{content:"";position:absolute;inset:-14% -6% -6%;border-radius:50%;
+  background:radial-gradient(ellipse at 50% 72%, rgba(242,182,74,.42), rgba(242,182,74,0) 70%);
+  opacity:0;transition:opacity .18s;}
+.mg-cards-plate{padding:5px 13px;border-radius:999px;background:rgba(30,20,12,.55);
+  box-shadow:inset 0 0 0 2px rgba(255,246,227,.16);transition:.16s;}
 .mg-cards-capy b{display:block;font-size:13px;color:#fff6e3;letter-spacing:.03em;white-space:nowrap;}
 .mg-cards-hp{margin-top:4px;width:clamp(90px,13vw,150px);height:15px;border-radius:999px;
   background:rgba(10,20,14,.55);box-shadow:inset 0 2px 4px rgba(0,0,0,.4);position:relative;overflow:hidden;}
@@ -1543,9 +3300,11 @@ const STYLE = `
   transition:width .45s cubic-bezier(.2,1.35,.4,1),background .3s;}
 .mg-cards-hp span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   font-size:11px;font-weight:900;color:#fffdf6;text-shadow:0 1px 2px rgba(0,0,0,.55);letter-spacing:.04em;}
-.mg-cards-capy.mg-cards-can{box-shadow:inset 0 0 0 3px #f2b64a,0 0 0 6px rgba(242,182,74,.28);cursor:pointer;
+.mg-cards-capy.mg-cards-can{cursor:pointer;}
+.mg-cards-capy.mg-cards-can .mg-cards-plate{box-shadow:inset 0 0 0 3px #f2b64a,0 0 0 6px rgba(242,182,74,.28);
   animation:mg-cards-pulse 1s ease-in-out infinite;}
-.mg-cards-capy.mg-cards-hit{animation:mg-cards-shake .4s ease;}
+.mg-cards-capy.mg-cards-can .mg-cards-bust::after{opacity:1;animation:mg-cards-pulse 1s ease-in-out infinite;}
+.mg-cards-capy.mg-cards-hit .mg-cards-plate{animation:mg-cards-shake .4s ease;}
 @keyframes mg-cards-shake{0%,100%{transform:translate(0,0)}25%{transform:translate(-7px,2px)}
   55%{transform:translate(6px,-2px)}80%{transform:translate(-3px,1px)}}
 @keyframes mg-cards-pulse{50%{transform:scale(1.04)}}
@@ -1561,6 +3320,13 @@ const STYLE = `
   display:flex;align-items:center;justify-content:center;color:#fff6e3;font-weight:900;font-size:13px;}
 .mg-cards-deck.mg-cards-drawpop{animation:mg-cards-bump .3s ease;}
 @keyframes mg-cards-bump{50%{transform:scale(1.18) rotate(-4deg)}}
+.mg-cards-grave{position:relative;width:30px;height:40px;border-radius:6px;flex:none;
+  background:linear-gradient(150deg,#5e5a52,#3c3a32);
+  box-shadow:2px 2px 0 rgba(0,0,0,.3),inset 0 0 0 2px #2c2a24;
+  display:flex;align-items:center;justify-content:center;color:#cdc6b6;font-weight:900;font-size:13px;
+  opacity:.55;transition:.2s;}
+.mg-cards-grave.mg-cards-any{opacity:1;}
+.mg-cards-grave.mg-cards-drawpop{animation:mg-cards-bump .3s ease;}
 
 .mg-cards-backs{display:flex;gap:2px;height:44px;align-items:center;}
 .mg-cards-backs i{display:block;width:24px;height:34px;border-radius:4px;margin-left:-8px;
@@ -1568,32 +3334,44 @@ const STYLE = `
 .mg-cards-backs i:first-child{margin-left:0;}
 
 /* ---- rows of slots ---- */
-.mg-cards-row{display:flex;gap:clamp(6px,1.2vw,16px);justify-content:center;}
-.mg-cards-slot{position:relative;width:var(--bw);height:var(--bh);border-radius:12px;
-  background:rgba(16,32,22,.34);box-shadow:inset 0 0 0 2px rgba(255,246,227,.14);transition:.18s;}
-.mg-cards-slot.mg-cards-can{background:rgba(242,182,74,.22);
-  box-shadow:inset 0 0 0 3px #f2b64a,0 0 16px rgba(242,182,74,.45);cursor:pointer;
-  animation:mg-cards-pulse 1s ease-in-out infinite;}
-.mg-cards-card{position:absolute;inset:0;border-radius:11px;cursor:pointer;
+.mg-cards-row{display:flex;gap:clamp(8px,1.7vw,26px);justify-content:center;}
+/* A slot is now a hit zone over the diorama: the critter standing in it is 3D,
+   so all the DOM keeps is the click target and a compact stat plaque. */
+.mg-cards-slot{position:relative;width:var(--bw);height:var(--bh);border-radius:12px;transition:.18s;}
+.mg-cards-slot::before{content:"";position:absolute;left:8%;right:8%;bottom:22%;height:16%;
+  border-radius:50%;background:rgba(255,246,227,.07);transition:.18s;}
+.mg-cards-slot.mg-cards-can{cursor:pointer;}
+.mg-cards-slot.mg-cards-can::before{background:rgba(242,182,74,.34);
+  box-shadow:0 0 22px rgba(242,182,74,.6);animation:mg-cards-pulse 1s ease-in-out infinite;}
+/* the stand is what the diorama measures: the critter's feet land on its bottom
+   edge and its height is how tall the model should read */
+.mg-cards-stand{position:absolute;left:0;right:0;top:0;bottom:25%;display:block;pointer-events:none;}
+.mg-cards-card{position:absolute;inset:0;cursor:pointer;
   transition:transform .16s cubic-bezier(.2,1.35,.4,1),filter .16s;}
 .mg-cards-card canvas{display:block;width:100%;height:100%;border-radius:11px;
   filter:drop-shadow(0 4px 6px rgba(0,0,0,.4));}
-.mg-cards-card.mg-cards-land{animation:mg-cards-land .4s cubic-bezier(.2,1.5,.4,1);}
-@keyframes mg-cards-land{from{transform:translateY(-40px) scale(.6) rotate(-8deg);opacity:0}
-  70%{transform:translateY(4px) scale(1.06)}}
-.mg-cards-card.mg-cards-ready:hover{transform:translateY(-5px) scale(1.04);}
-.mg-cards-card.mg-cards-ready::after{content:"";position:absolute;inset:-3px;border-radius:13px;
-  box-shadow:0 0 0 3px rgba(122,199,79,.85);pointer-events:none;}
-.mg-cards-card.mg-cards-sel{transform:translateY(-8px) scale(1.06);z-index:6;
+.mg-cards-slot .mg-cards-card canvas{position:absolute;left:-16%;bottom:-4%;width:132%;height:auto;
+  border-radius:0;filter:drop-shadow(0 5px 7px rgba(0,0,0,.55));}
+.mg-cards-card.mg-cards-land canvas{animation:mg-cards-land .42s cubic-bezier(.2,1.5,.4,1);}
+@keyframes mg-cards-land{from{transform:translateY(16px) scale(.7);opacity:0}
+  70%{transform:translateY(-3px) scale(1.05)}}
+.mg-cards-card.mg-cards-ready::after{content:"";position:absolute;left:-4%;right:-4%;bottom:2%;height:26%;
+  border-radius:999px;box-shadow:0 0 0 3px rgba(122,199,79,.9);pointer-events:none;}
+.mg-cards-slot .mg-cards-card.mg-cards-ready:hover canvas{transform:translateY(-4px);}
+.mg-cards-slot .mg-cards-card.mg-cards-sel canvas{transform:translateY(-6px) scale(1.06);
   filter:drop-shadow(0 0 12px rgba(242,182,74,.9));animation:mg-cards-pulse .9s ease-in-out infinite;}
 .mg-cards-card.mg-cards-poof{animation:mg-cards-poof .42s ease-in forwards;pointer-events:none;}
-@keyframes mg-cards-poof{40%{transform:scale(1.12) rotate(3deg)}
-  to{transform:scale(.35) rotate(-14deg) translateY(18px);opacity:0}}
-.mg-cards-card.mg-cards-lungeUp{animation:mg-cards-lungeUp .34s ease-in-out;}
-@keyframes mg-cards-lungeUp{50%{transform:translateY(-26px) scale(1.08)}}
-.mg-cards-card.mg-cards-lungeDown{animation:mg-cards-lungeDown .34s ease-in-out;}
-@keyframes mg-cards-lungeDown{50%{transform:translateY(26px) scale(1.08)}}
-.mg-cards-card.mg-cards-hit{animation:mg-cards-shake .34s ease;}
+@keyframes mg-cards-poof{40%{transform:scale(1.06)}
+  to{transform:scale(.4) translateY(16px);opacity:0}}
+/* a knocked-out critter's card greys out and slides onto the graveyard stack */
+.mg-cards-card.mg-cards-tomb{pointer-events:none;z-index:9;
+  animation:mg-cards-tomb .62s cubic-bezier(.4,.1,.5,1) forwards;}
+.mg-cards-card.mg-cards-tomb canvas{filter:grayscale(1) brightness(.62);}
+@keyframes mg-cards-tomb{0%{transform:translate(0,0) scale(1);opacity:1}
+  22%{transform:translate(0,-10px) scale(1.04)}
+  100%{transform:translate(var(--tx),var(--ty)) scale(.2) rotate(-12deg);opacity:0}}
+.mg-cards-card.mg-cards-hit canvas{animation:mg-cards-shake .34s ease;}
+.mg-cards-card.mg-cards-away canvas{opacity:.45;}
 
 /* ---- prompt strip ---- */
 .mg-cards-prompt{display:flex;align-items:center;gap:10px;min-height:30px;
@@ -1616,16 +3394,73 @@ const STYLE = `
   padding-top:12px;}
 .mg-cards-hand .mg-cards-card{position:relative;inset:auto;width:var(--hw);height:var(--hh);
   margin:0 clamp(-14px,-.8vw,-4px);transition:transform .18s cubic-bezier(.2,1.35,.4,1);}
+.mg-cards-hand .mg-cards-card canvas{position:static;width:100%;height:100%;border-radius:11px;}
 .mg-cards-hand .mg-cards-card:hover{transform:translateY(-16px) scale(1.06);z-index:7;}
 .mg-cards-hand .mg-cards-card.mg-cards-sel{transform:translateY(-22px) scale(1.1);z-index:8;}
 .mg-cards-hand .mg-cards-card.mg-cards-poor canvas{filter:grayscale(.55) brightness(.78)
   drop-shadow(0 4px 6px rgba(0,0,0,.4));}
 .mg-cards-hand .mg-cards-card.mg-cards-nope{animation:mg-cards-shake .34s ease;}
-.mg-cards-flycard{position:absolute;pointer-events:none;z-index:11;
-  animation:mg-cards-fly .34s ease-in forwards;}
+.mg-cards-flycard{position:absolute;pointer-events:none;z-index:11;perspective:800px;
+  animation:mg-cards-fly var(--fd,.3s) cubic-bezier(.45,0,.35,1) forwards;}
 .mg-cards-flycard canvas{width:100%;height:100%;display:block;border-radius:11px;
-  filter:drop-shadow(0 6px 10px rgba(0,0,0,.45));}
-@keyframes mg-cards-fly{to{transform:translateY(-80px) scale(.5) rotate(-6deg);opacity:0}}
+  filter:drop-shadow(0 8px 14px rgba(0,0,0,.5));}
+@keyframes mg-cards-fly{
+  0%{transform:translate(0,0) scale(1) rotateX(0deg);opacity:1}
+  62%{transform:translate(calc(var(--tx) * .78),calc(var(--ty) * .78 - 26px)) scale(calc(var(--ts) * 1.12)) rotateX(300deg);opacity:1}
+  100%{transform:translate(var(--tx),var(--ty)) scale(var(--ts)) rotateX(360deg);opacity:0}}
+
+/* ---- spectacle: triangle banner, finish whiteout, fast-mode switch ---- */
+.mg-cards-banner{position:absolute;left:50%;top:40%;transform:translate(-50%,-50%);z-index:12;
+  font-weight:900;font-size:clamp(28px,6.2vw,76px);letter-spacing:.05em;color:#fff6e3;white-space:nowrap;
+  text-shadow:0 6px 0 rgba(30,18,6,.5),0 0 34px var(--bc,#ffd070);pointer-events:none;
+  animation:mg-cards-banner .86s cubic-bezier(.2,1.4,.4,1) forwards;}
+@keyframes mg-cards-banner{0%{opacity:0;transform:translate(-50%,-50%) scale(.45) skewX(-13deg)}
+  16%{opacity:1;transform:translate(-50%,-50%) scale(1.16) skewX(-13deg)}
+  32%{transform:translate(-50%,-50%) scale(1) skewX(-13deg)}
+  74%{opacity:1;transform:translate(-50%,-50%) scale(1) skewX(-13deg)}
+  100%{opacity:0;transform:translate(-50%,-52%) scale(1.06) skewX(-13deg)}}
+.mg-cards-bannerbg{position:absolute;left:0;right:0;top:40%;height:clamp(50px,11vh,116px);z-index:11;
+  transform:translateY(-50%);pointer-events:none;
+  background:linear-gradient(90deg,rgba(0,0,0,0),var(--bc,#ffd070) 22%,var(--bc,#ffd070) 78%,rgba(0,0,0,0));
+  animation:mg-cards-bannerbg .86s ease forwards;mix-blend-mode:screen;}
+@keyframes mg-cards-bannerbg{0%{opacity:0;transform:translateY(-50%) scaleY(.12)}
+  18%{opacity:.6;transform:translateY(-50%) scaleY(1)}
+  100%{opacity:0;transform:translateY(-50%) scaleY(.8)}}
+.mg-cards-white{position:absolute;inset:0;z-index:13;background:#fffdf6;opacity:0;pointer-events:none;
+  transition:opacity .34s ease;}
+.mg-cards-root.mg-cards-cam .mg-cards-slot .mg-cards-card{opacity:0;transition:opacity .22s ease;}
+.mg-cards-root.mg-cards-cam .mg-cards-hand,.mg-cards-root.mg-cards-cam .mg-cards-prompt,
+.mg-cards-root.mg-cards-cam .mg-cards-bar{opacity:.18;transition:opacity .3s ease;}
+.mg-cards-white.mg-cards-on{opacity:1;}
+.mg-cards-toggle{display:inline-flex;align-items:center;gap:9px;background:#fff6e3;border:0;
+  border-radius:999px;padding:9px 17px;font-family:inherit;font-weight:900;font-size:12px;
+  letter-spacing:.1em;color:#9a8461;cursor:pointer;transition:.14s;box-shadow:0 4px 0 rgba(60,34,10,.18);}
+.mg-cards-toggle:hover{transform:translateY(-2px);}
+.mg-cards-toggle i{width:34px;height:18px;border-radius:999px;background:rgba(58,42,28,.22);
+  position:relative;transition:.16s;flex:none;}
+.mg-cards-toggle i::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;
+  border-radius:50%;background:#fffdf6;transition:.16s;}
+.mg-cards-toggle.mg-cards-on{color:#3a2a1c;}
+.mg-cards-toggle.mg-cards-on i{background:#7ac74f;}
+.mg-cards-toggle.mg-cards-on i::after{transform:translateX(16px);}
+.mg-cards-float.mg-cards-big{font-size:clamp(30px,4.6vw,60px);
+  text-shadow:0 4px 0 rgba(30,18,6,.55),0 0 26px rgba(255,140,110,.75);}
+/* prefers-reduced-motion: everything that shook or flashed becomes a fade */
+.mg-cards-root.mg-cards-calm .mg-cards-banner{animation:mg-cards-calmfade .86s ease forwards;}
+.mg-cards-root.mg-cards-calm .mg-cards-bannerbg{animation:mg-cards-calmfade .86s ease forwards;}
+.mg-cards-root.mg-cards-calm .mg-cards-flycard{animation:mg-cards-calmfly var(--fd,.3s) ease forwards;}
+.mg-cards-root.mg-cards-calm .mg-cards-float{animation:mg-cards-calmfloat 1.05s ease-out forwards;}
+.mg-cards-root.mg-cards-calm .mg-cards-slot.mg-cards-can::before,
+.mg-cards-root.mg-cards-calm .mg-cards-capy.mg-cards-can .mg-cards-plate,
+.mg-cards-root.mg-cards-calm .mg-cards-capy.mg-cards-can .mg-cards-bust::after,
+.mg-cards-root.mg-cards-calm .mg-cards-end.mg-cards-nudge,
+.mg-cards-root.mg-cards-calm .mg-cards-quit.mg-cards-armed{animation:none;}
+.mg-cards-root.mg-cards-calm.mg-cards-quake{animation:none;}
+@keyframes mg-cards-calmfade{0%{opacity:0}18%{opacity:1}74%{opacity:1}100%{opacity:0}}
+@keyframes mg-cards-calmfly{0%{opacity:1}100%{transform:translate(var(--tx),var(--ty)) scale(var(--ts));opacity:0}}
+@keyframes mg-cards-calmfloat{0%{opacity:0;transform:translate(-50%,-50%)}
+  20%{opacity:1;transform:translate(-50%,-70%)}80%{opacity:1;transform:translate(-50%,-90%)}
+  100%{opacity:0;transform:translate(-50%,-110%)}}
 
 /* ---- inspect panel ---- */
 .mg-cards-inspect{position:absolute;right:clamp(10px,2vw,26px);top:50%;transform:translateY(-50%) scale(.9);
@@ -1754,10 +3589,9 @@ const STYLE = `
 // ===========================================================================
 // THE GAME
 // ===========================================================================
-const BOARD_PAINT = 220;
 const HAND_PAINT = 260;
-const FOE_FACE = 92;
-const MY_FACE = 66;
+/** Board critters are 3D now; the slot only carries a compact stat plaque. */
+const PLAQUE_PAINT = 260;
 /** PvP only: how long a duelist gets before their own client passes the turn. */
 const TURN_MS = 90000;
 /** PvP only: how long past the clock a silent opponent earns a gentle hint. */
@@ -1831,7 +3665,27 @@ export class CardsGame extends Minigame {
     this._clockUntil = 0;
     this._stallNoted = false;
     this._quitArmed = 0;
+    // ---- the spectacle layer (docs/CARDGAME.md section 10) -------------------
+    this.stage = null;
+    this._raf = 0;
+    this._lastT = 0;
+    this._measureAt = 0;
+    this._onResize = null;
+    this._blockUntil = 0; // hit-stop + finish cam: the ONLY input blockers
+    this._finishing = false;
+    this._graves = [0, 0];
+    this._staged = new Map(); // uids whose entrance/exit the show still owns
+    this._flyFrom = null;     // the rect a played card is flying out of
+    this.fast = false;
+    this.reduced = false;
+    this._stinger = null;
   }
+
+  /** Every duration in the show funnels through here, so fast mode is one flag. */
+  D(ms) { return this.fast ? Math.round(ms * 0.5) : ms; }
+
+  /** True only during hit-stop and the finish cam; nothing else takes input away. */
+  _blocked() { return this._finishing || performance.now() < this._blockUntil; }
 
   // ---- lifecycle ----------------------------------------------------------
   mount(root) {
@@ -1879,7 +3733,15 @@ export class CardsGame extends Minigame {
       clockNum: q('[data-el="clockNum"]'),
       live: q('[data-el="live"]'),
       quit: q('[data-el="quit"]'),
+      white: q('[data-el="white"]'),
+      myGrave: q('[data-el="myGrave"]'),
+      foeGrave: q('[data-el="foeGrave"]'),
     };
+
+    try {
+      this.reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    } catch { this.reduced = false; }
+    if (this.reduced) wrap.classList.add('mg-cards-calm');
 
     // seats first: every row, click and highlight below is addressed by seat
     const ctx = this.game.__matchCtx;
@@ -1912,8 +3774,25 @@ export class CardsGame extends Minigame {
       this.el.live.classList.remove('mg-cards-hide');
       this.el.quit.textContent = 'FORFEIT';
     }
-    paintFace(this.el.foeFace, FOE_FACE, this.foeCfg, 'idle');
-    paintFace(this.el.myFace, MY_FACE, this.myCfg, 'idle');
+    // ---- the battle diorama --------------------------------------------------
+    this.stage = new Diorama(wrap, {
+      reduced: this.reduced,
+      sfx: (n) => this.game.audio?.play?.(n),
+    });
+    if (this.stage.ok) {
+      this.stage.addBust(this.foe, this.foeCfg);
+      this.stage.addBust(this.me, this.myCfg);
+      this._resizeStage();
+      this._onResize = () => this._resizeStage();
+      window.addEventListener('resize', this._onResize);
+      this._loop();
+      // debug handle, like window.__game: lets a playtest harness step and
+      // photograph the diorama without reaching through the module graph
+      if (typeof window !== 'undefined') window.__cards = this;
+    } else {
+      // no WebGL: keep the v1 flat board readable rather than showing nothing
+      wrap.classList.add('mg-cards-flat');
+    }
 
     this.el.end.addEventListener('click', () => this._endTurnClick());
     this.el.foeCapy.addEventListener('click', () => this._clickFace());
@@ -1949,11 +3828,66 @@ export class CardsGame extends Minigame {
     if (this.game.__matchCtx) this.game.__matchCtx = null;
     for (const id of this._timers) clearTimeout(id);
     this._timers.clear();
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this._raf = 0;
+    if (this._onResize) window.removeEventListener('resize', this._onResize);
+    this._onResize = null;
     if (this._onKey) window.removeEventListener('keydown', this._onKey);
     this._onKey = null;
+    if (this.stage) { try { this.stage.dispose(); } catch (e) { console.warn('[cards] stage dispose', e); } }
+    this.stage = null;
+    if (typeof window !== 'undefined' && window.__cards === this) window.__cards = null;
+    if (this._stinger) { this._stinger.dispose(); this._stinger = null; }
     this._nodes.clear();
     this.el = {};
     this.S = null;
+  }
+
+  // ---- the show's frame loop ----------------------------------------------
+  _resizeStage() {
+    if (!this.stage || !this.el.wrap) return;
+    const r = this.el.wrap.getBoundingClientRect();
+    this.stage.resize(Math.round(r.width), Math.round(r.height));
+    this._measureAt = 0; // anchors are stale the instant the box moves
+  }
+
+  _loop() {
+    this._raf = requestAnimationFrame((t) => {
+      this._raf = 0;
+      if (this._dead || !this.stage) return;
+      const dt = this._lastT ? Math.min(80, t - this._lastT) : 16;
+      this._lastT = t;
+      // the board's boxes only move on resize and on prompt rewraps, so a
+      // quarter-second cadence is plenty and keeps layout thrash off the frame
+      if (t - this._measureAt > 250) {
+        this._measureAt = t;
+        this._measureStage();
+      }
+      this.stage.update(dt);
+      this.stage.render();
+      this._loop();
+    });
+  }
+
+  _measureStage() {
+    if (!this.stage || !this.el.wrap || !this.el.mySlots) return;
+    const wrapRect = this.el.wrap.getBoundingClientRect();
+    if (!wrapRect.width) return;
+    const stands = (slots) => slots.map((sl) => sl._stand || sl);
+    this.stage.measure({
+      slotEls: { [this.me]: stands(this.el.mySlots), [this.foe]: stands(this.el.foeSlots) },
+      bustEls: { [this.me]: this.el.myFace, [this.foe]: this.el.foeFace },
+    }, wrapRect);
+    // the slab spans the two bars: HUD above and hand below stay off the table
+    const bars = this.el.bars || (this.el.bars = [...this.el.wrap.querySelectorAll('.mg-cards-bar')]);
+    if (bars.length >= 2) {
+      const a = bars[0].getBoundingClientRect();
+      const b = bars[bars.length - 1].getBoundingClientRect();
+      this.stage.setBoard({
+        x: 0, y: a.top - wrapRect.top,
+        w: wrapRect.width, h: Math.max(40, b.bottom - a.top),
+      });
+    }
   }
 
   _after(ms, fn) {
@@ -1988,6 +3922,7 @@ export class CardsGame extends Minigame {
       <div class="mg-cards-bg"></div>
       <div class="mg-cards-felt"></div>
       <div class="mg-cards-lamp"></div>
+      <div class="mg-cards-white" data-el="white"></div>
 
       <div class="mg-cards-hud">
         <div class="mg-cards-chip mg-cards-title">CAPY CLASH</div>
@@ -2005,11 +3940,12 @@ export class CardsGame extends Minigame {
         <div class="mg-cards-bar">
           <div class="mg-cards-endcap">
             <div class="mg-cards-deck" data-el="foeDeck">24</div>
+            <div class="mg-cards-grave" data-el="foeGrave">0</div>
             <div class="mg-cards-pips" data-el="foePips"></div>
           </div>
           <div class="mg-cards-capy" data-el="foeCapy">
-            <canvas data-el="foeFace"></canvas>
-            <div>
+            <div class="mg-cards-bust mg-cards-bustfoe" data-el="foeFace"></div>
+            <div class="mg-cards-plate">
               <b data-el="foeName">${AI_NAME}</b>
               <div class="mg-cards-hp"><i data-el="foeHpFill"></i><span data-el="foeHpText">25</span></div>
             </div>
@@ -2025,20 +3961,20 @@ export class CardsGame extends Minigame {
 
         <div class="mg-cards-bar">
           <div class="mg-cards-endcap">
-            <div class="mg-cards-capy" data-el="myCapy">
-              <canvas data-el="myFace"></canvas>
-              <div>
-                <b data-el="myName">You</b>
-                <div class="mg-cards-hp"><i data-el="myHpFill"></i><span data-el="myHpText">25</span></div>
-              </div>
+            <div class="mg-cards-deck" data-el="myDeck">24</div>
+            <div class="mg-cards-grave" data-el="myGrave">0</div>
+            <div class="mg-cards-pips" data-el="myPips"></div>
+          </div>
+          <div class="mg-cards-capy" data-el="myCapy">
+            <div class="mg-cards-bust mg-cards-bustme" data-el="myFace"></div>
+            <div class="mg-cards-plate">
+              <b data-el="myName">You</b>
+              <div class="mg-cards-hp"><i data-el="myHpFill"></i><span data-el="myHpText">25</span></div>
             </div>
           </div>
-          <div class="mg-cards-endcap" style="justify-content:center;flex:none">
-            <div class="mg-cards-pips" data-el="myPips"></div>
-            <div class="mg-cards-deck" data-el="myDeck">24</div>
+          <div class="mg-cards-endcap mg-cards-right">
             <button class="mg-cards-end" data-el="end">END TURN</button>
           </div>
-          <div class="mg-cards-endcap mg-cards-right"></div>
         </div>
 
         <div class="mg-cards-hand" data-el="myHand"></div>
@@ -2072,6 +4008,10 @@ export class CardsGame extends Minigame {
       d.className = 'mg-cards-slot';
       d.dataset.side = String(side);
       d.dataset.slot = String(i);
+      const stand = document.createElement('i');
+      stand.className = 'mg-cards-stand';
+      d.appendChild(stand);
+      d._stand = stand;
       d.addEventListener('click', () => this._clickSlot(side, i));
       row.appendChild(d);
       slots.push(d);
@@ -2099,7 +4039,8 @@ export class CardsGame extends Minigame {
       : `${def.id}|h`;
     if (n.dataset.sig !== sig) {
       n.dataset.sig = sig;
-      paintCard(n._cv, kind === 'hand' ? HAND_PAINT : BOARD_PAINT, def, live);
+      if (kind === 'hand') paintCard(n._cv, HAND_PAINT, def, null);
+      else paintPlaque(n._cv, PLAQUE_PAINT, def, live);
     }
     return n;
   }
@@ -2122,6 +4063,7 @@ export class CardsGame extends Minigame {
     this._renderBacks();
     this._renderStatus();
     this._renderHighlights();
+    this._syncStage();
   }
 
   _renderRow(slots, side) {
@@ -2131,7 +4073,10 @@ export class CardsGame extends Minigame {
       const c = board[i];
       const want = c ? this._cardNode(c.uid, CARDS[c.id], this._liveOf(c, side), 'board') : null;
       for (const child of [...slot.children]) {
-        if (child !== want && !child.classList.contains('mg-cards-poof')) child.remove();
+        if (child === want || child.classList.contains('mg-cards-stand')) continue;
+        if (child.classList.contains('mg-cards-poof') || child.classList.contains('mg-cards-tomb')
+          || child.classList.contains('mg-cards-away')) continue;
+        child.remove();
       }
       if (want) {
         if (want.parentNode !== slot) slot.appendChild(want);
@@ -2216,13 +4161,13 @@ export class CardsGame extends Minigame {
     this.el.foeCapy.classList.remove('mg-cards-can');
     for (const n of this._nodes.values()) n.classList.remove('mg-cards-sel');
     const sel = this.sel;
-    if (!sel || !this._myTurn()) return;
+    if (!sel || !this._myTurn()) { this._syncSlotGlow(); return; }
     const node = this._nodes.get(sel.uid);
     if (node) node.classList.add('mg-cards-sel');
 
     if (sel.kind === 'hand') {
       const card = this.S.sides[this.me].hand.find((c) => c.uid === sel.uid);
-      if (!card) return;
+      if (!card) { this._syncSlotGlow(); return; }
       const d = CARDS[card.id];
       if (d.type === 'critter') {
         this.S.sides[this.me].board.forEach((c, i) => {
@@ -2233,11 +4178,22 @@ export class CardsGame extends Minigame {
           (t.side === this.me ? this.el.mySlots : this.el.foeSlots)[t.slot].classList.add('mg-cards-can');
         }
       }
+      this._syncSlotGlow();
       return;
     }
     // an attacker is picked: every legal victim lights up
     for (const u of unitsOf(this.S.sides[this.foe])) this.el.foeSlots[u.i].classList.add('mg-cards-can');
     if (!guardsUp(this.S, this.foe)) this.el.foeCapy.classList.add('mg-cards-can');
+    this._syncSlotGlow();
+  }
+
+  /** The slot rings on the table glow with the DOM hit zones above them. */
+  _syncSlotGlow() {
+    if (!this.stage || !this.el.mySlots) return;
+    for (let i = 0; i < BOARD_SLOTS; i++) {
+      this.stage.setSlotGlow(this.me, i, this.el.mySlots[i].classList.contains('mg-cards-can'));
+      this.stage.setSlotGlow(this.foe, i, this.el.foeSlots[i].classList.contains('mg-cards-can'));
+    }
   }
 
   // ---- prompt line --------------------------------------------------------
@@ -2364,7 +4320,7 @@ export class CardsGame extends Minigame {
   _unhover() { this.el.inspect?.classList.remove('mg-cards-on'); }
 
   _clickCard(uid) {
-    if (!this.S) return;
+    if (!this.S || this._blocked()) return;
     if (!this._myTurn()) {
       // mid-animation clicks are just early, not wrong: only nag on their turn
       if (this.S.active !== this.me && this.S.winner === null && !this._frozen) {
@@ -2441,7 +4397,7 @@ export class CardsGame extends Minigame {
   }
 
   _clickSlot(side, i) {
-    if (!this._myTurn()) return;
+    if (this._blocked() || !this._myTurn()) return;
     const sel = this.sel;
     if (!sel) return;
     if (sel.kind === 'hand' && side === this.me && !this.S.sides[this.me].board[i]) {
@@ -2453,7 +4409,7 @@ export class CardsGame extends Minigame {
   }
 
   _clickFace() {
-    if (!this._myTurn() || !this.sel || this.sel.kind !== 'unit') return;
+    if (this._blocked() || !this._myTurn() || !this.sel || this.sel.kind !== 'unit') return;
     const from = unitsOf(this.S.sides[this.me]).find((x) => x.c.uid === this.sel.uid);
     if (!from) return this._deselect();
     if (guardsUp(this.S, this.foe)) {
@@ -2476,7 +4432,7 @@ export class CardsGame extends Minigame {
       return;
     }
     if (k === 'Escape') { e.preventDefault(); this._deselect(); return; }
-    if (!this._myTurn()) return;
+    if (this._blocked() || !this._myTurn()) return;
     if (k === 'Enter') { e.preventDefault(); this._endTurnClick(); return; }
     const idx = '12345678'.indexOf(k);
     if (idx >= 0) {
@@ -2492,7 +4448,9 @@ export class CardsGame extends Minigame {
     const hi = hand.findIndex((c) => c.uid === uid);
     const d = hi >= 0 ? CARDS[hand[hi].id] : null;
     if (!d) return;
-    this._flyOut(uid, d);
+    // lift the card out of the fan first: the show flies a ghost of it from
+    // exactly where it was sitting
+    this._flyFrom = this._takeHandNode(uid);
     if (!playCard(this.S, this.me, uid, opts)) { this._warn('That play is not legal.'); return; }
     this._sendMove({
       a: 'play',
@@ -2501,29 +4459,25 @@ export class CardsGame extends Minigame {
       target: opts?.target || null,
     });
     this.sel = null;
-    this.game.audio?.play?.(d.type === 'critter' ? 'pop' : 'sparkle');
     this._afterAction();
   }
 
-  /** Lift the played card out of the hand into a ghost so the fan never jumps. */
-  _flyOut(uid, def) {
+  /** Take the played card out of the fan and report where it was, so the show
+   *  can launch its ghost from the same spot. */
+  _takeHandNode(uid) {
     const node = this._nodes.get(uid);
-    if (!node || !this.el.fx) return;
-    const r = node.getBoundingClientRect();
-    const w = this.el.wrap.getBoundingClientRect();
-    if (r.width) {
-      const ghost = document.createElement('div');
-      ghost.className = 'mg-cards-flycard';
-      ghost.style.left = `${r.left - w.left}px`;
-      ghost.style.top = `${r.top - w.top}px`;
-      ghost.style.width = `${r.width}px`;
-      ghost.style.height = `${r.height}px`;
-      ghost.appendChild(cardCanvas(def, HAND_PAINT, null));
-      this.el.fx.appendChild(ghost);
-      this._after(360, () => ghost.remove());
+    if (!node) return null;
+    let from = null;
+    if (this.el.wrap) {
+      const r = node.getBoundingClientRect();
+      const w = this.el.wrap.getBoundingClientRect();
+      if (r.width) {
+        from = { x: r.left - w.left + r.width / 2, y: r.top - w.top + r.height / 2, w: r.width, h: r.height };
+      }
     }
     node.remove();
     this._nodes.delete(uid);
+    return from;
   }
 
   _doAttack(slot, target) {
@@ -2535,24 +4489,18 @@ export class CardsGame extends Minigame {
     this.busy = true;
     this.sel = null;
     this._renderHighlights();
-    const node = this._nodes.get(a.uid);
-    if (node) {
-      node.classList.remove('mg-cards-lungeUp');
-      void node.offsetWidth;
-      node.classList.add('mg-cards-lungeUp');
-    }
+    this.stage?.crouch(a.uid); // anticipation now, the leap when the rules agree
     this.game.audio?.play?.('whoosh');
     this._after(170, () => {
       if (this._dead || !this.S || this._frozen) return;
       attack(this.S, this.me, slot, target);
       this.busy = false;
       this._afterAction();
-      if (node) node.classList.remove('mg-cards-lungeUp');
     });
   }
 
   _endTurnClick() {
-    if (!this._myTurn()) return;
+    if (this._blocked() || !this._myTurn()) return;
     this.game.audio?.play?.('click');
     this.sel = null;
     if (this.mp) { this._passTurn(); return; }
@@ -2626,18 +4574,12 @@ export class CardsGame extends Minigame {
       return;
     }
     const c = S.sides[1].board[a.slot];
-    const node = c ? this._nodes.get(c.uid) : null;
-    if (node) {
-      node.classList.remove('mg-cards-lungeDown');
-      void node.offsetWidth;
-      node.classList.add('mg-cards-lungeDown');
-    }
+    if (c) this.stage?.crouch(c.uid);
     this.game.audio?.play?.('whoosh');
     this._after(190, () => {
       if (this._dead || !this.S) return;
       if (!applyAction(this.S, 1, a)) endTurn(this.S);
       this._afterAction();
-      if (node) node.classList.remove('mg-cards-lungeDown');
       this._nextAiStep(600 + Math.floor(Math.random() * 480));
     });
   }
@@ -2789,19 +4731,13 @@ export class CardsGame extends Minigame {
         return;
       }
       const c = S.sides[foe].board[a.from];
-      const node = c ? this._nodes.get(c.uid) : null;
-      if (node) {
-        node.classList.remove('mg-cards-lungeDown');
-        void node.offsetWidth;
-        node.classList.add('mg-cards-lungeDown');
-      }
+      if (c) this.stage?.crouch(c.uid);
       this.busy = true;
       this.game.audio?.play?.('whoosh');
       this._after(190, () => {
         if (this._dead || !this.S || this._frozen) return;
         this.busy = false;
         if (!attack(this.S, foe, a.from, target)) { this._desync('a swing the rules refused'); return; }
-        if (node) node.classList.remove('mg-cards-lungeDown');
         this._afterAction();
       });
       return;
@@ -3024,6 +4960,7 @@ export class CardsGame extends Minigame {
         <div class="mg-cards-sub">${first
           ? 'You have the opening move, so they draw an extra card.'
           : `${foeName} opens, so you start with an extra card.`}</div>
+        <div class="mg-cards-btns">${this._fastToggleHtml()}</div>
       </div>`;
     const mine = document.createElement('canvas');
     paintFace(mine, 96, this.myCfg, 'idle');
@@ -3031,6 +4968,7 @@ export class CardsGame extends Minigame {
     const theirs = document.createElement('canvas');
     paintFace(theirs, 96, this.foeCfg, 'smug');
     over.querySelector('[data-el="vsFoe"]').prepend(theirs);
+    this._wireFastToggle(over);
     this.game.audio?.play?.('open');
     this._after(2000, () => this._countdown());
   }
@@ -3097,64 +5035,321 @@ export class CardsGame extends Minigame {
     this._after(700, () => a.classList.remove('mg-cards-flash'));
   }
 
-  /** Turn the rules-core event log into juice. Returns post-render callbacks. */
+  /**
+   * The one bridge between the rules core and the show.
+   *
+   * A batch of events almost always starts with an ACTION (summon / swing /
+   * cast). That action owns the dramatic beat, so everything after it in the
+   * batch (the triangle callout, the damage, the knockouts, the draws) is held
+   * back and replayed at the moment the blow actually lands. The duel state is
+   * already applied by then: only the pixels are late, which is why PvP timing
+   * is untouched.
+   */
   _consumeFx() {
     const post = [];
     if (!this.S) return post;
     const fx = this.S.fx.splice(0, this.S.fx.length);
+    if (!fx.length) return post;
+
+    let leadIdx = -1;
+    for (let i = 0; i < fx.length; i++) {
+      const k = fx[i].k;
+      if (k === 'summon' || k === 'swing' || k === 'cast') { leadIdx = i; break; }
+    }
+    if (leadIdx < 0) { this._playFx(fx); return post; }
+
+    const lead = fx[leadIdx];
+    const head = fx.slice(0, leadIdx);
+    const tail = fx.slice(leadIdx + 1);
+    if (head.length) this._playFx(head);
+
+    // hold the tail's death notices out of the DOM sweep that is about to run
+    for (const e of tail) {
+      if (e.k !== 'die') continue;
+      const n = this._nodes.get(e.uid);
+      if (n) { n.classList.add('mg-cards-away'); this._nodes.delete(e.uid); }
+      // staged either way: reconciliation must not knock it out before the blow
+      this._staged.set(e.uid, n || null);
+    }
+    const fire = this._once(() => this._playFx(tail));
+    this._playLead(lead, fx, fire, post);
+    return post;
+  }
+
+  /** Run `fn` at most once, whoever gets there first (animation or backstop). */
+  _once(fn) {
+    let spent = false;
+    return () => { if (spent || this._dead) return; spent = true; fn(); };
+  }
+
+  /** Stage the action itself and arrange for `fire` to run on the payload beat. */
+  _playLead(lead, fx, fire, post) {
+    const st = this.stage && this.stage.ok ? this.stage : null;
+
+    if (lead.k === 'summon') {
+      const def = CARDS[lead.id];
+      this._setMood(def.el);
+      const uid = lead.uid;
+      post.push(() => {
+        const n = this._nodes.get(uid);
+        if (n) n.style.visibility = 'hidden'; // the plaque arrives with the critter
+      });
+      this._flyCard(def, lead.side, lead.slot, 'slot');
+      const flyMs = this.D(DUR.fly);
+      this._staged.set(uid, null); // reconciliation must not spawn it early
+      this._after(flyMs, () => {
+        st?.slam(lead.side, lead.slot);
+        this.game.audio?.play?.('thud');
+        this._stingerFor('slam');
+        this._quake(0.5);
+      });
+      const beatMs = flyMs + this.D(DUR.slam);
+      this._after(beatMs, () => {
+        this._staged.delete(uid);
+        st?.spawn(uid, lead.id, lead.side, lead.slot, false);
+        this.game.audio?.play?.('sparkle');
+        this._stingerFor('summon', def.el);
+        const n = this._nodes.get(uid);
+        if (n) {
+          n.style.visibility = '';
+          n.classList.remove('mg-cards-land');
+          void n.offsetWidth;
+          n.classList.add('mg-cards-land');
+        }
+      });
+      this._after(beatMs + this.D(DUR.beam), fire);
+      return;
+    }
+
+    if (lead.k === 'swing') {
+      const uid = this._attackerUid(lead, fx);
+      const foe = 1 - lead.side;
+      const face = lead.target === 'face';
+      const tSide = face ? foe : lead.target.side;
+      const tSlot = face ? -1 : lead.target.slot;
+      let dealt = 0;
+      for (const e of fx) {
+        if (e.k === 'dmg' && e.side === tSide && e.slot === tSlot) dealt += e.amount;
+        else if (e.k === 'face' && face && e.side === tSide) dealt += e.amount;
+      }
+      const attacker = this.S.sides[lead.side].board[lead.slot];
+      let el = 'neutral';
+      if (attacker) el = attacker.el;
+      else {
+        const gone = fx.find((e) => e.k === 'die' && e.side === lead.side && e.slot === lead.slot);
+        if (gone && CARDS[gone.id]) el = CARDS[gone.id].el;
+      }
+      const to = new THREE.Vector3();
+      if (st) {
+        const a = face ? st.bustAnchor(tSide) : st.slotAnchor(tSide, tSlot);
+        if (a) { to.copy(a.p); if (face) to.y += a.scale * 0.5; }
+      }
+      this.game.audio?.play?.('jump');
+      const est = st && uid != null
+        ? st.strike(uid, to, () => { this._impact(el, tSide, tSlot, dealt, face); fire(); })
+        : 0;
+      this._after(est + 280, fire);
+      return;
+    }
+
+    // a spell: the card flies to the middle, then the arena wears the effect
+    const def = CARDS[lead.id];
+    this._setMood(def.el);
+    this._flyCard(def, lead.side, null, 'centre');
+    const flyMs = this.D(DUR.fly);
+    this._after(flyMs, () => this._castFx(def, lead.side, lead.target));
+    this._after(flyMs + Math.round(this.D(DUR.spell) * 0.34), fire);
+  }
+
+  /** Whose swing is this? The board may already have reaped them. */
+  _attackerUid(lead, fx) {
+    const cur = this.S.sides[lead.side].board[lead.slot];
+    if (cur) return cur.uid;
+    for (const e of fx) {
+      if ((e.k === 'dmg' || e.k === 'die') && e.side === lead.side && e.slot === lead.slot) return e.uid;
+    }
+    return null;
+  }
+
+  /** The 90ms freeze, the damage-scaled shake and the element burst. */
+  _impact(el, tSide, tSlot, dealt, face) {
+    const st = this.stage && this.stage.ok ? this.stage : null;
+    const power = Math.max(1, dealt);
+    if (!this.reduced) {
+      this._blockUntil = performance.now() + this.D(DUR.hitstop);
+      st?.hitStop(this.D(DUR.hitstop));
+    }
+    st?.kick(Math.min(1.6, 0.4 + power * 0.16));
+    this._quake(Math.min(1, 0.3 + power * 0.1));
+    if (st) {
+      const a = face ? st.bustAnchor(tSide) : st.slotAnchor(tSide, tSlot);
+      if (a) {
+        const c = EL3[el] || EL3.neutral;
+        st.emit(a.p, c.mote, 16, { speed: 4.6, up: 3.4, ttl: 520, size: 0.17, gravity: 6, y0: a.scale * 0.4 });
+        st.ring(a.p, c.light, this.D(320), 0.5, 2.6);
+      }
+      if (!face) st.flashSlot(tSide, tSlot, (EL3[el] || EL3.neutral).light);
+    }
+    this.game.audio?.play?.('thud');
+    this._stingerFor('impact', el, power);
+  }
+
+  /** Full-board spell silhouettes. Everything here is <= 1.2s. */
+  _castFx(def, side, target) {
+    const st = this.stage && this.stage.ok ? this.stage : null;
+    this.game.audio?.play?.('sparkle');
+    this._stingerFor('spell', def.el);
+    if (!st) return;
+    let at = null;
+    if (target && Number.isInteger(target.slot)) {
+      const a = st.slotAnchor(target.side, target.slot);
+      if (a) at = a.p;
+    }
+    if (!at) {
+      const b = st.bustAnchor(side);
+      if (b) at = b.p;
+    }
+    if (def.id === 'sunburst') st.spell('flare', 'sun', at);
+    else if (def.id === 'splash') st.spell('wave', 'sea', at);
+    else if (def.id === 'flurry') {
+      st.spell('blizzard', 'snow', at);
+      const pts = [];
+      for (const u of unitsOf(this.S.sides[1 - side])) {
+        const a = st.slotAnchor(1 - side, u.i);
+        if (a) pts.push(a.p.clone());
+      }
+      this._after(this.D(280), () => st.icicles(pts));
+    } else if (def.id === 'cozy_cocoa') st.spell('blizzard', 'snow', at);
+    else st.spell('pillar', def.el, at);
+  }
+
+  /** A card leaving a hand: it tumbles across the table and lands face-up. */
+  _flyCard(def, side, slot, mode) {
+    if (!this.el.fx || !this.el.wrap) return;
+    const w = this.el.wrap.getBoundingClientRect();
+    let from = this._flyFrom;
+    this._flyFrom = null;
+    if (!from) {
+      const src = this.el.fx.querySelector('.mg-cards-reveal')
+        || (side === this.me ? this.el.myHand : this.el.foeHand);
+      const r = src ? src.getBoundingClientRect() : null;
+      const hw = Math.max(56, w.width * 0.075);
+      from = r && r.width
+        ? { x: r.left - w.left + r.width / 2, y: r.top - w.top + r.height / 2, w: Math.min(r.width, hw * 1.4) }
+        : { x: w.width / 2, y: w.height * 0.28, w: hw };
+      from.h = from.w * 1.38;
+    }
+    let tx = w.width / 2, ty = w.height * 0.44, ts = 0.42;
+    if (mode === 'slot' && Number.isInteger(slot)) {
+      const el = (side === this.me ? this.el.mySlots : this.el.foeSlots)[slot];
+      if (el) {
+        const r = el.getBoundingClientRect();
+        tx = r.left - w.left + r.width / 2;
+        ty = r.top - w.top + r.height * 0.78;
+        ts = Math.max(0.22, (r.width * 1.1) / Math.max(1, from.w));
+      }
+    }
+    const ghost = document.createElement('div');
+    ghost.className = 'mg-cards-flycard';
+    ghost.style.left = `${from.x - from.w / 2}px`;
+    ghost.style.top = `${from.y - from.h / 2}px`;
+    ghost.style.width = `${from.w}px`;
+    ghost.style.height = `${from.h}px`;
+    ghost.style.setProperty('--tx', `${Math.round(tx - from.x)}px`);
+    ghost.style.setProperty('--ty', `${Math.round(ty - from.y)}px`);
+    ghost.style.setProperty('--ts', String(ts.toFixed(3)));
+    ghost.style.setProperty('--fd', `${this.D(DUR.fly) + this.D(DUR.slam)}ms`);
+    ghost.appendChild(cardCanvas(def, HAND_PAINT, null));
+    this.el.fx.appendChild(ghost);
+    this.game.audio?.play?.('slide');
+    this._after(this.D(DUR.fly) + this.D(DUR.slam) + 80, () => ghost.remove());
+  }
+
+  _setMood(el) { this.stage?.setMood(el); }
+
+  _stingerFor(kind, el, power) {
+    if (this._dead) return;
+    if (!this._stinger) this._stinger = new Stinger(this.game);
+    try { this._stinger.play(kind, el, power); } catch { /* a dropped sting never breaks a duel */ }
+  }
+
+  _quake(mag) {
+    if (this.reduced || !this.el.wrap || mag < 0.45) return;
+    this._shake(this.el.wrap, 'mg-cards-quake');
+  }
+
+  /** The banner-flash callout that teaches the triangle without a tooltip. */
+  _banner(text, el) {
+    if (!this.el.fx) return;
+    const c = ELEMENTS[el] || ELEMENTS.neutral;
+    const bg = document.createElement('div');
+    bg.className = 'mg-cards-bannerbg';
+    bg.style.setProperty('--bc', c.c1);
+    const b = document.createElement('div');
+    b.className = 'mg-cards-banner';
+    b.style.setProperty('--bc', c.c1);
+    b.style.color = c.pale;
+    b.textContent = text;
+    this.el.fx.appendChild(bg);
+    this.el.fx.appendChild(b);
+    this._after(DUR.banner + 80, () => { bg.remove(); b.remove(); });
+  }
+
+  /** Every non-action event, played either at once or on the payload beat. */
+  _playFx(list) {
+    if (!this.S || !this.el.wrap) return;
+    const st = this.stage && this.stage.ok ? this.stage : null;
     let drewFor = -1;
     const sfx = new Set();
-    for (const e of fx) {
+    for (const e of list) {
       if (e.k === 'dmg') {
         const p = this._slotPoint(e.side, e.slot);
-        this._float(`-${e.amount}`, p, 'mg-cards-dmg');
+        this._float(`-${e.amount}`, p, `mg-cards-dmg${e.amount >= 4 ? ' mg-cards-big' : ''}`);
         this._shake(this._nodes.get(e.uid));
+        st?.hurtCritter(e.uid, e.amount);
         sfx.add('thud');
       } else if (e.k === 'face') {
         const p = this._facePoint(e.side);
-        this._float(`-${e.amount}`, p, 'mg-cards-dmg');
+        this._float(`-${e.amount}`, p, `mg-cards-dmg${e.amount >= 4 ? ' mg-cards-big' : ''}`);
         this._shake(e.side === this.me ? this.el.myCapy : this.el.foeCapy);
-        this._shake(this.el.wrap, 'mg-cards-quake');
+        this._quake(Math.min(1, 0.3 + e.amount * 0.1));
+        st?.flinchBust(e.side, e.amount);
+        st?.kick(Math.min(1.4, 0.3 + e.amount * 0.14));
         if (e.src === 'fatigue') this._float('SLEEPY!', { x: p.x, y: p.y - 34 }, 'mg-cards-note');
         this._setExpr(e.side, 'hurt', 900);
         sfx.add('thud');
       } else if (e.k === 'heal') {
         if (e.amount > 0) {
           this._float(`+${e.amount}`, this._facePoint(e.side), 'mg-cards-heal');
+          const b = st ? st.bustAnchor(e.side) : null;
+          if (b) st.emit(b.p, 0xa8e87a, 14, { speed: 1.1, up: 4.4, ttl: 780, size: 0.14, gravity: -1, spread: 0.6 });
           sfx.add('sparkle');
         }
       } else if (e.k === 'die') {
-        const p = this._slotPoint(e.side, e.slot);
-        const node = this._nodes.get(e.uid);
-        if (node) {
-          this._nodes.delete(e.uid);
-          node.classList.add('mg-cards-poof');
-          this._after(460, () => node.remove());
-        }
-        this._poofDots(p, ELEMENTS[CARDS[e.id].el].c1);
+        this._entomb(e);
         sfx.add('splash');
       } else if (e.k === 'tri') {
         this._flashArrow(e.from);
+        this._banner(TRI_CALL[e.from] || 'SUPER!', e.from);
+        this._setMood(e.from);
         const p = this._slotPoint(e.side, e.slot);
         this._float(`${ELEMENTS[e.from].name.toUpperCase()} +2`, { x: p.x, y: p.y - 26 }, 'mg-cards-tri');
+        st?.flashSlot(e.side, e.slot, (EL3[e.from] || EL3.neutral).light);
+        this._stingerFor('tri', e.from);
         sfx.add('ding');
       } else if (e.k === 'buff') {
         this._float('+2 ATK', this._slotPoint(e.side, e.slot), 'mg-cards-heal');
+        const a = st ? st.slotAnchor(e.side, e.slot) : null;
+        if (a) {
+          st.emit(a.p, 0x9be86a, 16, { speed: 0.9, up: 5, ttl: 760, size: 0.14, gravity: -1.4, spread: 0.5 });
+          st.ring(a.p, 0x9be86a, this.D(400), 0.5, 2.2);
+        }
       } else if (e.k === 'lastsplash') {
         this._float('LAST SPLASH', this._slotPoint(e.side, e.slot), 'mg-cards-note');
       } else if (e.k === 'burn') {
         this._float('HAND FULL', this._pointOf(e.side === this.me ? this.el.myDeck : this.el.foeDeck), 'mg-cards-note');
       } else if (e.k === 'draw') {
         drewFor = e.side;
-      } else if (e.k === 'summon') {
-        const uid = e.uid;
-        post.push(() => {
-          const n = this._nodes.get(uid);
-          if (n) {
-            n.classList.add('mg-cards-land');
-            this._after(460, () => n.classList.remove('mg-cards-land'));
-          }
-        });
       }
     }
     if (drewFor >= 0) {
@@ -3168,7 +5363,70 @@ export class CardsGame extends Minigame {
       if (i === 0) this.game.audio?.play?.(name);
       else this._after(70 * i, () => this.game.audio?.play?.(name));
     });
-    return post;
+  }
+
+  /** Crack, shatter, and slide the greyed card onto the graveyard stack. */
+  _entomb(e) {
+    const st = this.stage && this.stage.ok ? this.stage : null;
+    const koMs = st ? st.koCritter(e.uid) : this.D(DUR.koCrack + DUR.koPause + DUR.koShatter);
+    const node = this._staged.get(e.uid) || this._nodes.get(e.uid);
+    this._staged.delete(e.uid);
+    this._nodes.delete(e.uid);
+    const p = this._slotPoint(e.side, e.slot);
+    this._poofDots(p, ELEMENTS[CARDS[e.id].el].c1);
+    if (!node) return;
+    node.classList.remove('mg-cards-away');
+    const mine = e.side === this.me;
+    // the plaque waits for the crack, then falls onto the stack
+    this._after(Math.max(80, Math.round(koMs * 0.55)), () => {
+      if (!node.isConnected) return;
+      const grave = mine ? this.el.myGrave : this.el.foeGrave;
+      const w = this.el.wrap ? this.el.wrap.getBoundingClientRect() : null;
+      if (grave && w) {
+        const a = node.getBoundingClientRect();
+        const b = grave.getBoundingClientRect();
+        node.style.setProperty('--tx', `${Math.round(b.left + b.width / 2 - (a.left + a.width / 2))}px`);
+        node.style.setProperty('--ty', `${Math.round(b.top + b.height / 2 - (a.top + a.height / 2))}px`);
+      }
+      node.classList.add('mg-cards-tomb');
+      this._after(660, () => {
+        node.remove();
+        const i = mine ? 0 : 1;
+        this._graves[i] += 1;
+        const g = mine ? this.el.myGrave : this.el.foeGrave;
+        if (g) {
+          g.textContent = String(this._graves[i]);
+          g.classList.add('mg-cards-any');
+          this._shake(g, 'mg-cards-drawpop');
+        }
+      });
+    });
+  }
+
+  /**
+   * The stage is a view of the board, never a second copy of it: anything the
+   * rules say is standing there gets a model, anything that left gets removed.
+   * Cards mid-entrance (`_staged`) are exempt so their arrival still plays.
+   */
+  _syncStage() {
+    const st = this.stage;
+    if (!st || !st.ok || !this.S) return;
+    const seen = new Set();
+    for (const side of [0, 1]) {
+      const board = this.S.sides[side].board;
+      for (let i = 0; i < BOARD_SLOTS; i++) {
+        const c = board[i];
+        if (!c) continue;
+        seen.add(c.uid);
+        if (this._staged.has(c.uid)) continue;
+        if (st.has(c.uid)) st.moveTo(c.uid, side, i);
+        else st.spawn(c.uid, c.id, side, i, true);
+      }
+    }
+    for (const [uid, e] of st.crit) {
+      if (seen.has(uid) || e.phase === 'ko' || this._staged.has(uid)) continue;
+      st.koCritter(uid);
+    }
   }
 
   // ---- expressions --------------------------------------------------------
@@ -3177,7 +5435,7 @@ export class CardsGame extends Minigame {
     if (side === this.foe) {
       if (this.foeExpr !== expr) {
         this.foeExpr = expr;
-        paintFace(this.el.foeFace, FOE_FACE, this.foeCfg, expr);
+        this.stage?.setBustExpr(this.foe, expr);
       }
       if (holdMs) {
         this._foeHold = performance.now() + holdMs;
@@ -3187,7 +5445,7 @@ export class CardsGame extends Minigame {
     }
     if (this.myExpr !== expr) {
       this.myExpr = expr;
-      paintFace(this.el.myFace, MY_FACE, this.myCfg, expr);
+      this.stage?.setBustExpr(this.me, expr);
     }
     if (holdMs) {
       this._myHold = performance.now() + holdMs;
@@ -3197,6 +5455,9 @@ export class CardsGame extends Minigame {
 
   _syncExpr() {
     if (this._dead || !this.S || !this.el.foeFace) return;
+    // low HP droops the whole bust, not just the face
+    this.stage?.setBustHp(this.me, Math.max(0, this.S.sides[this.me].hp) / this.S.sides[this.me].maxHp);
+    this.stage?.setBustHp(this.foe, Math.max(0, this.S.sides[this.foe].hp) / this.S.sides[this.foe].maxHp);
     const S = this.S;
     const now = performance.now();
     if (!(this._foeHold > now)) {
@@ -3255,6 +5516,7 @@ export class CardsGame extends Minigame {
           <div class="mg-cards-stat"><b>${best}</b><span>YOUR BEST</span></div>
           <div class="mg-cards-stat mg-cards-gold"><b>70+</b><span>COINS ON A WIN</span></div>
         </div>
+        <div class="mg-cards-btns" style="margin-bottom:8px">${this._fastToggleHtml()}</div>
         <div class="mg-cards-btns">
           ${panel > 0 ? '<button class="mg-cards-btn mg-cards-ghost" data-a="back">Back</button>' : ''}
           <button class="mg-cards-btn" data-a="go">${last ? 'Start the duel' : 'Next'}</button>
@@ -3263,6 +5525,7 @@ export class CardsGame extends Minigame {
         </div>
       </div>`;
     this._fillPanel(over.querySelector('[data-el="panel"]'), panel);
+    this._wireFastToggle(over);
     over.querySelector('[data-a="go"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
       if (last) this._countdown(); else this._showSplash(panel + 1);
@@ -3278,6 +5541,24 @@ export class CardsGame extends Minigame {
     over.querySelector('[data-a="leave"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
       this.quit();
+    });
+  }
+
+  /** Fast mode halves every duration constant in the show; the rules never move. */
+  _fastToggleHtml() {
+    return `<button class="mg-cards-toggle${this.fast ? ' mg-cards-on' : ''}" data-a="fast" type="button">
+      <i></i>FAST MODE</button>`;
+  }
+
+  _wireFastToggle(over) {
+    const b = over.querySelector('[data-a="fast"]');
+    if (!b) return;
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.fast = !this.fast;
+      b.classList.toggle('mg-cards-on', this.fast);
+      this.stage?.setSpeed(this.fast ? 0.5 : 1);
+      this.game.audio?.play?.('click');
     });
   }
 
@@ -3373,9 +5654,32 @@ export class CardsGame extends Minigame {
 
   _startDuel() {
     this._nodes.clear();
+    this._staged.clear();
+    this._flyFrom = null;
+    this._blockUntil = 0;
+    this._finishing = false;
+    this.el.wrap?.classList.remove('mg-cards-cam');
+    this.el.white?.classList.remove('mg-cards-on');
     this.el.myHand.innerHTML = '';
-    for (const s of [...this.el.foeSlots, ...this.el.mySlots]) s.innerHTML = '';
+    for (const s of [...this.el.foeSlots, ...this.el.mySlots]) {
+      for (const child of [...s.children]) {
+        if (!child.classList.contains('mg-cards-stand')) child.remove();
+      }
+    }
     this.el.fx.innerHTML = '';
+    this._graves = [0, 0];
+    for (const g of [this.el.myGrave, this.el.foeGrave]) {
+      if (!g) continue;
+      g.textContent = '0';
+      g.classList.remove('mg-cards-any');
+    }
+    if (this.stage) {
+      for (const uid of [...this.stage.crit.keys()]) this.stage.removeCritter(uid);
+      this.stage.pinBusts = true;
+      this.stage.finishRun = null;
+      this.stage.setSpeed(this.fast ? 0.5 : 1);
+      this._measureStage();
+    }
     this.sel = null;
     this.busy = false;
     this._warnUntil = 0;
@@ -3404,7 +5708,38 @@ export class CardsGame extends Minigame {
     this._rq.length = 0;
     this._renderHighlights();
     this.game.audio?.play?.(this.S.winner === this.me ? 'success' : 'fail');
-    this._after(1100, () => this._results());
+    this._finishCam();
+  }
+
+  /**
+   * The lethal blow: a brief slow-mo push onto the losing bust, a whiteout, and
+   * only then the results card. The winner's survivors cheer through it.
+   */
+  _finishCam() {
+    const S = this.S;
+    const draw = S.winner === 'draw';
+    const winner = draw ? null : S.winner;
+    const loser = draw ? this.foe : 1 - winner;
+    this._finishing = true;
+    this.el.wrap?.classList.add('mg-cards-cam');
+    const camMs = this.D(DUR.finish);
+    if (this.stage) {
+      this.stage.finishCam(loser, camMs);
+      if (winner !== null) {
+        this.stage.cheerAll(winner);
+        this.stage.cheerBust(winner);
+      }
+    }
+    this._stingerFor('finish', winner === this.me ? 'sun' : 'sea');
+    this._after(camMs, () => {
+      this.el.white?.classList.add('mg-cards-on');
+      this._after(this.D(DUR.white), () => {
+        this._finishing = false;
+        this.el.wrap?.classList.remove('mg-cards-cam');
+        this._results();
+        this._after(60, () => this.el.white?.classList.remove('mg-cards-on'));
+      });
+    });
   }
 
   _results() {
