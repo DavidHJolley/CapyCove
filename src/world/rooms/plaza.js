@@ -1349,7 +1349,7 @@ export class PlazaRoom extends Room {
     const stone = makeToon(C.stone);
     const planeGeo = new THREE.PlaneGeometry(2.4, 0.8);
     const posts = [], arches = [], lamps = [], boards = [], poles = [], pennants = [];
-    const planters = [], bushes = [];
+    const planters = [], bushes = [], keystones = [];
 
     for (const gt of gates) {
       const yaw = Math.atan2(gt.x, gt.z);            // local +Z points out of the cove
@@ -1364,21 +1364,22 @@ export class PlazaRoom extends Room {
       posts.push(L([1.45, 1.6, 0]), L([-1.45, 1.6, 0]));
       arches.push(L([0, 3.2, 0]));
       lamps.push(L([1.45, 3.44, 0]), L([-1.45, 3.44, 0]));
-      // The board hangs ABOVE the arch, so it has to clear the crown: the
-      // torus tops out at 3.2 + 1.45 + 0.28 = 4.93, and a 0.9-tall board
-      // centred at 5.0 started at 4.55, i.e. a third of it inside the stone.
-      // 5.55 leaves a finger of daylight under it. The pole and pennant ride
-      // the same lift so the assembly stays together.
-      boards.push(L([0, 5.55, 0]));
-      poles.push(L([0, 6.45, 0]));
-      pennants.push(L([0.26, 6.75, 0], [0, 0, -Math.PI / 2]));
+      // The name board is MOUNTED, not floated: a stone keystone straddles the
+      // arch crown (torus tops out at 3.2 + 1.45 + 0.28 = 4.93) and the board
+      // seats on it. The first fix lifted the board clear of the stone but
+      // left it hanging off a hairline pole, which read as levitation from
+      // ten metres; the keystone gives the eye the load path.
+      keystones.push(L([0, 4.95, 0]));
+      boards.push(L([0, 5.42, 0]));
+      poles.push(L([0, 6.3, 0]));
+      pennants.push(L([0.26, 6.62, 0], [0, 0, -Math.PI / 2]));
       planters.push(L([2.5, 0.28, 0]), L([-2.5, 0.28, 0]));
       bushes.push(L([2.5, 0.74, 0]), L([-2.5, 0.74, 0]));
 
       // name board, painted on both faces so it reads coming and going
       const signMat = toonMap(0xffffff, woodSignTex(gt.name, ''));
-      put(g, planeGeo, signMat, 0, 5.55, 0.09, { cast: false });
-      put(g, planeGeo, signMat, 0, 5.55, -0.09, { rot: [0, Math.PI, 0], cast: false });
+      put(g, planeGeo, signMat, 0, 5.42, 0.09, { cast: false });
+      put(g, planeGeo, signMat, 0, 5.42, -0.09, { rot: [0, Math.PI, 0], cast: false });
 
       this.obstacles.push(
         { x: gt.x + px * 1.45, z: gt.z + pz * 1.45, r: 0.55 },
@@ -1399,6 +1400,14 @@ export class PlazaRoom extends Room {
     // the gate lanterns share the plaza lamp material, so they light together
     inst(scene, new THREE.SphereGeometry(0.2, 10, 8),
       this.anim.lamps?.lampMat || makeGlow(C.lampGlow), lamps, false, false);
+    // keystone: a tapered wedge (box narrowed at the foot) straddling the crown
+    const keyGeo = new THREE.BoxGeometry(0.56, 0.62, 0.44);
+    {
+      const kp = keyGeo.attributes.position;
+      for (let i = 0; i < kp.count; i++) if (kp.getY(i) < 0) kp.setX(i, kp.getX(i) * 0.7);
+      keyGeo.computeVertexNormals();
+    }
+    inst(scene, keyGeo, stone, keystones, true, true);
     inst(scene, new THREE.BoxGeometry(2.55, 0.9, 0.16), makeToon(C.woodDark), boards);
     inst(scene, new THREE.CylinderGeometry(0.05, 0.05, 0.9, 6), makeToon(C.iron), poles, false, false);
     inst(scene, new THREE.ConeGeometry(0.3, 0.55, 3), makeGlow(C.coral), pennants, false, false);
