@@ -900,6 +900,11 @@ const CSS = `
   position: absolute; inset: 0; z-index: 38; pointer-events: none;
   font-family: var(--font);
 }
+/* The HUD/overlay mount points blanket-enable pointer events on their children
+   ("#hud-root > *" / "#overlay-root > *"), which out-ranks the class rule
+   above and made this full-screen wrapper eat every floor click: placement
+   looked completely dead. ID+class beats ID+star, so click-through returns. */
+#hud-root > .he-root, #overlay-root > .he-root { pointer-events: none; }
 .he-root > * { pointer-events: auto; }
 .he-root.is-closing .he-drawer { translate: 0 130%; opacity: 0; }
 .he-root.is-closing .he-hint { opacity: 0; }

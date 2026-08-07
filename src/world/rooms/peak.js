@@ -776,6 +776,18 @@ export class PeakRoom extends Room {
     this.hotspots.push(
       this._joinSpot,
       {
+        // twin prompt AT the gate: playtest showed nobody discovers the rack,
+        // so solo riding must be offered where everyone already walks
+        id: 'play-sled-gate',
+        position: new THREE.Vector3(-2.9, 0, -6.6),
+        radius: 2.8,
+        label: 'Sled alone',
+        action: (g) => {
+          g.__raceCtx = null;
+          g.startMinigame('sled');
+        },
+      },
+      {
         id: 'play-sled',
         position: new THREE.Vector3(4.6, 0, -4.6),
         radius: 2.6,

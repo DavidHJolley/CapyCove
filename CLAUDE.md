@@ -54,6 +54,9 @@ Play-again runs). Shipped wave 3: house-info/house-config/house-invite/
 house-uninvite/house-save/house-guests, buy-furn/furn; dynamic 'house:<owner>'
 room sets, access enforced in houseGate() before any join side effect.
 Known limitation: access changes do not evict players already inside.
+In flight wave 4 (den PvP): table-join/table-leave/table,
+match-start/match-move/match-done/match-end; client re-emits are wired in
+src/net/client.js already.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

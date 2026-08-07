@@ -239,6 +239,19 @@ export class NetClient {
       case 'house-guests':
         game.events.emit('house-guests', m);
         break;
+      // ---- den tables / PvP matches (wave 4) -------------------------------
+      case 'table':
+        game.events.emit('table', m);
+        break;
+      case 'match-start':
+        game.events.emit('match-start', m);
+        break;
+      case 'match-move':
+        game.events.emit('match-move', m);
+        break;
+      case 'match-end':
+        game.events.emit('match-end', m);
+        break;
       case 'furn':
         // keep the purse and inventory authoritative before the UI reacts
         if (m.ok) {
