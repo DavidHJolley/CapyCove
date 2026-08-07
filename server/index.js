@@ -4,12 +4,16 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { users, saveSoon, ensureFriends, FRIEND_CAP } from './db.js';
+import {
+  users, saveSoon, ensureFriends, FRIEND_CAP,
+  ensureHouse, ensureOwnedFurniture, HOUSE_INVITE_CAP, HOUSE_BOUNDS,
+} from './db.js';
 import { signup, login, verifyToken, publicProfile } from './auth.js';
 import { BotManager } from './bots.js';
 import {
   ROOM_IDS, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
   NAME_MAX_LEN, NAME_MIN_LEN, clampCoinsForGame, MINIGAMES,
+  FURNITURE, HOUSE_MAX_ITEMS, HOUSE_ACCESS_MODES,
 } from '../shared/constants.js';
 
 // Client-supplied strings must never reach a catalog through the prototype
@@ -63,7 +67,10 @@ app.get('/api/me', (req, res) => {
   if (!username) return res.json({ ok: false });
   res.json({ ok: true, profile: publicProfile(users.get(username.toLowerCase())) });
 });
-app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size }));
+// `rooms` counts the live room sets: the fixed ROOM_IDS plus however many dens
+// currently have someone standing in them. Handy for spotting a den that failed
+// to get reaped when its last visitor left.
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size }));
 
 // dev-only: lets automated playtests save canvas captures to disk
 if (process.env.NODE_ENV !== 'production') {
@@ -126,16 +133,33 @@ function roomSnapshot(roomId) {
   return players;
 }
 
+/** Drop p from its current room set, tell the room, and reap the den if empty. */
+function leaveRoomSet(p) {
+  const set = world.rooms.get(p.room);
+  set?.delete(p.id);
+  broadcastToRoom(p.room, { t: 'pleave', id: p.id });
+  // dens exist only while somebody is standing in one; the fixed ROOM_IDS sets
+  // are permanent (bots live in them even when no player does)
+  if (set && set.size === 0 && isHouseRoom(p.room)) world.rooms.delete(p.room);
+}
+
 function joinRoom(p, roomId) {
+  if (isHouseRoom(roomId)) {
+    const key = houseOwnerKey(roomId);
+    const gate = houseGate(p, key);
+    // The door is checked BEFORE any side effect: someone turned away must not
+    // have already left their old room, blinked out for everyone in it, or
+    // spawned a room set for a den they never entered.
+    if (!gate.ok) { sendTo(p, { t: 'toast', msg: gate.msg || 'That den is closed right now' }); return; }
+    roomId = houseRoomId(key); // canonical lowercase id, whatever case was typed
+    if (!world.rooms.has(roomId)) world.rooms.set(roomId, new Set());
+  }
   if (!world.rooms.has(roomId)) return;
   if (p.room === roomId) return; // already here: re-joining would churn pleave/pjoin on everyone
   // walking away from the mountain gives up your spot on the sled queue (and
   // forfeits a run in progress); the lobby must never list someone who left
   if (p.room === SLED_ROOM) exitSled(p);
-  if (p.room) {
-    world.rooms.get(p.room)?.delete(p.id);
-    broadcastToRoom(p.room, { t: 'pleave', id: p.id });
-  }
+  if (p.room) leaveRoomSet(p);
   p.room = roomId;
   world.rooms.get(roomId).add(p.id);
   sendTo(p, { t: 'room', room: roomId, players: roomSnapshot(roomId) });
@@ -147,10 +171,7 @@ function joinRoom(p, roomId) {
 
 function leaveWorld(p) {
   exitSled(p);
-  if (p.room) {
-    world.rooms.get(p.room)?.delete(p.id);
-    broadcastToRoom(p.room, { t: 'pleave', id: p.id });
-  }
+  if (p.room) leaveRoomSet(p);
   world.players.delete(p.id);
 }
 
@@ -269,6 +290,117 @@ function friendsPayload(rec) {
 function sendFriends(p) {
   const rec = recordFor(p);
   sendTo(p, rec ? friendsPayload(rec) : { t: 'friends', friends: [] });
+}
+
+// ---------- player dens ----------
+// Every registered capy owns exactly one den, addressed as 'house:<ownerLower>'.
+// Guests own none but may visit the open ones. The room set is created when the
+// first visitor is let in and dropped when the last one leaves, so an idle
+// server carries nothing for the thousands of dens nobody is standing in.
+// Bots never reach them: BotManager only ever picks rooms out of ROOM_IDS.
+
+const HOUSE_PREFIX = 'house:';
+const isHouseRoom = (id) => typeof id === 'string' && id.startsWith(HOUSE_PREFIX);
+const houseRoomId = (ownerKey) => HOUSE_PREFIX + ownerKey;
+
+/** 'house:Mango' -> 'mango'; null for anything that could never name a den. */
+function houseOwnerKey(roomId) {
+  return isHouseRoom(roomId) ? friendKey(roomId.slice(HOUSE_PREFIX.length)) : null;
+}
+
+const houseName = (rec) => `${rec.username}'s Den`;
+
+/** Display-case names for the guest list (falls back to the key if deleted). */
+const inviteNames = (house) => house.invites.map((k) => users.get(k)?.username || k);
+
+/**
+ * The door. One place decides who gets in, used by both the join path (which
+ * enforces) and house-info (which lets the UI reflect it). Owner always passes.
+ */
+function houseGate(p, ownerKey) {
+  const owner = ownerKey ? users.get(ownerKey) : null;
+  if (!owner) return { ok: false, owner: null, msg: 'No capy signed up under that name' };
+  const house = ensureHouse(owner);
+  const meKey = p.username ? p.username.toLowerCase() : null;
+  const isOwner = !!meKey && meKey === ownerKey;
+  const isFriend = !!meKey && ensureFriends(owner).includes(meKey);
+  const ok = isOwner
+    || house.access === 'open'
+    || (house.access === 'friends' && isFriend)
+    || (house.access === 'invite' && !!meKey && house.invites.includes(meKey));
+  let msg = null;
+  if (!ok) {
+    const gate = house.access === 'friends' ? 'friends-only' : 'invite-only';
+    msg = p.registered
+      ? `${owner.username}'s den is ${gate}`
+      : `${owner.username}'s den is ${gate}: sign up and ask for a spot!`;
+  }
+  return { ok, owner, house, isOwner, isFriend, msg };
+}
+
+/** The house-info reply, told from `p`'s point of view. Null if no such den. */
+function housePayload(p, ownerKey) {
+  const gate = houseGate(p, ownerKey);
+  if (!gate.owner) return null;
+  const msg = {
+    t: 'house-info',
+    owner: gate.owner.username,
+    name: houseName(gate.owner),
+    access: gate.house.access,
+    allowed: gate.ok,
+    isOwner: gate.isOwner,
+    isFriend: gate.isFriend,
+    // a den you cannot walk into does not get to leak its layout either
+    furniture: gate.ok ? gate.house.furniture.map((it) => ({ ...it })) : [],
+  };
+  if (gate.isOwner) {
+    // the editor needs both halves and would otherwise need two more round trips
+    msg.invites = inviteNames(gate.house);
+    msg.ownedFurniture = { ...ensureOwnedFurniture(gate.owner) };
+  }
+  return msg;
+}
+
+/**
+ * Re-send house-info to everyone it could have changed for: the owner's tabs
+ * (a second one must not keep editing a stale layout) and whoever is currently
+ * standing in the den watching the furniture move.
+ */
+function broadcastHouse(ownerKey) {
+  const seen = new Set();
+  const inside = [...(world.rooms.get(houseRoomId(ownerKey)) || [])].map((id) => world.players.get(id));
+  for (const other of [...sessionsFor(ownerKey), ...inside]) {
+    if (!other || seen.has(other.id)) continue;
+    seen.add(other.id);
+    const payload = housePayload(other, ownerKey);
+    if (payload) sendTo(other, payload);
+  }
+}
+
+/**
+ * house-save is all-or-nothing: one bad item rejects the whole layout rather
+ * than quietly dropping it, so the client never renders something the server
+ * did not store. Placement is capped by what the account actually bought.
+ */
+function validatePlacements(list, owned) {
+  if (!Array.isArray(list)) return { ok: false, msg: 'That layout made no sense' };
+  if (list.length > HOUSE_MAX_ITEMS) return { ok: false, msg: `A den fits ${HOUSE_MAX_ITEMS} things, no more` };
+  const used = Object.create(null);
+  const clean = [];
+  for (const it of list) {
+    if (!it || typeof it !== 'object' || !has(FURNITURE, it.f)) return { ok: false, msg: 'That is not furniture from the catalog' };
+    const x = Number(it.x), z = Number(it.z), rot = Number(it.rot);
+    if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(rot)) return { ok: false, msg: 'Could not place that one' };
+    if (Math.abs(x) > HOUSE_BOUNDS.x || Math.abs(z) > HOUSE_BOUNDS.z) return { ok: false, msg: 'Keep the furniture inside the den!' };
+    used[it.f] = (used[it.f] || 0) + 1;
+    const have = has(owned, it.f) ? Math.floor(Number(owned[it.f]) || 0) : 0;
+    if (used[it.f] > have) {
+      const what = FURNITURE[it.f].name;
+      return { ok: false, msg: have ? `You only own ${have} x ${what}` : `You do not own a ${what} yet` };
+    }
+    clean.push({ f: it.f, x: +x.toFixed(2), z: +z.toFixed(2), rot: +rot.toFixed(3) });
+  }
+  return { ok: true, clean };
 }
 
 // ---------- sled race lobby ----------
@@ -430,7 +562,11 @@ wss.on('connection', (ws) => {
           if (m.token) {
             username = verifyToken(m.token);
             if (!username) return sendTo({ ws }, { t: 'denied', msg: 'Session expired, log in again' });
-            profile = publicProfile(users.get(username.toLowerCase()));
+            const rec = users.get(username.toLowerCase());
+            profile = publicProfile(rec);
+            // the den editor needs the inventory from the first frame; a copy,
+            // never the live record object (two tabs would share one map)
+            profile.ownedFurniture = { ...ensureOwnedFurniture(rec) };
           } else {
             const name = cleanName(m.guestName);
             if (name.length < NAME_MIN_LEN) return sendTo({ ws }, { t: 'denied', msg: 'Invalid name' });
@@ -618,6 +754,100 @@ wss.on('connection', (ws) => {
           break;
         }
 
+        // ---- player dens ---------------------------------------------------
+        // Same budget as the other social messages: every one of these either
+        // fans out to other sockets or writes the stored record.
+        case 'house-info': {
+          if (socialLimited(p, t0)) break;
+          const payload = housePayload(p, friendKey(m.owner));
+          if (!payload) { sendTo(p, { t: 'toast', msg: 'No capy signed up under that name' }); break; }
+          sendTo(p, payload);
+          break;
+        }
+        case 'house-config': {
+          if (socialLimited(p, t0)) break;
+          const rec = recordFor(p);
+          if (!rec) { sendTo(p, { t: 'toast', msg: 'Sign up to get your own den!' }); break; }
+          if (!HOUSE_ACCESS_MODES.includes(m.access)) break;
+          ensureHouse(rec).access = m.access;
+          saveSoon();
+          // owner-only message, so the owner key is the connection's own name:
+          // there is no way to ask for a door that is not yours
+          broadcastHouse(p.username.toLowerCase());
+          break;
+        }
+        case 'house-invite':
+        case 'house-uninvite': {
+          if (socialLimited(p, t0)) break;
+          const rec = recordFor(p);
+          if (!rec) { sendTo(p, { t: 'toast', msg: 'Sign up to get your own den!' }); break; }
+          const key = friendKey(m.name);
+          if (!key) break; // could never be a username: say nothing
+          const meKey = p.username.toLowerCase();
+          if (key === meKey) { sendTo(p, { t: 'toast', msg: 'You always have a key to your own den' }); break; }
+          // guests have no record to be looked up by, so the list is accounts-only
+          const target = users.get(key);
+          if (!target) { sendTo(p, { t: 'toast', msg: 'No capy signed up under that name' }); break; }
+          const house = ensureHouse(rec);
+          if (m.t === 'house-invite') {
+            if (!house.invites.includes(key)) {
+              if (house.invites.length >= HOUSE_INVITE_CAP) {
+                sendTo(p, { t: 'toast', msg: 'Your guest list is full' });
+                break;
+              }
+              house.invites.push(key);
+              for (const session of sessionsFor(key)) {
+                sendTo(session, { t: 'toast', msg: `${p.name} invited you over to their den!` });
+              }
+            }
+          } else {
+            const i = house.invites.indexOf(key);
+            if (i >= 0) house.invites.splice(i, 1);
+          }
+          saveSoon();
+          // every tab the owner has open, or the second one edits a stale list
+          const guests = { t: 'house-guests', invites: inviteNames(house) };
+          for (const session of sessionsFor(meKey)) sendTo(session, guests);
+          break;
+        }
+        case 'house-save': {
+          if (socialLimited(p, t0)) break;
+          const rec = recordFor(p);
+          if (!rec) { sendTo(p, { t: 'toast', msg: 'Sign up to get your own den!' }); break; }
+          // the inventory is read off the record, so two tabs saving the same
+          // sofa twice cannot conjure a second one
+          const check = validatePlacements(m.furniture, ensureOwnedFurniture(rec));
+          if (!check.ok) { sendTo(p, { t: 'toast', msg: check.msg }); break; }
+          ensureHouse(rec).furniture = check.clean;
+          saveSoon();
+          broadcastHouse(p.username.toLowerCase());
+          break;
+        }
+        case 'buy-furn': {
+          if (socialLimited(p, t0)) break;
+          const item = has(FURNITURE, m.id) ? FURNITURE[m.id] : null;
+          if (!item || !Number.isFinite(item.price)) return sendTo(p, { t: 'furn', ok: false, msg: 'Unknown furniture' });
+          const rec = recordFor(p);
+          if (!rec) return sendTo(p, { t: 'furn', ok: false, msg: 'Sign up to get your own den!' });
+          // unlike hats, furniture stacks: buying again adds another copy, and
+          // the count is what house-save checks placements against
+          const owned = ensureOwnedFurniture(rec);
+          const have = has(owned, m.id) ? Math.floor(Number(owned[m.id]) || 0) : 0;
+          if (have >= HOUSE_MAX_ITEMS) return sendTo(p, { t: 'furn', ok: false, msg: 'You have plenty of those already' });
+          // read the live record, not this connection's snapshot, so a second
+          // session cannot buy against a balance another one already spent
+          const bal = Number.isFinite(rec.coins) ? rec.coins : 0;
+          if (bal < item.price) return sendTo(p, { t: 'furn', ok: false, msg: 'Not enough coins' });
+          rec.coins = bal - item.price;
+          owned[m.id] = have + 1;
+          persist(p); // syncs p.coins back off the record
+          sendTo(p, {
+            t: 'furn', ok: true, coins: p.coins, delta: -item.price,
+            ownedFurniture: { ...owned }, bought: m.id,
+          });
+          break;
+        }
+
         // ---- sled race lobby -----------------------------------------------
         case 'lobby-join':
           if (socialLimited(p, t0)) break;
@@ -682,7 +912,9 @@ setInterval(() => {
   const dt = Math.min((now - last) / 1000, 0.25);
   last = now;
   bots.update(dt);
-  for (const roomId of ROOM_IDS) {
+  // world.rooms, not ROOM_IDS: occupied dens are room sets too, and their
+  // visitors would otherwise never see each other move
+  for (const roomId of world.rooms.keys()) {
     const players = roomSnapshot(roomId).map(({ id, x, z, rot, anim }) => ({ id, x, z, rot, anim }));
     if (players.length) broadcastToRoom(roomId, { t: 'state', players });
   }

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { HATS, MINIGAMES, ROOM_INFO } from '../../shared/constants.js';
 import { createAvatar } from '../player/avatar.js';
 import { makeToon, makeGlow, disposeObject } from '../core/materials.js';
+import { visitHouse } from '../net/client.js';
 
 /**
  * Player card: click a capybara, meet the capybara.
@@ -267,6 +268,10 @@ const CSS = `
   background: linear-gradient(180deg, #fffefa 0%, #f2e6cd 100%); color: var(--ink);
   box-shadow: 0 4px 0 rgba(45, 36, 23, 0.14), 0 8px 18px rgba(45, 36, 23, 0.14);
 }
+.pf-fbtn.is-den {
+  background: linear-gradient(180deg, #ffd98a 0%, var(--gold) 100%); color: var(--ink);
+  box-shadow: 0 4px 0 rgba(158, 111, 20, 0.3), 0 8px 18px rgba(45, 36, 23, 0.16);
+}
 .pf-fbtn:disabled { background: #ece0c4; color: #93815f; cursor: default; box-shadow: none; }
 .pf-note {
   font-size: 11.5px; font-weight: 700; color: var(--muted); line-height: 1.4;
@@ -300,6 +305,24 @@ const CSS = `
   content: ''; position: absolute; inset: -3px; border-radius: 50%;
   border: 2px solid rgba(111, 207, 95, 0.7); animation: fr-ping 2.6s ease-out infinite;
 }
+/* a row is the card button plus, for anyone who is around, a den door on top */
+.fr-item { position: relative; }
+.fr-item.has-den .fr-row { padding-right: 54px; }
+.fr-den {
+  position: absolute; right: 10px; top: 50%; translate: 0 -50%;
+  width: 34px; height: 34px; border: 0; border-radius: 13px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font); font-size: 15px; line-height: 1; color: var(--ink);
+  background: linear-gradient(180deg, #fffefa 0%, #f4e7cd 100%);
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.14), 0 6px 12px rgba(45, 36, 23, 0.12);
+  transition: scale 0.12s ease, translate 0.14s ease, filter 0.16s ease;
+  animation: pf-pop 0.3s backwards var(--spring); animation-delay: calc(var(--i) * 45ms + 70ms);
+}
+/* the row lifts on hover; the door rides along instead of peeling off it */
+.fr-item:hover .fr-den { translate: 0 calc(-50% - 2px); }
+.fr-den:hover { scale: 1.1; filter: brightness(1.05); }
+.fr-den:active { scale: 0.93; }
+.fr-den:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
 .fr-txt { flex: 1; min-width: 0; }
 .fr-name { font-weight: 900; font-size: 14px; line-height: 1.2; overflow-wrap: anywhere; }
 .fr-where { font-size: 11.5px; font-weight: 700; color: #a3906c; }
@@ -347,7 +370,7 @@ const CSS = `
   .pf-name-row { padding-right: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .pf-card, .fr-card, .pf-row, .fr-row, .fr-dot.is-on::after,
+  .pf-card, .fr-card, .pf-row, .fr-row, .fr-den, .fr-dot.is-on::after,
   .fr-hud-badge, .fr-empty-art { animation: none; }
 }
 `;
@@ -618,9 +641,32 @@ export function openProfile(game, playerId) {
 
   let busy = false;
 
+  /**
+   * A door for anyone with an account. Bots have no den, guests have no den,
+   * and until the server answers we do not know which of those they are, so the
+   * button simply is not there yet.
+   */
+  function denButton() {
+    const hasDen = isSelf ? !!game.state.registered : who.registered === true;
+    if (who.bot || !hasDen || !who.name) return null;
+    const b = elm('button', 'pf-fbtn is-den', isSelf ? 'Visit your den' : 'Visit their den');
+    b.type = 'button';
+    b.disabled = !game.net?.connected;
+    b.title = isSelf ? 'Waddle home to your own den' : `Knock on ${who.name}'s door`;
+    b.addEventListener('click', () => {
+      if (b.disabled) return;
+      game.audio?.play?.('click');
+      close(true); // the world needs the screen back for the trip
+      visitHouse(game, who.name);
+    });
+    return b;
+  }
+
   function renderActions() {
     actionsEl.textContent = '';
+    const den = denButton();
     if (isSelf) {
+      if (den) actionsEl.appendChild(den);
       actionsEl.appendChild(note('This is you. Looking good out there.'));
       return;
     }
@@ -637,6 +683,8 @@ export function openProfile(game, playerId) {
       return;
     }
     if (!game.state.registered) {
+      // a guest cannot make friends, but an open door is still an open door
+      if (den) actionsEl.appendChild(den);
       actionsEl.appendChild(note('Friends stick around only with an account. Make one from the title screen and you can keep them.'));
       return;
     }
@@ -654,6 +702,7 @@ export function openProfile(game, playerId) {
       : `Add ${who.name || 'them'} to your friends list`;
     b.addEventListener('click', () => toggleFriend(isFriend));
     actionsEl.appendChild(b);
+    if (den) actionsEl.appendChild(den);
     if (!game.net?.connected) actionsEl.appendChild(note('Offline right now, so the friend book is closed.'));
   }
 

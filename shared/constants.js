@@ -58,6 +58,34 @@ export const BOT_ZONES = {
   lounge: { x: 0, z: 2, r: 4 },
 };
 
+// Furniture catalog for player houses. Client builders live in
+// src/world/furniture.js and must cover every id here.
+export const FURNITURE = {
+  sofa: { name: 'Squashy Sofa', price: 250 },
+  armchair: { name: 'Snug Armchair', price: 150 },
+  beanbag: { name: 'Nap Beanbag', price: 80 },
+  rug_round: { name: 'Round Rug', price: 60 },
+  rug_stripe: { name: 'Stripy Rug', price: 60 },
+  low_table: { name: 'Low Table', price: 100 },
+  dining_set: { name: 'Dining Set', price: 220 },
+  bed: { name: 'Dreamy Bed', price: 300 },
+  bookshelf: { name: 'Bookshelf', price: 180 },
+  floor_lamp: { name: 'Floor Lamp', price: 90 },
+  string_lights: { name: 'String Lights', price: 70 },
+  plant_palm: { name: 'Potted Palm', price: 60 },
+  plant_flower: { name: 'Flower Pot', price: 40 },
+  fireplace: { name: 'Cozy Fireplace', price: 500 },
+  aquarium: { name: 'Bubbly Aquarium', price: 400 },
+  arcade_cab: { name: 'Mini Arcade', price: 600 },
+  trophy_case: { name: 'Trophy Case', price: 350 },
+  wall_surfboard: { name: 'Wall Surfboard', price: 120 },
+  capy_portrait: { name: 'Capy Portrait', price: 100 },
+  cocoa_station: { name: 'Cocoa Station', price: 280 },
+};
+
+export const HOUSE_MAX_ITEMS = 60;
+export const HOUSE_ACCESS_MODES = ['open', 'friends', 'invite'];
+
 export const CHAT_MAX_LEN = 120;
 export const NAME_MIN_LEN = 3;
 export const NAME_MAX_LEN = 16;

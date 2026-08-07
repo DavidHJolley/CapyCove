@@ -8,4 +8,7 @@ export const ROOMS = {
   cafe: () => import('./rooms/cafe.js').then((m) => m.CafeRoom),
   club: () => import('./rooms/club.js').then((m) => m.ClubRoom),
   lounge: () => import('./rooms/lounge.js').then((m) => m.LoungeRoom),
+  // dynamic per-player houses: any 'house:<owner>' id resolves to this loader
+  // (see Engine.switchRoom), parameterized via game.__houseCtx
+  house: () => import('./rooms/house.js').then((m) => m.HouseRoom),
 };

@@ -52,10 +52,26 @@ export function initHud(game) {
   });
   $('coin-count').textContent = game.state.coins;
 
-  // room
+  // room. Player dens are dynamic rooms ('house:<owner>') and never appear in
+  // ROOM_INFO, so they name themselves off the visit context the den flow parked
+  // before travelling (see net/client.js visitHouse).
   game.events.on('room', (id) => {
-    $('room-name').textContent = ROOM_INFO[id]?.name || id;
-    game.toast(`${ROOM_INFO[id]?.name} : ${ROOM_INFO[id]?.desc || ''}`, 2200);
+    const info = Object.prototype.hasOwnProperty.call(ROOM_INFO, id) ? ROOM_INFO[id] : null;
+    if (info) {
+      $('room-name').textContent = info.name;
+      game.toast(`${info.name} : ${info.desc || ''}`, 2200);
+      return;
+    }
+    const owner = typeof id === 'string' && id.startsWith('house:')
+      ? (game.__houseCtx?.owner || id.slice(6))
+      : null;
+    if (!owner) { $('room-name').textContent = id; return; }
+    // guests own no den, so a guest who happens to share the owner's nickname
+    // is still a visitor
+    const mine = !!game.state?.registered
+      && String(game.state.name || '').toLowerCase() === String(owner).toLowerCase();
+    $('room-name').textContent = `${owner}'s Den`;
+    game.toast(`${owner}'s Den : ${mine ? 'home sweet home' : 'make yourself at home'}`, 2200);
   });
   game.events.on('population', (n) => { $('pop-count').textContent = n > 1 ? ` * ${n} here` : ''; });
 

@@ -1,4 +1,5 @@
 import { GAME_NAME } from '../../shared/constants.js';
+import { visitHouse } from '../net/client.js';
 
 /**
  * The pause / options menu behind the Capy Cove logo chip.
@@ -56,7 +57,9 @@ export function openMenu(game) {
       <div class="menu-sub">Take a breath. The cove waits for no one, but it will wait for you.</div>
       <div class="menu-list">
         <button class="menu-item is-primary" type="button" data-act="resume">Resume</button>
+        <button class="menu-item" type="button" data-act="den"></button>
       </div>
+      <div class="menu-sub menu-den-note" hidden style="margin: 10px 4px 0;"></div>
       <div class="menu-how">
         <h3>How to play</h3>
         <ul></ul>
@@ -72,6 +75,8 @@ export function openMenu(game) {
 
   const card = root.querySelector('.menu-card');
   const list = root.querySelector('.menu-how ul');
+  const denBtn = root.querySelector('[data-act="den"]');
+  const denNote = root.querySelector('.menu-den-note');
   const soundBtn = root.querySelector('[data-act="sound"]');
   const logoutBtn = root.querySelector('[data-act="logout"]');
   const exitBtn = root.querySelector('[data-act="exit"]');
@@ -86,6 +91,27 @@ export function openMenu(game) {
     li.append(k, t);
     list.appendChild(li);
   }
+
+  // ---- my den --------------------------------------------------------------
+  // Registered capybaras own exactly one den; guests get the sales pitch.
+  denBtn.innerHTML = '<span class="menu-ico">&#127968;</span>';
+  denBtn.appendChild(document.createTextNode('My Den'));
+  denBtn.title = isGuest(game)
+    ? 'Dens come with a (free) account.'
+    : 'Waddle home to your own den.';
+  denBtn.addEventListener('click', () => {
+    disarm();
+    if (isGuest(game)) {
+      game.audio?.play?.('pop');
+      denNote.textContent = 'Guests can visit any open den, but your own comes with an account. '
+        + 'Sign up from the title screen and the keys are yours.';
+      denNote.hidden = false;
+      game.toast('Sign up to get your own den!');
+      return;
+    }
+    close();
+    visitHouse(game, game.state.name);
+  });
 
   // ---- sound ---------------------------------------------------------------
   function syncSound() {

@@ -66,7 +66,9 @@ export class Engine {
 
   // ---- room lifecycle ------------------------------------------------------
   switchRoom(id, fromId) {
-    const loader = Object.prototype.hasOwnProperty.call(this.rooms, id) ? this.rooms[id] : null;
+    // 'house:<owner>' ids all resolve to the one house room class
+    const key = id.startsWith('house:') ? 'house' : id;
+    const loader = Object.prototype.hasOwnProperty.call(this.rooms, key) ? this.rooms[key] : null;
     if (!loader) { console.error(`[engine] unknown room '${id}'`); return; }
 
     // Collapse re-entrant calls (double-clicked exit prompt): the same

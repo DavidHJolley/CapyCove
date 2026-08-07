@@ -120,7 +120,15 @@ export class NetClient {
           this.lastSent = { x, z, rot, anim };
           this.send({ t: 'move', x: +x.toFixed(2), z: +z.toFixed(2), rot: +rot.toFixed(2), anim });
         }
-        if (game.roomId) this.send({ t: 'join', room: game.roomId });
+        if (game.roomId?.startsWith('house:')) {
+          // the den's door may have closed while we were gone (access change,
+          // uninvite); a refused rejoin would leave us rendering a room the
+          // server thinks we are not in. Reconnect lands at the plaza instead.
+          game.toast('Reconnected, waddling back to the plaza');
+          game.goToRoom('plaza', null);
+        } else if (game.roomId) {
+          this.send({ t: 'join', room: game.roomId });
+        }
         // a run in progress survived the drop; re-announce it so it still pays
         if (game.activeMinigame) this.send({ t: 'mgstart', game: game.activeMinigame });
         break;
@@ -220,6 +228,28 @@ export class NetClient {
       case 'race-end':
         game.events.emit('race-end', m);
         break;
+      // ---- player houses ---------------------------------------------------
+      // Re-emitted raw; the house UIs own the shapes (see server/index.js):
+      // 'house-info'   {owner, name, access, allowed, isFriend, furniture}
+      // 'house-guests' {invites:[names]}
+      // 'furn'         {ok, coins, delta, ownedFurniture}
+      case 'house-info':
+        game.events.emit('house-info', m);
+        break;
+      case 'house-guests':
+        game.events.emit('house-guests', m);
+        break;
+      case 'furn':
+        // keep the purse and inventory authoritative before the UI reacts
+        if (m.ok) {
+          if (m.ownedFurniture) {
+            game.state.ownedFurniture = m.ownedFurniture;
+            game.events.emit('profile', game.state);
+          }
+          if (Number.isFinite(m.coins)) game.syncCoins(m.coins, m.delta ?? 0, 'furniture');
+        }
+        game.events.emit('furn', m);
+        break;
     }
   }
 
@@ -300,4 +330,101 @@ export class NetClient {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// visiting player dens
+// ---------------------------------------------------------------------------
+
+/** Why the door stayed shut, in a voice that does not blame the visitor. */
+function doorClosedLine(m, name, viewerRegistered) {
+  const access = typeof m?.access === 'string' ? m.access : '';
+  if (access === 'friends') {
+    return viewerRegistered
+      ? `${name} keeps the den for friends right now. Add each other and knock again!`
+      : `${name} keeps the den for friends, and friends need an account. Sign up and knock again!`;
+  }
+  if (access === 'invite') return `${name}'s den is invite-only right now. Ask for an invite!`;
+  return `${name}'s den door is shut right now. Try again later.`;
+}
+
+// Only one knock is in the air at a time: a second click replaces the first
+// rather than racing it into a room we already left.
+let housePending = null;
+
+/**
+ * The one "knock on a den door" flow, shared by the game menu, the player card
+ * and the friends list. Ask the server about the house and travel there only if
+ * it says we may: the server is the authority, this just reflects its answer.
+ *
+ * Sets `game.__houseCtx = {owner, isOwner, furniture, access}` for the house
+ * room to read on build, then hands over to `game.goToRoom`.
+ * Never rejects; resolves true when we actually set off, false for a refusal.
+ */
+export function visitHouse(game, owner) {
+  const name = String(owner ?? '').trim();
+  if (!game?.events || !name) return Promise.resolve(false);
+
+  const ownerLower = name.toLowerCase();
+  const roomId = `house:${ownerLower}`;
+  const viewerRegistered = !!game.state?.registered;
+  const isOwner = viewerRegistered
+    && String(game.state?.name ?? '').trim().toLowerCase() === ownerLower;
+
+  if (game.roomId === roomId) {
+    game.toast?.(isOwner ? 'You are already home. Cosy, isn\'t it?' : `You are already in ${name}'s den.`);
+    return Promise.resolve(true);
+  }
+  if (!game.net?.connected) {
+    game.audio?.play?.('pop');
+    game.toast?.('The cove is offline for a moment, so no doors are opening yet.');
+    return Promise.resolve(false);
+  }
+
+  housePending?.cancel();
+
+  return new Promise((resolve) => {
+    let done = false;
+    let timer = 0;
+    let off = null;
+
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      if (timer) { clearTimeout(timer); timer = 0; }
+      try { off?.(); } catch { /* emitter already dropped it */ }
+      if (housePending === handle) housePending = null;
+      resolve(ok);
+    };
+    const handle = { cancel: () => finish(false) };
+
+    off = game.events.on('house-info', (m) => {
+      // the same message refreshes everyone standing in a den after a save, so
+      // only the reply about the door we knocked on counts
+      if (!m || String(m.owner ?? '').trim().toLowerCase() !== ownerLower) return;
+      if (m.allowed === false) {
+        game.audio?.play?.('pop');
+        game.toast?.(doorClosedLine(m, name, viewerRegistered));
+        finish(false);
+        return;
+      }
+      game.__houseCtx = {
+        owner: typeof m.owner === 'string' && m.owner.trim() ? m.owner.trim() : name,
+        // the server says whose den this is; our own guess is only the fallback
+        isOwner: typeof m.isOwner === 'boolean' ? m.isOwner : isOwner,
+        furniture: Array.isArray(m.furniture) ? m.furniture : [],
+        access: typeof m.access === 'string' ? m.access : 'open',
+      };
+      game.goToRoom(roomId, game.roomId);
+      finish(true);
+    });
+
+    timer = setTimeout(() => {
+      game.toast?.('Nobody is answering that door right now. Try again in a moment.');
+      finish(false);
+    }, 4000);
+
+    housePending = handle;
+    game.net.send({ t: 'house-info', owner: name });
+  });
 }

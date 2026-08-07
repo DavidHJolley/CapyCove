@@ -24,6 +24,7 @@ class Game {
       color: 0xb08a5a,
       hat: 'none',
       ownedHats: ['none'],
+      ownedFurniture: {},
       bests: {},
     };
   }

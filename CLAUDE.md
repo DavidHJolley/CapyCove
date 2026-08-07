@@ -49,8 +49,11 @@ Source of truth is `server/index.js` (message handlers) + `src/net/client.js`
 pleave/state, move, chat, emote, custom, score/best, buy/shop, coins, toast.
 Shipped wave 1: inspect/profile, friend-add/friend-remove/friends,
 lobby-join/lobby-leave/lobby, race-start/race-progress/race-state/race-done/
-race-end, plus mgstart run tokens for score. Planned wave 3 (houses):
-house-config/house-invite/house-uninvite/house-save/house-info, buy-furn.
+race-end, plus mgstart run tokens for score (re-armed after each score for
+Play-again runs). Shipped wave 3: house-info/house-config/house-invite/
+house-uninvite/house-save/house-guests, buy-furn/furn; dynamic 'house:<owner>'
+room sets, access enforced in houseGate() before any join side effect.
+Known limitation: access changes do not evict players already inside.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.
@@ -75,8 +78,9 @@ this list.
 Shipped: 5 rooms, 3 minigames, accounts + guest play, chat/emotes/shop sync,
 server bots, security hardening pass, wave 1 (3-player seeded sled racing with
 gate lobby, friends + profile cards with medals, game menu, chat history,
-walk-through exits, chairlift/bench/quit/ramp/fishing-lives fixes). In flight:
-wave 2 Game Den ('lounge' room: pong, shuffle, chess, connect4, cards per
-docs/CARDGAME.md). Next: wave 3 player houses (dynamic 'house:<owner>' rooms,
-furniture catalog + placement editor, open/friends/invite access). The session
-task list is the live source of truth for wave status.
+walk-through exits, chairlift/bench/quit/ramp/fishing-lives fixes); wave 2
+Game Den ('lounge': pong, shuffle, chess, connect4, cards per
+docs/CARDGAME.md, all vs capybara AI with win payouts); wave 3 player houses
+(dynamic 'house:<owner>' rooms, 20-item furniture catalog + placement editor
+in src/ui/houseEditor.js, open/friends/invite access, Furniture shop tab,
+visits via menu/profile/friends). Not yet done: public deployment.

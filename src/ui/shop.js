@@ -1,15 +1,18 @@
 import * as THREE from 'three';
-import { HATS, BODY_COLORS, MINIGAMES } from '../../shared/constants.js';
+import { HATS, BODY_COLORS, MINIGAMES, FURNITURE, HOUSE_MAX_ITEMS } from '../../shared/constants.js';
 import { createAvatar } from '../player/avatar.js';
 import { makeToon, makeGlow, disposeObject } from '../core/materials.js';
 
 /**
  * Wardrobe & Shop modal.
  *
- * A live 3D capybara turntable on the left, Colors / Hats tabs on the right.
- * Hovering a hat (or a color) tries it on instantly without committing;
- * clicking equips or buys. Purchases that go to the server show a pending
- * spinner and resolve on the next 'profile' / 'coins' event.
+ * A live 3D capybara turntable on the left, Colors / Hats / Furniture tabs on
+ * the right. Hovering a hat (or a color) tries it on instantly without
+ * committing; clicking equips or buys. Purchases that go to the server show a
+ * pending spinner and resolve on the next 'profile' / 'coins' / 'furn' event.
+ *
+ * Furniture is bought for the player's den (see the house rooms). It stacks:
+ * every copy you own can be placed, so the cards count instead of locking.
  *
  * Exported API is exactly: openShop(game)  (the HUD button toggles it).
  */
@@ -42,6 +45,29 @@ const HAT_BLURBS = {
   propeller: 'Spins nonstop. Lift not included.',
   chef: 'Smells permanently of mango smoothie.',
   pirate: 'Yarr, and excellent sun protection.',
+};
+
+const FURN_BLURBS = {
+  sofa: 'Seats four capys, or one very committed one.',
+  armchair: 'Exactly the right shape for doing nothing.',
+  beanbag: 'Sinks precisely as far as you hoped.',
+  rug_round: 'Hides a truly heroic amount of sand.',
+  rug_stripe: 'Stripes make the room go faster. Science.',
+  low_table: 'For snacks, board games and propped up feet.',
+  dining_set: 'Four chairs, endless snack negotiations.',
+  bed: 'Naps taken here officially count double.',
+  bookshelf: 'Mostly thrillers set entirely in ponds.',
+  floor_lamp: 'Warm light, zero fire, all cozy.',
+  string_lights: 'Turns any wall into a small festival.',
+  plant_palm: 'Low maintenance, high vibes, gentle rustle.',
+  plant_flower: 'Small, cheerful, faintly smug about it.',
+  fireplace: 'Crackles politely. Never once smokes.',
+  aquarium: 'The fish are neighbours, not a menu.',
+  arcade_cab: 'One more go. Every single time.',
+  trophy_case: 'Medals, shells, and one very lucky pebble.',
+  wall_surfboard: 'Retired from waves, promoted to decor.',
+  capy_portrait: 'The eyes follow you. Kindly, though.',
+  cocoa_station: 'Marshmallows are strictly non negotiable.',
 };
 
 const TIERS = [
@@ -243,6 +269,57 @@ const CSS = `
 @media (prefers-reduced-motion: reduce) {
   .shop-modal, .shop-hat, .shop-swatch, .shop-rays, .shop-pane { animation: none; }
 }
+
+/* ---- furniture grid ---- */
+.shop-furn-note {
+  display: none; margin: 0 0 10px; padding: 9px 13px; border-radius: 14px;
+  background: #fff3d6; border: 2px solid #f3e2b8; color: #8a7a5a;
+  font-size: 12px; font-weight: 700; line-height: 1.36;
+}
+.shop-furn-note.is-on { display: block; }
+.shop-furn-note b { color: var(--ink); }
+.shop-fgrid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(146px, 1fr)); gap: 10px;
+  max-height: 42vh; overflow-y: auto; padding: 3px 6px 8px 3px;
+  scrollbar-width: thin; scrollbar-color: #e2d5b6 transparent;
+}
+.shop-fgrid::-webkit-scrollbar { width: 9px; }
+.shop-fgrid::-webkit-scrollbar-thumb { background: #e2d5b6; border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+.shop-furn {
+  position: relative; display: flex; flex-direction: column; gap: 6px;
+  background: var(--card); border-radius: 16px; padding: 9px 10px 10px;
+  border: 3px solid transparent; box-shadow: 0 3px 0 rgba(45,36,23,.07);
+  transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+  animation: shop-pop .34s backwards cubic-bezier(.2,1.3,.5,1); animation-delay: calc(var(--i) * 30ms);
+}
+.shop-furn:hover { transform: translateY(-3px); border-color: var(--accent2); box-shadow: 0 9px 18px rgba(45,36,23,.16); }
+.shop-furn.is-owned { border-color: var(--gold); background: #fff8e6; }
+.shop-furn.is-pending { cursor: progress; }
+.shop-furn.shop-shake { animation: shop-shake .34s ease; }
+.shop-furn-thumb {
+  position: relative; border-radius: 12px; overflow: hidden; background: #fdf3dc;
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,.7), 0 2px 6px rgba(45,36,23,.1);
+}
+.shop-furn-thumb canvas { display: block; width: 100%; height: auto; }
+.shop-furn-count {
+  display: none; position: absolute; right: 5px; top: 5px; padding: 2px 7px;
+  border-radius: 999px; background: var(--gold); color: var(--ink); border: 2px solid #fff;
+  font-size: 10px; font-weight: 900; letter-spacing: .03em; box-shadow: 0 2px 6px rgba(45,36,23,.24);
+}
+.shop-furn.is-owned .shop-furn-count { display: block; }
+.shop-furn-name { font-weight: 900; font-size: 13px; line-height: 1.16; }
+.shop-furn-blurb { font-size: 10.5px; font-weight: 600; color: #a3906c; line-height: 1.3; min-height: 27px; }
+.shop-furn-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 6px; row-gap: 7px; margin-top: auto; padding-top: 2px;
+}
+
+@media (max-width: 720px) {
+  .shop-fgrid { max-height: 30vh; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .shop-furn { animation: none; }
+}
 `;
 
 function ensureStyles() {
@@ -388,6 +465,124 @@ function buildPreview(canvas, game) {
 }
 
 // ---------------------------------------------------------------------------
+// furniture thumbnails: one throwaway tiny renderer, one shot per catalog item,
+// blitted into each card's 2D canvas. The GL context is disposed as soon as the
+// queue drains, so the wardrobe never holds two live contexts for long.
+// ---------------------------------------------------------------------------
+
+const THUMB_W = 132;
+const THUMB_H = 94;
+
+function makeThumbShooter(pw, ph) {
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true, alpha: true, powerPreference: 'low-power',
+    preserveDrawingBuffer: true, // we drawImage() the buffer straight after render()
+  });
+  renderer.setPixelRatio(1);
+  renderer.setSize(pw, ph, false);
+  renderer.setClearAlpha(0);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.08;
+
+  const scene = new THREE.Scene();
+  scene.add(new THREE.HemisphereLight(0xfff3da, 0x8a6642, 1.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.15);
+  key.position.set(2.4, 4.1, 3.1);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x8fd4ff, 0.5);
+  rim.position.set(-3, 2, -2.6);
+  scene.add(rim);
+
+  const camera = new THREE.PerspectiveCamera(32, pw / ph, 0.05, 60);
+  const dir = new THREE.Vector3(0.6, 0.7, 1).normalize(); // same 3/4 read as the world camera
+  const box = new THREE.Box3();
+  const sphere = new THREE.Sphere();
+
+  return {
+    canvas: renderer.domElement,
+    /** Frame `obj` and render it. Returns false if it has no drawable bounds. */
+    shoot(obj) {
+      obj.rotation.y -= 0.55; // three-quarter turn so fronts and sides both read
+      scene.add(obj);
+      try {
+        obj.updateMatrixWorld(true);
+        box.setFromObject(obj);
+        if (box.isEmpty()) return false;
+        box.getBoundingSphere(sphere);
+        const r = Math.max(0.35, sphere.radius);
+        const dist = (r / Math.sin((camera.fov * Math.PI) / 360)) * 1.03;
+        camera.position.copy(dir).multiplyScalar(dist).add(sphere.center);
+        camera.lookAt(sphere.center);
+        camera.near = Math.max(0.05, dist - r * 2.2);
+        camera.far = dist + r * 3;
+        camera.updateProjectionMatrix();
+        renderer.render(scene, camera);
+        return true;
+      } finally {
+        // never leave a half-shot prop in the scene: it is disposed right after
+        scene.remove(obj);
+      }
+    },
+    dispose() {
+      disposeObject(scene);
+      renderer.dispose();
+      try { renderer.forceContextLoss(); } catch { /* not all contexts support it */ }
+    },
+  };
+}
+
+function roundedPath(ctx, x, y, w, h, r) {
+  const k = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + k, y);
+  ctx.arcTo(x + w, y, x + w, y + h, k);
+  ctx.arcTo(x + w, y + h, x, y + h, k);
+  ctx.arcTo(x, y + h, x, y, k);
+  ctx.arcTo(x, y, x + w, y, k);
+  ctx.closePath();
+}
+
+/** Warm little stage behind every thumbnail, then whatever art we have. */
+function paintThumb(canvas, drawArt) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const g = ctx.createRadialGradient(w * 0.5, h * 0.36, h * 0.05, w * 0.5, h * 0.52, h * 0.98);
+  g.addColorStop(0, '#fffaea');
+  g.addColorStop(0.6, '#fbeed0');
+  g.addColorStop(1, '#f1dcab');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  ctx.save();
+  ctx.globalAlpha = 0.15;
+  ctx.fillStyle = '#6b4f35';
+  ctx.beginPath();
+  ctx.ellipse(w * 0.5, h * 0.82, w * 0.27, h * 0.06, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  drawArt(ctx, w, h);
+}
+
+/** Stand-in art for when WebGL (or a builder) is unavailable: a delivery crate. */
+function paintCrate(ctx, w, h) {
+  const cx = w * 0.5;
+  const base = h * 0.79;
+  const bw = w * 0.42;
+  const bh = h * 0.4;
+  ctx.fillStyle = '#d9b483';
+  roundedPath(ctx, cx - bw / 2, base - bh, bw, bh, h * 0.06);
+  ctx.fill();
+  ctx.fillStyle = '#e8c99b';
+  roundedPath(ctx, cx - bw * 0.57, base - bh - h * 0.1, bw * 1.14, h * 0.13, h * 0.05);
+  ctx.fill();
+  ctx.fillStyle = '#e8657a';
+  ctx.fillRect(cx - bw * 0.07, base - bh, bw * 0.14, bh);
+}
+
+// ---------------------------------------------------------------------------
 // modal
 // ---------------------------------------------------------------------------
 
@@ -438,6 +633,7 @@ export function openShop(game) {
           <div class="shop-tabs" role="tablist">
             <button class="shop-tab" role="tab" data-tab="colors">Colors</button>
             <button class="shop-tab" role="tab" data-tab="hats">Hats</button>
+            <button class="shop-tab" role="tab" data-tab="furniture">Furniture</button>
           </div>
           <div class="shop-pane" data-pane="colors">
             <div class="shop-swatches"></div>
@@ -445,6 +641,10 @@ export function openShop(game) {
           </div>
           <div class="shop-pane" data-pane="hats">
             <div class="shop-grid"></div>
+          </div>
+          <div class="shop-pane" data-pane="furniture">
+            <div class="shop-furn-note"></div>
+            <div class="shop-fgrid"></div>
           </div>
           <div class="shop-foot"><span class="shop-coin shop-coin-sm"></span><span class="shop-foot-text"></span></div>
         </div>
@@ -466,6 +666,12 @@ export function openShop(game) {
   const colorNameEl = q('.shop-color-name');
   const colorHintEl = q('.shop-color-hint');
   const grid = q('.shop-grid');
+  const subEl = q('.shop-sub');
+  const furnNote = q('.shop-furn-note');
+  const fgrid = q('.shop-fgrid');
+
+  const SUB_WEAR = subEl.textContent;
+  const SUB_FURN = 'Everything you buy is delivered to your den, ready to place.';
 
   stageName.textContent = game.state.name || 'Capybara';
   q('.shop-foot-text').textContent =
@@ -680,6 +886,235 @@ export function openShop(game) {
     refreshHats();
   }
 
+  // ---- furniture -----------------------------------------------------------
+  const furnEntries = Object.entries(FURNITURE).sort((a, b) => a[1].price - b[1].price);
+  const furnRefs = new Map();
+  const thumbJobs = [];
+  let furnPendingId = null;
+  let furnPendingTimer = 0;
+
+  const thumbScale = Math.min(globalThis.devicePixelRatio || 1, 2);
+  const thumbPW = Math.round(THUMB_W * thumbScale);
+  const thumbPH = Math.round(THUMB_H * thumbScale);
+
+  function shake(el) {
+    el.classList.remove('shop-shake');
+    void el.offsetWidth; // restart the animation
+    el.classList.add('shop-shake');
+  }
+
+  furnEntries.forEach(([id, item], i) => {
+    const cardEl = elm('div', 'shop-furn');
+    cardEl.style.setProperty('--i', String(i));
+
+    const thumb = elm('div', 'shop-furn-thumb');
+    const tcanvas = document.createElement('canvas');
+    tcanvas.width = thumbPW;
+    tcanvas.height = thumbPH;
+    tcanvas.setAttribute('aria-hidden', 'true');
+    const count = elm('span', 'shop-furn-count');
+    thumb.append(tcanvas, count);
+
+    const name = elm('div', 'shop-furn-name', item.name);
+    const blurb = elm('div', 'shop-furn-blurb', FURN_BLURBS[id] || 'A fine find from the driftwood market.');
+
+    const foot = elm('div', 'shop-furn-foot');
+    const price = elm('div', 'shop-price');
+    price.appendChild(elm('span', 'shop-coin shop-coin-sm'));
+    price.appendChild(elm('span', null, String(item.price)));
+    const btn = elm('button', 'shop-hat-btn shop-furn-btn');
+    btn.type = 'button';
+    foot.append(price, btn);
+
+    cardEl.append(thumb, name, blurb, foot);
+    fgrid.appendChild(cardEl);
+
+    // button-only: repeat buys are allowed, so a stray card click must not spend
+    btn.addEventListener('click', (e) => { e.stopPropagation(); onFurnBuy(id, cardEl); });
+
+    furnRefs.set(id, { el: cardEl, btn, price, count });
+    thumbJobs.push({ id, canvas: tcanvas });
+  });
+
+  function ownedCount(id) {
+    const owned = game.state.ownedFurniture;
+    if (!owned || typeof owned !== 'object') return 0;
+    // own-property lookup: ownedFurniture['constructor'] would otherwise be truthy
+    if (!Object.prototype.hasOwnProperty.call(owned, id)) return 0;
+    return Math.max(0, Math.floor(Number(owned[id]) || 0));
+  }
+
+  // Dens belong to registered players, and the server owns the ledger, so a
+  // guest or a dropped socket browses instead of buying.
+  function canBuyFurniture() {
+    return !!(game.net?.connected && game.state.registered);
+  }
+
+  function refreshFurniture() {
+    const buyable = canBuyFurniture();
+    const registered = !!game.state.registered;
+    furnNote.classList.toggle('is-on', !buyable);
+    if (!buyable) {
+      furnNote.textContent = registered
+        ? 'The delivery boat is paddling back to shore. Your furniture will be here the moment you reconnect.'
+        : 'Guests are welcome to visit any den. Sign up to furnish your own, and this lot is yours to buy.';
+    }
+    for (const [id, ref] of furnRefs) {
+      const item = FURNITURE[id];
+      const n = ownedCount(id);
+      const pending = furnPendingId === id;
+      const full = n >= HOUSE_MAX_ITEMS; // the server refuses past this, mirror it
+      const short = buyable && !pending && !full && game.state.coins < item.price;
+
+      ref.el.classList.toggle('is-owned', n > 0);
+      ref.el.classList.toggle('is-pending', pending);
+      ref.price.classList.toggle('is-short', short);
+      ref.count.textContent = `x${n}`;
+      ref.count.title = n === 1 ? `You own 1 ${item.name}` : `You own ${n} of these`;
+
+      ref.btn.disabled = !buyable || full || furnPendingId !== null;
+      ref.btn.textContent = '';
+      ref.btn.setAttribute('aria-label', `${item.name}, ${item.price} coins${n > 0 ? `, you own ${n}` : ''}`);
+      if (pending) {
+        ref.btn.appendChild(elm('span', 'shop-spinner'));
+        ref.btn.appendChild(elm('span', null, 'Buying'));
+      } else if (!buyable) {
+        ref.btn.textContent = registered ? 'Offline' : 'Sign up';
+      } else if (full) {
+        ref.btn.textContent = 'Plenty';
+      } else {
+        ref.btn.textContent = n > 0 ? 'Buy another' : 'Buy';
+      }
+    }
+  }
+
+  function clearFurnPending() {
+    furnPendingId = null;
+    if (furnPendingTimer) { clearTimeout(furnPendingTimer); furnPendingTimer = 0; }
+  }
+
+  function onFurnBuy(id, cardEl) {
+    if (furnPendingId) return;
+    const item = FURNITURE[id];
+    if (!item) return;
+
+    if (!canBuyFurniture()) {
+      game.audio?.play?.('fail');
+      game.toast(game.state.registered
+        ? 'The delivery boat is offline right now. Try again in a moment.'
+        : `Sign up to get your own den, and the ${item.name} is yours to buy.`);
+      shake(cardEl);
+      return;
+    }
+    if (ownedCount(id) >= HOUSE_MAX_ITEMS) {
+      game.audio?.play?.('fail');
+      game.toast(`You have plenty of those. Even the ${item.name} needs breathing room.`);
+      shake(cardEl);
+      return;
+    }
+    if (game.state.coins < item.price) {
+      game.audio?.play?.('fail');
+      game.toast(`${item.name} costs ${item.price}. You need ${item.price - game.state.coins} more.`);
+      shake(cardEl);
+      return;
+    }
+
+    furnPendingId = id;
+    game.audio?.play?.('click');
+    game.net.send({ t: 'buy-furn', id });
+    refreshFurniture();
+    furnPendingTimer = setTimeout(() => {
+      if (furnPendingId !== id) return;
+      clearFurnPending();
+      refreshFurniture();
+      game.toast('The delivery capys are still loading the cart. Try again.');
+    }, 8000);
+  }
+
+  // Server reply: {t:'furn', ok, coins, delta, ownedFurniture}. The net layer
+  // normally folds coins/ownedFurniture into game.state before re-emitting;
+  // the guards below make this correct either way instead of assuming.
+  function onFurn(msg) {
+    const m = msg && typeof msg === 'object' ? msg : {};
+    if (m.ok === false) {
+      clearFurnPending();
+      game.audio?.play?.('fail');
+      game.toast(m.msg || 'That one is out of stock at the moment.');
+      refreshFurniture();
+      return;
+    }
+    if (m.ownedFurniture && typeof m.ownedFurniture === 'object'
+      && game.state.ownedFurniture !== m.ownedFurniture) {
+      game.state.ownedFurniture = m.ownedFurniture;
+      // let the den editor (and anything else reading state) see the new stock
+      game.events.emit('profile', game.state);
+    }
+    // trust the server's echo first: a reply that arrives after our 8s timeout
+    // still gets to say what landed
+    const boughtId = typeof m.bought === 'string' ? m.bought : furnPendingId;
+    const bought = boughtId && Object.prototype.hasOwnProperty.call(FURNITURE, boughtId)
+      ? FURNITURE[boughtId] : null;
+    clearFurnPending();
+    if (typeof m.coins === 'number' && m.coins !== game.state.coins) {
+      game.syncCoins(m.coins, Number(m.delta) || 0, 'shop');
+    }
+    if (bought) {
+      game.audio?.play?.('success');
+      game.toast(`${bought.name} is on its way to your den!`);
+      preview?.celebrate(0.8);
+    }
+    purseN.textContent = String(game.state.coins);
+    refreshFurniture();
+  }
+
+  // Thumbnails: build each catalog mesh once, blit it, throw the mesh away.
+  let thumbRaf = 0;
+  let shooter = null;
+
+  function paintFallbacks() {
+    for (const job of thumbJobs) paintThumb(job.canvas, paintCrate);
+    thumbJobs.length = 0;
+  }
+
+  function startThumbs() {
+    if (!thumbJobs.length) return;
+    import('../world/furniture.js').then((mod) => {
+      if (closed) return;
+      const build = typeof mod.buildFurniture === 'function' ? mod.buildFurniture
+        : typeof mod.default === 'function' ? mod.default : null;
+      if (!build) { paintFallbacks(); return; }
+      try {
+        shooter = makeThumbShooter(thumbPW, thumbPH);
+      } catch {
+        paintFallbacks(); // no WebGL context to spare: crates it is
+        return;
+      }
+      const step = () => {
+        thumbRaf = 0;
+        if (closed) return;
+        const t0 = performance.now();
+        // a few per frame: 20 little renders in one go would hitch the modal
+        while (thumbJobs.length && performance.now() - t0 < 7) {
+          const job = thumbJobs.shift();
+          let obj = null;
+          try { obj = build(job.id); } catch { obj = null; }
+          let shot = false;
+          if (obj && obj.isObject3D) {
+            try { shot = shooter.shoot(obj); } catch { shot = false; }
+            disposeObject(obj);
+          }
+          paintThumb(job.canvas, shot
+            ? (ctx, w, h) => ctx.drawImage(shooter.canvas, 0, 0, w, h)
+            : paintCrate);
+        }
+        if (thumbJobs.length) { thumbRaf = requestAnimationFrame(step); return; }
+        try { shooter?.dispose(); } catch { /* context may already be lost */ }
+        shooter = null;
+      };
+      step();
+    }).catch(() => { if (!closed) paintFallbacks(); });
+  }
+
   // ---- tabs ----------------------------------------------------------------
   const tabs = [...root.querySelectorAll('.shop-tab')];
   const panes = [...root.querySelectorAll('.shop-pane')];
@@ -691,6 +1126,7 @@ export function openShop(game) {
       t.setAttribute('aria-selected', on ? 'true' : 'false');
     }
     for (const p of panes) p.classList.toggle('is-on', p.dataset.pane === name);
+    subEl.textContent = name === 'furniture' ? SUB_FURN : SUB_WEAR;
   }
   for (const t of tabs) {
     t.addEventListener('click', () => {
@@ -699,7 +1135,7 @@ export function openShop(game) {
       game.audio?.play?.('click');
     });
   }
-  selectTab(lastTab === 'hats' ? 'hats' : 'colors');
+  selectTab(lastTab === 'hats' || lastTab === 'furniture' ? lastTab : 'colors');
 
   // ---- live state ----------------------------------------------------------
   function setCoins(total) {
@@ -711,19 +1147,24 @@ export function openShop(game) {
   purseN.textContent = String(game.state.coins);
 
   const unsubs = [
-    game.events.on('coins', (total) => { setCoins(total); checkPending(); refreshHats(); }),
+    game.events.on('coins', (total) => { setCoins(total); checkPending(); refreshHats(); refreshFurniture(); }),
     game.events.on('profile', () => {
       purseN.textContent = String(game.state.coins);
       checkPending();
       stageName.textContent = game.state.name || 'Capybara';
       refreshSwatches();
       refreshHats();
+      refreshFurniture();
       syncPreview();
     }),
+    game.events.on('furn', onFurn),
+    // reconnecting mid-browse turns the furniture buttons back on
+    game.events.on('net', () => refreshFurniture()),
   ];
 
   refreshSwatches();
   refreshHats();
+  refreshFurniture();
   syncPreview();
 
   // ---- close ---------------------------------------------------------------
@@ -733,9 +1174,14 @@ export function openShop(game) {
     closed = true;
     openInstance = null;
     clearPending();
+    clearFurnPending();
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
     root.removeEventListener('pointerdown', onBackdrop);
+    if (thumbRaf) { cancelAnimationFrame(thumbRaf); thumbRaf = 0; }
+    thumbJobs.length = 0;
+    try { shooter?.dispose(); } catch { /* context may already be lost */ }
+    shooter = null;
     try { preview?.dispose(); } catch { /* context may already be lost */ }
     preview = null;
     root.classList.add('shop-closing');
@@ -758,6 +1204,7 @@ export function openShop(game) {
   addEventListener('keydown', onKey, true);
   card.focus({ preventScroll: true });
   game.audio?.play?.('whoosh');
+  startThumbs(); // after `closed` exists: the queue bails if the modal is gone
 
   openInstance = { close };
 }

@@ -1,5 +1,6 @@
 import { ROOM_INFO } from '../../shared/constants.js';
 import { openProfile, ensureSocialStyles, normalizeFriends } from './profile.js';
+import { visitHouse } from '../net/client.js';
 
 /**
  * Friends list overlay + the HUD button that opens it.
@@ -52,7 +53,7 @@ export function openFriends(game) {
       <div class="fr-head"><h2>Friends</h2><span class="fr-count"></span></div>
       <div class="fr-sub"></div>
       <div class="fr-list"></div>
-      <div class="fr-foot">Click any capybara in the world to see their card.</div>
+      <div class="fr-foot">Click any capybara in the world to see their card. The door visits their den.</div>
     </div>
   `;
   mountPoint().appendChild(root);
@@ -100,6 +101,9 @@ export function openFriends(game) {
       // a card is a live look at a player, so it needs them connected: an
       // offline friend still gets a row, it just does not pretend to open one
       const canOpen = f.id != null;
+      // the door sits ON the row rather than inside it: a button inside a
+      // button swallows its own clicks and confuses every screen reader
+      const item = elm('div', 'fr-item');
       const row = elm('button', 'fr-row');
       row.type = 'button';
       row.style.setProperty('--i', String(i));
@@ -115,7 +119,25 @@ export function openFriends(game) {
         if (canOpen) openProfile(game, f.id);
         else game.toast(`${f.name} is off exploring. Their card opens when they are back.`);
       });
-      listEl.appendChild(row);
+      item.appendChild(row);
+
+      if (f.online) {
+        item.classList.add('has-den');
+        const den = elm('button', 'fr-den');
+        den.type = 'button';
+        den.style.setProperty('--i', String(i));
+        den.innerHTML = '&#128682;'; // a little door
+        den.title = `Visit ${f.name}'s den`;
+        den.setAttribute('aria-label', `Visit ${f.name}'s den`);
+        den.addEventListener('click', (e) => {
+          e.stopPropagation();
+          close(); // plays the click for us, and clears the screen for the trip
+          visitHouse(game, f.name);
+        });
+        item.appendChild(den);
+      }
+
+      listEl.appendChild(item);
     });
   }
 
