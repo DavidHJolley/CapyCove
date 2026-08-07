@@ -130,3 +130,66 @@ worried, hurt, beaten). Heuristic AI, in strict order:
 PvP duels over the race-lobby pattern; card collection + shop packs; ranked
 ladder; a fourth element. Design space is reserved: keep element/keyword enums
 extensible.
+
+## 10. v2: SPECTACLE (planned wave: make every card feel like an event)
+
+Playtester direction (2026-08-07): "genuinely exciting to play: animations
+like Yu-Gi-Oh, where you summon a creature using your card and you see
+animations of them attacking, and for spells." This section is the
+authoritative plan; rules above are UNCHANGED: this is a presentation layer.
+
+### The stage
+- The flat board becomes a 3D BATTLE DIORAMA rendered by one THREE
+  WebGLRenderer inside the minigame root: a mossy stone arena table in the
+  Den's art style, element-tinted rim lighting, the two capy portraits
+  become small 3D busts (player's colors/hat vs the AI/rival's) that react
+  (flinch on damage, droop at low HP, cheer on win). Cards in hand STAY 2D
+  DOM (readability first); the board is where the show happens.
+
+### Summons
+- Playing a critter card: the card flies from your hand to the slot, flips,
+  SLAMS (dust ring + screen kick), then the critter MATERIALIZES from an
+  element-colored light beam + particle burst: a procedural 3D chibi
+  creature standing on the slot. New module src/minigames/games/critters.js:
+  buildCritter(cardId) -> Group with idle/attack/hurt/ko hooks, one builder
+  per critter in the section-6 table (14 models, 200-400 tris each, prop/
+  avatar art language, element accents: sun = warm gold + tiny sunbeam halo,
+  snow = frosty blues + breath puffs, sea = teal + drip sparkles). Reusable
+  registry pattern like hats/furniture (future: pets).
+- Idle life: each summoned critter breathes, blinks, shuffles its feet;
+  taunt keyword = it stamps and flares its chest.
+
+### Attacks
+- Declaring an attack: the critter CROSSES THE BOARD: crouch, leap (arc),
+  impact with HIT-STOP (90ms freeze), screen shake scaled by damage,
+  element-colored impact burst, big punchy damage numbers, then hop back.
+- Element triangle procs a callout banner in cove voice: "MELTED!" (sun>snow),
+  "FROSTED!" (snow>sea), "SOAKED!" (sea>sun) with matching full-slot flash.
+- KO: the critter cracks, pauses, SHATTERS into element motes that drift up;
+  its card grays and slides to a small graveyard stack.
+- Lethal blow on a capy: FINISH CAM: brief slow-mo zoom toward the losing
+  bust, whiteout, then the results card. Win = your critters group-cheer.
+
+### Spells
+- Each spell gets a distinct full-board effect with a readable silhouette:
+  e.g. sun spells wash the arena in a sweeping dawn flare, snow spells roll
+  a blizzard band across enemy slots with icicle stabs, sea spells send a
+  tidal wave crossing the table (buffs: rising light pillars + stat-up
+  chevrons). Duration <= 1.2s each; damage/heal numbers ride the effect.
+
+### Rules of the show (hard constraints)
+- PRESENTATION ONLY: game state, rules, AI, PvP match frames unchanged; the
+  animation layer consumes the same internal events both clients already
+  share, so PvP stays in sync (animations are local, deterministic from
+  events, and never gate the protocol).
+- Input is never blocked except during hit-stop (<100ms) and finish cam
+  (<1.5s); a "fast mode" toggle in the splash halves all duration constants;
+  prefers-reduced-motion collapses shakes/flashes to fades.
+- Budget: <= 120 draw calls with 8 critters on board, instanced particles
+  (one system, retargeted), full dispose on unmount (renderer, all critter
+  geometries, particle textures). No new npm deps, no external assets.
+- Audio: summon stinger, per-element impact, spell motifs, finish sting:
+  via game.audio.play names that exist, plus local WebAudio synthesis inside
+  cards.js where a new sound is needed (dispose oscillators).
+- Acceptance test: a spectator who cannot read the cards should still be
+  able to narrate the duel from the animations alone.

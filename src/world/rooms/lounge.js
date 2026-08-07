@@ -5,13 +5,34 @@ import { createAvatar } from '../../player/avatar.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
 
 // ---------------------------------------------------------------------------
-// The Game Den: the warm timber games room INSIDE the Frosty Peak ski lodge.
-// Floor plus three walls, the south side open to the camera; the door leads
-// back out onto the mountain, so every window looks at snow, pines and the far
-// ridges. The star attraction is the grand stone fireplace on the north wall
-// with a shelf of little gold capy trophies across its mantel, set opposite the
-// door so players walk toward it. Five game stations ring the room, each with a
-// different silhouette, its own painted sign and TWO chairs.
+// The Game Den: the warm timber games room INSIDE the Frosty Peak ski lodge,
+// now on TWO floors. Floor plus three walls, the south side open to the camera;
+// the door leads back out onto the mountain, so every window looks at snow,
+// pines and the far ridges.
+//
+//   GROUND FLOOR (loud): the arcade cabinet, the shuffleboard and the big
+//   four-in-a-row stand, spread wide around the open middle, plus the cocoa bar
+//   and the way out.
+//   THE LOFT (quiet): a timber mezzanine across the north end at y = 3.2 on
+//   chunky posts, reached by a boxed stair up the east wall. The grand stone
+//   fireplace is up here on the gable wall, with chess and the card table
+//   either side of it and deep chairs in front of the fire.
+//
+// The fireplace moved upstairs deliberately, and it is the whole reason the
+// layout works. A balcony is opaque from a 3/4 camera 14 units south and 9.5
+// up: anything standing on the ground under it is invisible from the room, so
+// the undercroft became an arcade of posts and shelves, and the star attraction
+// went UP where the ground floor can still see it glowing over the balcony rail.
+//
+// Two-floor rules, all of them consequences of the shipped ground snap (walkers
+// take the HIGHEST surface within +1.2 of their feet):
+//   * the deck sits 3.2 up, so ground walkers under it never get lifted;
+//   * a walker who steps off a deck edge DOES drop (any surface below is in
+//     range), so every open edge carries railing obstacle circles;
+//   * obstacle circles are 2D and blind to height: a rail on the balcony edge
+//     also walls the ground floor off at that line. So the ground floor stops
+//     at the balcony, the undercroft is scenery, and the ONLY way up is the
+//     stair, whose treads are real ground meshes.
 //
 // Those chairs are the multiplayer half of the room (wave 4). Every station is
 // a two-seat table on the server (protocol in CLAUDE.md / src/net/client.js):
@@ -21,20 +42,23 @@ import { BOT_ZONES } from '../../../shared/constants.js';
 // Seated capybaras are drawn here from the table roster (their networked body
 // is un-parented while they sit, exactly like the peak race lobby), and each
 // sign carries a live status chip: OPEN / "<name> waits a rival!" / MATCH LIVE.
+// A seated capy who simply walks away gives the chair up (see _updateTables).
 //
 // Everything is procedural: canvas textures for signs, boards, felts, rugs and
 // the champion portraits; InstancedMesh batches for the hundreds of small
-// props, which keeps the room near 60 draw calls.
+// props, which keeps the room at about 105 draw calls.
 //
-// Three framing rules drove the layout, all of them found by screenshot:
-//   * the room is 16 deep, not 18: with this camera the whole north wall
-//     compresses into the top ~20px of frame, and at 18 the fire itself was
-//     hidden behind the HUD from the arrival spawn;
-//   * nothing overhead reaches south of z = 0.5, because the camera's line to
-//     the player crosses head-height ceilings about 6.5 units south of them —
-//     side-bay rafters put three beams across the player at every west station;
+// Framing rules the layout obeys, all of them found by screenshot:
+//   * NOTHING overhead. The camera rides 9.5 above the player, so on the loft
+//     it sits at y ~12.7: a ceiling, a rafter or a roof at lodge height would
+//     put itself between the camera and anyone upstairs. The lodge is a
+//     cutaway: walls, eaves and snow on the OUTSIDE, open sky above;
+//   * the balcony rail is low (0.92) and mostly air, so the loft reads from the
+//     ground floor and from the static camera instead of hiding behind a board;
+//   * the loft's own signs stay under y = 5.05 (deck + 1.85), which is where the
+//     camera's line to a standing capybara's head passes one unit south of them;
 //   * the doorway has posts but NO lintel (the cafe's lesson): with the camera
-//     13.5 behind the player, a lintel at z 8.3 lands exactly on the head of
+//     14 behind the player, a lintel at z 8.3 lands exactly on the head of
 //     anyone standing on the default spawn.
 // ---------------------------------------------------------------------------
 
@@ -78,68 +102,104 @@ const PAL = {
 
 // room shell
 const HW = 11;        // half width in x
-// 16 deep, matching the shack: with the follow camera 13.5 back and 10.5 up,
+// 16 deep, matching the shack: with the follow camera 14 back and 9.5 up,
 // the whole north wall compresses into the top ~20px of the frame, so a room
 // any deeper than this hides its own landmark from the arrival spawn.
 const ZN = -7;        // north wall (inner face)
 const ZS = 9;         // south edge of the floor
-const WALL_H = 6.4;
-const RAFT_Y = 5.5;
+const WALL_H = 6.4;   // side walls
+const WALL_N = 8.8;   // north gable: the loft fireplace is a two-storey stack
 const FZ = -6.5;      // centre plane of the fireplace stonework
 const DZ = 8.3;       // doorway posts
 const ZONE = BOT_ZONES.lounge; // { x: 0, z: 2, r: 4 }
 
+// --- the loft --------------------------------------------------------------
+// MZ_Y is 2.6x the 1.2 step-up range, so nothing on the ground floor is ever
+// snapped up onto the deck. MZ_BAY steps the middle of the balcony back to keep
+// the whole bot circle (0, 2, r 4: it reaches z = -2) out from under the deck.
+const MZ_Y = 3.2;          // deck walking surface
+const MZ_T = 0.44;         // slab thickness (the soffit reads from below)
+const MZ_S = -2.2;         // south edge of the two wings
+const MZ_BAY = -2.8;       // south edge of the middle bay
+const MZ_BAYX = 4.5;       // |x| where the balcony steps back
+const RAIL_Y = 0.92;       // rail height above the deck (low: sight lines)
+const RAIL_R = 0.6;        // railing collider radius
+// Collider spacing. "Just overlap them" is NOT enough to make a wall out of
+// circles: WalkController pushes you onto a circle's rim and then slides you
+// along it toward your target, so two circles 0.9 apart squeeze you onto their
+// centre line, where the rim normal is sideways and the slide tangent points
+// straight through the fence. At 0.45 every point of the line is deep inside
+// three or more circles and the push-out always has a component back the way
+// you came. Walked at 0.25 resolution across the whole edge, plus eight
+// diagonal approaches per side: 0 crossings either way (see the stair lane,
+// x >= 8.7, which is meant to be the only way between the floors).
+const RAIL_STEP = 0.45;
+// The stair boxes up the east wall and climbs north onto the east wing. Rise
+// 0.4 a step is well inside the 1.2 snap, so it walks as one continuous ramp.
+const ST_X0 = 8.7, ST_X1 = HW;   // west rail / east wall
+const ST_Z0 = 3.6;               // bottom tread, at the foot by the cocoa bar
+const ST_N = 8;
+const ST_RISE = MZ_Y / ST_N;     // 0.4
+const ST_GOING = (ST_Z0 - MZ_S) / ST_N; // 0.725
+
 // window openings, given in WORLD z and mirrored onto both side walls
 const WINZ = [[-1.2, 2.0], [3.8, 7.0]];
 const WIN_LO = 2.2, WIN_HI = 4.5;
+// Upper runs: one either side of the loft's own floor, plus a clerestory over
+// the stair. The clerestory is not for the view, it is for the frame: climbing
+// the stair puts the camera a metre off the east wall, and 6.4 metres of blank
+// plaster filled a third of the shot until the daylight went through it.
+const WINZ_UP = [[-6.3, -3.4, 4.4, 6.0], [-1.7, 6.6, 4.75, 5.9]];
 
 const FONT = '"Trebuchet MS", "Segoe UI", system-ui, sans-serif';
 const OUTLINE = '#2d2417';
 
-// Every station in one table so the floor plan is auditable at a glance: where
-// the prop stands, where each of its two prompts fires, where its sign post
-// goes, and where its two chairs sit. Sign posts sit off to one side of the
-// approach line, never on it.
+// Every station in one table so the floor plan is auditable at a glance: which
+// floor it is on, where the prop stands, where each of its two prompts fires,
+// where its sign post goes, and where its two chairs sit.
 //
 // Layout rules the numbers obey, all of them checked against the obstacle list:
 //   * chairs sit clear of every collider (+0.15) and at least 0.9 from their
 //     own sign post, so nothing grows through a capybara's hat;
-//   * `hs` (sit down) and `aiAt` (play the house) are ~1.5 apart with most of
-//     that in z, because the camera trails 13.5 south: two prompts separated in
+//   * `hs` (sit down) and `aiAt` (play the house) are ~1.4 apart with most of
+//     that in z, because the camera trails 14 south: two prompts separated in
 //     x land on top of each other, separated in z they stack neatly;
-//   * neighbouring stations keep their prompts >=2.2 apart, which is as far as
-//     chess and four-in-a-row can get from each other and still face the room.
+//   * the loft's prompts run tighter radii (1.5 / 1.2) and stay north of
+//     z = -2.9. Hotspot proximity is measured in 2D, so a generous radius up
+//     here would pop a chess prompt for somebody leaning on the rail below;
+//   * every ground station keeps its whole collider footprint outside the bot
+//     circle (0, 2, r 4), which stays plain open floor.
 // `ai` is the opponent each minigame actually names in its own code.
 const STATIONS = [
   {
     id: 'pong', label: 'Play Paddle Panic', name: 'PADDLE PANIC',
-    sub: 'out-volley the house bot', ai: 'Blip',
-    at: [-8.6, -4.8], hs: [-5.6, -3.4], aiAt: [-5.35, -1.95], sign: [-8.35, -3.1],
-    seats: [[-6.59, -4.74], [-7.27, -3.29]],
+    sub: 'out-volley the house bot', ai: 'Blip', y: 0, yaw: 0.95,
+    at: [-8.2, -0.2], hs: [-6.3, 0.5], aiAt: [-6.15, 1.95], sign: [-8.6, 2.2],
+    seats: [[-6.9, -1.3], [-7.0, 1.2]],
   },
   {
     id: 'shuffle', label: 'Play Shuffle Showdown', name: 'SHUFFLE SHOWDOWN',
-    sub: 'slide it, do not shove it', ai: 'Waxwell',
-    at: [-9.2, 0.8], hs: [-7.0, 0.8], aiAt: [-6.7, 2.25], sign: [-7.95, 2.25],
-    seats: [[-9.45, -3.6], [-9.2, 5.25]],
-  },
-  {
-    id: 'cards', label: 'Play Capy Clash', name: 'CAPY CLASH',
-    sub: 'elements at dawn', ai: 'Grandmaster Pebble',
-    at: [-7.4, 5.8], hs: [-5.2, 5.2], aiAt: [-4.8, 3.75], sign: [-5.3, 7.1],
-    seats: [[-6.25, 7.35], [-8.3, 4.35]],
-  },
-  {
-    id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS',
-    sub: 'think before you nibble', ai: 'Grandmaster Pebble',
-    at: [8.2, -4.8], hs: [6.0, -3.3], aiAt: [6.2, -1.85], sign: [8.05, -2.4],
-    seats: [[6.4, -4.55], [8.55, -3.15]],
+    sub: 'slide it, do not shove it', ai: 'Waxwell', y: 0,
+    at: [6.3, 0.9], hs: [4.3, 0.9], aiAt: [4.2, 2.35], sign: [7.9, -1.3],
+    seats: [[4.75, -0.6], [4.75, 2.4]],
   },
   {
     id: 'connect4', label: 'Play Four in a Row', name: 'FOUR IN A ROW',
-    sub: 'drop, stack, gloat', ai: 'Dizzy',
-    at: [9.7, -1.0], hs: [6.75, 0.5], aiAt: [7.0, 1.95], sign: [8.7, 1.85],
-    seats: [[8.3, -1.85], [8.3, 0.55]],
+    sub: 'drop, stack, gloat', ai: 'Dizzy', y: 0, yaw: 0.95,
+    at: [-8.6, 5.4], hs: [-6.5, 4.9], aiAt: [-6.35, 6.35], sign: [-6.3, 7.6],
+    seats: [[-6.9, 4.3], [-6.9, 6.6]],
+  },
+  {
+    id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS',
+    sub: 'think before you nibble', ai: 'Grandmaster Pebble', y: MZ_Y,
+    at: [6.4, -5.6], hs: [6.4, -4.15], aiAt: [6.4, -2.95], sign: [8.35, -4.4],
+    seats: [[4.75, -5.6], [8.05, -5.6]],
+  },
+  {
+    id: 'cards', label: 'Play Capy Clash', name: 'CAPY CLASH',
+    sub: 'elements at dawn', ai: 'Grandmaster Pebble', y: MZ_Y,
+    at: [-6.6, -5.6], hs: [-6.6, -4.15], aiAt: [-6.6, -2.95], sign: [-8.6, -4.4],
+    seats: [[-8.25, -5.6], [-4.95, -5.6]],
   },
 ];
 const STATION_BY_ID = new Map(STATIONS.map((s) => [s.id, s]));
@@ -1044,7 +1104,11 @@ export class LoungeRoom extends Room {
     this._flat = (map, extra = {}) => new THREE.MeshBasicMaterial({ map, ...extra });
 
     scene.background = new THREE.Color(0x2b1e14);
-    scene.fog = new THREE.Fog(0x3a2a1c, 34, 78);
+    // Snow haze, not the old brown murk. Nothing indoors is more than ~30 from
+    // the camera so the room never sees it; everything the camera catches over
+    // the walls is mountainside, and brown fog turned the far snowfield into a
+    // slab of mud.
+    scene.fog = new THREE.Fog(0xd8e8f6, 44, 108);
 
     const B = {
       box: new Batch(new THREE.BoxGeometry(1, 1, 1)),
@@ -1058,7 +1122,7 @@ export class LoungeRoom extends Room {
 
     this._buildShell(scene, B);
     this._buildLights(scene);
-    this._buildCeiling(scene, B);
+    this._buildLoft(scene, B);
     this._buildFireplace(scene, B, rand);
     this._buildStations(scene, B);
     this._buildSeating(scene, B, rand);
@@ -1083,27 +1147,45 @@ export class LoungeRoom extends Room {
       default: new THREE.Vector3(0, 0, 5),
       from_peak: new THREE.Vector3(0, 0, 6),
     };
-    this.cameraHint = { offset: new THREE.Vector3(0, 10.5, 13.5), lookHeight: 1 };
+    // Flatter than the den used to be (was 10.5/13.5, a 38 degree pitch): with
+    // the hearth up on the loft the old angle put the whole fireplace above the
+    // top of the frame from the arrival spawn, which is exactly the shot the
+    // room is composed for. 9.5/14 keeps the same camera distance and the same
+    // 3/4 read as the rest of the world, and brings the fire back into it.
+    this.cameraHint = { offset: new THREE.Vector3(0, 9.5, 14.0), lookHeight: 1.5 };
+    // Whole-room vantage: high enough south that the loft deck is not edge-on
+    // and the rail does not eat the chess table, close enough that the arcade
+    // downstairs still reads. Everything from the gable top (8.8) to the porch
+    // (z 9) sits inside the 16:9 frustum with ~14% margin.
+    this.staticCamera = {
+      position: new THREE.Vector3(0, 19.5, 25.5),
+      lookAt: new THREE.Vector3(0, 3.0, 0),
+    };
 
     // Two prompts per station: sit down at the real table, or play the house.
     // Solo runs always clear __matchCtx first, so a match that never started
     // can never turn a later solo run into a phantom duel.
     for (const s of STATIONS) {
+      const up = s.y > 0;
       const sit = {
         id: `sit-${s.id}`,
-        position: new THREE.Vector3(s.hs[0], 0, s.hs[1]),
-        radius: 1.9,
+        position: new THREE.Vector3(s.hs[0], s.y, s.hs[1]),
+        radius: up ? 1.5 : 1.9,
         label: this._sitLabel(s),
-        action: (g) => this._onSit(g, s),
+        action: (g) => { if (this._onFloor(g, s)) this._onSit(g, s); },
       };
       this.hotspots.push(sit);
       this._sitSpots.set(s.id, sit);
       this.hotspots.push({
         id: `play-${s.id}`,
-        position: new THREE.Vector3(s.aiAt[0], 0, s.aiAt[1]),
-        radius: 1.6,
+        position: new THREE.Vector3(s.aiAt[0], s.y, s.aiAt[1]),
+        radius: up ? 1.2 : 1.6,
         label: `Play vs ${s.ai}`,
-        action: (g) => { g.__matchCtx = null; g.startMinigame(s.id); },
+        action: (g) => {
+          if (!this._onFloor(g, s)) return;
+          g.__matchCtx = null;
+          g.startMinigame(s.id);
+        },
       });
     }
     this.hotspots.push({
@@ -1123,6 +1205,23 @@ export class LoungeRoom extends Room {
   }
 
   /* --- tables: prompts ----------------------------------------------------- */
+
+  /**
+   * Hotspot proximity is measured in 2D, so a capybara on the ground floor can
+   * be "at" a loft prompt (and the reverse) just by standing under it. Every
+   * station action goes through this first: same storey, or a nudge toward the
+   * stair. Without it a click down here would seat you at a chair you cannot
+   * walk to, and _updateTables would stand you straight back up.
+   */
+  _onFloor(g, s) {
+    const py = this._game?.engine?.playerAvatar?.group?.position?.y ?? 0;
+    if (Math.abs(py - s.y) <= 1.2) return true;
+    g?.audio?.play?.('pop');
+    g?.toast?.(s.y > 0
+      ? `${s.name.toLowerCase()} is up on the loft: the stairs are by the cocoa bar!`
+      : `${s.name.toLowerCase()} is down on the floor below.`);
+    return false;
+  }
 
   /** The sit-down prompt reads the table it belongs to. */
   _sitLabel(s) {
@@ -1157,7 +1256,7 @@ export class LoungeRoom extends Room {
       return;
     }
     if (this._localTable === s.id) {
-      g.net.send({ t: 'table-leave' });
+      this._leaveSeat('stand');
       return;
     }
     // the server would drop a join at a full table on the floor, and a prompt
@@ -1166,9 +1265,11 @@ export class LoungeRoom extends Room {
       g.toast?.('Both chairs are taken. Watch the duel, or start one of your own!');
       return;
     }
-    // one table at a time, so hopping across the room gives up the old chair
-    // first. Two frames back to back sit well inside the server's social budget.
-    if (this._localTable) g.net.send({ t: 'table-leave' });
+    // One table at a time, so hopping to another game gives up the old chair
+    // first: leave locally as well, or the capybara walks to the new station
+    // still folded into the sit pose and still holding the old seat's label.
+    // Two frames back to back sit well inside the server's social budget.
+    if (this._localTable) this._leaveSeat('switch');
     g.net.send({ t: 'table-join', game: s.id });
   }
 
@@ -1224,7 +1325,7 @@ export class LoungeRoom extends Room {
       hat: remote?.p?.hat ?? 'none',
     });
     avatar.setAnim('sit');
-    avatar.group.position.set(seat[0], SEAT_Y, seat[1]);
+    avatar.group.position.set(seat[0], SEAT_Y + s.y, seat[1]);
     avatar.group.rotation.y = seatYaw(s, slot);
     this._seatGroup.add(avatar.group);
 
@@ -1288,7 +1389,7 @@ export class LoungeRoom extends Room {
     this._localTable = id;
     this._localSeat = slot;
     if (seat) {
-      engine?.controller?.setTarget(this._v.set(seat[0], 0, seat[1]));
+      engine?.controller?.setTarget(this._v.set(seat[0], s.y, seat[1]));
       game?.audio?.play?.('whoosh');
       game?.toast?.(`You take a chair at ${s.name.toLowerCase()}. Waiting for a rival!`);
     } else if (avatar) {
@@ -1296,6 +1397,20 @@ export class LoungeRoom extends Room {
       engine?.snapY?.(avatar.group.position, this);
       game?.audio?.play?.('click');
     }
+  }
+
+  /**
+   * Give the chair up locally and tell the server. Used by the walk-away guard
+   * and by dispose(); the authoritative 'table' broadcast that follows just
+   * agrees with what we already did, so the label and the chip never lag.
+   */
+  _leaveSeat(reason) {
+    const game = this._game;
+    if (!this._localTable) return;
+    game?.net?.send?.({ t: 'table-leave' });
+    this._setLocalTable(null, 0);
+    this._refreshLabels();
+    if (reason === 'walk') game?.toast?.('You wander off, so the chair goes back on offer.');
   }
 
   /** Server->client 'match-start': stash the ctx, then launch the duel. */
@@ -1371,13 +1486,31 @@ export class LoungeRoom extends Room {
     snowfield.position.y = -0.06;
     scene.add(snowfield);
 
-    // the plank floor: the only walkable surface
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW, ZS - ZN), this._toonMap(texPlanks()));
+    // The plank floor comes in two pieces. The south piece is the walkable one;
+    // the strip under the balcony is scenery, and leaving it OUT of
+    // groundMeshes is what stops a click landing a capybara in a space the
+    // camera cannot see into (and stops anyone who slips off the deck edge from
+    // ending up wedged under it).
+    const UNDER_Z = -3.2;
+    const walkTex = texPlanks();
+    walkTex.repeat.set(6, (ZS - UNDER_Z) * 0.3125);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW, ZS - UNDER_Z), this._toonMap(walkTex));
     floor.rotation.x = -Math.PI / 2;
-    floor.position.z = (ZN + ZS) / 2;
+    floor.position.z = (UNDER_Z + ZS) / 2;
     floor.receiveShadow = true;
     scene.add(floor);
     this.groundMeshes = [floor];
+
+    const underTex = texPlanks();
+    underTex.repeat.set(6, (UNDER_Z - ZN) * 0.3125); // same plank size across the seam
+    const under = new THREE.Mesh(
+      new THREE.PlaneGeometry(2 * HW, UNDER_Z - ZN),
+      this._toonMap(underTex, 0xcbb595),
+    );
+    under.rotation.x = -Math.PI / 2;
+    under.position.set(0, 0.002, (ZN + UNDER_Z) / 2);
+    under.receiveShadow = true;
+    scene.add(under);
 
     // Decking beyond the door: the lodge's swept porch, snow banked up either
     // side of it. Not walkable, but it fills the bottom third of the frame
@@ -1409,20 +1542,23 @@ export class LoungeRoom extends Room {
     }
 
     // --- walls, with the window openings punched clean through -------------
+    // The north wall is a gable end: it carries a two-storey fireplace, so it
+    // runs to WALL_N while the side walls stop at WALL_H. Nothing bridges them
+    // overhead — see the header note about the loft camera.
     const wallMat = makeToon(PAL.wall);
-    const mkWall = (width, holes) => {
+    const mkWall = (width, height, holes) => {
       const s = new THREE.Shape();
       s.moveTo(-width / 2, 0);
       s.lineTo(width / 2, 0);
-      s.lineTo(width / 2, WALL_H);
-      s.lineTo(-width / 2, WALL_H);
+      s.lineTo(width / 2, height);
+      s.lineTo(-width / 2, height);
       s.closePath();
-      for (const [x0, x1] of holes) {
+      for (const [x0, x1, lo, hi] of holes) {
         const p = new THREE.Path();
-        p.moveTo(x0, WIN_LO);
-        p.lineTo(x1, WIN_LO);
-        p.lineTo(x1, WIN_HI);
-        p.lineTo(x0, WIN_HI);
+        p.moveTo(x0, lo);
+        p.lineTo(x1, lo);
+        p.lineTo(x1, hi);
+        p.lineTo(x0, hi);
         p.closePath();
         s.holes.push(p);
       }
@@ -1434,60 +1570,116 @@ export class LoungeRoom extends Room {
       return m;
     };
 
-    const north = mkWall(2 * HW + 1, []);
+    const north = mkWall(2 * HW + 1, WALL_N, []);
     north.position.z = ZN;
-    // Side walls carry the same world-z openings. Wall-local +x maps to world
-    // -z on the west and +z on the east, so the west holes are mirrored.
-    const west = mkWall(ZS - ZN + 0.8, WINZ.map(([a, b]) => [-b, -a]));
+    // Side walls carry the same world-z openings on both storeys. Wall-local +x
+    // maps to world -z on the west and +z on the east, so the west holes are
+    // mirrored.
+    const holesE = [...WINZ.map(([a, b]) => [a, b, WIN_LO, WIN_HI]), ...WINZ_UP];
+    const holesW = holesE.map(([a, b, c, d]) => [-b, -a, c, d]);
+    const west = mkWall(ZS - ZN + 0.8, WALL_H, holesW);
     west.rotation.y = Math.PI / 2;
     west.position.set(-HW, 0, 0);
-    const east = mkWall(ZS - ZN + 0.8, WINZ.map(([a, b]) => [a, b]));
+    const east = mkWall(ZS - ZN + 0.8, WALL_H, holesE);
     east.rotation.y = -Math.PI / 2;
     east.position.set(HW, 0, 0);
 
-    // the painted mountainside, hung just outside each run of glass
+    // the painted mountainside, hung just outside each run of glass: tall and
+    // long enough to fill the loft windows as well as the ones downstairs
     for (const s of [-1, 1]) {
-      const v = new THREE.Mesh(new THREE.PlaneGeometry(15, 5.6), this._flat(texAlps(s > 0)));
+      const v = new THREE.Mesh(new THREE.PlaneGeometry(17.6, 6.8), this._flat(texAlps(s > 0)));
       v.rotation.y = s > 0 ? -Math.PI / 2 : Math.PI / 2;
-      v.position.set(s * (HW + 0.8), 3.4, 2.4);
+      v.position.set(s * (HW + 0.8), 3.5, 1.6);
       scene.add(v);
     }
 
-    // frames, sills, mullions, sill plants
-    const midY = (WIN_LO + WIN_HI) / 2;
+    // frames, sills, mullions, sill plants: every storey off one loop
+    const winRuns = [
+      ...WINZ.map(([a, b]) => [a, b, WIN_LO, WIN_HI, true]),
+      ...WINZ_UP.map(([a, b, c, d]) => [a, b, c, d, false]),
+    ];
     for (const s of [-1, 1]) {
-      for (const [z0, z1] of WINZ) {
+      for (const [z0, z1, y0, y1, plants] of winRuns) {
+        const midY = (y0 + y1) / 2, h = y1 - y0;
         const cz = (z0 + z1) / 2, len = z1 - z0;
         const wx = s * (HW - 0.14);
-        boxFlat.add(PAL.cream, wx, WIN_HI + 0.1, cz, 0.36, 0.2, len + 0.4);
-        boxFlat.add(PAL.cream, wx, WIN_LO - 0.1, cz, 0.36, 0.2, len + 0.4);
-        boxFlat.add(PAL.cream, wx, midY, cz - len / 2, 0.36, WIN_HI - WIN_LO, 0.2);
-        boxFlat.add(PAL.cream, wx, midY, cz + len / 2, 0.36, WIN_HI - WIN_LO, 0.2);
-        boxFlat.add(PAL.cream, wx, midY, cz, 0.28, WIN_HI - WIN_LO, 0.12);
+        boxFlat.add(PAL.cream, wx, y1 + 0.1, cz, 0.36, 0.2, len + 0.4);
+        boxFlat.add(PAL.cream, wx, y0 - 0.1, cz, 0.36, 0.2, len + 0.4);
+        boxFlat.add(PAL.cream, wx, midY, cz - len / 2, 0.36, h, 0.2);
+        boxFlat.add(PAL.cream, wx, midY, cz + len / 2, 0.36, h, 0.2);
+        boxFlat.add(PAL.cream, wx, midY, cz, 0.28, h, 0.12);
         boxFlat.add(PAL.cream, wx, midY, cz, 0.28, 0.12, len);
-        box.add(PAL.woodLight, s * (HW - 0.34), WIN_LO - 0.16, cz, 0.62, 0.16, len + 0.5);
+        box.add(PAL.woodLight, s * (HW - 0.34), y0 - 0.16, cz, 0.62, 0.16, len + 0.5);
+        if (!plants) continue;
         for (let i = 0; i < 3; i++) {
-          ball.add(i % 2 ? PAL.leaf : PAL.leafDark, s * (HW - 0.42), WIN_LO + 0.1,
+          ball.add(i % 2 ? PAL.leaf : PAL.leafDark, s * (HW - 0.42), y0 + 0.1,
             cz - len / 3 + i * (len / 3), 0.52, 0.36, 0.52);
         }
       }
     }
 
-    // wainscot, chair rail, top plate
+    // wainscot, chair rail, top plate. The coral band rides low at 1.55 now:
+    // at its old 5.05 it cut straight across the loft's windows.
     const runs = [
-      [0, ZN + 0.1, 2 * HW, 0.2],
-      [-HW + 0.1, 0, 0.2, ZS - ZN],
-      [HW - 0.1, 0, 0.2, ZS - ZN],
+      [0, ZN + 0.1, 2 * HW, 0.2, WALL_N],
+      [-HW + 0.1, 0, 0.2, ZS - ZN, WALL_H],
+      [HW - 0.1, 0, 0.2, ZS - ZN, WALL_H],
     ];
-    for (const [x, z, sx, sz] of runs) {
+    for (const [x, z, sx, sz, top] of runs) {
       boxFlat.add(PAL.wainscot, x, 0.62, z, sx, 1.24, sz);
       boxFlat.add(PAL.woodLight, x, 1.3, z, sx + 0.08, 0.16, sz + 0.08);
-      boxFlat.add(PAL.wood, x, WALL_H - 0.22, z, sx + 0.08, 0.34, sz + 0.08);
-      boxFlat.add(PAL.coral, x, 5.05, z, sx, 0.1, sz);
+      boxFlat.add(PAL.wood, x, top - 0.22, z, sx + 0.08, 0.34, sz + 0.08);
+      boxFlat.add(PAL.coral, x, 1.55, z, sx, 0.1, sz);
     }
+    // the loft's own chair rail, on the gable wall above the deck
+    boxFlat.add(PAL.woodLight, 0, MZ_Y + 1.34, ZN + 0.1, 2 * HW, 0.14, 0.2);
     for (const sx of [-1, 1]) {
-      box.add(PAL.wood, sx * (HW - 0.2), WALL_H / 2, ZN + 0.2, 0.4, WALL_H, 0.4);
+      box.add(PAL.wood, sx * (HW - 0.2), WALL_N / 2, ZN + 0.2, 0.4, WALL_N, 0.4);
       box.add(PAL.wood, sx * (HW - 0.2), WALL_H / 2, ZS - 0.24, 0.4, WALL_H, 0.4);
+    }
+
+    // Eaves and snow, all of it OUTSIDE the walls. The den is a cutaway: with
+    // the camera 9.5 above a player (12.7 when they are upstairs) any roof
+    // over the room would render between the two, so the roofline is sold from
+    // the outside edge in and the room stays open to the sky.
+    for (const sx of [-1, 1]) {
+      box.add(PAL.woodMid, sx * (HW + 0.42), WALL_H + 0.08, 1.0, 1.1, 0.22, ZS - ZN + 1.2, 0, 0, sx * 0.12);
+      box.add(PAL.snow, sx * (HW + 0.52), WALL_H + 0.28, 1.0, 1.15, 0.22, ZS - ZN + 1.0, 0, 0, sx * 0.12);
+      box.add(PAL.woodLight, sx * (HW + 0.18), WALL_H - 0.08, 1.0, 0.44, 0.2, ZS - ZN + 1.2);
+    }
+    box.add(PAL.woodMid, 0, WALL_N + 0.1, ZN - 0.42, 2 * HW + 2.2, 0.24, 1.1, 0.12, 0, 0);
+    box.add(PAL.snow, 0, WALL_N + 0.32, ZN - 0.56, 2 * HW + 1.9, 0.22, 1.1, 0.12, 0, 0);
+    for (let i = 0; i < 5; i++) {
+      ball.add(PAL.snow, -8 + i * 4, WALL_N + 0.42, ZN - 0.8, 1.6, 0.44, 0.8);
+    }
+
+    // The mountainside OUTSIDE, which is not scenery you can ignore: the walls
+    // are 6.4 and the camera rides 9.5 above the player, so from anywhere near
+    // a side wall (the stair especially) you look straight over it. Empty
+    // snowfield out there filled a third of the frame with flat white until
+    // this went in. All of it lives beyond |x| 12.5 / z -9, so it can never
+    // come between the camera and a capybara. Deterministic: same every visit.
+    for (let i = 0; i < 30; i++) {
+      const a = (i * 2.3999) % TAU;                 // golden-angle scatter
+      const rad = 19 + ((i * 7) % 19) + (i % 3) * 2.5;
+      const px = Math.cos(a) * rad * 1.35;
+      const pz = Math.sin(a) * rad - 6;
+      if (Math.abs(px) < 15 || pz > 17) continue; // never over the room or the porch
+      const s = 1.5 + ((i * 13) % 9) * 0.28;
+      const drop = ((i * 17) % 7) * 0.12;
+      for (let k = 0; k < 3; k++) {
+        cone.add(k % 2 ? PAL.pine : PAL.pineDark, px, drop + s * (0.9 + k * 0.62), pz, s * 1.25, s * 1.1, s * 1.25);
+        cone.add(PAL.snow, px, drop + s * (1.14 + k * 0.62), pz, s * 0.66, s * 0.46, s * 0.66);
+      }
+      cyl.add(PAL.cocoa, px, drop + s * 0.45, pz, s * 0.24, s * 0.9, s * 0.24);
+      ball.add(PAL.snowShade, px, 0.05, pz, s * 3.2, 0.5, s * 2.6);
+    }
+    // far ridges, big and hazy, closing the horizon on three sides
+    for (const [rx, rz, rs] of [
+      [-34, -30, 15], [-14, -40, 19], [12, -44, 17], [33, -28, 14], [40, 2, 12], [-42, 4, 13],
+    ]) {
+      cone.add(PAL.snowShade, rx, rs * 0.42, rz, rs * 2.0, rs * 0.9, rs * 1.6);
+      cone.add(PAL.snow, rx, rs * 0.72, rz, rs * 0.9, rs * 0.36, rs * 0.72);
     }
   }
 
@@ -1496,14 +1688,18 @@ export class LoungeRoom extends Room {
     scene.add(new THREE.HemisphereLight(0xffe3ba, 0x5a3c24, 0.5));
     scene.add(new THREE.AmbientLight(0xffeacd, 0.24));
 
+    // Two storeys, six fills: one per ground station cluster, one per loft
+    // table, and a dim one under the balcony so the undercroft is shadow with
+    // something in it rather than a black band. The hearth light upstairs (in
+    // _buildFireplace) covers the middle of the loft; no fill by the door,
+    // where daylight through the opening does the job.
     for (const [x, y, z, col, i, dist] of [
-      [0, 4.2, -2.2, 0xffd8a4, 16, 15],
-      [-7.4, 3.6, 3.6, 0xffcf9a, 13, 13],
-      [7.4, 3.6, 3.6, 0xffd6a8, 13, 13],
-      [-8.4, 3.4, -4.6, 0xffc890, 11, 12],
-      [8.4, 3.4, -4.6, 0xffc890, 11, 12],
-      // no sixth fill by the door: daylight through the opening covers it, and
-      // toon shading pays for every extra point light
+      [0, 4.2, 2.2, 0xffd8a4, 15, 15],
+      [-8.0, 3.4, 4.6, 0xffcf9a, 13, 13],
+      [8.0, 3.4, 4.6, 0xffd6a8, 13, 13],
+      [0, 2.3, -4.6, 0xffb877, 7, 9],
+      [-6.6, MZ_Y + 2.0, -4.4, 0xffc890, 12, 11],
+      [6.6, MZ_Y + 2.0, -4.4, 0xffc890, 12, 11],
     ]) {
       const p = new THREE.PointLight(col, i, dist, 2);
       p.position.set(x, y, z);
@@ -1516,12 +1712,12 @@ export class LoungeRoom extends Room {
     sun.target.position.set(1, 0, -3);
     sun.castShadow = true;
     sun.shadow.mapSize.set(1024, 1024);
-    sun.shadow.camera.left = -15;
-    sun.shadow.camera.right = 15;
-    sun.shadow.camera.top = 14;
-    sun.shadow.camera.bottom = -13;
+    sun.shadow.camera.left = -16;
+    sun.shadow.camera.right = 16;
+    sun.shadow.camera.top = 18;   // the loft deck and the gable live up here now
+    sun.shadow.camera.bottom = -14;
     sun.shadow.camera.near = 1;
-    sun.shadow.camera.far = 55;
+    sun.shadow.camera.far = 62;
     sun.shadow.bias = -0.0006;
     sun.shadow.normalBias = 0.03;
     scene.add(sun);
@@ -1529,47 +1725,120 @@ export class LoungeRoom extends Room {
   }
 
   // -------------------------------------------------------------------------
-  // Boarded ceiling and truss over the NORTH end only, plus string lights.
+  // THE LOFT: deck, posts, railings, and the boxed stair up the east wall.
   //
-  // The first cut ran rafters down both side bays and they were a disaster:
-  // the camera sits 10.5 up and 13.5 back, so its line to the player crosses
-  // y = 5.5 about 6.4 units south of wherever the player stands. Walk to the
-  // pong cabinet or the shuffleboard and you are looking at the player through
-  // three beams. Everything overhead therefore stops at z = CEIL_S: for any
-  // reachable spot (the fireplace mass blocks past z = -6.6) that crossing
-  // lands south of the boards, so nothing up here can ever come between the
-  // camera and a player again.
+  // Nothing here reaches above the deck except the rails, because the camera
+  // rides 9.5 above whoever it is following: on this floor that is y ~12.7,
+  // so a ceiling, a rafter or a roof would simply erase the player. The
+  // undercroft below is scenery for the same reason in reverse (a balcony is
+  // opaque from a low 3/4 camera), which is why its floor is not walkable.
+  //
+  // Edges: north, east and west are the walls, and the walkable floor stops
+  // there, so stepping off that way just stops the walker. The south edge has
+  // real ground 3.2 below it, and the snap takes any surface below without ado,
+  // so that edge is fenced with obstacle circles the whole way. They are 2D and
+  // so they fence the ground floor off at the same line: that is the deal, and
+  // the ground floor is laid out south of it.
   // -------------------------------------------------------------------------
-  _buildCeiling(scene, B) {
-    const { boxFlat, bead } = B;
-    const CEIL_S = 0.5;
+  _buildLoft(scene, B) {
+    const { box, boxFlat, bead } = B;
 
-    const deck = new THREE.Mesh(
-      new THREE.PlaneGeometry(2 * HW, CEIL_S - ZN),
-      makeToon(PAL.woodMid),
-    );
-    deck.rotation.x = Math.PI / 2; // faces down into the room
-    deck.position.set(0, WALL_H, (ZN + CEIL_S) / 2);
+    // --- the deck ----------------------------------------------------------
+    // Shape space is (x, -z); extruding MZ_T and laying it flat puts the
+    // walking surface exactly on MZ_Y. The middle steps back to MZ_BAY so the
+    // whole bot circle stays out from under the balcony.
+    const sh = new THREE.Shape();
+    sh.moveTo(-HW, -ZN);
+    sh.lineTo(HW, -ZN);
+    sh.lineTo(HW, -MZ_S);
+    sh.lineTo(MZ_BAYX, -MZ_S);
+    sh.lineTo(MZ_BAYX, -MZ_BAY);
+    sh.lineTo(-MZ_BAYX, -MZ_BAY);
+    sh.lineTo(-MZ_BAYX, -MZ_S);
+    sh.lineTo(-HW, -MZ_S);
+    sh.closePath();
+    const deckTex = texPlanks();
+    deckTex.wrapS = deckTex.wrapT = THREE.RepeatWrapping;
+    deckTex.repeat.set(0.273, 0.3125); // extrude UVs are world units: match the floor
+    const deckGeo = new THREE.ExtrudeGeometry(sh, { depth: MZ_T, bevelEnabled: false });
+    const deck = new THREE.Mesh(deckGeo, this._toonMap(deckTex));
+    deck.rotation.x = -Math.PI / 2;
+    deck.position.y = MZ_Y - MZ_T;
+    deck.castShadow = true;
+    deck.receiveShadow = true;
     scene.add(deck);
-    // truss under the boards, and the transverse beam that ends them
-    for (const z of [-6.2, -4.8, -3.4, -2.0, -0.6]) {
-      boxFlat.add(PAL.wood, 0, RAFT_Y + 0.4, z, 2 * HW, 0.24, 0.34);
-    }
-    for (const x of [-5.5, 5.5]) {
-      boxFlat.add(PAL.woodLight, x, RAFT_Y + 0.62, (ZN + CEIL_S) / 2, 0.26, 0.26, CEIL_S - ZN);
-    }
-    boxFlat.add(PAL.wood, 0, WALL_H - 0.3, CEIL_S, 2 * HW, 0.6, 0.5);
+    this.groundMeshes.push(deck);
 
-    // three runs of string lights sagging along the walls
+    // the edge segments, south side only: [x0, z0, x1, z1]
+    const EDGES = [
+      [-HW, MZ_S, -MZ_BAYX, MZ_S],
+      [-MZ_BAYX, MZ_S, -MZ_BAYX, MZ_BAY],
+      [-MZ_BAYX, MZ_BAY, MZ_BAYX, MZ_BAY],
+      [MZ_BAYX, MZ_BAY, MZ_BAYX, MZ_S],
+      [MZ_BAYX, MZ_S, ST_X0, MZ_S], // stops at the stair head: that gap is the way down
+    ];
+
+    // fascia board + soffit trim, and the railing above it
+    for (const [x0, z0, x1, z1] of EDGES) {
+      const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+      const len = Math.hypot(x1 - x0, z1 - z0);
+      const alongX = Math.abs(x1 - x0) > Math.abs(z1 - z0);
+      const sx = alongX ? len : 0.3, sz = alongX ? 0.3 : len;
+      boxFlat.add(PAL.wood, cx, MZ_Y - MZ_T / 2, cz, sx + 0.02, MZ_T + 0.18, sz + 0.02);
+      boxFlat.add(PAL.woodLight, cx, MZ_Y - MZ_T - 0.16, cz, sx + 0.1, 0.14, sz + 0.1);
+      // top and mid rails: chunky but mostly air, so the loft still reads from
+      // the ground floor and from the static camera
+      box.add(PAL.woodMid, cx, MZ_Y + RAIL_Y, cz, alongX ? len : 0.14, 0.16, alongX ? 0.14 : len);
+      box.add(PAL.wood, cx, MZ_Y + RAIL_Y * 0.55, cz, alongX ? len : 0.09, 0.1, alongX ? 0.09 : len);
+
+      const n = Math.max(2, Math.round(len / 1.7));
+      for (let i = 0; i <= n; i++) {
+        const u = i / n;
+        const px = x0 + (x1 - x0) * u, pz = z0 + (z1 - z0) * u;
+        box.add(PAL.wood, px, MZ_Y + RAIL_Y / 2, pz, 0.15, RAIL_Y, 0.15);
+        bead.add(PAL.gold, px, MZ_Y + RAIL_Y + 0.12, pz, 0.17, 0.17, 0.17);
+      }
+      // the fence itself: circles tight enough to overlap into a solid line
+      const steps = Math.max(1, Math.round(len / RAIL_STEP));
+      for (let i = 0; i <= steps; i++) {
+        const u = i / steps;
+        this.obstacles.push({ x: x0 + (x1 - x0) * u, z: z0 + (z1 - z0) * u, r: RAIL_R });
+      }
+    }
+
+    // --- the posts that hold it up -----------------------------------------
+    for (const [px, pz] of [
+      [-10.3, MZ_S], [-7.2, MZ_S], [-MZ_BAYX, MZ_BAY], [0, MZ_BAY], [MZ_BAYX, MZ_BAY],
+      [7.2, MZ_S], [ST_X0 - 0.1, MZ_S], [-8.0, -6.4], [8.0, -6.4],
+    ]) {
+      box.add(PAL.wood, px, MZ_Y / 2, pz, 0.36, MZ_Y, 0.36);
+      box.add(PAL.woodMid, px, MZ_Y - 0.42, pz, 0.62, 0.22, 0.62);
+      for (const sx of [-1, 1]) {
+        box.add(PAL.woodMid, px + sx * 0.3, MZ_Y - 0.72, pz, 0.42, 0.42, 0.3, 0, 0, sx * 0.78);
+      }
+    }
+    // beams under the deck, all of them below 3.2 and north of the edge, so
+    // they can never land between the camera and anybody
+    for (const z of [-6.2, -4.6, -3.0]) {
+      boxFlat.add(PAL.wood, 0, MZ_Y - MZ_T - 0.14, z, 2 * HW, 0.26, 0.34);
+    }
+
+    // --- the stair ---------------------------------------------------------
+    this._buildStair(scene, B);
+
+    // --- festoon along the balcony edge, plus the run over the door ---------
     const bulbs = [], cord = [];
-    for (const [x0, z0, x1, z1] of [
-      [-10.4, -6.2, -10.4, 8.2], [10.4, -6.2, 10.4, 8.2], [-10.4, 8.2, 10.4, 8.2],
+    for (const [x0, z0, x1, z1, by] of [
+      [-10.5, MZ_S - 0.18, -4.7, MZ_S - 0.18, MZ_Y - 0.72],
+      [-4.3, MZ_BAY - 0.18, 4.3, MZ_BAY - 0.18, MZ_Y - 0.72],
+      [4.7, MZ_S - 0.18, 8.5, MZ_S - 0.18, MZ_Y - 0.72],
+      [-10.4, 8.2, 10.4, 8.2, 4.6],
     ]) {
       const n = 16;
       let prev = null;
       for (let i = 0; i <= n; i++) {
         const u = i / n;
-        const p = [x0 + (x1 - x0) * u, 4.6 - Math.abs(Math.sin(u * Math.PI * 4)) * 0.18, z0 + (z1 - z0) * u];
+        const p = [x0 + (x1 - x0) * u, by - Math.abs(Math.sin(u * Math.PI * 4)) * 0.18, z0 + (z1 - z0) * u];
         if (prev) cord.push(prev[0], prev[1], prev[2], p[0], p[1], p[2]);
         prev = p;
         if (i % 2 === 0) bulbs.push(p);
@@ -1598,26 +1867,100 @@ export class LoungeRoom extends Room {
     this._bulbs = bulbMesh;
   }
 
+  /**
+   * The stair: eight boxed treads up the east wall, climbing north onto the
+   * east wing. Every tread is a solid block from the floor up, so the ground
+   * snap sees one continuous rising surface (0.4 a step, a third of the 1.2
+   * step-up range) and walks a capybara up it without a single special case.
+   * One InstancedMesh, and it goes straight into groundMeshes.
+   */
+  _buildStair(scene, B) {
+    const { box, boxFlat, bead } = B;
+    const W = ST_X1 - ST_X0, cx = (ST_X0 + ST_X1) / 2;
+
+    const steps = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(W, 1, ST_GOING), makeToon(PAL.woodMid), ST_N,
+    );
+    const d = new THREE.Object3D();
+    for (let i = 0; i < ST_N; i++) {
+      const h = (i + 1) * ST_RISE;
+      d.position.set(cx, h / 2, ST_Z0 - (i + 0.5) * ST_GOING);
+      d.rotation.set(0, 0, 0);
+      d.scale.set(1, h, 1);
+      d.updateMatrix();
+      steps.setMatrixAt(i, d.matrix);
+      // pale nosing on the lip of each tread, so the flight reads as steps and
+      // not as a ramp from the camera above
+      boxFlat.add(PAL.woodLight, cx, h - 0.02, ST_Z0 - i * ST_GOING - 0.07, W - 0.12, 0.08, 0.2);
+    }
+    steps.castShadow = true;
+    steps.receiveShadow = true;
+    scene.add(steps);
+    this.groundMeshes.push(steps);
+
+    // skirt board down the open side, and the raked handrail above it
+    const run = ST_Z0 - MZ_S, rise = MZ_Y;
+    const len = Math.hypot(run, rise), rake = Math.atan2(rise, run);
+    box.add(PAL.wood, ST_X0 - 0.06, (ST_RISE + MZ_Y) / 2 - 0.32, (ST_Z0 + MZ_S) / 2,
+      0.2, 0.72, len + 0.3, rake, 0, 0);
+    box.add(PAL.woodMid, ST_X0 - 0.06, (ST_RISE + MZ_Y) / 2 + RAIL_Y - 0.1, (ST_Z0 + MZ_S) / 2,
+      0.16, 0.16, len, rake, 0, 0);
+    for (let i = 0; i <= ST_N; i++) {
+      const pz = ST_Z0 - i * ST_GOING;
+      const py = i * ST_RISE;
+      box.add(PAL.wood, ST_X0 - 0.06, py + RAIL_Y / 2 + 0.1, pz, 0.14, RAIL_Y + 0.2, 0.14);
+      // The fence: same overlapping circles as the balcony edge, but NOT over
+      // the bottom two treads. Those sit 0.4 and 0.8 up, which the ground snap
+      // treats as a step, so their open sides are a way on rather than a fall
+      // — and a fenced bottom step would have shut the only lane to the stair
+      // between the rail and the cocoa bar (found by walking it).
+      if (i >= 2) this.obstacles.push({ x: ST_X0, z: pz, r: RAIL_R });
+    }
+    // newels: a chunky one at the foot, a taller one at the head
+    for (const [px, py, pz, h] of [[ST_X0 - 0.06, 0, ST_Z0 + 0.2, 1.5], [ST_X0 - 0.06, MZ_Y, MZ_S - 0.1, 1.3]]) {
+      box.add(PAL.wood, px, py + h / 2, pz, 0.3, h, 0.3);
+      bead.add(PAL.gold, px, py + h + 0.12, pz, 0.3, 0.32, 0.3);
+    }
+
+    // the invitation upstairs, hung on the skirt where the foot of the flight
+    // meets the cocoa bar
+    const sign = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.9, 0.72),
+      this._flat(texSign('UP TO THE LOFT', 'fireside, chess & cards')),
+    );
+    sign.rotation.y = -0.62;
+    sign.position.set(ST_X0 - 0.3, 1.85, ST_Z0 + 1.0);
+    scene.add(sign);
+    box.add(PAL.woodMid, ST_X0 - 0.24, 1.85, ST_Z0 + 1.0, 1.98, 0.8, 0.1, 0, -0.62, 0);
+    boxFlat.add(PAL.brass, ST_X0 - 0.3, 2.32, ST_Z0 + 1.0, 0.9, 0.12, 0.12, 0, -0.62, 0);
+  }
+
   // -------------------------------------------------------------------------
-  // THE STAR: grand stone fireplace, live flames, trophy shelf on the mantel.
-  // Heights are deliberately low-slung: from the default spawn the camera
-  // frames down to about 14 degrees below level, and a taller mantel would put
-  // the trophies off the top of the shot on arrival.
+  // THE STAR: grand stone fireplace, live flames, trophy shelf on the mantel,
+  // and since the loft went in it stands on the LOFT, on the gable wall.
+  //
+  // That is the whole trick of the two-floor room. A balcony reads as opaque
+  // from a 3/4 camera 9.5 up: put the fire under it and the room's landmark is
+  // a rumour. Up here the hearth floor sits at 3.2 and the camera's line from
+  // the arrival spawn clears the balcony rail at 4.45, so the fire is the first
+  // thing you see through the door, glowing over the heads of the crowd.
   // -------------------------------------------------------------------------
   _buildFireplace(scene, B, rand) {
     const { box, boxFlat, cyl, cyl8, ball, bead, cone } = B;
-    const OPEN_HW = 1.7, OPEN_TOP = 2.0;
+    const Y = MZ_Y;                       // hearth floor = the loft deck
+    const OPEN_HW = 1.6, OPEN_TOP = Y + 1.75;
+    this._fireY = Y;
 
     // chunky coursed stonework, opening left hollow
-    for (let row = 0; row < 7; row++) {
-      const y = 0.32 + row * 0.62;
+    for (let row = 0; row < 6; row++) {
+      const y = Y + 0.3 + row * 0.58;
       let x = -3.2;
       while (x < 3.2) {
         const w = 0.66 + rand() * 0.5;
         const inOpening = y < OPEN_TOP && x + w > -OPEN_HW && x < OPEN_HW;
         if (!inOpening) {
           const tone = [PAL.stone, PAL.stoneMid, PAL.stoneDark][(row + ((x * 3) | 0) + 9) % 3];
-          box.add(tone, x + w / 2, y, FZ, w, 0.58, 1.2);
+          box.add(tone, x + w / 2, y, FZ, w, 0.54, 1.2);
         }
         x += w + 0.04;
       }
@@ -1626,18 +1969,18 @@ export class LoungeRoom extends Room {
     for (let i = 0; i < 11; i++) {
       const a = Math.PI * (0.06 + (i / 10) * 0.88);
       box.add(i % 2 ? PAL.stone : PAL.stoneMid,
-        Math.cos(a) * 1.95, 1.85 + Math.sin(a) * 0.62, FZ,
+        Math.cos(a) * 1.85, Y + 1.62 + Math.sin(a) * 0.6, FZ,
         0.42, 0.5, 1.24, 0, 0, -(a - Math.PI / 2) * 0.55);
     }
     // dark firebox behind, so the opening reads as depth not a painted panel
-    boxFlat.add(0x21150c, 0, 1.0, -6.9, 3.5, 2.2, 0.9);
-    box.add(PAL.stoneDark, 0, 0.09, -6.4, 3.6, 0.18, 1.0);
+    boxFlat.add(0x21150c, 0, Y + 0.95, -6.9, 3.3, 2.0, 0.9);
+    box.add(PAL.stoneDark, 0, Y + 0.09, -6.4, 3.4, 0.18, 1.0);
 
     // logs and ash, sitting proud of the dark so the firelight catches them
-    cyl8.add(PAL.wood, -0.45, 0.3, -6.3, 0.34, 1.5, 0.34, Math.PI / 2, 0.28, 0);
-    cyl8.add(PAL.wood, 0.45, 0.3, -6.32, 0.34, 1.5, 0.34, Math.PI / 2, -0.3, 0);
-    cyl8.add(PAL.woodMid, 0, 0.5, -6.2, 0.3, 1.3, 0.3, Math.PI / 2, 0.1, 0);
-    bead.add(0x54483a, 0, 0.16, -6.24, 2.6, 0.24, 0.8);
+    cyl8.add(PAL.wood, -0.45, Y + 0.3, -6.3, 0.34, 1.5, 0.34, Math.PI / 2, 0.28, 0);
+    cyl8.add(PAL.wood, 0.45, Y + 0.3, -6.32, 0.34, 1.5, 0.34, Math.PI / 2, -0.3, 0);
+    cyl8.add(PAL.woodMid, 0, Y + 0.5, -6.2, 0.3, 1.3, 0.3, Math.PI / 2, 0.1, 0);
+    bead.add(0x54483a, 0, Y + 0.16, -6.24, 2.6, 0.24, 0.8);
 
     // nine flame tongues, driven per frame
     const flames = new THREE.InstancedMesh(
@@ -1681,35 +2024,35 @@ export class LoungeRoom extends Room {
     this._embers = emberMesh;
 
     const fireLight = new THREE.PointLight(PAL.ember, 24, 17, 2);
-    fireLight.position.set(0, 1.0, -6.0);
+    fireLight.position.set(0, Y + 1.0, -6.0);
     scene.add(fireLight);
     this._fireLight = fireLight;
     const glow = new THREE.Mesh(
-      new THREE.PlaneGeometry(3.3, 2.0),
+      new THREE.PlaneGeometry(3.1, 1.9),
       new THREE.MeshBasicMaterial({ color: 0xff9c46, transparent: true, opacity: 0.28, depthWrite: false }),
     );
-    glow.position.set(0, 1.0, -6.42);
+    glow.position.set(0, Y + 0.95, -6.42);
     scene.add(glow);
     this._fireGlow = glow;
 
     // hearth apron, fire irons, log basket
-    box.add(PAL.stoneDark, 0, 0.09, -5.4, 6.0, 0.18, 1.5);
-    box.add(PAL.stone, 0, 0.2, -5.4, 5.7, 0.1, 1.3);
-    for (const [ix, lean] of [[-2.5, 0.12], [-2.32, -0.1]]) {
-      cyl8.add(PAL.steel, ix, 0.6, -5.3, 0.07, 1.2, 0.07, 0, 0, lean);
-      bead.add(PAL.brass, ix, 1.24, -5.3, 0.16, 0.16, 0.16);
+    box.add(PAL.stoneDark, 0, Y + 0.09, -5.5, 5.6, 0.18, 1.3);
+    box.add(PAL.stone, 0, Y + 0.2, -5.5, 5.3, 0.1, 1.1);
+    for (const [ix, lean] of [[-2.4, 0.12], [-2.22, -0.1]]) {
+      cyl8.add(PAL.steel, ix, Y + 0.6, -5.4, 0.07, 1.2, 0.07, 0, 0, lean);
+      bead.add(PAL.brass, ix, Y + 1.24, -5.4, 0.16, 0.16, 0.16);
     }
-    cyl.add(PAL.woodMid, 2.6, 0.34, -5.3, 1.1, 0.66, 1.1);
+    cyl.add(PAL.woodMid, 2.5, Y + 0.34, -5.4, 1.1, 0.66, 1.1);
     for (let i = 0; i < 5; i++) {
-      cyl8.add(PAL.wood, 2.6 + (i % 2 ? 0.16 : -0.16), 0.62 + i * 0.1, -5.3 + ((i % 3) - 1) * 0.14,
+      cyl8.add(PAL.wood, 2.5 + (i % 2 ? 0.16 : -0.16), Y + 0.62 + i * 0.1, -5.4 + ((i % 3) - 1) * 0.14,
         0.2, 0.9, 0.2, Math.PI / 2, i * 0.5, 0);
     }
 
     // --- mantel + trophy shelf ---------------------------------------------
-    box.add(PAL.wood, 0, 2.62, -6.1, 7.0, 0.4, 1.9);
-    box.add(PAL.woodLight, 0, 2.87, -6.1, 7.2, 0.1, 2.0);
+    box.add(PAL.wood, 0, Y + 2.35, -6.1, 7.0, 0.4, 1.9);
+    box.add(PAL.woodLight, 0, Y + 2.6, -6.1, 7.2, 0.1, 2.0);
     const band = new THREE.Mesh(new THREE.PlaneGeometry(6.6, 0.28), this._flat(texMantelBand()));
-    band.position.set(0, 2.62, -5.14);
+    band.position.set(0, Y + 2.35, -5.14);
     scene.add(band);
 
     // One little gold capy per minigame, echoing the avatar's proportions in
@@ -1739,7 +2082,7 @@ export class LoungeRoom extends Room {
       },
     ];
     this._trophyAt = [];
-    for (let i = 0; i < 5; i++) this._trophyAt.push([-2.6 + i * 1.3, 2.92, -5.8]);
+    for (let i = 0; i < 5; i++) this._trophyAt.push([-2.6 + i * 1.3, Y + 2.65, -5.8]);
     this._trophy = [];
     for (const k of trophyKinds) {
       const locals = k.parts.map((p) => {
@@ -1758,22 +2101,34 @@ export class LoungeRoom extends Room {
       this._trophy.push({ mesh: im, locals });
     }
 
-    // chimney breast + crest
-    box.add(PAL.stoneMid, 0, 4.8, -6.6, 2.6, 3.6, 1.0);
-    box.add(PAL.stone, 0, 6.45, -6.6, 2.9, 0.3, 1.2);
-    const crest = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), this._flat(texCrest()));
-    crest.position.set(0, 4.4, -6.08);
+    // chimney breast + crest, running up the gable to just under the eaves
+    box.add(PAL.stoneMid, 0, Y + 3.65, -6.6, 2.6, 2.2, 1.0);
+    box.add(PAL.stone, 0, Y + 4.85, -6.6, 2.9, 0.3, 1.2);
+    const crest = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 1.4), this._flat(texCrest()));
+    crest.position.set(0, Y + 3.7, -6.08);
     scene.add(crest);
     for (const s of [-1, 1]) {
-      cone.add(PAL.brass, s * 1.6, 4.0, -6.05, 0.28, 0.42, 0.28, Math.PI, 0, 0);
-      bead.add(0xffe0a8, s * 1.6, 3.76, -6.05, 0.24, 0.24, 0.24);
+      cone.add(PAL.brass, s * 1.55, Y + 3.3, -6.05, 0.28, 0.42, 0.28, Math.PI, 0, 0);
+      bead.add(0xffe0a8, s * 1.55, Y + 3.06, -6.05, 0.24, 0.24, 0.24);
     }
 
+    // The hearth's footprint on the loft. Leaves a 1.1-wide walkway across the
+    // middle of the balcony (z -4.5 to -3.4) so the two wings connect.
+    //
+    // The flanks are 0.85, not 1.25, and that is load-bearing. At 1.25 they
+    // reached far enough south to bite deep into the armchair circle at
+    // (3.0, -5.2), and the lens where two obstacle circles overlap is a trap:
+    // WalkController pushes you onto one rim, the other pushes you back, and you
+    // stand there walking on the spot. From a chair at the cards table, "go to
+    // the stairs" jammed there every time, still holding the seat. 0.85 is the
+    // smallest circle that still covers the stonework corners
+    // (hypot(0.6, 0.6) = 0.849), and the whole 0.80-0.88 band walks clean;
+    // at 0.90 the jam comes back.
     this.obstacles.push(
-      { x: 0, z: -6.5, r: 2.3 },
-      { x: -2.6, z: -6.5, r: 1.4 },
-      { x: 2.6, z: -6.5, r: 1.4 },
-      { x: 0, z: -5.4, r: 1.2 },
+      { x: 0, z: -6.5, r: 2.0 },
+      { x: -2.6, z: -6.5, r: 0.85 },
+      { x: 2.6, z: -6.5, r: 0.85 },
+      { x: 0, z: -5.5, r: 1.05 },
     );
   }
 
@@ -1782,11 +2137,11 @@ export class LoungeRoom extends Room {
   // -------------------------------------------------------------------------
   _buildStations(scene, B) {
     this._rings = [];
-    this._pong(scene, B, STATIONS[0]);
-    this._shuffle(scene, B, STATIONS[1]);
-    this._cards(scene, B, STATIONS[2]);
-    this._chess(scene, B, STATIONS[3]);
-    this._connect4(scene, B, STATIONS[4]);
+    this._pong(scene, B, STATION_BY_ID.get('pong'));
+    this._shuffle(scene, B, STATION_BY_ID.get('shuffle'));
+    this._connect4(scene, B, STATION_BY_ID.get('connect4'));
+    this._cards(scene, B, STATION_BY_ID.get('cards'));
+    this._chess(scene, B, STATION_BY_ID.get('chess'));
 
     // Seated challengers get their own group so dispose() can empty it without
     // hunting through the scene graph.
@@ -1795,56 +2150,63 @@ export class LoungeRoom extends Room {
 
     const { box, cyl, bead } = B;
     for (const s of STATIONS) {
+      const y = s.y;
       // two chairs per station, both looking at the game they belong to
       for (let i = 0; i < s.seats.length; i++) {
-        this._chair(B, s.seats[i][0], s.seats[i][1], seatYaw(s, i), i ? PAL.leather : PAL.coral);
+        this._chair(B, s.seats[i][0], s.seats[i][1], y, seatYaw(s, i), i ? PAL.leather : PAL.coral);
       }
 
       // Sign post, turned to face the room camera rather than its own wall.
       // Post, backer and finial ride the shared batches; only the painted face
       // and the live status chip need meshes of their own, because only they
       // carry a canvas nobody else shares.
+      //
+      // The loft's posts are stubby (board top 4.88, i.e. deck + 1.68). The
+      // camera's line to a standing capybara's head passes deck + 1.7 about a
+      // metre south of them, so a full-height post up here would blot out
+      // whoever was walking behind it.
       const [sx, sz] = s.sign;
+      const h = y ? 1.35 : 2.42;
       const yaw = Math.atan2(-sx, 12 - sz);
       const nx = Math.sin(yaw), nz = Math.cos(yaw);
-      cyl.add(PAL.wood, sx, 1.25, sz, 0.18, 2.5, 0.18);
-      box.add(PAL.woodMid, sx, 2.42, sz, 1.86, 0.74, 0.1, 0, yaw, 0);
-      bead.add(PAL.gold, sx, 2.88, sz, 0.22, 0.22, 0.22);
+      cyl.add(PAL.wood, sx, y + (h + 0.35) / 2, sz, 0.18, h + 0.35, 0.18);
+      box.add(PAL.woodMid, sx, y + h, sz, 1.86, 0.74, 0.1, 0, yaw, 0);
+      bead.add(PAL.gold, sx, y + h + 0.46, sz, 0.22, 0.22, 0.22);
       const face = new THREE.Mesh(new THREE.PlaneGeometry(1.76, 0.66), this._flat(texSign(s.name, s.sub)));
-      face.position.set(sx + nx * 0.07, 2.42, sz + nz * 0.07);
+      face.position.set(sx + nx * 0.07, y + h, sz + nz * 0.07);
       face.rotation.y = yaw;
       scene.add(face);
 
       // the chip hangs off the bottom of the board on two little brass hooks
-      box.add(PAL.woodMid, sx, 1.86, sz, 1.6, 0.44, 0.09, 0, yaw, 0);
+      box.add(PAL.woodMid, sx, y + h - 0.56, sz, 1.6, 0.44, 0.09, 0, yaw, 0);
       for (const hx of [-0.62, 0.62]) {
-        bead.add(PAL.brass, sx + Math.cos(yaw) * hx, 2.05, sz - Math.sin(yaw) * hx, 0.1, 0.16, 0.1);
+        bead.add(PAL.brass, sx + Math.cos(yaw) * hx, y + h - 0.37, sz - Math.sin(yaw) * hx, 0.1, 0.16, 0.1);
       }
       const tex = texChip();
       const chip = new THREE.Mesh(
         new THREE.PlaneGeometry(1.5, 0.375),
         this._flat(tex, { transparent: true, depthWrite: false }),
       );
-      chip.position.set(sx + nx * 0.075, 1.86, sz + nz * 0.075);
+      chip.position.set(sx + nx * 0.075, y + h - 0.56, sz + nz * 0.075);
       chip.rotation.y = yaw;
       scene.add(chip);
       this._chips.set(s.id, { tex, mesh: chip, state: 'open' });
 
       // glowing rings on the floor where each prompt fires: gold for the table
       // you can sit at, a smaller cool one for the house opponent
-      this._rings.push(this._ring(scene, s.hs, 0.9, 1.24, 0xffd489, 0.42));
-      this._rings.push(this._ring(scene, s.aiAt, 0.5, 0.76, 0x8fd8ff, 0.3));
+      this._rings.push(this._ring(scene, s.hs, y, 0.9, 1.24, 0xffd489, 0.42));
+      this._rings.push(this._ring(scene, s.aiAt, y, 0.5, 0.76, 0x8fd8ff, 0.3));
     }
   }
 
   /** Pulsing prompt marker on the boards. */
-  _ring(scene, at, r0, r1, color, opacity) {
+  _ring(scene, at, y, r0, r1, color, opacity) {
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(r0, r1, 24),
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false }),
     );
     ring.rotation.x = -Math.PI / 2;
-    ring.position.set(at[0], 0.018, at[1]);
+    ring.position.set(at[0], y + 0.018, at[1]);
     scene.add(ring);
     return ring;
   }
@@ -1855,21 +2217,21 @@ export class LoungeRoom extends Room {
    * so `yaw` is the direction the sitter looks. No obstacle circle: a collider
    * here would shove the local player straight back out of their own seat.
    */
-  _chair(B, x, z, yaw, cushion) {
+  _chair(B, x, z, y, yaw, cushion) {
     const { box, cyl, ball } = B;
     const c = Math.cos(yaw), s = Math.sin(yaw);
     const at = (lx, lz) => [x + lx * c + lz * s, z - lx * s + lz * c];
-    const pad = 0.5;
+    const pad = y + 0.5;
 
     const [px, pz] = at(0, 0);
     box.add(PAL.woodLight, px, pad + 0.05, pz, 0.78, 0.1, 0.74, 0, yaw, 0);
-    // cushion tops out at 0.68, which is SEAT_Y minus the 0.06 of squish a
-    // capybara's rear makes when the sit pose drops it onto the pad
+    // cushion tops out at floor + 0.68, which is SEAT_Y minus the 0.06 of
+    // squish a capybara's rear makes when the sit pose drops it onto the pad
     ball.add(cushion, px, pad + 0.11, pz, 0.72, 0.14, 0.68, 0, yaw, 0);
     for (const lx of [-0.28, 0.28]) {
       for (const lz of [-0.26, 0.26]) {
         const [gx, gz] = at(lx, lz);
-        cyl.add(PAL.wood, gx, pad / 2, gz, 0.1, pad, 0.1);
+        cyl.add(PAL.wood, gx, y + 0.25, gz, 0.1, 0.5, 0.1);
       }
     }
     // back: two posts and two slats, high enough to frame a seated capy
@@ -1886,8 +2248,11 @@ export class LoungeRoom extends Room {
   /** PONG: upright arcade cabinet, glowing marquee, joystick. */
   _pong(scene, B, s) {
     const g = new THREE.Group();
-    g.position.set(s.at[0], 0, s.at[1]);
-    g.rotation.y = Math.atan2(s.hs[0] - s.at[0], s.hs[1] - s.at[1]);
+    g.position.set(s.at[0], s.y, s.at[1]);
+    // Turned toward the approach AND the camera. Facing the prompt alone put
+    // the marquee and the screen nearly edge-on: the camera always looks due
+    // north, so a face with no +z in its normal is a sliver.
+    g.rotation.y = s.yaw ?? Math.atan2(s.hs[0] - s.at[0], s.hs[1] - s.at[1]);
     scene.add(g);
     // cabinet carcass, control deck and bezel: one instanced batch in the
     // cabinet's own frame, so the whole thing costs three draw calls of solids
@@ -1933,9 +2298,9 @@ export class LoungeRoom extends Room {
 
   /** SHUFFLEBOARD: long waxed table with the scoring zones painted on it. */
   _shuffle(scene, B, s) {
-    const { box, cyl, boxFlat } = B;
+    const { box, cyl } = B;
     const [x, z] = s.at;
-    const LEN = 6.6, WID = 1.25, TOP = 0.78;
+    const LEN = 6.0, WID = 1.25, TOP = 0.78;
     box.add(PAL.woodMid, x, TOP - 0.11, z, WID + 0.34, 0.22, LEN + 0.3);
     const top = new THREE.Mesh(new THREE.PlaneGeometry(WID, LEN), this._toonMap(texShuffleTop()));
     top.rotation.x = -Math.PI / 2;
@@ -1950,34 +2315,38 @@ export class LoungeRoom extends Room {
       }
     }
     for (const [px, pz, col] of [
-      [-0.28, -2.5, PAL.coral], [0.22, -2.2, PAL.coral], [-0.1, -1.5, PAL.sky],
-      [0.3, -0.9, PAL.sky], [-0.36, 2.6, PAL.coral], [0.34, 2.7, PAL.sky],
+      [-0.28, -2.2, PAL.coral], [0.22, -1.9, PAL.coral], [-0.1, -1.3, PAL.sky],
+      [0.3, -0.8, PAL.sky], [-0.36, 2.3, PAL.coral], [0.34, 2.4, PAL.sky],
     ]) {
       cyl.add(col, x + px, TOP + 0.06, z + pz, 0.34, 0.1, 0.34);
       cyl.add(0xfff6e3, x + px, TOP + 0.115, z + pz, 0.2, 0.02, 0.2);
     }
-    // scoreboard on the solid stretch of wall north of the windows
+    // Scoreboard hung on the stair skirt beside the board, turned to the room.
+    // It used to be on the west wall; the board lives on the east side now. The
+    // stair rail keeps every walker at least 0.6 west of it, so nobody can ever
+    // stand behind it and be hidden by it.
     const sb = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.12), this._flat(texScoreboard()));
-    sb.rotation.y = Math.PI / 2;
-    sb.position.set(-HW + 0.3, 2.9, -2.9);
+    sb.rotation.y = -1.0;
+    sb.position.set(ST_X0 - 0.24, 2.2, z + 0.7);
     scene.add(sb);
-    boxFlat.add(PAL.wood, -HW + 0.24, 2.9, -2.9, 0.12, 1.3, 1.7);
-    cyl.add(PAL.brass, x + 1.06, 0.94, z + 3.5, 0.28, 0.3, 0.28);
+    box.add(PAL.wood, ST_X0 - 0.18, 2.2, z + 0.7, 1.7, 1.3, 0.1, 0, -1.0, 0);
+    cyl.add(PAL.brass, x + 1.06, 0.94, z + 3.1, 0.28, 0.3, 0.28);
 
     this.obstacles.push(
       { x, z: z - 2.4, r: 1.15 }, { x, z, r: 1.15 }, { x, z: z + 2.4, r: 1.15 },
     );
   }
 
-  /** CARDS: round green felt, a fanned hand, element tokens, low pendant. */
+  /** CARDS: round green felt, a fanned hand, element tokens, wall lantern. */
   _cards(scene, B, s) {
     const { box, cyl, bead } = B;
     const [x, z] = s.at;
-    const TOP = 0.8;
-    cyl.add(PAL.wood, x, TOP - 0.06, z, 2.7, 0.14, 2.7);
-    cyl.add(PAL.woodMid, x, TOP / 2, z, 0.5, TOP, 0.5);
-    cyl.add(PAL.wood, x, 0.07, z, 1.5, 0.14, 1.5);
-    const felt = new THREE.Mesh(new THREE.CircleGeometry(1.24, 30), this._toonMap(texFelt()));
+    const y = s.y;
+    const TOP = y + 0.8;
+    cyl.add(PAL.wood, x, TOP - 0.06, z, 2.4, 0.14, 2.4);
+    cyl.add(PAL.woodMid, x, y + 0.4, z, 0.5, 0.8, 0.5);
+    cyl.add(PAL.wood, x, y + 0.07, z, 1.4, 0.14, 1.4);
+    const felt = new THREE.Mesh(new THREE.CircleGeometry(1.1, 30), this._toonMap(texFelt()));
     felt.rotation.x = -Math.PI / 2;
     felt.position.set(x, TOP + 0.02, z);
     felt.receiveShadow = true;
@@ -2001,52 +2370,65 @@ export class LoungeRoom extends Room {
     const fan = [], deck = [];
     for (let i = 0; i < 5; i++) {
       const a = -0.5 + i * 0.25;
-      fan.push([x + Math.sin(a) * 0.66, TOP + 0.03 + i * 0.003, z + 0.74 - Math.cos(a) * 0.12, -a]);
+      fan.push([x + Math.sin(a) * 0.6, TOP + 0.03 + i * 0.003, z + 0.66 - Math.cos(a) * 0.12, -a]);
     }
-    for (let i = 0; i < 4; i++) deck.push([x - 0.62, TOP + 0.03 + i * 0.012, z - 0.5, 0.3 + i * 0.04]);
+    for (let i = 0; i < 4; i++) deck.push([x - 0.56, TOP + 0.03 + i * 0.012, z - 0.44, 0.3 + i * 0.04]);
     lay(this._flat(texCard(), { side: THREE.DoubleSide }), fan);
     lay(this._flat(texCardBack(), { side: THREE.DoubleSide }), deck);
     for (const [col, dx, dz] of [[PAL.coral, -0.3, 0], [PAL.sky, 0.1, -0.24], [PAL.gold, 0.3, 0.16], [PAL.plum, -0.1, 0.3]]) {
       cyl.add(col, x + dx, TOP + 0.06, z + dz, 0.3, 0.1, 0.3);
       bead.add(0xfff6e3, x + dx, TOP + 0.12, z + dz, 0.14, 0.04, 0.14);
     }
-    box.add(0x4a3524, x, 3.2, z, 0.06, 1.6, 0.06);
-    const shadeMesh = new THREE.Mesh(
-      new THREE.ConeGeometry(0.52, 0.44, 12, 1, true),
-      makeToon(PAL.coral, { side: THREE.DoubleSide }),
-    );
-    shadeMesh.position.set(x, 2.4, z);
-    scene.add(shadeMesh);
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.13, 10, 8), makeGlow(0xffe2ac));
-    bulb.position.set(x, 2.26, z);
-    scene.add(bulb);
+    // A lantern on a bracket off the gable wall, not a pendant: there is no
+    // ceiling over the loft to hang one from, and anything tall enough to see
+    // over the table would stand between the camera and whoever walks past it.
+    this._wallLamp(scene, B, x, y + 2.05, PAL.coral);
 
-    this.obstacles.push({ x, z, r: 1.45 });
+    this.obstacles.push({ x, z, r: 1.3 });
+  }
+
+  /** Bracket lantern on the gable wall, for the loft's two tables. */
+  _wallLamp(scene, B, x, y, col) {
+    const { box, bead } = B;
+    box.add(PAL.wood, x, y + 0.34, ZN + 0.5, 0.09, 0.09, 1.0);
+    box.add(PAL.wood, x, y + 0.62, ZN + 0.16, 0.09, 0.56, 0.09);
+    const shade = new THREE.Mesh(
+      new THREE.ConeGeometry(0.46, 0.4, 12, 1, true),
+      makeToon(col, { side: THREE.DoubleSide }),
+    );
+    shade.position.set(x, y + 0.2, ZN + 0.95);
+    scene.add(shade);
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), makeGlow(0xffe2ac));
+    bulb.position.set(x, y + 0.06, ZN + 0.95);
+    scene.add(bulb);
+    bead.add(PAL.brass, x, y + 0.42, ZN + 0.95, 0.14, 0.14, 0.14);
   }
 
   /** CHESS: heavy table, oversized pieces caught mid-game. */
   _chess(scene, B, s) {
     const { box, cyl, cone, ball, bead } = B;
     const [x, z] = s.at;
-    const TOP = 0.72;
-    box.add(PAL.wood, x, TOP - 0.08, z, 2.5, 0.18, 2.5);
+    const y = s.y;
+    const TOP = y + 0.72;
+    box.add(PAL.wood, x, TOP - 0.08, z, 2.2, 0.18, 2.2);
     for (const dx of [-1, 1]) {
       for (const dz of [-1, 1]) {
-        box.add(PAL.woodMid, x + dx * 0.95, (TOP - 0.16) / 2, z + dz * 0.95, 0.22, TOP - 0.16, 0.22);
+        box.add(PAL.woodMid, x + dx * 0.82, y + (0.72 - 0.16) / 2, z + dz * 0.82, 0.22, 0.72 - 0.16, 0.22);
       }
     }
-    box.add(PAL.woodMid, x, 0.24, z, 2.0, 0.12, 0.16);
-    const board = new THREE.Mesh(new THREE.PlaneGeometry(2.1, 2.1), this._toonMap(texChessBoard()));
+    box.add(PAL.woodMid, x, y + 0.24, z, 1.7, 0.12, 0.16);
+    const board = new THREE.Mesh(new THREE.PlaneGeometry(1.86, 1.86), this._toonMap(texChessBoard()));
     board.rotation.x = -Math.PI / 2;
     board.position.set(x, TOP + 0.02, z);
     board.receiveShadow = true;
     scene.add(board);
+    this._wallLamp(scene, B, x, y + 2.05, PAL.sky);
 
-    const cell = 2.1 / 8;
+    const cell = 1.86 / 8;
     const light = 0xf4e2bb, dark = 0x53331d;
     const piece = (cx, cz, col, kind) => {
-      const px = x - 1.05 + (cx + 0.5) * cell;
-      const pz = z - 1.05 + (cz + 0.5) * cell;
+      const px = x - 0.93 + (cx + 0.5) * cell;
+      const pz = z - 0.93 + (cz + 0.5) * cell;
       cyl.add(col, px, TOP + 0.05, pz, 0.2, 0.1, 0.2);
       cyl.add(col, px, TOP + 0.16, pz, 0.12, 0.22, 0.12);
       if (kind === 'pawn') ball.add(col, px, TOP + 0.32, pz, 0.16, 0.16, 0.16);
@@ -2062,18 +2444,19 @@ export class LoungeRoom extends Room {
     piece(3, 1, dark, 'pawn'); piece(5, 2, dark, 'pawn'); piece(7, 0, dark, 'rook');
     piece(4, 0, dark, 'king'); piece(2, 1, dark, 'bishop');
     // two captured pieces lying on the rim
-    cyl.add(light, x + 1.4, TOP + 0.06, z + 0.4, 0.2, 0.12, 0.2, 0.3, 0, 1.3);
-    cyl.add(dark, x + 1.4, TOP + 0.06, z - 0.3, 0.2, 0.12, 0.2, 0.2, 0, 1.4);
+    cyl.add(light, x + 1.24, TOP + 0.06, z + 0.4, 0.2, 0.12, 0.2, 0.3, 0, 1.3);
+    cyl.add(dark, x + 1.24, TOP + 0.06, z - 0.3, 0.2, 0.12, 0.2, 0.2, 0, 1.4);
 
-    this.obstacles.push({ x, z, r: 1.5 });
+    this.obstacles.push({ x, z, r: 1.3 });
   }
 
   /** CONNECT 4: big standing blue grid with red and yellow discs. */
   _connect4(scene, B, s) {
     const [x, z] = s.at;
     const g = new THREE.Group();
-    g.position.set(x, 0, z);
-    g.rotation.y = -Math.PI / 2; // faces west, into the room
+    const yaw = s.yaw ?? Math.PI / 2;
+    g.position.set(x, s.y, z);
+    g.rotation.y = yaw; // into the room AND toward the camera: see _pong
     scene.add(g);
 
     const COLS = 7, ROWS = 6, STEP = 0.44;
@@ -2138,9 +2521,15 @@ export class LoungeRoom extends Room {
     this._c4Disc = hover;
     this._c4Base = y0 + GH + 0.45;
 
-    // the grid is 3.4 long: one collider at its centre would leave both ends
-    // walkable-through
-    this.obstacles.push({ x, z, r: 1.35 }, { x, z: z - 1.5, r: 1.0 }, { x, z: z + 1.5, r: 1.0 });
+    // The grid is 3.4 long: one collider at its centre would leave both ends
+    // walkable-through, so two more ride its long axis (local +x, which the
+    // yaw swings around with the stand).
+    const ax = Math.cos(yaw) * 1.5, az = -Math.sin(yaw) * 1.5;
+    this.obstacles.push(
+      { x, z, r: 1.35 },
+      { x: x - ax, z: z - az, r: 1.0 },
+      { x: x + ax, z: z + az, r: 1.0 },
+    );
   }
 
   /** Padded three-legged stool: the cocoa bar's seating. */
@@ -2164,27 +2553,30 @@ export class LoungeRoom extends Room {
 
     // rugs stay flat decoration: never in groundMeshes, so the bot zone floor
     // stays exactly one raycast surface
+    // centred on the bot circle, which is the room's one guaranteed patch of
+    // plain open floor: the rug is how a player reads that promise
     const rug = new THREE.Mesh(new THREE.PlaneGeometry(9.0, 6.4), this._toonMap(texRug(0)));
     rug.rotation.x = -Math.PI / 2;
-    rug.position.set(0, 0.012, 1.6);
+    rug.position.set(ZONE.x, 0.012, ZONE.z - 0.1);
     rug.receiveShadow = true;
     scene.add(rug);
-    const hearthRug = new THREE.Mesh(new THREE.CircleGeometry(2.5, 32), this._toonMap(texRug(1)));
+    // the hearth rug came upstairs with the fire
+    const hearthRug = new THREE.Mesh(new THREE.CircleGeometry(2.3, 32), this._toonMap(texRug(1)));
     hearthRug.rotation.x = -Math.PI / 2;
-    hearthRug.position.set(0, 0.012, -3.2);
+    hearthRug.position.set(0, MZ_Y + 0.012, -4.7);
     hearthRug.receiveShadow = true;
     scene.add(hearthRug);
-    const cardRug = new THREE.Mesh(new THREE.PlaneGeometry(4.6, 4.6), this._toonMap(texRug(1)));
+    const cardRug = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 4.2), this._toonMap(texRug(1)));
     cardRug.rotation.set(-Math.PI / 2, 0, 0.4);
-    cardRug.position.set(-7.4, 0.01, 5.8);
+    cardRug.position.set(-6.6, MZ_Y + 0.01, -5.5);
     scene.add(cardRug);
 
-    // two leather-look armchairs pulled up to the fire
+    // two leather-look armchairs pulled up to the fire, up on the loft
     for (const sx of [-1, 1]) {
-      const x = sx * 3.1, z = -3.4;
+      const x = sx * 3.0, z = -5.2;
       const g = new THREE.Group();
-      g.position.set(x, 0, z);
-      g.rotation.y = Math.atan2(0 - x, -6.4 - z);
+      g.position.set(x, MZ_Y, z);
+      g.rotation.y = Math.atan2(0 - x, -6.6 - z);
       scene.add(g);
       const hide = makeToon(PAL.leather);
       const hideD = makeToon(PAL.leatherDark);
@@ -2208,30 +2600,36 @@ export class LoungeRoom extends Room {
           add(new THREE.CylinderGeometry(0.09, 0.07, 0.2, 8), makeToon(PAL.wood), ax * 0.5, 0.1, az * 0.45);
         }
       }
-      this.obstacles.push({ x, z, r: 0.85 });
+      this.obstacles.push({ x, z, r: 0.75 });
     }
 
-    // low table between them, with a leaning stack of games
-    cyl.add(PAL.woodMid, 0, 0.44, -3.4, 1.7, 0.12, 1.7);
-    cyl.add(PAL.wood, 0, 0.22, -3.4, 0.34, 0.44, 0.34);
-    cyl.add(PAL.wood, 0, 0.05, -3.4, 1.0, 0.1, 1.0);
+    // low table with a leaning stack of games, down in the south-east corner
+    // where the room's own hangout spot is: the loft's middle has to stay a
+    // through route between the two wings.
+    const [tx, tz] = [2.6, 6.4];
+    cyl.add(PAL.woodMid, tx, 0.44, tz, 1.7, 0.12, 1.7);
+    cyl.add(PAL.wood, tx, 0.22, tz, 0.34, 0.44, 0.34);
+    cyl.add(PAL.wood, tx, 0.05, tz, 1.0, 0.1, 1.0);
     for (let i = 0; i < 3; i++) {
-      box.add([PAL.coral, PAL.sky, PAL.gold][i], -0.24, 0.56 + i * 0.11, -3.4,
+      box.add([PAL.coral, PAL.sky, PAL.gold][i], tx - 0.24, 0.56 + i * 0.11, tz,
         0.72, 0.1, 0.52, 0, i * 0.25, 0);
     }
-    cyl.add(PAL.cream, 0.42, 0.6, -3.28, 0.24, 0.2, 0.24);
-    this.obstacles.push({ x: 0, z: -3.4, r: 0.9 });
+    cyl.add(PAL.cream, tx + 0.42, 0.6, tz - 0.12, 0.24, 0.2, 0.24);
+    this.obstacles.push({ x: tx, z: tz, r: 0.9 });
 
-    // floor cushions between the hearth and the chairs
-    for (const [cx, cz, col] of [[-1.6, -2.2, PAL.coral], [1.7, -2.3, PAL.sky], [-1.3, -4.4, PAL.gold], [1.4, -4.5, PAL.plum]]) {
-      ball.add(col, cx, 0.19, cz, 0.98, 0.38, 0.98, 0, rand() * 3, 0);
-      bead.add(0xfff6e3, cx, 0.34, cz, 0.12, 0.06, 0.12);
+    // floor cushions: two round the low table, two on the hearth rug upstairs
+    for (const [cx, cy, cz, col] of [
+      [1.3, 0, 5.5, PAL.coral], [3.9, 0, 7.1, PAL.sky],
+      [-1.5, MZ_Y, -5.1, PAL.gold], [1.5, MZ_Y, -5.1, PAL.plum],
+    ]) {
+      ball.add(col, cx, cy + 0.19, cz, 0.98, 0.38, 0.98, 0, rand() * 3, 0);
+      bead.add(0xfff6e3, cx, cy + 0.34, cz, 0.12, 0.06, 0.12);
     }
 
-    // The regular: a capybara fast asleep on a beanbag. Parked in the cocoa
-    // corner rather than by the fire, where the hearth, chairs, bookshelf and
-    // pong cabinet already leave no gap wide enough to nap in.
-    const bx = 6.3, bz = 6.6;
+    // The regular: a capybara fast asleep on a beanbag, parked between the
+    // doorway and the four-in-a-row stand, clear of the bot circle and of the
+    // planted half wall behind him.
+    const bx = -3.4, bz = 6.2;
     ball.add(0x8e6f4e, bx, 0.32, bz, 2.0, 0.72, 1.8);
     const sleeper = new THREE.Group();
     sleeper.position.set(bx, 0.52, bz);
@@ -2272,7 +2670,10 @@ export class LoungeRoom extends Room {
   // -------------------------------------------------------------------------
   _buildBar(scene, B) {
     const { box, boxFlat, cyl, bead, cone } = B;
-    const BX = 8.8, Z0 = 3.0, Z1 = 6.6;
+    // South of the stair foot (ST_Z0 3.6) with a 1.5-wide lane left between
+    // them: the two share the east wall, and that lane is how everybody gets
+    // upstairs, so the counter is not allowed to creep north into it.
+    const BX = 8.9, Z0 = 4.6, Z1 = 7.8;
     const cz = (Z0 + Z1) / 2, len = Z1 - Z0;
 
     box.add(PAL.wainscot, BX, 0.56, cz, 1.1, 1.12, len);
@@ -2321,8 +2722,8 @@ export class LoungeRoom extends Room {
     scene.add(sign);
     boxFlat.add(PAL.wood, BX + 0.52, 3.0, cz - 0.5, 0.1, 1.1, 2.1, 0, -0.7, 0);
 
-    this._stool(B, BX - 1.6, Z0 + 0.6, PAL.gold);
-    this._stool(B, BX - 1.6, Z0 + 2.0, PAL.gold);
+    this._stool(B, BX - 1.65, Z0 + 0.6, PAL.gold);
+    this._stool(B, BX - 1.65, Z0 + 2.0, PAL.gold);
 
     this.obstacles.push(
       { x: BX, z: Z0 + 0.4, r: 1.05 }, { x: BX, z: cz, r: 1.05 }, { x: BX, z: Z1 - 0.4, r: 1.05 },
@@ -2335,76 +2736,78 @@ export class LoungeRoom extends Room {
   _buildDecor(scene, B, rand) {
     const { box, boxFlat, cyl, bead, cone } = B;
 
-    // --- bookshelves of board game boxes, flanking the fireplace -----------
-    for (const sx of [-1, 1]) {
-      const x = sx * 5.9, z = ZN + 0.55;
-      box.add(PAL.wood, x, 1.85, z, 2.7, 3.7, 0.9);
-      boxFlat.add(0x5d3a1e, x, 1.85, z + 0.02, 2.4, 3.5, 0.86);
-      for (let s = 0; s < 4; s++) {
-        const sy = 0.45 + s * 0.86;
-        boxFlat.add(PAL.woodLight, x, sy, z + 0.06, 2.5, 0.1, 0.86);
-        let bx = x - 1.06;
-        while (bx < x + 0.9) {
+    // --- game-box shelves in the undercroft ---------------------------------
+    // Low and pulled forward to z -3.5. Under a balcony the camera only sees
+    // what is below the line from its eye through the deck lip: at this depth
+    // that is y 1.8, so a full-height bookcase back at the wall would be a
+    // rumour and these read fully.
+    for (const [x, z] of [[-8.6, -3.5], [-4.4, -3.5], [4.4, -3.5], [8.0, -3.5]]) {
+      box.add(PAL.wood, x, 0.85, z, 2.4, 1.7, 0.7);
+      boxFlat.add(0x5d3a1e, x, 0.9, z + 0.02, 2.1, 1.5, 0.66);
+      for (let s = 0; s < 2; s++) {
+        const sy = 0.34 + s * 0.62;
+        boxFlat.add(PAL.woodLight, x, sy, z + 0.06, 2.2, 0.1, 0.66);
+        let bx = x - 0.92;
+        while (bx < x + 0.78) {
           const w = 0.16 + rand() * 0.12;
-          const hgt = 0.5 + rand() * 0.2;
+          const hgt = 0.4 + rand() * 0.16;
           const col = [PAL.coral, PAL.sky, PAL.gold, PAL.leaf, PAL.plum, PAL.cream][(rand() * 6) | 0];
-          box.add(col, bx + w / 2, sy + 0.06 + hgt / 2, z + 0.06, w, hgt, 0.68, 0, 0, (rand() - 0.5) * 0.12);
+          box.add(col, bx + w / 2, sy + 0.06 + hgt / 2, z + 0.06, w, hgt, 0.52, 0, 0, (rand() - 0.5) * 0.12);
           bx += w + 0.03;
         }
-        if (s % 2 === 0) {
-          for (let k = 0; k < 3; k++) {
-            box.add([PAL.leaf, PAL.coral, PAL.sky][k], x + 0.86, sy + 0.14 + k * 0.11, z + 0.06,
-              0.62, 0.1, 0.62, 0, 0.2 * k, 0);
-          }
-        }
       }
-      box.add(PAL.woodLight, x, 3.78, z, 2.9, 0.16, 1.0);
-      cyl.add(PAL.terracotta, x - 0.9, 3.98, z, 0.44, 0.3, 0.44);
-      cone.add(PAL.leafDark, x - 0.9, 4.32, z, 0.56, 0.6, 0.56);
-      this.obstacles.push({ x, z: z + 0.2, r: 1.5 });
+      box.add(PAL.woodLight, x, 1.74, z, 2.6, 0.14, 0.86);
+      cyl.add(PAL.terracotta, x - 0.8, 1.92, z, 0.4, 0.28, 0.4);
+      cone.add(PAL.leafDark, x - 0.8, 2.22, z, 0.5, 0.54, 0.5);
     }
 
-    // --- the wall of framed champions, in both north corners ---------------
-    const banners = ['HALL OF CHAMPIONS', "TONIGHT'S CHALLENGERS"];
+    // --- the wall of framed champions, up on the gable over the loft --------
     for (const side of [0, 1]) {
       const sx = side ? 1 : -1;
       for (let i = 0; i < 3; i++) {
-        const x = sx * (7.7 + i * 1.35);
+        const x = sx * (7.9 + i * 1.2);
         const cfg = CHAMPIONS[side * 3 + i];
-        boxFlat.add(0x6b4a2c, x, 3.3, ZN + 0.2, 1.3, 1.5, 0.1);   // frame
-        boxFlat.add(PAL.brass, x, 3.3, ZN + 0.26, 1.14, 1.34, 0.08); // mat
-        const p = new THREE.Mesh(new THREE.PlaneGeometry(1.02, 1.2), this._flat(texPortrait(cfg)));
-        p.position.set(x, 3.3, ZN + 0.32);
+        boxFlat.add(0x6b4a2c, x, 5.4, ZN + 0.2, 1.16, 1.34, 0.1);   // frame
+        boxFlat.add(PAL.brass, x, 5.4, ZN + 0.26, 1.02, 1.2, 0.08); // mat
+        const p = new THREE.Mesh(new THREE.PlaneGeometry(0.92, 1.08), this._flat(texPortrait(cfg)));
+        p.position.set(x, 5.4, ZN + 0.32);
         scene.add(p);
         if (i < 2) {
-          cyl.add(PAL.brass, sx * (8.4 + i * 1.35), 4.16, ZN + 0.42, 0.16, 0.34, 0.16, 0.9, 0, 0);
-          bead.add(0xffe0a8, sx * (8.4 + i * 1.35), 4.04, ZN + 0.54, 0.16, 0.16, 0.16);
+          cyl.add(PAL.brass, sx * (8.5 + i * 1.2), 6.18, ZN + 0.42, 0.16, 0.34, 0.16, 0.9, 0, 0);
+          bead.add(0xffe0a8, sx * (8.5 + i * 1.2), 6.06, ZN + 0.54, 0.16, 0.16, 0.16);
         }
       }
-      const b = new THREE.Mesh(new THREE.PlaneGeometry(3.9, 0.98), this._flat(texBanner(banners[side])));
-      b.position.set(sx * 9.05, 4.72, ZN + 0.3);
-      scene.add(b);
     }
 
-    // --- potted plants in the corners --------------------------------------
-    for (const [x, z] of [[-10.3, -6.1], [-10.3, 7.9], [10.3, 7.9], [10.3, -6.1]]) {
-      cyl.add(PAL.terracotta, x, 0.32, z, 0.86, 0.64, 0.86);
-      cyl.add(0x6b4b32, x, 0.62, z, 0.74, 0.06, 0.74);
+    // --- the banners, hung off the balcony fascia where the camera lives ----
+    const banners = ['HALL OF CHAMPIONS', "TONIGHT'S CHALLENGERS"];
+    [[-7.4, MZ_S], [7.0, MZ_S]].forEach(([x, z], i) => {
+      const b = new THREE.Mesh(new THREE.PlaneGeometry(3.6, 0.9), this._flat(texBanner(banners[i])));
+      b.position.set(x, MZ_Y - 0.98, z - 0.2);
+      scene.add(b);
+    });
+
+    // --- potted plants in the corners, both storeys -------------------------
+    for (const [x, y, z] of [
+      [-10.3, MZ_Y, -6.2], [10.3, MZ_Y, -6.2], [-10.3, 0, 7.9], [10.3, 0, 7.9],
+    ]) {
+      cyl.add(PAL.terracotta, x, y + 0.32, z, 0.86, 0.64, 0.86);
+      cyl.add(0x6b4b32, x, y + 0.62, z, 0.74, 0.06, 0.74);
       for (let i = 0; i < 7; i++) {
         const a = (i / 7) * Math.PI * 2 + rand();
         const lean = 0.4 + rand() * 0.3;
         cone.add(i % 2 ? PAL.leaf : PAL.leafDark,
-          x + Math.cos(a) * 0.34, 1.05 + rand() * 0.4, z + Math.sin(a) * 0.34,
+          x + Math.cos(a) * 0.34, y + 1.05 + rand() * 0.4, z + Math.sin(a) * 0.34,
           0.34, 1.3, 0.34, Math.sin(a) * lean, 0, -Math.cos(a) * lean);
       }
       this.obstacles.push({ x, z, r: 0.7 });
     }
 
-    // a trophy plaque on the solid stretch of the west wall
-    boxFlat.add(PAL.wood, -HW + 0.24, 3.2, -4.9, 0.14, 1.3, 1.3);
-    cyl.add(PAL.cream, -HW + 0.34, 3.2, -4.9, 0.9, 0.06, 0.9, 0, 0, Math.PI / 2);
-    cyl.add(PAL.coral, -HW + 0.38, 3.2, -4.9, 0.5, 0.04, 0.5, 0, 0, Math.PI / 2);
-    bead.add(PAL.gold, -HW + 0.42, 3.2, -4.9, 0.14, 0.14, 0.14);
+    // a trophy plaque on the solid stretch of the loft's west wall
+    boxFlat.add(PAL.wood, -HW + 0.24, 4.5, -2.95, 0.14, 1.3, 1.3);
+    cyl.add(PAL.cream, -HW + 0.34, 4.5, -2.95, 0.9, 0.06, 0.9, 0, 0, Math.PI / 2);
+    cyl.add(PAL.coral, -HW + 0.38, 4.5, -2.95, 0.5, 0.04, 0.5, 0, 0, Math.PI / 2);
+    bead.add(PAL.gold, -HW + 0.42, 4.5, -2.95, 0.14, 0.14, 0.14);
   }
 
   // -------------------------------------------------------------------------
@@ -2438,7 +2841,7 @@ export class LoungeRoom extends Room {
 
     // The sign hangs off the west post, clear of the centre sight line, and
     // faces SOUTH. It is tempting to point it back into the room at the player
-    // walking toward it, but the camera always trails 13.5 south of them, so a
+    // walking toward it, but the camera always trails 14 south of them, so a
     // north-facing board only ever shows the camera its back.
     const sign = new THREE.Mesh(
       new THREE.PlaneGeometry(2.3, 0.78),
@@ -2490,7 +2893,7 @@ export class LoungeRoom extends Room {
       const f = this._flameData[i];
       const k = 0.62 + 0.32 * Math.sin(t * f.sp + f.ph) + 0.12 * Math.sin(t * f.sp * 2.7 + f.ph);
       const hgt = f.s * (0.7 + k * 0.75);
-      d.position.set(f.x + Math.sin(t * 1.7 + f.ph) * 0.05, 0.3 + hgt / 2, f.z);
+      d.position.set(f.x + Math.sin(t * 1.7 + f.ph) * 0.05, this._fireY + 0.3 + hgt / 2, f.z);
       d.rotation.set(0, t * 0.6 + f.ph, Math.sin(t * 2.1 + f.ph) * 0.12);
       d.scale.set(f.s * (0.42 + k * 0.16), hgt, f.s * (0.42 + k * 0.16));
       d.updateMatrix();
@@ -2506,7 +2909,10 @@ export class LoungeRoom extends Room {
       e.t += dt * e.sp;
       if (e.t > 1) e.t -= 1;
       const f = e.t;
-      d.position.set(e.x + Math.sin(f * 6 + e.ph) * 0.3, 0.5 + f * 2.2, -8.3 + Math.cos(f * 4 + e.ph) * 0.14);
+      // the old cut launched these at z -8.3, a unit and a half behind the wall
+      // where nobody has ever seen one: they belong in the mouth of the firebox
+      d.position.set(e.x + Math.sin(f * 6 + e.ph) * 0.3, this._fireY + 0.5 + f * 2.2,
+        -6.35 + Math.cos(f * 4 + e.ph) * 0.14);
       d.rotation.set(0, 0, 0);
       d.scale.setScalar(Math.max(0, 1 - f) * (0.7 + Math.sin(f * 12 + e.ph) * 0.3));
       d.updateMatrix();
@@ -2615,17 +3021,29 @@ export class LoungeRoom extends Room {
       c.mesh.scale.set(k, k, k);
     }
 
-    // keep the local capybara settled in their chair while they wait
+    // Keep the local capybara settled in their chair while they wait, and take
+    // the chair back off them the moment they wander off it.
+    //
+    // The bug this fixes: sitting is a server-side claim, but the world lets
+    // you walk out of the chair whenever you like. Anyone who clicked the floor
+    // while seated strolled away still holding the table, still showing "Stand
+    // up", still blocking the seat for everyone else until they left the room.
+    // A walk whose destination IS the chair is exempt, because that is exactly
+    // what _setLocalTable orders up when the seat is granted.
     const engine = this._game?.engine;
     const avatar = engine?.playerAvatar;
     const st = this._localTable ? STATION_BY_ID.get(this._localTable) : null;
     const seat = st?.seats[this._localSeat];
     if (seat && avatar) {
       const g = avatar.group;
-      const walking = !!engine.controller?.target;
-      if (!walking && Math.hypot(g.position.x - seat[0], g.position.z - seat[1]) < 0.6) {
+      const tgt = engine.controller?.target;
+      const away = Math.hypot(g.position.x - seat[0], g.position.z - seat[1]);
+      const bound = !!tgt && Math.hypot(tgt.x - seat[0], tgt.z - seat[1]) < 0.7;
+      if (away > 1.6 && !bound) {
+        this._leaveSeat('walk');
+      } else if (!tgt && away < 0.6) {
         if (avatar.state.anim !== 'sit') avatar.setAnim('sit');
-        g.position.y = SEAT_Y;
+        g.position.y = SEAT_Y + st.y;
         const yaw = seatYaw(st, this._localSeat);
         const d = ((((yaw - g.rotation.y) % TAU) + Math.PI * 3) % TAU) - Math.PI;
         g.rotation.y += d * Math.min(1, dt * 6);

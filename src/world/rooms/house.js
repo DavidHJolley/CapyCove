@@ -539,7 +539,7 @@ export class HouseRoom extends Room {
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 11.5, 15), lookHeight: 1.1 };
     // static camera: the whole den floor, both shelf walls and the doormat
-    this.staticCamera = { position: new THREE.Vector3(0, 14, 16.5), lookAt: new THREE.Vector3(0, 1.2, -0.5) };
+    this.staticCamera = { position: new THREE.Vector3(0, 13.5, 16.5), lookAt: new THREE.Vector3(0, 1.15, -1) };
 
     this._buildHotspots();
 

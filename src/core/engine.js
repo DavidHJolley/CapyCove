@@ -62,8 +62,7 @@ export class Engine {
       try { return localStorage.getItem('capycove-cam') === 'static' ? 'static' : 'follow'; } catch { return 'follow'; }
     })();
     this._staticCam = null;
-    this._staticAuto = false; // fallback vantage: refit it when the aspect changes
-    this._camEase = 0;        // seconds left in the entry/arrival ease
+    this._camEase = 0; // seconds left in the entry/arrival ease
     this._camFrom = new THREE.Vector3();
     this._lookFrom = new THREE.Vector3();
     this._lookNow = new THREE.Vector3();
@@ -316,7 +315,6 @@ export class Engine {
     if (!this.room) return;
     const sc = this.room.staticCamera;
     if (sc?.position && sc?.lookAt) {
-      this._staticAuto = false;
       const position = sc.position.clone();
       const lookAt = sc.lookAt.clone();
       // Rooms frame their vantage on a 16:9 window. A narrower one sees less
@@ -326,7 +324,6 @@ export class Engine {
       if (k > 1.001) position.sub(lookAt).multiplyScalar(Math.min(k, 2.2)).add(lookAt);
       this._staticCam = { position, lookAt };
     } else {
-      this._staticAuto = true;
       // no ground to fit (a room still building, or one with none): park on the
       // usual follow vantage rather than dumping the player inside the floor
       this._staticCam = this._fitGround() || {

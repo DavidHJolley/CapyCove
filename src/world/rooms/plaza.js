@@ -439,7 +439,7 @@ export class PlazaRoom extends Room {
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 15, 20), lookHeight: 1.2 };
     // static camera: the whole cobbled circle, all three gate arches and the club mouth
-    this.staticCamera = { position: new THREE.Vector3(0, 22.5, 30.5), lookAt: new THREE.Vector3(0, 1.2, -1.2) };
+    this.staticCamera = { position: new THREE.Vector3(0, 23.5, 32), lookAt: new THREE.Vector3(0, 1.2, 0.6) };
   }
 
   // -------------------------------------------------------------- ground --

@@ -57,23 +57,42 @@ const C = {
 const GROUND_HALF = 20;
 const GROUND_SEGS = 58;
 const SUN_DIR = new THREE.Vector3(-34, 10, -44); // where the pale sun sits
-const COCOA = { x: 6.2, z: 5.4 }; // barrel table outside the lodge
 
 /**
- * The ski lodge is the Game Den's front door. The lodge group sits at
+ * The ski lodge is the Game Den's front door. The lodge body group sits at
  * (LODGE.x, 0, LODGE.z) yawed -PI/2, so local +Z points west into the clearing
- * and local +X points south: world = (LODGE.x - lz, LODGE.z + lx). The entrance
- * lives on that west face, dead centre (local x = 0).
+ * and local +X points south: world = (LODGE.x - lz, LODGE.z + lx).
+ *
+ * The entrance is on the SOUTH gable end. The follow camera looks north from
+ * +Z (offset (0, 11.5, 20)), so the west face the doorway used to occupy is
+ * exactly edge-on from every spawn: it read as a sliver and nobody could find
+ * the way in. The gable end is the one wall of this building that is square to
+ * the play camera, from the clearing, the trail and the forecourt alike.
+ *
+ * Entrance geometry therefore lives in its own group (see _denPorch), parked at
+ * the lodge centre with NO yaw: inside it +X is east and +Z is south, so +Z
+ * points straight out of the doorway and straight down the camera's barrel.
+ * The gable wall is 6 wide (world x 7.6 .. 13.6) and its outer face is at
+ * porch-frame z = WALL_Z (world z 5.0).
  */
 const LODGE = { x: 10.6, z: 1.0 };
 const FLOOR_Y = 0.5;    // lodge plinth top: the doorway sill
-const DOOR_HW = 1.15;   // doorway half width, local x
-const DOOR_HEAD = 2.96; // top of the opening, tucked under the fifth log course
-const DOOR_Z = 3.04;    // doorway plane, local z (world x 7.56)
-// The walk-in exit. Kept 0.66 west of the doorway plane so the prompt and the
-// auto-fire ring sit on open snow instead of inside the porch steps.
-const DEN_DOOR = { x: LODGE.x - DOOR_Z - 0.66, z: LODGE.z }; // (6.90, 1.0)
+const DOOR_HW = 1.15;   // doorway half width, porch-frame x
+const DOOR_HEAD = 2.96; // top of the opening, just under the gable
+const WALL_Z = 4.0;     // gable wall outer face, porch-frame z (world z 5.0)
+const WALL_T = 0.4;     // face-plate thickness: the depth of the doorway reveal
+const DOOR_Z = WALL_Z + 0.04; // jamb plane, a hair proud of the wall
+// The walk-in exit, out on the steps. Its auto-fire ring (radius * 0.8 = 1.76)
+// reaches world z 7.51, so you trigger it 0.75 short of the bottom tread: the
+// prompt and the hand-off both happen on open, shovelled snow.
+const DEN_DOOR = { x: LODGE.x, z: LODGE.z + 4.75 }; // (10.60, 5.75)
 const DEN_RADIUS = 2.2;
+// Barrel table, standing ON the west veranda deck (top = FLOOR_Y). It used to
+// sit out on the snow south-west of the lodge, which is exactly the corridor
+// walkers now use to get between the den door and the gate: its collider and
+// the lodge's pinched together into a notch that jammed them. On the deck it
+// needs no collider of its own at all.
+const COCOA = { x: 6.6, z: 2.6 };
 
 const GATE_Z = -9; // the start gate group sits here; the chute runs to -Z
 
@@ -147,6 +166,15 @@ function terrainH(x, z) {
 
   let mask = ringMask(x, z, BZ.x, BZ.z, BZ.r + 0.9, BZ.r + 3.4);
   mask = Math.min(mask, ringMask(x, z, 10.6, 1.0, 4.4, 8.0)); // lodge terrace
+  // Forecourt in front of the den door, stretched south into a sightline
+  // saddle (the z distance counts 0.62, so the flat pad blends out over ~11
+  // units south but only 7 sideways). Two jobs: the approach to a south-facing
+  // entrance would otherwise climb the shoulder of the snowbank rim, and the
+  // follow camera looks back THROUGH that rim. Its sightline climbs 0.575 per
+  // unit (11.5 up, 20 back) and the untouched crest outruns it, so a capybara
+  // standing at the door vanished behind snow - verified at (10.6, 8.6), then
+  // re-verified visible with this saddle in.
+  mask = Math.min(mask, ringMask(x, 6.2 + (z - 6.2) * 0.62, 10.6, 6.2, 3.2, 7.2));
   mask = Math.min(mask, ringMask(x, z, -8.0, -1.6, 4.1, 5.8)); // pond hollow
   mask = Math.min(mask, ringMask(x, z, 0, -9, 3.4, 5.6)); // start gate apron
   mask = Math.min(mask, bandMask(x, -2.4, 2.4, 4.6)); // the pass, with soft shoulders
@@ -327,6 +355,18 @@ function flakeTexture() {
   });
 }
 
+/** Soft warm puddle, used for the light lying on the snow along the den path. */
+function glowPoolTexture() {
+  return canvasTexture(128, 128, (c, w, h) => {
+    const rg = c.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2 - 1);
+    rg.addColorStop(0, 'rgba(255,214,150,0.95)');
+    rg.addColorStop(0.45, 'rgba(255,196,120,0.36)');
+    rg.addColorStop(1, 'rgba(255,190,110,0)');
+    c.fillStyle = rg;
+    c.fillRect(0, 0, w, h);
+  });
+}
+
 function bannerTexture() {
   return canvasTexture(768, 192, (c, w, h) => {
     const g = c.createLinearGradient(0, 0, 0, h);
@@ -410,10 +450,10 @@ function lodgeSignTexture() {
 }
 
 /**
- * The Game Den shingle. Hung on a bracket whose faces point along world +/-Z,
- * which is straight down the barrel of the follow camera (offset (0, 11.5, 20)),
- * so this is the one sign on the lodge that is never seen edge-on. Big ink on
- * cream, one glyph, one subtitle: legible at a 960px capture.
+ * The trailhead board, hung on the gallows where the clearing meets the
+ * shovelled path. Its faces point along world +/-Z, straight down the barrel of
+ * the follow camera (offset (0, 11.5, 20)), so it is never seen edge-on. Big
+ * ink on cream, one glyph, one subtitle: legible at a 960px capture.
  */
 function denSignTexture() {
   return canvasTexture(512, 256, (c, w, h) => {
@@ -469,6 +509,57 @@ function denSignTexture() {
     c.fillStyle = '#8a6242';
     c.font = '700 30px system-ui, "Segoe UI", Verdana, sans-serif';
     c.fillText('pong · chess · cards', w / 2, 196);
+  });
+}
+
+/**
+ * The board bolted to the gable straight above the doorway: the close-range
+ * confirmation that this lit hole is the Game Den. Wide and short because it
+ * has to live between the door hood and the roof, so it is one line of ink with
+ * a die and a pawn for company, sized to still read at a 960px capture.
+ */
+function denShingleTexture() {
+  return canvasTexture(512, 184, (c, w, h) => {
+    c.fillStyle = '#fff6e3';
+    c.beginPath();
+    c.roundRect(5, 5, w - 10, h - 10, 22);
+    c.fill();
+    c.strokeStyle = '#5f3f28';
+    c.lineWidth = 10;
+    c.beginPath();
+    c.roundRect(5, 5, w - 10, h - 10, 22);
+    c.stroke();
+
+    // a die on the left, a pawn on the right, both well clear of the word
+    c.fillStyle = '#f2b64a';
+    c.beginPath();
+    c.roundRect(28, 62, 58, 58, 13);
+    c.fill();
+    c.fillStyle = '#2d2417';
+    for (const [dx, dy] of [[16, 16], [42, 16], [16, 42], [42, 42], [29, 29]]) {
+      c.beginPath();
+      c.arc(28 + dx, 62 + dy, 6, 0, TAU);
+      c.fill();
+    }
+    c.fillStyle = '#4fb3e8';
+    c.beginPath();
+    c.arc(w - 57, 74, 16, 0, TAU);
+    c.fill();
+    c.beginPath();
+    c.moveTo(w - 80, 122);
+    c.lineTo(w - 34, 122);
+    c.lineTo(w - 46, 94);
+    c.lineTo(w - 68, 94);
+    c.closePath();
+    c.fill();
+
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillStyle = 'rgba(90,60,35,0.26)';
+    c.font = '900 86px system-ui, "Segoe UI", Verdana, sans-serif';
+    c.fillText('GAME DEN', w / 2 + 5, h / 2 + 5);
+    c.fillStyle = '#2d2417';
+    c.fillText('GAME DEN', w / 2, h / 2);
   });
 }
 
@@ -848,6 +939,7 @@ export class PeakRoom extends Room {
     this._trees(scene);
     this._rocks(scene);
     this._lodge(scene);
+    this._denPorch(scene);
     this._denApproach(scene);
     this._cocoaStand(scene);
     this._chairlift(scene);
@@ -866,12 +958,15 @@ export class PeakRoom extends Room {
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 4),
       from_plaza: new THREE.Vector3(0, 0, 8.5), // exit-plaza is (0,12) r=3
-      // Out of the den, standing on the shovelled path facing the clearing.
-      // exit-lounge is (6.90, 1.0) r=2.20, and engine._updateHotspots only arms
-      // a walk-through exit once the player has been more than radius + 0.75
-      // (2.95) away from it: this spot is 3.80 out, so the exit arms on the
-      // first frame instead of bouncing the arrival straight back inside.
-      from_lounge: new THREE.Vector3(3.1, 0, 1.0),
+      // Out of the den and a step off the shovelled forecourt, south-west of
+      // the doorway with the lit gable behind you and the clearing ahead.
+      // exit-lounge is (10.60, 5.75) r=2.20, and engine._updateHotspots only
+      // arms a walk-through exit once the player has been more than
+      // radius + 0.75 (2.95) away from it: this spot is 3.09 out, so the exit
+      // arms on the first frame instead of bouncing the arrival back inside.
+      // It also stays north of z 8: past that the south snowbank crest rises
+      // into the camera's sightline and clips the capybara's feet.
+      from_lounge: new THREE.Vector3(8.2, 0, 7.7),
     };
 
     // The gate offers the multiplayer lobby; the sled rack a few steps east is
@@ -917,7 +1012,7 @@ export class PeakRoom extends Room {
         },
       },
       {
-        // The lodge is the Game Den now: walk into the porch and you are in.
+        // The lodge is the Game Den now: walk up the steps and you are in.
         id: 'exit-lounge',
         position: new THREE.Vector3(DEN_DOOR.x, 0, DEN_DOOR.z),
         radius: DEN_RADIUS,
@@ -945,7 +1040,7 @@ export class PeakRoom extends Room {
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11.5, 20), lookHeight: 1.8 };
     // static camera: the sled gate up top, the lodge door east, the frozen pond west
-    this.staticCamera = { position: new THREE.Vector3(-1, 24.5, 30), lookAt: new THREE.Vector3(-1, 1.5, -3) };
+    this.staticCamera = { position: new THREE.Vector3(0, 24, 31), lookAt: new THREE.Vector3(0, 1.5, -2) };
 
     // Live only while this room is: both handles are dropped in dispose().
     if (game?.events?.on) {
@@ -1202,9 +1297,10 @@ export class PeakRoom extends Room {
     scene.add(sun.target);
     scene.add(sun);
 
-    // warm fill spilling out of the lodge
+    // warm fill spilling out of the lodge, parked off the south gable so the
+    // entrance and its forecourt are the warmest thing in a blue-white room
     this._lodgeLight = new THREE.PointLight(0xffc178, 26, 14, 2);
-    this._lodgeLight.position.set(8.4, 2.4, 1.0);
+    this._lodgeLight.position.set(10.6, 2.6, 6.2);
     scene.add(this._lodgeLight);
 
     const lantern = new THREE.PointLight(0xffd08a, 9, 8, 2);
@@ -1350,6 +1446,12 @@ export class PeakRoom extends Room {
       if (Math.abs(x) < 3.6) continue; // keep the pass clear
       if (Math.hypot(x - BZ.x, z - BZ.z) < BZ.r + 2.6) continue;
       if (Math.hypot(x - 10.6, z - 1.0) < 6.4) continue; // lodge terrace
+      // The den's viewing corridor. The camera sits 20 south of whoever is
+      // walking here, so a pine anywhere in this band stands between it and the
+      // doorway (playtest: three of them hid the entrance and the capybara from
+      // the forecourt). Rocks are still allowed through: at 1.0 tall nothing
+      // that low can reach the sightline.
+      if (x > 5.0 && x < 13.8 && z > 5.0) continue;
       if (Math.hypot(x + 8.0, z + 1.6) < 5.2) continue; // pond
       if (Math.hypot(x, z + 9) < 5.4) continue; // start gate
       let clash = false;
@@ -1392,12 +1494,25 @@ export class PeakRoom extends Room {
 
   _rocks(scene) {
     const rng = this._rng;
-    const inst = new THREE.InstancedMesh(makeRockGeo(), makeToon(0xffffff, VC), 18);
+    const inst = new THREE.InstancedMesh(makeRockGeo(), makeToon(0xffffff, VC), 24);
     inst.castShadow = true;
     inst.receiveShadow = true;
     const d = this._dummy;
     let n = 0;
-    for (let i = 0; i < 60 && n < 18; i++) {
+    // The saddle south of the den forecourt is a pine-free zone (they would
+    // stand in the doorway's sightline), so it gets boulders: under a metre
+    // tall, they read as terrain detail and never cross the camera's line to a
+    // capybara on the steps.
+    for (const [x, z] of [[6.4, 11.3], [8.7, 12.6], [11.0, 11.5], [12.9, 13.1], [9.7, 14.4], [13.6, 10.3]]) {
+      const s = 0.7 + rng() * 0.4;
+      d.position.set(x, terrainH(x, z) - 0.14, z);
+      d.rotation.set(rng() * 0.2, rng() * TAU, rng() * 0.2);
+      d.scale.setScalar(s);
+      d.updateMatrix();
+      inst.setMatrixAt(n++, d.matrix);
+      this.obstacles.push({ x, z, r: 0.6 * s });
+    }
+    for (let i = 0; i < 60 && n < 24; i++) {
       const a = rng() * TAU;
       const r = 6.5 + rng() * 10;
       const x = Math.cos(a) * r;
@@ -1405,6 +1520,7 @@ export class PeakRoom extends Room {
       if (Math.abs(x) < 3.2) continue;
       if (Math.hypot(x - BZ.x, z - BZ.z) < BZ.r + 1.6) continue;
       if (Math.hypot(x - 10.6, z - 1.0) < 5.4) continue;
+      if (x > 4.0 && x < 14.4 && z > 5.2 && z < 10.6) continue; // den approach
       if (Math.hypot(x + 8.0, z + 1.6) < 4.4) continue;
       const s = 0.55 + rng() * 1.05;
       d.position.set(x, terrainH(x, z) - 0.14, z);
@@ -1423,36 +1539,41 @@ export class PeakRoom extends Room {
 
   /* --- ski lodge: the Game Den's front door ------------------------------- */
 
-  // ROUTE AUDIT for the den entrance (world units, obstacle radii are already
-  // the walkable rim: the controller treats the player as a point).
+  // ROUTE AUDIT for the den entrance (world units; obstacle radii are already
+  // the walkable rim, the controller treats the player as a point). Numbers
+  // below come from a headless replay of WalkController.update over the real
+  // obstacle list, spawn -> hotspot and hotspot -> hotspot, every pair.
   //
-  // The doorway sits at (7.56, 1.0) on the lodge's west face; the exit hotspot
-  // 'exit-lounge' is 0.66 out at (6.90, 1.0) r 2.20, so it auto-fires at 1.76,
-  // i.e. from x >= 5.14 on the door axis. Colliders near that axis:
-  //   lodge body   (11.0, -2.4 / 1.0 / 4.4) r 3.4  -> west face at x 7.6
-  //   porch wings  (6.6, -1.15) and (6.6, 3.15) r 1.0
-  //   sign posts   (3.15, -1.15) and (5.25, -1.15) r 0.3
-  //   cocoa barrel (6.2, 5.4) r 1.0
-  // The entry lane between the two wings runs z -0.15..2.15: 2.30 of free width
-  // aimed straight at a 2.30 doorway, and it is 1.0 clear of the nearer sign
-  // post. Nothing else reaches inside x 4.6..7.6 between those bounds.
+  // The doorway is a 2.30 hole in the south gable at z 5.04, world x 9.45 ..
+  // 11.75. 'exit-lounge' sits on the steps at (10.60, 5.75) r 2.20, so it
+  // auto-fires at 1.76: from z <= 7.51 on the door axis, or from x >= 9.27
+  // walking east along the shovelled path at z 6.90.
+  // Colliders anywhere near the approach:
+  //   lodge + veranda  (8.4, 1.0) (10.6, 1.0) (12.8, 1.0) r 4.0, one capsule
+  //   step lanterns    (8.3, 6.6) and (12.9, 6.6) r 0.30
+  //   gallows posts    (4.9, 5.7) and (7.9, 5.7) r 0.30
+  //   saddle boulders  six, z >= 10.3, all south of everything that matters
+  // Nothing at all sits inside x 8.6..12.6, z 5.8..9.4: that block of shovelled
+  // snow is the forecourt, and every route into the den ends inside it.
   //
-  // Route 1, default spawn (0, 4) -> fire point (5.14, 1.0): the only collider
-  // within reach is the cocoa barrel, whose closest approach is 4.33 from the
-  // line (3.33 of clearance past its rim). Straight walk, no slide.
-  // Route 2, from_plaza (0, 8.5) -> (5.14, 1.0): cocoa again, 3.36 away (2.36
-  // clear). The trail fence starts at z 9.0 and is never crossed.
-  // Route 3, from_lounge (3.1, 1.0) -> anywhere west: the spawn is 3.80 from
-  // the hotspot (arming needs > 2.95), 2.15 off the nearest sign post and 4.97
-  // from the bot zone rim, so bots wandering BZ (0, 5) r 4.5 never touch it.
-  // Route 4, gate/rack (0, -7) -> the door: passes north of the wings and meets
-  // the lane at its open west mouth; the wing pair is the only pinch and it is
-  // the 2.30 lane itself.
+  // Route 1, default spawn (0, 4) -> fire ring: 1.7s, threading between the
+  // east gallows post (0.09 off the line) and the lodge capsule (0.42).
+  // Route 2, from_plaza (0, 8.5) -> fire ring: 1.8s. The straight line clips the
+  // west step lantern by 0.05, i.e. you brush past a lamp post and the slide
+  // carries you round it; every other collider is over a metre off the line.
+  // Route 3, from_lounge (8.2, 7.7) -> anywhere: the spawn is 3.09 from the
+  // hotspot (arming needs > 2.95, and re-entry needs 1.76 + 0.5 of margin: it
+  // has 0.83), 0.80 clear of the west step lantern, 1.72 clear of the east
+  // gallows post, and 7.95 out from the bot zone rim, so server bots wandering
+  // BZ (0, 5) r 4.5 blind never meet a collider of mine.
+  // Route 4, gate (0, -7) -> the door: the straight line runs through the
+  // building, so this one is all slide - 2.6s down the west flank and round the
+  // veranda. It only works because the lodge's colliders are a convex capsule;
+  // the grid of small circles tried first jammed walkers in the notches where
+  // two rims crossed, both here and coming back out of the den.
   //
-  // Deliberate dead nooks, none of which any route is funnelled into: between
-  // the two sign posts (1.50, but the board hangs at y 2.0+, so it is walkable
-  // headroom rather than a trap), and the 0.05 slot between the east sign post
-  // and the north porch wing, which is sealed for practical purposes.
+  // Deliberate dead nook, which no route is funnelled into: the 1.3 slot
+  // between each step lantern and the lodge capsule.
   _lodge(scene) {
     const g = new THREE.Group();
     g.position.set(LODGE.x, 0, LODGE.z);
@@ -1462,30 +1583,21 @@ export class PeakRoom extends Room {
     const solid = [];
     const glow = [];
 
-    // plinth + walls
+    // Plinth + walls. The body stops 0.4 short of the south gable face: that
+    // last slice is built as a pierced plate in _denPorch so the doorway is a
+    // real hole with a reveal, not a dark rectangle painted on a solid box.
     part(solid, new THREE.BoxGeometry(8.6, 0.5, 6.6), C.rockDark, { y: 0.25 });
-    part(solid, new THREE.BoxGeometry(8, 3.2, 6), C.wood, { y: 2.1 });
+    part(solid, new THREE.BoxGeometry(7.6, 3.2, 6), C.wood, { x: -0.2, y: 2.1 });
     // snow drift banked against the base
     part(solid, new THREE.SphereGeometry(1, 10, 7), C.snowLit, { sx: 4.6, sy: 0.7, sz: 1.1, y: 0.1, z: 3.1 });
     part(solid, new THREE.SphereGeometry(1, 10, 7), C.snowLit, { sx: 1.1, sy: 0.7, sz: 3.4, y: 0.1, x: -4.0 });
 
-    // Stacked log detail on the facade. The four courses that cross the new
-    // doorway are split either side of it, so the entrance is a hole in the wall
-    // rather than a door panel stuck on top of solid logs.
+    // Stacked log detail on the west facade. It runs unbroken now: the entrance
+    // it used to be split around lives on the south gable.
     for (let i = 0; i < 5; i++) {
       const y = 0.78 + i * 0.62;
       const hex = i % 2 ? C.woodLit : C.wood;
-      if (y < DOOR_HEAD) {
-        for (const s of [-1, 1]) {
-          const inner = s * (DOOR_HW + 0.2);
-          const outer = s * 4.025;
-          part(solid, new THREE.CylinderGeometry(0.3, 0.3, Math.abs(outer - inner), 8), hex, {
-            rz: Math.PI / 2, x: (inner + outer) / 2, y, z: 2.94,
-          });
-        }
-      } else {
-        part(solid, new THREE.CylinderGeometry(0.3, 0.3, 8.05, 8), hex, { rz: Math.PI / 2, y, z: 2.94 });
-      }
+      part(solid, new THREE.CylinderGeometry(0.3, 0.3, 8.05, 8), hex, { rz: Math.PI / 2, y, z: 2.94 });
     }
     for (const sx of [-1, 1]) {
       for (const sz of [-1, 1]) {
@@ -1513,21 +1625,163 @@ export class PeakRoom extends Room {
       part(solid, new THREE.ShapeGeometry(tri), C.cream, { ry: s * Math.PI / 2, x: s * 4.03, y: 3.58 });
     }
     part(solid, new THREE.CylinderGeometry(0.22, 0.22, 9.3, 7), C.snowLit, { rz: Math.PI / 2, y: 5.76 });
-    // round gable windows
-    for (const s of [1, -1]) {
-      part(glow, new THREE.CircleGeometry(0.4, 14), C.warm, { ry: s * Math.PI / 2, x: s * 4.08, y: 4.42 });
-      part(solid, new THREE.TorusGeometry(0.46, 0.08, 5, 14), C.woodDark, { ry: s * Math.PI / 2, x: s * 4.09, y: 4.42 });
+    // Round gable window, north end only: the south gable carries the GAME DEN
+    // board at that height instead, and two things in one gable is a jumble.
+    part(glow, new THREE.CircleGeometry(0.4, 14), C.warm, { ry: -Math.PI / 2, x: -4.08, y: 4.42 });
+    part(solid, new THREE.TorusGeometry(0.46, 0.08, 5, 14), C.woodDark, { ry: -Math.PI / 2, x: -4.09, y: 4.42 });
+
+    // facade + side windows. `s` shrinks a pane: the two flanking the den
+    // doorway have 1.5 of gable wall each and a full-size window would butt
+    // straight into the jambs.
+    const win = (x, y, z, ry, s = 1) => {
+      part(solid, new THREE.BoxGeometry(1.4 * s, 1.6 * s, 0.12), C.woodLit, { ry, x, y, z });
+      const gx = Math.sin(ry) * 0.08;
+      const gz = Math.cos(ry) * 0.08;
+      part(glow, new THREE.PlaneGeometry(1.1 * s, 1.28 * s), C.warm, { ry, x: x + gx, y, z: z + gz });
+      part(solid, new THREE.BoxGeometry(0.08, 1.34 * s, 0.06), C.woodDark, { ry, x: x + gx * 1.4, y, z: z + gz * 1.4 });
+      part(solid, new THREE.BoxGeometry(1.16 * s, 0.08, 0.06), C.woodDark, { ry, x: x + gx * 1.4, y, z: z + gz * 1.4 });
+      part(solid, new THREE.BoxGeometry(1.6 * s, 0.14, 0.34), C.snowLit, {
+        ry, x: x + gx * 2.2, y: y + 0.88 * s, z: z + gz * 2.2,
+      });
+    };
+    win(-2.3, 2.25, 3.02, 0);
+    win(2.3, 2.25, 3.02, 0);
+    win(4.03, 2.15, 2.2, Math.PI / 2, 0.72);
+    win(4.03, 2.15, -2.2, Math.PI / 2, 0.72);
+
+    // West veranda: one unbroken deck again. It was split into two wings to let
+    // players walk between them to a west-facing door; with the entrance on the
+    // south gable this is purely the cocoa terrace, and a deck with a gap in the
+    // middle and no door behind it just reads as missing geometry.
+    part(solid, new THREE.BoxGeometry(6.0, 0.36, 2.0), C.woodLit, { y: 0.32, z: 4.0 });
+    part(solid, new THREE.BoxGeometry(6.04, 0.1, 1.1), C.snowLit, { y: 0.53, z: 4.5 });
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.BoxGeometry(0.2, 0.5, 2.04), C.woodDark, { x: s * 2.94, y: 0.3, z: 4.0 });
     }
+    // beam across the porch: the cocoa shingle hangs off this
+    part(solid, new THREE.BoxGeometry(5.7, 0.22, 0.26), C.woodDark, { y: 3.1, z: 4.8 });
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.BoxGeometry(0.18, 2.9, 0.18), C.woodDark, { x: s * 2.7, y: 2.0, z: 4.8 });
+      part(solid, new THREE.BoxGeometry(0.14, 0.5, 1.7), C.woodDark, { x: s * 2.7, y: 1.05, z: 4.1 });
+      part(solid, new THREE.CylinderGeometry(0.06, 0.06, 1.7, 5), C.woodLit, { rx: Math.PI / 2, x: s * 2.7, y: 1.28, z: 4.1 });
+    }
+    part(solid, new THREE.BoxGeometry(6.2, 0.2, 2.6), C.coralDark, { rx: 0.4, y: 3.62, z: 4.5 });
+    part(solid, new THREE.BoxGeometry(6.3, 0.12, 2.4), C.snowLit, { rx: 0.4, y: 3.76, z: 4.55 });
 
-    // ---- Game Den entrance: recessed double door, frame, hood, steps --------
-    // Floor level is the plinth top (FLOOR_Y): the opening sits on it and three
-    // shallow stone treads bring the clearing up to meet it.
+    // chimney
+    part(solid, new THREE.BoxGeometry(0.95, 2.8, 0.95), C.rockDark, { x: 2.6, y: 4.6, z: -0.9 });
+    part(solid, new THREE.BoxGeometry(1.14, 0.2, 1.14), C.rock, { x: 2.6, y: 5.95, z: -0.9 });
+    part(solid, new THREE.BoxGeometry(1.2, 0.16, 1.2), C.snowLit, { x: 2.6, y: 6.1, z: -0.9 });
+
+    // skis and poles left leaning on the veranda posts, which is what a ski
+    // lodge deck is for
+    part(solid, new THREE.BoxGeometry(0.14, 2.1, 0.05), C.sky, { rz: 0.22, rx: -0.16, x: -2.5, y: 1.6, z: 4.62 });
+    part(solid, new THREE.BoxGeometry(0.14, 2.1, 0.05), C.gold, { rz: 0.3, rx: -0.16, x: -2.2, y: 1.6, z: 4.62 });
+    link(solid, [2.3, 0.55, 4.66], [2.56, 2.05, 4.84], 0.035, C.steel);
+    link(solid, [2.55, 0.55, 4.66], [2.81, 2.05, 4.84], 0.035, C.steel);
+
+    const solidMeshLodge = solidMesh(solid);
+    g.add(solidMeshLodge);
+    const glowMeshLodge = glowMesh(glow);
+    g.add(glowMeshLodge);
+    this._windowMat = glowMeshLodge.userData.mat;
+
+    // The cocoa shingle hangs dead centre on the veranda beam. It faces west and
+    // is read at a slant; that is fine for flavour, and the two boards that
+    // actually have to be READ (the gallows and the gable shingle) are both
+    // square to the camera.
+    const signMat = texMat(lodgeSignTexture(), { double: true });
+    const sign = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 0.69), signMat);
+    sign.position.set(0, 2.4, 4.7);
+    g.add(sign);
+    const chains = [];
+    link(chains, [-0.8, 2.74, 4.7], [-0.8, 2.99, 4.78], 0.03, C.steelDark);
+    link(chains, [0.8, 2.74, 4.7], [0.8, 2.99, 4.78], 0.03, C.steelDark);
+    g.add(solidMesh(chains, { shadow: false }));
+
+    // icicles along the eaves and the porch roof
+    const ice = new THREE.InstancedMesh(makeIcicleGeo(), makeToon(0xffffff, VC), 34);
+    const d = this._dummy;
+    const rng = this._rng;
+    let n = 0;
+    for (let i = 0; i < 17; i++) {
+      const x = -4.1 + (i / 16) * 8.2;
+      d.position.set(x, 3.5, 3.62);
+      d.rotation.set(0, 0, 0);
+      d.scale.set(1, 0.5 + rng() * 1.2, 1);
+      d.updateMatrix();
+      ice.setMatrixAt(n++, d.matrix);
+    }
+    for (let i = 0; i < 13; i++) {
+      const x = -3.0 + (i / 12) * 6.0;
+      d.position.set(x, 3.09, 5.7);
+      d.scale.set(0.9, 0.4 + rng() * 0.9, 0.9);
+      d.updateMatrix();
+      ice.setMatrixAt(n++, d.matrix);
+    }
+    ice.count = n;
+    ice.instanceMatrix.needsUpdate = true;
+    ice.computeBoundingSphere();
+    g.add(ice);
+    d.scale.setScalar(1);
+
+    // chimney smoke origin, in world space
+    g.updateMatrixWorld(true);
+    this._smokeAt = g.localToWorld(new THREE.Vector3(2.6, 6.3, -0.9));
+
+    // Lodge body + veranda, as ONE convex capsule: three equal circles with
+    // collinear centres, so the union has no re-entrant corner anywhere for the
+    // controller's push-out-and-slide to jam in. That matters more here than it
+    // used to: with the door on the south face, walking between the den and the
+    // gate means rounding the building, and a grid of circles (tried first)
+    // deadlocked walkers in the notches where two rims crossed.
+    //
+    // It stops at z 5.0, three centimetres short of the gable face, so the
+    // whole forecourt is open and the exit's fire ring (to z 7.51) is reached
+    // with 2.5 to spare, while the doorway itself still cannot be walked into.
+    for (const bx of [8.4, 10.6, 12.8]) this.obstacles.push({ x: bx, z: 1.0, r: 4.0 });
+
+    this._puffs(scene);
+  }
+
+  /**
+   * The Game Den entrance, on the lodge's SOUTH gable.
+   *
+   * This group sits at the lodge centre with NO yaw, so inside it +X is east
+   * and +Z is south: +Z points out through the doorway and straight down the
+   * follow camera's barrel. Every face built here is square to the play view,
+   * which is the whole point of the move - on the west face, where this used to
+   * live, the opening was edge-on from every spawn and simply could not be seen.
+   *
+   * The gable is pierced for real: the lodge body stops 0.4 short of the face
+   * and that last slice is three plates around a 2.30 x 2.46 hole, so the dark
+   * recess and its lit card are visible through a genuine reveal instead of
+   * being buried inside a solid wall box the way the old ones were.
+   */
+  _denPorch(scene) {
+    const g = new THREE.Group();
+    g.position.set(LODGE.x, 0, LODGE.z);
+    scene.add(g);
+
+    const solid = [];
+    const glow = [];
     const DOOR_H = DOOR_HEAD - FLOOR_Y;
+    const PLATE_Z = WALL_Z - WALL_T / 2;
 
-    // dark interior box behind the opening, so the doorway reads as depth,
-    // with a lit card of den floating in front of it
-    part(solid, new THREE.BoxGeometry(DOOR_HW * 2 + 0.3, DOOR_H + 0.2, 0.9), 0x3a2617, {
-      y: FLOOR_Y + DOOR_H / 2, z: DOOR_Z - 0.62,
+    // ---- the pierced gable plate: two panes and a header ------------------
+    for (const s of [-1, 1]) {
+      part(solid, new THREE.BoxGeometry(1.85, 3.2, WALL_T), C.wood, {
+        x: s * 2.075, y: 2.1, z: PLATE_Z,
+      });
+    }
+    part(solid, new THREE.BoxGeometry(DOOR_HW * 2, 3.7 - DOOR_HEAD, WALL_T), C.wood, {
+      y: (DOOR_HEAD + 3.7) / 2, z: PLATE_Z,
+    });
+
+    // the dark slice of den behind the hole, with a lit card standing in the
+    // reveal so the doorway reads as depth rather than as a painted rectangle
+    part(solid, new THREE.BoxGeometry(DOOR_HW * 2 + 0.3, DOOR_H + 0.2, 0.12), 0x3a2617, {
+      y: FLOOR_Y + DOOR_H / 2, z: WALL_Z - WALL_T - 0.02,
     });
     const innerMat = makeGlow(0xffffff, { unique: true });
     innerMat.map = denDoorwayTexture();
@@ -1536,10 +1790,10 @@ export class PeakRoom extends Room {
       new THREE.PlaneGeometry(DOOR_HW * 2 - 0.06, DOOR_H - 0.06),
       innerMat,
     );
-    innerCard.position.set(0, FLOOR_Y + DOOR_H / 2, DOOR_Z - 0.14);
+    innerCard.position.set(0, FLOOR_Y + DOOR_H / 2, WALL_Z - WALL_T + 0.06);
     g.add(innerCard);
 
-    // jambs, lintel and a little snow-capped hood over the whole thing
+    // jambs, lintel and a snow-capped hood over the whole thing
     for (const s of [-1, 1]) {
       part(solid, new THREE.BoxGeometry(0.34, DOOR_H + 0.5, 0.52), C.woodDark, {
         x: s * (DOOR_HW + 0.17), y: FLOOR_Y + (DOOR_H + 0.5) / 2, z: DOOR_Z,
@@ -1581,7 +1835,7 @@ export class PeakRoom extends Room {
       part(solid, new THREE.TorusGeometry(0.1, 0.03, 4, 10), C.gold, { ry, x: fx - s * 0.14 * Math.cos(AJAR), y: FLOOR_Y + 1.28, z: fz + 0.14 * Math.sin(AJAR) });
     }
 
-    // stone landing + two treads down to the snow, flanked by the porch wings
+    // stone landing + two treads down to the forecourt
     part(solid, new THREE.BoxGeometry(DOOR_HW * 2 + 0.5, FLOOR_Y, 0.9), C.rock, { y: FLOOR_Y / 2, z: DOOR_Z + 0.41 });
     part(solid, new THREE.BoxGeometry(DOOR_HW * 2 + 0.5, 0.34, 0.42), C.rockDark, { y: 0.17, z: DOOR_Z + 1.07 });
     part(solid, new THREE.BoxGeometry(DOOR_HW * 2 + 0.5, 0.18, 0.42), C.rock, { y: 0.09, z: DOOR_Z + 1.49 });
@@ -1590,240 +1844,205 @@ export class PeakRoom extends Room {
       part(solid, new THREE.BoxGeometry(DOOR_HW * 2 + 0.54, 0.06, 0.14), C.snowLit, { y: ny, z: DOOR_Z + nz });
     }
 
-    // warm spill: threshold strip plus a pool of light on the trodden snow
+    // ---- step lanterns, one each side of the bottom tread ------------------
+    // North of the shovelled path on purpose: anything on its south side would
+    // stand between the camera and a capybara walking in.
+    for (const s of [-1, 1]) {
+      const lx = s * 2.3;
+      part(solid, new THREE.CylinderGeometry(0.3, 0.36, 0.22, 9), C.snowLit, { x: lx, y: 0.11, z: 5.6 });
+      part(solid, new THREE.CylinderGeometry(0.1, 0.12, 1.05, 7), C.woodDark, { x: lx, y: 0.68, z: 5.6 });
+      part(solid, new THREE.BoxGeometry(0.32, 0.05, 0.32), C.steelDark, { x: lx, y: 1.2, z: 5.6 });
+      part(solid, new THREE.BoxGeometry(0.32, 0.05, 0.32), C.steelDark, { x: lx, y: 1.52, z: 5.6 });
+      part(solid, new THREE.ConeGeometry(0.28, 0.22, 4), C.coralDark, { ry: Math.PI / 4, x: lx, y: 1.65, z: 5.6 });
+      part(solid, new THREE.SphereGeometry(0.08, 7, 5), C.gold, { x: lx, y: 1.79, z: 5.6 });
+      part(glow, new THREE.BoxGeometry(0.24, 0.3, 0.24), C.warm, { x: lx, y: 1.36, z: 5.6 });
+      this.obstacles.push({ x: LODGE.x + lx, z: LODGE.z + 5.6, r: 0.3 });
+    }
+
+    // ---- GAME DEN board, bolted flat to the gable above the hood -----------
+    // Its bottom edge clears the hood by 0.13 and its snow cap clears the
+    // roofline by 0.13; more to the point it starts 0.6 ABOVE the sightline
+    // that grazes the lintel from 20 units out, so it never covers the doorway
+    // it is advertising. The gable's round window moved to the north end.
+    part(solid, new THREE.BoxGeometry(2.62, 1.0, 0.1), C.woodDark, { y: 4.22, z: 4.26 });
+    part(solid, new THREE.BoxGeometry(2.72, 0.12, 0.26), C.snowLit, { y: 4.78, z: 4.28 });
+    for (const s of [-1, 1]) {
+      link(solid, [s * 1.14, 4.74, 4.24], [s * 1.14, 4.92, 4.06], 0.035, C.steelDark);
+      part(solid, new THREE.SphereGeometry(0.1, 8, 6), C.gold, { x: s * 1.31, y: 4.22, z: 4.32 });
+    }
+    const shingle = new THREE.Mesh(new THREE.PlaneGeometry(2.5, 0.9), texMat(denShingleTexture()));
+    shingle.position.set(0, 4.22, 4.32);
+    g.add(shingle);
+
+    // ---- warm spill: threshold strip plus a pool on the trodden snow -------
     part(glow, new THREE.PlaneGeometry(DOOR_HW * 2 - 0.1, 0.09), C.warm, { rx: -Math.PI / 2, y: FLOOR_Y + 0.01, z: DOOR_Z + 0.2 });
     this._doorGlowMat = makeGlow(0xffcf8a, { unique: true });
     this._doorGlowMat.transparent = true;
     this._doorGlowMat.opacity = 0.42;
     this._doorGlowMat.depthWrite = false;
     this._doorGlowMat.blending = THREE.AdditiveBlending;
-    this._doorGlowMat.map = canvasTexture(128, 128, (c, w, h) => {
-      const rg = c.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2 - 1);
-      rg.addColorStop(0, 'rgba(255,214,150,0.95)');
-      rg.addColorStop(0.45, 'rgba(255,196,120,0.36)');
-      rg.addColorStop(1, 'rgba(255,190,110,0)');
-      c.fillStyle = rg;
-      c.fillRect(0, 0, w, h);
-    });
+    this._doorGlowMat.map = glowPoolTexture();
     this._doorGlowMat.needsUpdate = true;
-    // sits above the shovelled slab (top 0.07) and its flagstones (0.10), or the
-    // path would z-fight the light it is supposed to be lying under
+    // sits above the forecourt slab (top 0.06) and its flagstones, or the path
+    // would z-fight the light it is supposed to be lying under
     const pool = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 4.2), this._doorGlowMat);
     pool.rotation.x = -Math.PI / 2;
     pool.position.set(0, 0.12, DOOR_Z + 2.3);
     pool.renderOrder = 1;
     g.add(pool);
 
+    g.add(solidMesh(solid));
+    g.add(glowMesh(glow));
+
     // hearth light in the doorway itself, so a capybara at the steps is lit
     this._doorLight = new THREE.PointLight(0xffc98c, 11, 9, 2);
     this._doorLight.position.set(0, 1.7, DOOR_Z + 0.3);
     g.add(this._doorLight);
-
-    // facade + side windows
-    const win = (x, y, z, ry) => {
-      part(solid, new THREE.BoxGeometry(1.4, 1.6, 0.12), C.woodLit, { ry, x, y, z });
-      const gx = Math.sin(ry) * 0.08;
-      const gz = Math.cos(ry) * 0.08;
-      part(glow, new THREE.PlaneGeometry(1.1, 1.28), C.warm, { ry, x: x + gx, y, z: z + gz });
-      part(solid, new THREE.BoxGeometry(0.08, 1.34, 0.06), C.woodDark, { ry, x: x + gx * 1.4, y, z: z + gz * 1.4 });
-      part(solid, new THREE.BoxGeometry(1.16, 0.08, 0.06), C.woodDark, { ry, x: x + gx * 1.4, y, z: z + gz * 1.4 });
-      part(solid, new THREE.BoxGeometry(1.6, 0.14, 0.34), C.snowLit, {
-        ry, x: x + gx * 2.2, y: y + 0.88, z: z + gz * 2.2,
-      });
-    };
-    win(-2.3, 2.25, 3.02, 0);
-    win(2.3, 2.25, 3.02, 0);
-    win(4.03, 2.25, 1.5, Math.PI / 2);
-    win(4.03, 2.25, -1.5, Math.PI / 2);
-
-    // Porch deck, now two wings either side of the entry lane. It used to be one
-    // 6.0-wide slab whose colliders sealed the door off completely; the lane it
-    // leaves (local x -1.4..1.4) is the walk-in route to the Game Den.
-    for (const s of [-1, 1]) {
-      part(solid, new THREE.BoxGeometry(1.5, 0.36, 2.0), C.woodLit, { x: s * 2.15, y: 0.32, z: 4.0 });
-      part(solid, new THREE.BoxGeometry(1.54, 0.1, 1.1), C.snowLit, { x: s * 2.15, y: 0.53, z: 4.5 });
-      part(solid, new THREE.BoxGeometry(0.2, 0.5, 2.04), C.woodDark, { x: s * 1.44, y: 0.3, z: 4.0 });
-    }
-    // beam across the porch: both hanging signs hang off this
-    part(solid, new THREE.BoxGeometry(5.7, 0.22, 0.26), C.woodDark, { y: 3.1, z: 4.8 });
-    for (const s of [-1, 1]) {
-      part(solid, new THREE.BoxGeometry(0.18, 2.9, 0.18), C.woodDark, { x: s * 2.7, y: 2.0, z: 4.8 });
-      part(solid, new THREE.BoxGeometry(0.14, 0.5, 1.7), C.woodDark, { x: s * 2.7, y: 1.05, z: 4.1 });
-      part(solid, new THREE.CylinderGeometry(0.06, 0.06, 1.7, 5), C.woodLit, { rx: Math.PI / 2, x: s * 2.7, y: 1.28, z: 4.1 });
-    }
-    part(solid, new THREE.BoxGeometry(6.2, 0.2, 2.6), C.coralDark, { rx: 0.4, y: 3.62, z: 4.5 });
-    part(solid, new THREE.BoxGeometry(6.3, 0.12, 2.4), C.snowLit, { rx: 0.4, y: 3.76, z: 4.55 });
-
-    // chimney
-    part(solid, new THREE.BoxGeometry(0.95, 2.8, 0.95), C.rockDark, { x: 2.6, y: 4.6, z: -0.9 });
-    part(solid, new THREE.BoxGeometry(1.14, 0.2, 1.14), C.rock, { x: 2.6, y: 5.95, z: -0.9 });
-    part(solid, new THREE.BoxGeometry(1.2, 0.16, 1.2), C.snowLit, { x: 2.6, y: 6.1, z: -0.9 });
-
-    // Skis and poles now lean on the porch posts, not the doorway: the entrance
-    // widened onto the ground they used to stand on, and a ski across the door
-    // would read as "closed".
-    part(solid, new THREE.BoxGeometry(0.14, 2.1, 0.05), C.sky, { rz: 0.22, rx: -0.16, x: -2.5, y: 1.6, z: 4.62 });
-    part(solid, new THREE.BoxGeometry(0.14, 2.1, 0.05), C.gold, { rz: 0.3, rx: -0.16, x: -2.2, y: 1.6, z: 4.62 });
-    link(solid, [2.3, 0.55, 4.66], [2.56, 2.05, 4.84], 0.035, C.steel);
-    link(solid, [2.55, 0.55, 4.66], [2.81, 2.05, 4.84], 0.035, C.steel);
-
-    const solidMeshLodge = solidMesh(solid);
-    g.add(solidMeshLodge);
-    const glowMeshLodge = glowMesh(glow);
-    g.add(glowMeshLodge);
-    this._windowMat = glowMeshLodge.userData.mat;
-
-    // The cocoa shingle used to hang dead centre over the door; the Game Den
-    // entrance owns that wall now, so it moved one bay south onto the porch beam.
-    // It still faces west, and the den's own board (see _denApproach) is the one
-    // turned to the play camera.
-    const signMat = texMat(lodgeSignTexture(), { double: true });
-    const sign = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 0.69), signMat);
-    sign.position.set(2.05, 2.4, 4.7);
-    g.add(sign);
-    const chains = [];
-    link(chains, [1.25, 2.74, 4.7], [1.25, 2.99, 4.78], 0.03, C.steelDark);
-    link(chains, [2.85, 2.74, 4.7], [2.85, 2.99, 4.78], 0.03, C.steelDark);
-    g.add(solidMesh(chains, { shadow: false }));
-
-    // icicles along the eaves and the porch roof
-    const ice = new THREE.InstancedMesh(makeIcicleGeo(), makeToon(0xffffff, VC), 34);
-    const d = this._dummy;
-    const rng = this._rng;
-    let n = 0;
-    for (let i = 0; i < 17; i++) {
-      const x = -4.1 + (i / 16) * 8.2;
-      if (Math.abs(x) < 1.9) continue; // the door hood occupies this bay
-      d.position.set(x, 3.5, 3.62);
-      d.rotation.set(0, 0, 0);
-      d.scale.set(1, 0.5 + rng() * 1.2, 1);
-      d.updateMatrix();
-      ice.setMatrixAt(n++, d.matrix);
-    }
-    for (let i = 0; i < 13; i++) {
-      const x = -3.0 + (i / 12) * 6.0;
-      d.position.set(x, 3.09, 5.7);
-      d.scale.set(0.9, 0.4 + rng() * 0.9, 0.9);
-      d.updateMatrix();
-      ice.setMatrixAt(n++, d.matrix);
-    }
-    ice.count = n;
-    ice.instanceMatrix.needsUpdate = true;
-    ice.computeBoundingSphere();
-    g.add(ice);
-    d.scale.setScalar(1);
-
-    // chimney smoke origin, in world space
-    g.updateMatrixWorld(true);
-    this._smokeAt = g.localToWorld(new THREE.Vector3(2.6, 6.3, -0.9));
-
-    this.obstacles.push(
-      { x: 11.0, z: -2.4, r: 3.4 },
-      { x: 11.0, z: 1.0, r: 3.4 },
-      { x: 11.0, z: 4.4, r: 3.4 },
-      // Porch wings. They used to be one pair of r=1.9 circles that met on the
-      // door axis and sealed the entrance; now each covers only its own wing
-      // (world x 5.6..7.6) and the lane between them, world z -0.15..2.15, is
-      // 2.30 of clear walk-in width straight at the doorway.
-      { x: 6.6, z: -1.15, r: 1.0 },
-      { x: 6.6, z: 3.15, r: 1.0 },
-    );
-
-    this._puffs(scene);
   }
 
   /**
-   * The shoveled stub from the clearing to the den door, and the gallows sign
-   * that names it.
+   * The shovelled forecourt in front of the den door, the gallows sign that
+   * names it at the clearing end, and the lantern light lying on the snow in
+   * between: sign -> lit path -> lit doorway, all of it read from one camera.
    *
-   * Everything here lives north or south of the entry lane (world z -0.15..2.15)
-   * so the walk-in route stays a clean 2.30 corridor: the berms are spoil piles
-   * at z -0.75 / 2.75 with no colliders at all, and the two sign posts stand at
-   * z -1.15, a full 1.0 clear of the lane's north edge.
-   *
-   * The board hangs with its faces along world +/-Z, which is straight into the
-   * follow camera. Every other sign on this lodge faces west and is seen
-   * edge-on; this is the one that has to be read at a glance, so it gets the
-   * one orientation that works.
+   * The path runs east-west, so a gallows straddling it would face east-west
+   * too and be edge-on to the play camera. It therefore stands beside the path
+   * with its boards along world +/-Z - and on the NORTH edge, which is the only
+   * side that works: a board south of the path is between the camera and
+   * everyone walking it (playtest: standing at the west end of the path put the
+   * capybara completely behind the sign). North of the path it can only ever
+   * cover the dead pocket between the veranda and the lane, which nobody walks.
+   * It also stops at x 7.6, short of the sightline from the clearing into the
+   * doorway, and its west post is 4.95 out from the bot zone centre (r 4.5), so
+   * server bots wandering blind never meet a collider.
    */
   _denApproach(scene) {
-    const CZ = LODGE.z;            // lane centreline, world z
-    const X0 = 2.5, X1 = 5.65;     // clearing end -> porch deck edge
-    const g = new THREE.Group();
-    // The terrace dips to about -0.05 as it runs east into the lodge mask, so
-    // the whole stub is sunk by that much: every base stays buried and every
-    // top stays proud instead of one end floating over its own shadow.
-    g.position.y = -0.05;
-    scene.add(g);
-
-    // ---- trodden path ------------------------------------------------------
+    const rng = this._rng;
     const p = [];
-    part(p, new THREE.BoxGeometry(X1 - X0, 0.07, 2.2), C.packed, { x: (X0 + X1) / 2, y: 0.035, z: CZ });
-    // flagstones, nudged off-grid so the stub reads shovelled rather than paved
-    for (let i = 0; i < 6; i++) {
-      const fx = X0 + 0.42 + i * 0.5;
-      part(p, new THREE.BoxGeometry(0.44, 0.05, 0.86 + (i % 3) * 0.16), i % 2 ? C.rock : C.snowShade, {
-        ry: 0.09 * ((i % 3) - 1), x: fx, y: 0.075, z: CZ + 0.22 * ((i % 4) - 1.5),
+
+    // ---- shovelled path, slabs snapped to the ground they cross ------------
+    // Each slab's top comes from the HIGHEST of its corners, so it never sinks
+    // into the hillside on the uphill side; the spoil berms cover the lip it
+    // leaves downhill.
+    const NODES = [[4.6, 6.8], [6.0, 7.0], [7.4, 7.2], [8.8, 7.3], [10.2, 7.3], [11.6, 7.1]];
+    const topAt = (cx, cz, hw = 1.0, hz = 1.3) => Math.max(
+      terrainH(cx - hw, cz - hz), terrainH(cx + hw, cz - hz),
+      terrainH(cx - hw, cz + hz), terrainH(cx + hw, cz + hz),
+    ) + 0.06;
+    for (let i = 0; i < NODES.length; i++) {
+      const [nx, nz] = NODES[i];
+      part(p, new THREE.BoxGeometry(2.0, 0.34, 2.6), C.packed, {
+        ry: 0.05 * ((i % 3) - 1), x: nx, y: topAt(nx, nz) - 0.17, z: nz,
       });
     }
-    // shovel spoil banked along both edges
-    const rng = this._rng;
-    for (const s of [-1, 1]) {
-      for (let i = 0; i < 9; i++) {
-        const bx = X0 - 0.1 + i * 0.42;
+    // the apron at the foot of the steps: where every route ends up
+    part(p, new THREE.BoxGeometry(4.6, 0.34, 3.0), C.packed, {
+      x: 10.6, y: topAt(10.6, 6.9, 2.3, 1.5) - 0.17, z: 6.9,
+    });
+
+    // flagstones, nudged off-grid so it reads shovelled rather than paved
+    for (let i = 0; i < 9; i++) {
+      const t = i / 8;
+      const fx = 5.1 + t * 5.4;
+      const fz = 6.95 + Math.sin(t * 2.4) * 0.45;
+      part(p, new THREE.BoxGeometry(0.5, 0.06, 0.88 + (i % 3) * 0.16), i % 2 ? C.rock : C.snowShade, {
+        ry: 0.1 * ((i % 3) - 1), x: fx, y: topAt(fx, fz) + 0.02, z: fz,
+      });
+    }
+
+    // shovel spoil banked along the edges (no colliders: they are ankle high)
+    for (let i = 0; i < 13; i++) {
+      const t = i / 12;
+      const bx = 4.3 + t * 7.6;
+      const bz = 6.95 + Math.sin(t * 2.0) * 0.3;
+      for (const s of [-1, 1]) {
+        if (s < 0 && bx > 8.0) continue; // north side is wall, steps and lanterns
+        const pz = bz + s * 1.62;
         part(p, new THREE.SphereGeometry(0.34, 8, 6), i % 2 ? C.snowLit : C.snow, {
-          sx: 0.85 + rng() * 0.5, sy: 0.42 + rng() * 0.3, sz: 0.8,
-          x: bx, y: 0.02, z: CZ + s * 1.75,
+          sx: 0.9 + rng() * 0.5, sy: 0.42 + rng() * 0.3, sz: 0.8,
+          x: bx, y: terrainH(bx, pz) + 0.02, z: pz,
         });
       }
     }
-    // The shovel that cut the stub, left leaning on the near sign post. Parked
-    // INSIDE that post's collider so it is scenery you look at, not a 1.5-tall
-    // handle you walk through.
-    part(p, new THREE.BoxGeometry(0.4, 0.46, 0.08), C.steel, { rz: 0.19, rx: -0.22, x: 5.57, y: 0.24, z: -0.68 });
-    link(p, [5.57, 0.06, -0.68], [5.28, 1.55, -1.02], 0.05, C.woodLit);
-    part(p, new THREE.BoxGeometry(0.05, 0.24, 0.05), C.woodDark, { x: 5.28, y: 1.62, z: -1.02 });
-    g.add(solidMesh(p));
+    // wind-drifted humps out on the saddle, so the ground the camera looks over
+    // on the way in is not one flat sheet of white (they are 0.4 tall: the
+    // sightline to the doorway clears them by a metre and a half)
+    for (const [dx, dz, sx, sz] of [[7.6, 10.6, 2.2, 1.1], [11.9, 12.4, 2.6, 1.2], [9.3, 13.6, 1.8, 0.9], [14.0, 11.4, 1.6, 1.0]]) {
+      part(p, new THREE.SphereGeometry(1, 10, 7), rng() > 0.5 ? C.snowLit : C.snow, {
+        sx, sy: 0.34 + rng() * 0.12, sz, x: dx, y: terrainH(dx, dz) - 0.06, z: dz,
+      });
+    }
+    scene.add(solidMesh(p));
 
-    // ---- gallows sign ------------------------------------------------------
-    const SX = 4.2, SZ = CZ - 2.15; // (4.20, -1.15): clear of lane and porch
+    // ---- the light lying on the path: one merged sheet of warm puddles -----
+    const pud = [];
+    for (let i = 0; i < NODES.length; i++) {
+      const [nx, nz] = NODES[i];
+      const size = 1.5 + i * 0.22;
+      part(pud, new THREE.PlaneGeometry(size, size), 0xffffff, {
+        rx: -Math.PI / 2, x: nx, y: topAt(nx, nz) + 0.03, z: nz,
+      });
+    }
+    this._trailGlowMat = makeGlow(0xffcf8a, { unique: true });
+    this._trailGlowMat.map = glowPoolTexture();
+    this._trailGlowMat.transparent = true;
+    this._trailGlowMat.opacity = 0.3;
+    this._trailGlowMat.depthWrite = false;
+    this._trailGlowMat.blending = THREE.AdditiveBlending;
+    this._trailGlowMat.needsUpdate = true;
+    const puddles = new THREE.Mesh(mergeParts(pud), this._trailGlowMat);
+    puddles.renderOrder = 1;
+    scene.add(puddles);
+
+    // ---- gallows sign on the path's north shoulder -------------------------
+    const SX = 6.4, SZ = 5.7; // posts land at world x 4.9 and 7.9
+    const sg = new THREE.Group();
+    sg.position.set(SX, Math.min(terrainH(SX - 1.5, SZ), terrainH(SX + 1.5, SZ)) - 0.12, SZ);
+    scene.add(sg);
+
     const post = [];
     for (const s of [-1, 1]) {
-      part(post, new THREE.CylinderGeometry(0.13, 0.16, 3.45, 8), C.woodDark, { x: SX + s * 1.05, y: 1.72, z: SZ });
-      part(post, new THREE.CylinderGeometry(0.42, 0.48, 0.26, 10), C.snowLit, { x: SX + s * 1.05, y: 0.12, z: SZ });
-      part(post, new THREE.SphereGeometry(0.17, 9, 7), C.gold, { x: SX + s * 1.05, y: 3.52, z: SZ });
+      part(post, new THREE.CylinderGeometry(0.14, 0.17, 3.8, 8), C.woodDark, { x: s * 1.5, y: 1.9 });
+      part(post, new THREE.CylinderGeometry(0.42, 0.48, 0.28, 10), C.snowLit, { x: s * 1.5, y: 0.26 });
+      part(post, new THREE.SphereGeometry(0.18, 9, 7), C.gold, { x: s * 1.5, y: 3.88 });
       // lantern hood on a stub bracket, one each end
-      part(post, new THREE.BoxGeometry(0.06, 0.06, 0.34), C.steelDark, { x: SX + s * 1.05, y: 3.1, z: SZ + 0.2 });
-      part(post, new THREE.ConeGeometry(0.19, 0.15, 4), C.coralDark, { ry: Math.PI / 4, x: SX + s * 1.05, y: 3.02, z: SZ + 0.36 });
-      this.obstacles.push({ x: SX + s * 1.05, z: SZ, r: 0.3 });
+      part(post, new THREE.BoxGeometry(0.06, 0.06, 0.34), C.steelDark, { x: s * 1.5, y: 3.42, z: 0.2 });
+      part(post, new THREE.ConeGeometry(0.2, 0.16, 4), C.coralDark, { ry: Math.PI / 4, x: s * 1.5, y: 3.34, z: 0.36 });
+      this.obstacles.push({ x: SX + s * 1.5, z: SZ, r: 0.3 });
     }
-    part(post, new THREE.BoxGeometry(2.5, 0.2, 0.26), C.woodDark, { x: SX, y: 3.35, z: SZ });
-    part(post, new THREE.BoxGeometry(2.56, 0.11, 0.3), C.snowLit, { x: SX, y: 3.48, z: SZ });
-    part(post, new THREE.BoxGeometry(2.14, 1.06, 0.13), C.coralDark, { x: SX, y: 2.5, z: SZ });
-    link(post, [SX - 0.72, 3.03, SZ], [SX - 0.72, 3.25, SZ], 0.028, C.steelDark);
-    link(post, [SX + 0.72, 3.03, SZ], [SX + 0.72, 3.25, SZ], 0.028, C.steelDark);
-    g.add(solidMesh(post));
+    part(post, new THREE.BoxGeometry(3.2, 0.22, 0.28), C.woodDark, { y: 3.7 });
+    part(post, new THREE.BoxGeometry(3.26, 0.12, 0.32), C.snowLit, { y: 3.84 });
+    part(post, new THREE.BoxGeometry(2.56, 1.3, 0.13), C.coralDark, { y: 2.75 });
+    link(post, [-0.9, 3.4, 0], [-0.9, 3.6, 0], 0.03, C.steelDark);
+    link(post, [0.9, 3.4, 0], [0.9, 3.6, 0], 0.03, C.steelDark);
+    // the shovel that cut the path, leaning on the west post. Parked INSIDE
+    // that post's collider so it is scenery you look at, not a handle you walk
+    // through.
+    part(post, new THREE.BoxGeometry(0.42, 0.5, 0.08), C.steel, { rz: 0.19, rx: -0.22, x: -1.35, y: 0.5, z: 0.2 });
+    link(post, [-1.35, 0.28, 0.2], [-1.62, 1.9, -0.04], 0.05, C.woodLit);
+    part(post, new THREE.BoxGeometry(0.05, 0.24, 0.05), C.woodDark, { x: -1.62, y: 1.98, z: -0.04 });
+    sg.add(solidMesh(post));
 
     // two faces, never one double-sided plane: the back would read mirrored
     const faceMat = texMat(denSignTexture());
     for (const s of [-1, 1]) {
-      const face = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 0.98), faceMat);
-      face.position.set(SX, 2.5, SZ + s * 0.075);
+      const face = new THREE.Mesh(new THREE.PlaneGeometry(2.4, 1.2), faceMat);
+      face.position.set(0, 2.75, s * 0.075);
       face.rotation.y = s < 0 ? Math.PI : 0;
-      g.add(face);
+      sg.add(face);
     }
 
     // the two lanterns actually burn (one draw call, one flickering material)
     const bulbs = [];
     for (const s of [-1, 1]) {
-      part(bulbs, new THREE.BoxGeometry(0.15, 0.2, 0.15), C.warm, { x: SX + s * 1.05, y: 2.86, z: SZ + 0.36 });
+      part(bulbs, new THREE.BoxGeometry(0.16, 0.22, 0.16), C.warm, { x: s * 1.5, y: 3.16, z: 0.36 });
     }
     const bulbMesh = glowMesh(bulbs);
-    g.add(bulbMesh);
+    sg.add(bulbMesh);
     this._denLampMat = bulbMesh.userData.mat;
     this._denLight = new THREE.PointLight(0xffc98c, 6, 7, 2);
-    this._denLight.position.set(SX, 2.9, SZ + 0.4);
-    g.add(this._denLight);
+    this._denLight.position.set(0, 3.2, 0.4);
+    sg.add(this._denLight);
   }
 
   /** One instanced puff cloud shared by the chimney and the cocoa mugs. */
@@ -1846,14 +2065,14 @@ export class PeakRoom extends Room {
     for (let i = 0; i < 6; i++) {
       this._puffData.push({ src: 1, t: rng(), speed: 0.8 + rng() * 0.3, drift: 0.12, size: 0.3 });
     }
-    this._cocoaAt = new THREE.Vector3(COCOA.x, terrainH(COCOA.x, COCOA.z) + 1.45, COCOA.z);
+    this._cocoaAt = new THREE.Vector3(COCOA.x, FLOOR_Y + 1.45, COCOA.z);
   }
 
   _cocoaStand(scene) {
     const p = [];
     const x = COCOA.x;
     const z = COCOA.z;
-    const y = terrainH(x, z);
+    const y = FLOOR_Y; // it stands on the veranda deck, not on the snow
     // barrel table
     part(p, new THREE.CylinderGeometry(0.62, 0.55, 1.05, 12), C.woodDark, { y: 0.52 });
     part(p, new THREE.TorusGeometry(0.6, 0.06, 5, 14), C.steelDark, { rx: Math.PI / 2, y: 0.28 });
@@ -1870,18 +2089,19 @@ export class PeakRoom extends Room {
       part(p, new THREE.TorusGeometry(0.08, 0.025, 4, 8), mugColors[i], { x: mx + 0.16, y: 1.32, z: mz });
       part(p, new THREE.CylinderGeometry(0.115, 0.115, 0.03, 9), 0xd6a06a, { x: mx, y: 1.44, z: mz });
     }
-    // a stack of firewood beside it
+    // a stack of firewood beside it, stacked along the deck rather than across
+    // it: the deck is only 2.0 wide and logs sticking off the edge read as bugs
     for (let i = 0; i < 5; i++) {
       const row = i < 3 ? 0 : 1;
       const idx = i < 3 ? i : i - 3;
       part(p, new THREE.CylinderGeometry(0.11, 0.11, 0.86, 7), i % 2 ? C.bark : C.woodDark, {
-        rz: Math.PI / 2, x: 1.35, y: 0.12 + row * 0.21, z: -0.55 + idx * 0.24 + row * 0.12,
+        rz: Math.PI / 2, x: 0.05, y: 0.12 + row * 0.21, z: -1.55 + idx * 0.24 + row * 0.12,
       });
     }
     const mesh = solidMesh(p);
     mesh.position.set(x, y, z);
     scene.add(mesh);
-    this.obstacles.push({ x, z, r: 1.0 });
+    // no collider: the veranda it stands on is already inside the lodge capsule
   }
 
   /* --- chairlift ---------------------------------------------------------- */
@@ -2511,6 +2731,8 @@ export class PeakRoom extends Room {
     // den doorway: hearth spilling onto the steps, lanterns on the sign
     if (this._doorLight) this._doorLight.intensity = 10 + Math.sin(t * 2.6 + 1.1) * 1.7;
     if (this._doorGlowMat) this._doorGlowMat.opacity = 0.34 + 0.11 * (0.5 + 0.5 * Math.sin(t * 1.9));
+    // the puddles along the path breathe a beat behind the doorway they lead to
+    if (this._trailGlowMat) this._trailGlowMat.opacity = 0.24 + 0.09 * (0.5 + 0.5 * Math.sin(t * 1.9 - 0.9));
     if (this._denLampMat) {
       // vertex colours already carry C.warm; this only breathes on top of them
       const f = 0.88 + 0.12 * Math.sin(t * 5.1 + 2.2);
@@ -2604,6 +2826,7 @@ export class PeakRoom extends Room {
     this._lodgeLight = null;
     this._doorLight = null;
     this._doorGlowMat = null;
+    this._trailGlowMat = null;
     this._denLampMat = null;
     this._denLight = null;
     this._halo = null;
