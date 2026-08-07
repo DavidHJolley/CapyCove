@@ -57,6 +57,9 @@ export class WalkController {
         if (!best || Math.abs(h.point.y - pos.y) < Math.abs(best.point.y - pos.y)) best = h;
       }
     }
+    // rooms whose ground dips below a hard line (the beach's wet sand slopes
+    // under the sea) refuse footing past it: walkers stop at the shoreline
+    if (room.minWalkY !== undefined && best.point.y < room.minWalkY) return false;
     pos.y = best.point.y;
     return true;
   }

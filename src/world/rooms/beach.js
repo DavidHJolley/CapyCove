@@ -580,6 +580,9 @@ export class BeachRoom extends Room {
       // of the davit and clear of the rod rack
       from_drift: new THREE.Vector3(-18.7, DECK_Y, -3.3),
     };
+    // the wet-sand band slopes on under the sea as one mesh: refuse footing
+    // below ankle depth so walkers stop at the shoreline instead of wading in
+    this.minWalkY = -0.06;
     // gentle east bias: keeps the cove and dock in frame even at the eastern
     // from_plaza spawn (a stronger offset framed mostly open sea there)
     this.cameraHint = { offset: new THREE.Vector3(3.5, 13, 16), lookHeight: 1.1 };
