@@ -10,6 +10,15 @@ import { BOT_ZONES } from '../../../shared/constants.js';
  *
  * Ground layout is polar around COVE: land where r < shoreR(theta).
  * The BOT_ZONES.beach circle is guaranteed dead flat (see sandY()).
+ *
+ * The Social Cove (wave 7, docs/LIVING-COVE.md) adds four live systems:
+ *  - onClock(dayT, weather, aurora): a full day/night relight off the world
+ *    clock (the western sunset is this room's signature) plus rain.
+ *  - the BONFIRE: a cold log pile by day, lit dusk-to-dawn; idling in its
+ *    glow earns the server-paid cozy trickle and shows an ember halo.
+ *  - the BEACH BALL: server-owned position, locally predicted, bopped by
+ *    clicking it or walking into it.
+ *  - the DIVE BELL at the dock end: the way down to The Drift.
  */
 
 // ---------------------------------------------------------------- geometry math
@@ -77,13 +86,116 @@ function spot(x, z, clear = 0.9, margin = 2.2) {
   return toLand(a.x, a.z, margin);
 }
 
+// ---------------------------------------------------------------- world clock
+// One cove day is 40 real minutes (server owns the truth; this only keeps the
+// phase ticking smoothly between the 10s 'clock' frames).
+const DAY_SECONDS = 40 * 60;
+const MAX_ELEV = (58 * Math.PI) / 180;   // sun height at noon: raking, not overhead
+// Once the sun is down the key light keeps the sun's azimuth and sits on this
+// floor instead of mirroring to the anti-sun point: a mirror would swing every
+// shadow through 180 degrees in one frame at the exact moment of sunset.
+const NIGHT_ELEV = (9 * Math.PI) / 180;
+// Phase used until the first clock frame lands: the golden late afternoon the
+// room was originally lit for, so an offline/solo boot looks authored.
+const DEFAULT_DAY_T = 0.4;
+
+/**
+ * Four-stop lighting LUT: dawn (dayT 0.0), noon (0.25), dusk (0.5),
+ * night (0.75), wrapping back to dawn. Every relight smoothsteps between two
+ * neighbouring stops, so the cove never snaps between looks.
+ *
+ * Dusk is this room's signature: violet overhead, coral mid-sky and gold along
+ * the horizon exactly where the sun drops into the sea to the west.
+ * `hemiI` never goes below 0.45 (LIVING-COVE playability floor).
+ */
+const SKY = [
+  { // dawn
+    top: 0x2f5f9e, mid: 0xf0a07c, hor: 0xffd9a8, horC: 0xa9c2dd, fog: 0xf4cba6,
+    sun: 0xffb478, sunI: 1.25, hemiS: 0xffd3b0, hemiG: 0xc09a70, hemiI: 0.95,
+    amb: 0xffd0b0, ambI: 0.32, water: 0x3f95c8, deep: 0x2a6f9e,
+    cloud: 0xffd9c8, unlit: 0.86,
+  },
+  { // noon (the room's original palette)
+    top: 0x3f9fd8, mid: 0x7cc8ea, hor: 0xdff0f2, horC: 0xc9e6ef, fog: 0xbfe3ef,
+    sun: 0xffdaa0, sunI: 2.1, hemiS: 0xffe9c4, hemiG: 0xc89f68, hemiI: 1.15,
+    amb: 0xffd9a8, ambI: 0.35, water: 0x3ba7dd, deep: 0x2b7fb8,
+    cloud: 0xfff6e4, unlit: 1,
+  },
+  { // dusk
+    top: 0x4a3f86, mid: 0xe8657a, hor: 0xffb257, horC: 0x7a5f96, fog: 0xf0a06e,
+    // golden hour: the key light is grazing the sand at this point, so the warm
+    // fills carry the look (this is what makes the whole cove glow at dusk)
+    sun: 0xff8f4d, sunI: 1.75, hemiS: 0xffbe8a, hemiG: 0x74608a, hemiI: 1.0,
+    amb: 0xffc79a, ambI: 0.5, water: 0x3c82bc, deep: 0x2d6b9c,
+    cloud: 0xffb49c, unlit: 0.9,
+  },
+  { // night
+    top: 0x0e1630, mid: 0x1a2447, hor: 0x2c3c62, horC: 0x18213c, fog: 0x1b2544,
+    sun: 0xa8c4f0, sunI: 0.55, hemiS: 0x40548a, hemiG: 0x181d2e, hemiI: 0.5,
+    amb: 0x8fa6d8, ambI: 0.3, water: 0x1d3f68, deep: 0x16324f,
+    cloud: 0x3b4468, unlit: 0.42,
+  },
+];
+
+/** Weather can arrive as a plain string or as a per-family map; take either. */
+function readWeather(w) {
+  if (typeof w === 'string') return w === 'rain' || w === 'breeze' ? w : 'clear';
+  if (w && typeof w === 'object') return readWeather(w.beach ?? w.coast ?? w.outdoor);
+  return 'clear';
+}
+
+const smoothstep = (u) => u * u * (3 - 2 * u);
+const lerp = (a, b, u) => a + (b - a) * u;
+
 // ---------------------------------------------------------------- scratch
 const _m4 = new THREE.Matrix4();
 const _v3 = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _s3 = new THREE.Vector3(1, 1, 1);
+const _v2 = new THREE.Vector2();
 const _eu = new THREE.Euler(0, 0, 0, 'YXZ');
 const _col = new THREE.Color();
+// relight scratch: the clock runs every frame, so nothing here may allocate
+const _mix = new THREE.Color();
+const _mixB = new THREE.Color();
+const _dir = new THREE.Vector3();
+
+/** hex -> hex lerp into `out` (sRGB in, working space out). No allocation. */
+function mixHex(a, b, f, out) {
+  return out.setHex(a).lerp(_mixB.setHex(b), f);
+}
+
+// ---------------------------------------------------------------- toy layout
+/**
+ * The bonfire. Open flat sand north-east of the cove centre: 3.7 clear of the
+ * BOT_ZONES circle, 2.3 clear of the jungle path corridor, well east of the
+ * dock ramp and well north of the plaza path, so it is a gathering spot rather
+ * than a road block. Sits at r 6.5 from the cove centre, i.e. sandY() === 0.
+ */
+const FIRE = { x: 3.6, z: -5.0, r: 1.3 };
+const COZY_R = 3.0;          // "in the glow": LIVING-COVE says 3 units
+const HALO_SLOTS = 5;        // capys who can show an ember halo at once
+const HALO_PER = 8;          // embers each
+
+// Beach ball. The server owns the position and tick-integrates at 10Hz; we
+// predict with the same constants so it never looks like a slideshow, then
+// ease onto every authoritative frame that arrives (see _onBallFrame).
+const BALL_R = 0.42;
+const BALL_G = 15;           // gravity
+const BALL_BOUNCE = 0.62;    // restitution off the sand
+const BALL_ROLL = 1.7;       // rolling friction (per second, exponential)
+const BALL_AIR = 0.16;       // air drag
+const BALL_HOME = { x: 1.2, z: 3.4 }; // open sand, only used until the server speaks
+const BOP_H = 5.6;           // horizontal impulse of one bop
+const BOP_V = 4.6;           // and its loft
+const BOP_COOLDOWN = 0.35;   // seconds between bops from one player
+
+// Dive bell davit. South-west corner of the fishing platform with the arm
+// reaching out over the open water TOWARD the camera: hung off the far edge it
+// spent its life behind its own mast.
+const BELL = { x: -19.4, z: -0.75, out: 1.45 };
+
+const RAIN_N = 240;          // rain streak pool (instanced, recycled)
 
 function instAt(mesh, i, x, y, z, ry = 0, rx = 0, rz = 0, sx = 1, sy = sx, sz = sx) {
   _eu.set(rx, ry, rz, 'YXZ');
@@ -349,16 +461,43 @@ function texGlint() {
   });
 }
 
-function texSky() {
-  return canvasTexture(16, 256, (c, w, h) => {
+/** Soft vertical streak for rain (alpha only; the material carries the tint). */
+function texStreak() {
+  return canvasTexture(8, 64, (c, w, h) => {
+    c.clearRect(0, 0, w, h);
     const g = c.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, '#3f9fd8');
-    g.addColorStop(0.34, '#7cc8ea');
-    g.addColorStop(0.62, '#bfe3ef');
-    g.addColorStop(0.83, '#ffd9a0');
-    g.addColorStop(1, '#f6dcae');
+    g.addColorStop(0, 'rgba(255,255,255,0)');
+    g.addColorStop(0.35, 'rgba(255,255,255,0.85)');
+    g.addColorStop(0.8, 'rgba(255,255,255,0.95)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
     c.fillStyle = g; c.fillRect(0, 0, w, h);
   });
+}
+
+/** Wet gloss decal: a dark damp pool with a bright rim highlight. */
+function texPuddle() {
+  return canvasTexture(64, 64, (c, w, h) => {
+    c.clearRect(0, 0, w, h);
+    const g = c.createRadialGradient(32, 32, 4, 32, 32, 31);
+    g.addColorStop(0, 'rgba(120,150,170,0.85)');
+    g.addColorStop(0.55, 'rgba(96,126,150,0.6)');
+    g.addColorStop(0.86, 'rgba(150,180,200,0.45)');
+    g.addColorStop(1, 'rgba(150,180,200,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(32, 32, 31, 0, TAU); c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.5)'; c.lineWidth = 2;
+    c.beginPath(); c.ellipse(26, 25, 12, 6, -0.5, 0, TAU); c.stroke();
+  });
+}
+
+/** The toast-free coin mote drawn above a capy warming by the fire. */
+function drawMote(c, w, h, text) {
+  c.clearRect(0, 0, w, h);
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 58px "Trebuchet MS", system-ui, sans-serif';
+  c.lineWidth = 10; c.lineJoin = 'round'; c.strokeStyle = '#6b3f1d';
+  c.strokeText(text, w / 2, h / 2 + 2);
+  c.fillStyle = '#ffd77a';
+  c.fillText(text, w / 2, h / 2 + 2);
 }
 
 function texSign(title, sub, accent) {
@@ -390,10 +529,25 @@ export class BeachRoom extends Room {
 
   build(scene, game) {
     this.t = Math.random() * 40;
+    this._game = game;
+    this._scene = scene;
     this.anim = {
       fronds: [], crabs: [], gulls: [], boats: [], clouds: [], torches: [],
       floats: [], glints: [], umbrellas: [],
     };
+
+    // ---- world clock state (see onClock; dormant-safe defaults) ------------
+    this._dayT = DEFAULT_DAY_T;   // locally advanced phase, eased onto the server's
+    this._srvT = DEFAULT_DAY_T;   // last phase the server told us, aged forward
+    this._hasClock = false;
+    this._weather = 'clear';
+    this._rainAmt = 0;            // eased 0..1 rain presence
+    this._windAmt = 0.35;         // sway multiplier: clear 0.35, breeze 1, rain 0.8
+    this._skyDirty = 0;           // seconds until the dome gradient is rewritten
+    this._sunH = { x: -1, z: 0 }; // the sun's horizontal direction (sky azimuth)
+    this._unlit = [];             // [{ mat, hex }] unlit decals that follow the sky
+    this._lamps = [];             // [{ delay, on }] staggered dusk-to-dawn lights
+    this._fireLit = 0;            // eased 0..1: the bonfire's night presence
 
     scene.background = new THREE.Color(0xf3d9ac);
     scene.fog = new THREE.Fog(0xf6dcae, 42, 150);
@@ -403,12 +557,16 @@ export class BeachRoom extends Room {
     this._buildSand(scene);
     this._buildSea(scene);
     this._buildDock(scene);
+    this._buildDiveBell(scene);
     this._buildBoat(scene);
     this._buildPalms(scene);
     this._buildBeachStuff(scene);
+    this._buildBonfire(scene);
+    this._buildBall(scene);
     this._buildCritters(scene);
     this._buildExit(scene);
     this._buildJungleMouth(scene);
+    this._buildRain(scene);
 
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 4),
@@ -418,6 +576,9 @@ export class BeachRoom extends Room {
       // West of the driftwood log at (0.5,-8.5): that log and the palm behind it
       // have overlapping colliders, so the walkable gap is the one on this side.
       from_jungle: new THREE.Vector3(-0.1, 0, -6.0),
+      // stepping off the dive bell: on the fishing platform, a pace south-east
+      // of the davit and clear of the rod rack
+      from_drift: new THREE.Vector3(-18.7, DECK_Y, -3.3),
     };
     // gentle east bias: keeps the cove and dock in frame even at the eastern
     // from_plaza spawn (a stronger offset framed mostly open sea there)
@@ -425,13 +586,243 @@ export class BeachRoom extends Room {
     // static camera: the whole cove, the dock out to the fishing spot, the plaza gate
     this.staticCamera = { position: new THREE.Vector3(0, 20, 29), lookAt: new THREE.Vector3(0, 1, -1.5) };
 
+    // Live only while this room is: every handle is dropped in dispose().
+    if (game?.events?.on) {
+      this._offBall = game.events.on('ball', (m) => this._onBallFrame(m));
+      this._offCoins = game.events.on('coins', (_total, delta, reason) => this._onCoins(delta, reason));
+    }
+    /*
+     * A press on the beach ball has to be seen BEFORE the engine turns it into
+     * a walk target, and the engine listens on the canvas itself. This sits on
+     * window in the CAPTURE phase so it runs first; a press we take calls
+     * stopPropagation and the canvas listener never sees it. Everything else -
+     * HUD buttons, hotspot prompts, clicks on other capybaras, and every press
+     * that misses the ball - passes through untouched.
+     */
+    this._onDown = (e) => this._pointerDown(e);
+    addEventListener('pointerdown', this._onDown, true);
+
+    this._relight();               // paint the authored default before frame one
     scene.updateMatrixWorld(true); // ground raycasts happen before the first render
   }
 
+  // ---- world clock ---------------------------------------------------------
+  /**
+   * Server clock frame (also replayed once right after build by the engine).
+   * `dayT` is a continuous phase in [0,1): 0 dawn, 0.25 noon, 0.5 dusk,
+   * 0.75 midnight. `aurora` is a peak-only affair and ignored here.
+   */
+  onClock(dayT, weather, _aurora) {
+    if (Number.isFinite(dayT)) {
+      this._srvT = ((dayT % 1) + 1) % 1;
+      if (!this._hasClock) this._dayT = this._srvT; // first frame: take it whole
+      this._hasClock = true;
+    }
+    const w = readWeather(weather);
+    if (w !== this._weather) {
+      this._weather = w;
+      this._windAmt = w === 'breeze' ? 1 : w === 'rain' ? 0.8 : 0.35;
+    }
+  }
+
+  /** Advance the local phase and creep onto the server's between frames. */
+  _advanceClock(dt) {
+    const step = dt / DAY_SECONDS;
+    this._dayT = (this._dayT + step) % 1;
+    if (!this._hasClock) return;
+    this._srvT = (this._srvT + step) % 1; // the last frame ages at the same rate
+    let d = this._srvT - this._dayT;
+    if (d > 0.5) d -= 1; else if (d < -0.5) d += 1;
+    // a big gap means a backgrounded tab or a fresh join: take it in one go
+    if (Math.abs(d) > 0.02) this._dayT = this._srvT;
+    else this._dayT = (this._dayT + d * Math.min(1, dt * 0.7) + 1) % 1;
+  }
+
+  /**
+   * Repaint the cove for the current phase + weather. Runs every frame, so it
+   * lerps into preallocated colours and never allocates. The sky dome's vertex
+   * gradient is the one heavy part and is rewritten at 5Hz (see _skyDirty).
+   */
+  _relight(dt = 0) {
+    const dayT = this._dayT;
+    const seg = dayT * 4;
+    const i = Math.floor(seg) % 4;
+    const j = (i + 1) % 4;
+    const f = smoothstep(seg - Math.floor(seg));
+    const A = SKY[i], B = SKY[j];
+
+    // rain eases in and out rather than switching; it also greys everything
+    const wantRain = this._weather === 'rain' ? 1 : 0;
+    this._rainAmt += (wantRain - this._rainAmt) * Math.min(1, dt * 0.5);
+    const rain = this._rainAmt;
+    // rain kills the key light much harder than the fills: overcast is flat
+    const gloom = 1 - rain * 0.62;
+
+    // ---- sun / moon --------------------------------------------------------
+    // Elevation is a sine over the day; the horizontal swing runs east -> north
+    // -> west, which is what drops the sun into the sea to the west (this
+    // room's whole reason for being) and keeps the noon light raking in from
+    // behind the cove.
+    const elev = Math.sin(dayT * TAU) * MAX_ELEV;
+    const swing = dayT * TAU;
+    let hx = Math.cos(swing), hz = -0.5 * Math.sin(swing);
+    const hl = Math.hypot(hx, hz) || 1;
+    hx /= hl; hz /= hl;
+    this._sunH.x = hx; this._sunH.z = hz;   // _paintSky burns the sky around this
+    // the key light never dips below the floor, so nothing ever flips
+    const el = Math.max(elev, NIGHT_ELEV);
+    const ce = Math.cos(el);
+    _dir.set(hx * ce, Math.sin(el), hz * ce);
+
+    const sun = this._sun;
+    sun.position.copy(sun.target.position).addScaledVector(_dir, 44);
+    mixHex(A.sun, B.sun, f, _mix);
+    sun.color.copy(_mix);
+    sun.intensity = lerp(A.sunI, B.sunI, f) * gloom;
+
+    // The moon hangs where the light comes from; it fades up as the sun goes
+    // down and is the only thing in the sky at midnight.
+    const moon = this._moon;
+    const moonK = clamp01((0.16 - elev) / 0.3);
+    moon.visible = moonK > 0.02;
+    if (moon.visible) {
+      moon.position.copy(_dir).multiplyScalar(128);
+      moon.lookAt(0, 6, 0);
+      moon.material.opacity = moonK * 0.95 * gloom;
+    }
+
+    // The sun disc rides its TRUE elevation, so it actually sets into the sea
+    // instead of hovering on the light's floor.
+    const orb = this._orb;
+    const ceRaw = Math.cos(elev);
+    orb.group.position.set(hx * ceRaw, Math.sin(elev), hz * ceRaw).multiplyScalar(132);
+    orb.group.lookAt(0, 6, 0);
+    orb.group.visible = elev > -0.22;      // below that it is under the sea
+    if (orb.group.visible) {
+      // low sun = fat warm halo, high sun = small bright bead
+      const low = 1 - Math.min(1, Math.max(0, elev) / MAX_ELEV);
+      const dip = clamp01((elev + 0.22) / 0.22);   // fades out as it sinks
+      orb.group.scale.setScalar(0.75 + low * 0.6);
+      for (const d of orb.discs) {
+        d.mat.color.copy(_mix).lerp(_mixB.setHex(0xffffff), low * 0.12);
+        if (d.base < 1) d.mat.opacity = d.base * (0.55 + low * 0.8) * gloom * dip;
+        else d.mat.opacity = dip;
+      }
+    }
+
+    // ---- fills -------------------------------------------------------------
+    const hemi = this._hemi;
+    mixHex(A.hemiS, B.hemiS, f, _mix); hemi.color.copy(_mix);
+    mixHex(A.hemiG, B.hemiG, f, _mix); hemi.groundColor.copy(_mix);
+    // the sky fill barely dims in rain (that is what makes it read as overcast
+    // rather than as dusk), and never drops below the playability floor
+    hemi.intensity = Math.max(0.45, lerp(A.hemiI, B.hemiI, f) * (1 - rain * 0.12));
+    const amb = this._amb;
+    mixHex(A.amb, B.amb, f, _mix); amb.color.copy(_mix);
+    amb.intensity = lerp(A.ambI, B.ambI, f);
+
+    // ---- sky, fog, water ---------------------------------------------------
+    const scene = this._scene;
+    mixHex(A.fog, B.fog, f, _mix);
+    if (rain > 0.01) _mix.lerp(_mixB.setHex(0x8fa0ac), rain * 0.55);
+    scene.fog.color.copy(_mix);
+    scene.background.copy(_mix);
+    mixHex(A.water, B.water, f, _mix);
+    this._waterMat.color.copy(_mix).multiplyScalar(gloom);
+    mixHex(A.deep, B.deep, f, _mix);
+    this._deepMat.color.copy(_mix).multiplyScalar(gloom);
+    mixHex(A.cloud, B.cloud, f, _mix);
+    this._cloudMat.color.copy(_mix).lerp(_mixB.setHex(0x9aa3ad), rain * 0.6);
+
+    // unlit decals (foam, wet sand, paths, sign faces) have no light to dim
+    // them, so they follow the sky by hand or they glow like paper at midnight
+    const un = lerp(A.unlit, B.unlit, f) * gloom;
+    for (const u of this._unlit) u.mat.color.setHex(u.hex).multiplyScalar(un);
+
+    // Sun glitter belongs to the sun. The scatter is baked along the western
+    // path, so it comes up through the morning, peaks into the sunset and
+    // leaves a thinner moon trail behind it.
+    const up = smoothstep(clamp01((elev + 0.14) / 0.4));
+    const west = smoothstep(clamp01((dayT - 0.06) / 0.16));
+    this._glintAmt = (0.3 + 0.8 * up * west) * (1 - rain * 0.8);
+
+    if (this._skyDirty <= 0) { this._paintSky(A, B, f, rain); this._skyDirty = 0.2; }
+    else this._skyDirty -= dt;
+
+    // ---- lamps: on from dusk to dawn, each with its own lazy start ----------
+    const want = elev < 0.1 ? 1 : 0;
+    for (const l of this._lamps) {
+      if (want && l.wait > 0) { l.wait -= dt; continue; }
+      if (!want) l.wait = l.delay;
+      l.on += (want - l.on) * Math.min(1, dt * 0.6);
+    }
+    this._fireLit = this._fireLamp ? this._fireLamp.on : want;
+  }
+
+  /**
+   * Rewrite the dome's vertex gradient for the phase. Three stops up (horizon /
+   * mid / zenith) and one across: the horizon burns toward the sun's azimuth
+   * and cools away from it, so a sunset reads as a place in the sky rather than
+   * a gold ring around the whole cove.
+   */
+  _paintSky(A, B, f, rain) {
+    const dome = this._dome;
+    if (!dome) return;
+    const col = dome.geometry.attributes.color;
+    const arr = col.array;
+    const ts = this._domeT;
+    const hs = this._domeH;
+    const sx = this._sunH.x, sz = this._sunH.z;
+    mixHex(A.top, B.top, f, _mix); if (rain > 0.01) _mix.lerp(_mixB.setHex(0x6d7c8a), rain * 0.6);
+    const tr = _mix.r, tg = _mix.g, tb = _mix.b;
+    mixHex(A.mid, B.mid, f, _mix); if (rain > 0.01) _mix.lerp(_mixB.setHex(0x8b98a4), rain * 0.6);
+    const mr = _mix.r, mg = _mix.g, mb = _mix.b;
+    mixHex(A.hor, B.hor, f, _mix); if (rain > 0.01) _mix.lerp(_mixB.setHex(0xa6b1ba), rain * 0.55);
+    const hr = _mix.r, hg = _mix.g, hb = _mix.b;
+    mixHex(A.horC, B.horC, f, _mix); if (rain > 0.01) _mix.lerp(_mixB.setHex(0x93a0ab), rain * 0.6);
+    const cr = _mix.r, cg = _mix.g, cb = _mix.b;
+    for (let i = 0; i < ts.length; i++) {
+      const t = ts[i];
+      // 1 facing the sun, 0 facing away; squared so the glow stays local
+      let w = hs[i * 2] * sx + hs[i * 2 + 1] * sz;
+      w = w * 0.5 + 0.5;
+      w *= w;
+      const br = cr + (hr - cr) * w, bg = cg + (hg - cg) * w, bb = cb + (hb - cb) * w;
+      let r, g, b;
+      if (t < 0.36) {           // horizon -> mid
+        const u = t / 0.36;
+        r = br + (mr - br) * u; g = bg + (mg - bg) * u; b = bb + (mb - bb) * u;
+      } else {                  // mid -> zenith
+        const u = (t - 0.36) / 0.64;
+        r = mr + (tr - mr) * u; g = mg + (tg - mg) * u; b = mb + (tb - mb) * u;
+      }
+      arr[i * 3] = r; arr[i * 3 + 1] = g; arr[i * 3 + 2] = b;
+    }
+    col.needsUpdate = true;
+  }
+
+  /** Register an unlit material so the clock can dim it with the sky. */
+  _followSky(mat, hex) {
+    this._unlit.push({ mat, hex });
+    return mat;
+  }
+
+  /** A dusk-to-dawn light with its own lazy start, so nothing lights in sync. */
+  _addLamp(delay) {
+    const l = { delay, wait: delay, on: 0 };
+    this._lamps.push(l);
+    return l;
+  }
+
   // ---- lighting ------------------------------------------------------------
+  // The whole rig is clock-driven (see _relight): one shadow-casting key that
+  // swings from east to west and doubles as the moon, plus hemisphere/ambient
+  // fills that dim but never go dark.
   _buildLight(scene) {
-    scene.add(new THREE.HemisphereLight(0xffe9c4, 0xc89f68, 1.15));
-    scene.add(new THREE.AmbientLight(0xffd9a8, 0.35));
+    this._hemi = new THREE.HemisphereLight(0xffe9c4, 0xc89f68, 1.15);
+    scene.add(this._hemi);
+    this._amb = new THREE.AmbientLight(0xffd9a8, 0.35);
+    scene.add(this._amb);
 
     const sun = new THREE.DirectionalLight(0xffdaa0, 2.1);
     sun.position.set(-30, 16, -14); // low, from the west
@@ -446,31 +837,80 @@ export class BeachRoom extends Room {
     scene.add(sun);
     scene.add(sun.target);
     sun.target.position.set(-2, 0, 0);
+    this._sun = sun;
   }
 
   // ---- sky, sun, clouds ----------------------------------------------------
   _buildSky(scene) {
-    const dome = new THREE.Mesh(
-      new THREE.SphereGeometry(170, 32, 18, 0, TAU, 0, Math.PI * 0.58),
-      glowTex(0xffffff, texSky(), { side: THREE.BackSide, fog: false, depthWrite: false }),
-    );
+    // The dome carries its gradient in vertex colours rather than a baked
+    // texture: the clock rewrites three stops (horizon / mid / zenith) into it,
+    // which is what makes the sunset actually change colour instead of tint.
+    const dg = new THREE.SphereGeometry(170, 32, 18, 0, TAU, 0, Math.PI * 0.58);
+    const dp = dg.attributes.position;
+    const dcol = new Float32Array(dp.count * 3);
+    this._domeT = new Float32Array(dp.count);
+    this._domeH = new Float32Array(dp.count * 2); // horizontal unit dir per vertex
+    for (let i = 0; i < dp.count; i++) {
+      this._domeT[i] = clamp01(dp.getY(i) / 170);   // 0 at the horizon, 1 overhead
+      const hx = dp.getX(i), hz = dp.getZ(i);
+      const hl = Math.hypot(hx, hz) || 1;
+      this._domeH[i * 2] = hx / hl;
+      this._domeH[i * 2 + 1] = hz / hl;
+      dcol[i * 3] = dcol[i * 3 + 1] = dcol[i * 3 + 2] = 1;
+    }
+    dg.setAttribute('color', new THREE.BufferAttribute(dcol, 3));
+    const domeMat = makeGlow(0xffffff, { unique: true });
+    domeMat.vertexColors = true;
+    domeMat.side = THREE.BackSide;
+    domeMat.fog = false;
+    domeMat.depthWrite = false;
+    const dome = new THREE.Mesh(dg, domeMat);
     dome.renderOrder = -10;
     scene.add(dome);
+    this._dome = dome;
 
-    // low western sun + halos
-    const sunPos = new THREE.Vector3(-124, 20, -44);
+    // Sun/moon: one group the clock swings around the sky. The discs face the
+    // cove (the group's +Z looks at it) and are stacked a hair apart so the
+    // depth-write-free stack always paints core over halo.
+    const orb = new THREE.Group();
+    orb.position.set(-124, 20, -44);
+    orb.renderOrder = -9;
+    scene.add(orb);
+    this._orb = { group: orb, discs: [] };
+    let zoff = 0;
     for (const [r, c, o] of [[26, 0xffca7a, 0.16], [15, 0xffdc9c, 0.3], [7.4, 0xfff3d2, 1]]) {
       const m = makeGlow(c, { unique: true });
       m.fog = false; m.depthWrite = false;
-      if (o < 1) { m.transparent = true; m.opacity = o; m.blending = THREE.AdditiveBlending; }
+      m.transparent = true; m.opacity = o;   // the core fades too as the sun sets
+      if (o < 1) m.blending = THREE.AdditiveBlending;
       const disc = new THREE.Mesh(new THREE.CircleGeometry(r, 28), m);
-      disc.position.copy(sunPos);
-      disc.lookAt(0, 6, 0);
+      disc.position.z = (zoff += 0.4);
       disc.renderOrder = -9;
-      scene.add(disc);
+      orb.add(disc);
+      this._orb.discs.push({ mat: m, base: o });
     }
 
+    // the moon: one soft disc that lives where the night light comes from
+    const moon = new THREE.Mesh(new THREE.CircleGeometry(9, 24), glowTex(0xdfe9ff, canvasTexture(64, 64, (c, w, h) => {
+      c.clearRect(0, 0, w, h);
+      const rg = c.createRadialGradient(32, 32, 2, 32, 32, 31);
+      rg.addColorStop(0, 'rgba(255,255,255,1)');
+      rg.addColorStop(0.34, 'rgba(240,246,255,0.95)');
+      rg.addColorStop(0.42, 'rgba(210,226,255,0.35)');
+      rg.addColorStop(1, 'rgba(180,205,255,0)');
+      c.fillStyle = rg; c.beginPath(); c.arc(32, 32, 31, 0, TAU); c.fill();
+      // a couple of lazy craters so it is not a sticker
+      c.fillStyle = 'rgba(196,210,238,0.55)';
+      c.beginPath(); c.arc(26, 26, 4.5, 0, TAU); c.fill();
+      c.beginPath(); c.arc(38, 35, 3, 0, TAU); c.fill();
+    }), { transparent: true, depthWrite: false, opacity: 0, fog: false, blending: THREE.AdditiveBlending }));
+    moon.renderOrder = -9;
+    moon.visible = false;
+    scene.add(moon);
+    this._moon = moon;
+
     const cloudMat = makeToon(0xfff6e4, { unique: true, fog: false });
+    this._cloudMat = cloudMat;
     for (let i = 0; i < 5; i++) {
       const parts = [];
       const n = 4 + (i % 3);
@@ -562,17 +1002,18 @@ export class BeachRoom extends Room {
     pg.setAttribute('uv', new THREE.BufferAttribute(pu, 2));
     pg.setIndex(new THREE.BufferAttribute(pi, 1));
     pg.computeVertexNormals();
-    const path = new THREE.Mesh(pg, glowTex(0xffffff, texPath(), {
+    const path = new THREE.Mesh(pg, this._followSky(glowTex(0xffffff, texPath(), {
       transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3,
-    }));
+    }), 0xffffff));
     path.renderOrder = 1;
     scene.add(path);
   }
 
   // ---- sea, foam, glints, horizon -----------------------------------------
   _buildSea(scene) {
-    // deep water out to the horizon
-    const deep = new THREE.Mesh(new THREE.CircleGeometry(160, 40), makeToon(0x2b7fb8));
+    // deep water out to the horizon (unique: the clock recolours it)
+    this._deepMat = makeToon(0x2b7fb8, { unique: true });
+    const deep = new THREE.Mesh(new THREE.CircleGeometry(160, 40), this._deepMat);
     deep.rotation.x = -Math.PI / 2;
     deep.position.y = -0.9;
     scene.add(deep);
@@ -582,7 +1023,8 @@ export class BeachRoom extends Room {
     // the wave faces, which is the look we want anyway.
     const WSEG = 40, WSIZE = 62;
     const wg = new THREE.PlaneGeometry(WSIZE, WSIZE, WSEG, WSEG);
-    const water = new THREE.Mesh(wg, makeToon(0x3ba7dd, { unique: true }));
+    this._waterMat = makeToon(0x3ba7dd, { unique: true });
+    const water = new THREE.Mesh(wg, this._waterMat);
     water.rotation.x = -Math.PI / 2;
     water.position.set(-3, WATER_Y, 3);
     water.frustumCulled = false;
@@ -600,7 +1042,9 @@ export class BeachRoom extends Room {
       shoreRibbon(84,
         (th) => { const r = shoreR(th) - 2.6; const x = CX + Math.cos(th) * r, z = CZ + Math.sin(th) * r; return { x: x - CX, y: sandY(x, z) + 0.02, z: z - CZ }; },
         (th) => { const r = shoreR(th) + 0.3; const x = CX + Math.cos(th) * r, z = CZ + Math.sin(th) * r; return { x: x - CX, y: sandY(x, z) + 0.02, z: z - CZ }; }, 1),
-      glowTex(0xffffff, texWet(), { transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4 }),
+      this._followSky(glowTex(0xffffff, texWet(), {
+        transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4,
+      }), 0xffffff),
     );
     wet.position.set(CX, 0, CZ);
     wet.renderOrder = 2;
@@ -611,9 +1055,9 @@ export class BeachRoom extends Room {
       shoreRibbon(96,
         (th) => { const r = shoreR(th) - 1.35; const x = CX + Math.cos(th) * r, z = CZ + Math.sin(th) * r; return { x: x - CX, y: sandY(x, z) + 0.05, z: z - CZ }; },
         (th) => { const r = shoreR(th) + 0.85; return { x: Math.cos(th) * r, y: 0, z: Math.sin(th) * r }; }, 11),
-      glowTex(0xffffff, (() => { const t = texFoam(); t.wrapS = THREE.RepeatWrapping; return t; })(), {
+      this._followSky(glowTex(0xffffff, (() => { const t = texFoam(); t.wrapS = THREE.RepeatWrapping; return t; })(), {
         transparent: true, depthWrite: false, opacity: 0.9,
-      }),
+      }), 0xffffff),
     );
     foam.position.set(CX, 0, CZ);
     foam.renderOrder = 3;
@@ -626,9 +1070,9 @@ export class BeachRoom extends Room {
     // sun glints
     const gg = new THREE.PlaneGeometry(0.6, 0.6);
     gg.rotateX(-Math.PI / 2);
-    const glints = new THREE.InstancedMesh(gg, glowTex(0xffffff, texGlint(), {
+    const glints = new THREE.InstancedMesh(gg, this._followSky(glowTex(0xffffff, texGlint(), {
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-    }), 54);
+    }), 0xffffff), 54);
     glints.frustumCulled = false;
     scene.add(glints);
     for (let i = 0; i < 54; i++) {
@@ -814,7 +1258,7 @@ export class BeachRoom extends Room {
     const signTex2 = texSign('REEL RUSH', 'biggest catch wins coins', '#e8657a');
     for (const [ry, tex, off] of [[Math.PI / 2, signTex, 0.13], [-Math.PI / 2, signTex2, -0.13]]) {
       // unlit so the lettering reads even with the sun behind the board
-      const s = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 0.92), glowTex(0xf7ead2, tex));
+      const s = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 0.92), this._followSky(glowTex(0xf7ead2, tex), 0xf7ead2));
       s.position.set(-16.5 + off, DECK_Y + 2.35, DOCK_Z);
       s.rotation.y = ry;
       scene.add(s);
@@ -836,6 +1280,8 @@ export class BeachRoom extends Room {
     scene.add(lampLight);
     this.anim.lamp = lamp;
     this.anim.lampLight = lampLight;
+    // the dock lantern is the first thing lit at dusk (someone works out here)
+    this._lampDock = this._addLamp(0.3);
 
     // cast lines running from the rod tips out to bobbing floats
     const floatG = merge([
@@ -1129,13 +1575,8 @@ export class BeachRoom extends Room {
     scene.add(castleFlag);
     this.anim.flag = castleFlag;
 
-    // ---------- beach ball
-    const bp = spot(8.4, 4.6, 1.0, 2.4);
-    const ball = new THREE.Mesh(new THREE.SphereGeometry(0.42, 14, 10), toonTex(0xffffff, texBall()));
-    ball.position.set(bp.x, sandY(bp.x, bp.z) + 0.42, bp.z);
-    ball.castShadow = true;
-    scene.add(ball);
-    this.anim.ball = ball;
+    // NB: the beach ball used to be a static prop here. It is now the shared,
+    // server-owned toy built in _buildBall().
 
     scene.add(Object.assign(
       new THREE.Mesh(merge(clutter), makeToon(0xffffff, { unique: true, vertexColors: true })),
@@ -1211,6 +1652,355 @@ export class BeachRoom extends Room {
     shells.count = si;
     shells.instanceColor.needsUpdate = true;
     scene.add(shells);
+  }
+
+  // ---- the bonfire ---------------------------------------------------------
+  /**
+   * A ring of beach stones around a criss-crossed pile of driftwood, cold and
+   * grey by day. At dusk it catches: flames, embers, a warm point light and a
+   * glow pooled on the sand. Idling inside COZY_R earns the server-paid trickle
+   * (see _onCoins) and wears an ember halo (see _updateCozy).
+   *
+   * Placement: see FIRE. Nothing routes through it, and the stone ring's
+   * collider (r 1.3) sits 3.7 clear of the bot circle.
+   */
+  _buildBonfire(scene) {
+    const gy = sandY(FIRE.x, FIRE.z);
+    const solid = [];
+    const S = (g, c) => solid.push({ g, c });
+
+    // scooped-out pit + a low sand berm the stones sit in
+    S(xf(new THREE.CylinderGeometry(1.02, 0.86, 0.18, 16), FIRE.x, gy + 0.02, FIRE.z), 0x8c6b3f);
+    S(xf(new THREE.TorusGeometry(1.16, 0.2, 5, 20), FIRE.x, gy + 0.04, FIRE.z, Math.PI / 2, 0, 0), 0xdfc38c);
+
+    // hearth stones: chunky, all slightly different, none of them upright
+    for (let i = 0; i < 11; i++) {
+      const a = (i / 11) * TAU + 0.2;
+      const r = 1.12 + (i % 3) * 0.04;
+      S(xf(new THREE.IcosahedronGeometry(0.3, 0), FIRE.x + Math.cos(a) * r, gy + 0.14, FIRE.z + Math.sin(a) * r,
+        a * 1.7, i * 0.9, 0.2 + (i % 2) * 0.3, 1.05 + (i % 4) * 0.16, 0.78, 0.95), i % 2 ? 0xb0a394 : 0x93887a);
+    }
+
+    // ash bed and charred stubs under the pile
+    S(xf(new THREE.CylinderGeometry(0.72, 0.8, 0.1, 14), FIRE.x, gy + 0.1, FIRE.z), 0x4a423b);
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * TAU + 0.7;
+      S(xf(new THREE.CylinderGeometry(0.06, 0.08, 0.44, 5), FIRE.x + Math.cos(a) * 0.3, gy + 0.28, FIRE.z + Math.sin(a) * 0.3,
+        0, a, 0.35), 0x35302b);
+    }
+
+    // the pile itself: a teepee of driftwood over two crossed base logs
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU + 0.35;
+      S(xf(new THREE.CylinderGeometry(0.085, 0.115, 1.55, 6),
+        FIRE.x + Math.cos(a) * 0.34, gy + 0.72, FIRE.z + Math.sin(a) * 0.34,
+        0, -a + Math.PI / 2, 0.42 + (i % 2) * 0.05), i % 2 ? 0xcbb794 : 0xb59a76);
+    }
+    for (const [dx, dz, ry] of [[0, 0, 0.4], [0, 0, 1.9]]) {
+      S(xf(new THREE.CylinderGeometry(0.13, 0.15, 1.9, 7), FIRE.x + dx, gy + 0.2, FIRE.z + dz, 0, ry, Math.PI / 2), 0xc2ab8b);
+    }
+
+    // two driftwood benches: the reason a circle forms here at all
+    for (const [bx, bz, byaw] of [[FIRE.x + 0.35, FIRE.z + 2.15, 0.12], [FIRE.x - 1.9, FIRE.z - 1.1, -1.15]]) {
+      const by = sandY(bx, bz);
+      S(xf(new THREE.CylinderGeometry(0.26, 0.29, 2.3, 8), bx, by + 0.3, bz, 0, byaw, Math.PI / 2), 0xd8c6a8);
+      for (const s of [-0.72, 0.72]) {
+        S(xf(new THREE.BoxGeometry(0.3, 0.3, 0.34), bx + Math.cos(byaw) * s, by + 0.1, bz - Math.sin(byaw) * s, 0, byaw, 0), 0xb59a76);
+      }
+      this.obstacles.push({ x: bx, z: bz, r: 0.85 });
+    }
+    scene.add(Object.assign(new THREE.Mesh(merge(solid), makeToon(0xffffff, {
+      unique: true, vertexColors: true,
+    })), { castShadow: true, receiveShadow: true }));
+
+    // ---- fire: flames, embers, light, the pool of glow on the sand ---------
+    const flameG = new THREE.ConeGeometry(0.44, 1.15, 7, 1, true);
+    const flameMat = makeGlow(0xffffff, { unique: true });
+    flameMat.transparent = true;
+    flameMat.depthWrite = false;
+    flameMat.opacity = 0;
+    flameMat.side = THREE.DoubleSide;
+    flameMat.blending = THREE.AdditiveBlending;
+    const flames = new THREE.InstancedMesh(flameG, flameMat, 5);
+    flames.frustumCulled = false;
+    flames.visible = false;
+    scene.add(flames);
+    const tongues = [];
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * TAU;
+      tongues.push({
+        x: FIRE.x + Math.cos(a) * (i ? 0.3 : 0), z: FIRE.z + Math.sin(a) * (i ? 0.3 : 0),
+        h: i ? 0.78 + Math.random() * 0.34 : 1.5, ph: Math.random() * TAU, sp: 5 + Math.random() * 4,
+      });
+      // deep orange outside, one hot core: additive blending stacks these into
+      // a warm blaze rather than a pale spike
+      _col.setHex(i ? [0xff6a1c, 0xffa32c, 0xff5714, 0xff8f24][i - 1] : 0xffb43e);
+      flames.setColorAt(i, _col);
+    }
+    if (flames.instanceColor) flames.instanceColor.needsUpdate = true;
+
+    const emberG = new THREE.SphereGeometry(0.045, 5, 4);
+    const emberMat = makeGlow(0xffb15a, { unique: true });
+    emberMat.transparent = true;
+    emberMat.depthWrite = false;
+    emberMat.blending = THREE.AdditiveBlending;
+    const embers = new THREE.InstancedMesh(emberG, emberMat, 26);
+    embers.frustumCulled = false;
+    embers.visible = false;
+    scene.add(embers);
+    const emberData = [];
+    for (let i = 0; i < 26; i++) emberData.push({ life: Math.random() * -2, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, sc: 1 });
+
+    const light = new THREE.PointLight(0xff9838, 0, 13, 2);
+    light.position.set(FIRE.x, gy + 1.1, FIRE.z);
+    scene.add(light);
+
+    const pool = new THREE.Mesh(
+      new THREE.CircleGeometry(3.1, 24),
+      (() => {
+        const m = makeGlow(0xff9a44, { unique: true });
+        m.transparent = true; m.opacity = 0; m.depthWrite = false;
+        m.blending = THREE.AdditiveBlending;
+        return m;
+      })(),
+    );
+    pool.rotation.x = -Math.PI / 2;
+    pool.position.set(FIRE.x, gy + 0.03, FIRE.z);
+    pool.renderOrder = 2;
+    pool.visible = false;
+    scene.add(pool);
+
+    // ember halo worn by everyone idling in the glow (one mesh for all of them)
+    const haloMat = makeGlow(0xffc978, { unique: true });
+    haloMat.transparent = true;
+    haloMat.depthWrite = false;
+    haloMat.blending = THREE.AdditiveBlending;
+    const halo = new THREE.InstancedMesh(new THREE.SphereGeometry(0.09, 5, 4), haloMat, HALO_SLOTS * HALO_PER);
+    halo.frustumCulled = false;
+    halo.visible = false;
+    scene.add(halo);
+
+    // the toast-free "+1" that floats off a capy the fire has just paid
+    const moteTex = canvasTexture(128, 64, (c, w, h) => drawMote(c, w, h, '+1'));
+    const mote = new THREE.Mesh(new THREE.PlaneGeometry(1.35, 0.68), glowTex(0xffffff, moteTex, {
+      transparent: true, depthWrite: false, opacity: 0,
+    }));
+    mote.renderOrder = 6;
+    mote.visible = false;
+    scene.add(mote);
+    this._mote = { mesh: mote, tex: moteTex, t: 99, x: 0, y: 0, z: 0 };
+
+    this._fire = { y: gy, flames, tongues, embers, emberData, light, pool, halo, spawn: 0 };
+    this._fireLamp = this._addLamp(1.1);
+
+    this.obstacles.push({ x: FIRE.x, z: FIRE.z, r: FIRE.r });
+    this.hotspots.push({
+      id: 'bonfire',
+      position: new THREE.Vector3(FIRE.x, gy + 0.6, FIRE.z + 1.05),
+      radius: 2.6,
+      label: 'Settle in by the fire',
+      action: (g) => {
+        const av = g.engine?.playerAvatar;
+        if (!av) return;
+        g.engine.controller?.stop?.();
+        av.setAnim(av.state.anim === 'sit' ? 'idle' : 'sit');
+        g.audio?.play?.(av.state.anim === 'sit' ? 'ding' : 'click');
+      },
+    });
+  }
+
+  // ---- the beach ball ------------------------------------------------------
+  /**
+   * ONE ball, shared by the room. The server owns it and integrates at 10Hz;
+   * this predicts locally with the same constants and eases onto every
+   * authoritative frame, so it never stutters and never disagrees for long.
+   * Bop it by clicking it (_pointerDown) or walking into it (_updateBall).
+   *
+   * Frames are read tolerantly: {x,y,z}/{p:[x,y,z]} for position and
+   * {vx,vy,vz}/{v:[..]} for velocity, velocity derived from consecutive frames
+   * when the server sends position only.
+   *
+   * Known gap (server-side, not fixable from here): the server's join-time
+   * ball frame is sent the moment 'join' lands, which is ~220ms before this
+   * room finishes building and subscribes. A ball asleep away from home
+   * therefore renders at home until the next bop, which broadcasts instantly
+   * and re-syncs everyone. Fixing it properly means caching the last frame in
+   * src/net/client.js the way it already caches 'table'.
+   */
+  _buildBall(scene) {
+    // pivot carries position + the world-aligned squash; the mesh inside it
+    // carries the roll, so a bounce never squashes along a tumbling axis
+    const pivot = new THREE.Group();
+    pivot.position.set(BALL_HOME.x, sandY(BALL_HOME.x, BALL_HOME.z) + BALL_R, BALL_HOME.z);
+    scene.add(pivot);
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(BALL_R, 16, 12), toonTex(0xffffff, texBall()));
+    ball.castShadow = true;
+    pivot.add(ball);
+
+    // contact shadow: keeps the ball glued to the sand mid-arc
+    const blob = new THREE.Mesh(new THREE.CircleGeometry(BALL_R, 14), (() => {
+      const m = makeGlow(0x6b5636, { unique: true });
+      m.transparent = true; m.opacity = 0.24; m.depthWrite = false;
+      return m;
+    })());
+    blob.rotation.x = -Math.PI / 2;
+    blob.renderOrder = 2;
+    scene.add(blob);
+
+    // splash droplets, recycled: the ball spends a lot of its life in the surf
+    const dropMat = makeGlow(0xdff2ff, { unique: true });
+    dropMat.transparent = true;
+    dropMat.depthWrite = false;
+    const drops = new THREE.InstancedMesh(new THREE.SphereGeometry(0.07, 5, 4), dropMat, 22);
+    drops.frustumCulled = false;
+    drops.visible = false;
+    scene.add(drops);
+    const dropData = [];
+    for (let i = 0; i < 22; i++) dropData.push({ life: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 });
+
+    this._ball = {
+      obj: ball, pivot, blob, drops, dropData,
+      x: BALL_HOME.x, y: sandY(BALL_HOME.x, BALL_HOME.z) + BALL_R, z: BALL_HOME.z,
+      vx: 0, vy: 0, vz: 0,
+      spinX: 0, spinZ: 0, squash: 0, wet: false, cool: 0,
+      // server correction: where the last frame says it is, and how much of
+      // that error we have left to bleed off
+      ex: 0, ey: 0, ez: 0, authAt: -99, lastNet: null,
+    };
+    this._ballRay = new THREE.Raycaster();
+  }
+
+  // ---- dive bell (the way down to The Drift) -------------------------------
+  /**
+   * A brass bell on a davit at the north edge of the fishing platform, swung
+   * out over the open water. The prompt rides high above the deck so it never
+   * lands on top of the Reel Rush prompt a couple of paces away.
+   */
+  _buildDiveBell(scene) {
+    const solid = [];
+    const S = (g, c) => solid.push({ g, c });
+    const baseY = DECK_Y;
+
+    // mast + angled arm out over the water, with a stay back to the deck
+    S(xf(new THREE.CylinderGeometry(0.16, 0.2, 3.3, 8), BELL.x, baseY + 1.65, BELL.z), 0x8b6039);
+    S(xf(new THREE.BoxGeometry(0.44, 0.2, 0.44), BELL.x, baseY + 0.08, BELL.z), 0x6d4a2b);
+    const arm = BELL.out - BELL.z;                 // reach out over the sea (-z)
+    S(xf(new THREE.CylinderGeometry(0.11, 0.13, Math.abs(arm) + 0.5, 7),
+      BELL.x, baseY + 3.16, BELL.z + arm / 2 - 0.1, Math.PI / 2, 0, 0), 0xa87844);
+    S(xf(new THREE.CylinderGeometry(0.07, 0.07, 1.5, 5),
+      BELL.x, baseY + 2.62, BELL.z + arm * 0.28, Math.sign(arm) * -0.72, 0, 0), 0x8b6039);
+    // winch drum + rope coil at the mast foot
+    S(xf(new THREE.CylinderGeometry(0.2, 0.2, 0.5, 9), BELL.x + 0.3, baseY + 0.4, BELL.z - 0.12, 0, 0, Math.PI / 2), 0x6d4a2b);
+    S(xf(new THREE.CylinderGeometry(0.055, 0.055, 0.62, 5), BELL.x + 0.62, baseY + 0.4, BELL.z - 0.12, 0, 0, Math.PI / 2), 0xc98f52);
+    for (let i = 0; i < 3; i++) {
+      S(xf(new THREE.TorusGeometry(0.3 - i * 0.05, 0.05, 4, 12), BELL.x - 0.5, baseY + 0.06 + i * 0.09, BELL.z - 0.7, Math.PI / 2, 0, 0), 0xe4cd99);
+    }
+    scene.add(Object.assign(new THREE.Mesh(merge(solid), makeToon(0xffffff, {
+      unique: true, vertexColors: true,
+    })), { castShadow: true, receiveShadow: true }));
+
+    // the bell: a brass lathe with a porthole, hanging on a short chain
+    // Hung low on purpose: from the play camera (36 degrees down) a bell up at
+    // the arm reads as a golden hoop. Down here its whole silhouette sits
+    // against the dark water where it reads as a bell.
+    const group = new THREE.Group();
+    group.position.set(BELL.x, baseY + 2.25, BELL.out);
+    scene.add(group);
+
+    const chain = [];
+    for (let i = 0; i < 7; i++) {
+      chain.push({ g: xf(new THREE.TorusGeometry(0.08, 0.025, 4, 8), 0, 0.9 - i * 0.14, 0, 0, (i % 2) * 1.57, Math.PI / 2), c: 0xbfae86 });
+    }
+    // guide chain running on down into the water: this thing GOES somewhere
+    chain.push({ g: xf(new THREE.CylinderGeometry(0.035, 0.035, 1.7, 5), 0.52, -2.7, 0), c: 0xa79572 });
+    group.add(new THREE.Mesh(merge(chain), makeToon(0xffffff, { unique: true, vertexColors: true })));
+
+    const prof = [
+      [0.0, 0.0], [0.1, 0.02], [0.12, 0.16], [0.2, 0.4], [0.34, 0.72], [0.5, 1.0],
+      [0.62, 1.24], [0.66, 1.34], [0.6, 1.35], [0.56, 1.25], [0.44, 1.0], [0.3, 0.68],
+      [0.16, 0.36], [0.06, 0.14], [0.0, 0.1],
+    ].map(([x, y]) => new THREE.Vector2(x * 1.6, -y * 1.6 + 0.02));
+    const brass = makeToon(0xc9922f, { unique: true });
+    const bell = new THREE.Mesh(new THREE.LatheGeometry(prof, 16), brass);
+    brass.side = THREE.DoubleSide; // the lathe's return path faces inward
+    bell.castShadow = true;
+    group.add(bell);
+
+    const bands = [];
+    for (const [ry, rr] of [[-0.62, 0.66], [-1.02, 0.55]]) {
+      bands.push({ g: xf(new THREE.TorusGeometry(rr * 1.6, 0.07, 5, 18), 0, ry * 1.6, 0, Math.PI / 2, 0, 0), c: 0xf0c463 });
+    }
+    group.add(new THREE.Mesh(merge(bands), makeToon(0xffffff, { unique: true, vertexColors: true })));
+
+    // porthole facing the camera side, so you can see there is room inside
+    const port = new THREE.Mesh(new THREE.CircleGeometry(0.36, 14), makeGlow(0x9fd8ec, { unique: true }));
+    port.position.set(0, -1.0, 0.93);
+    group.add(port);
+    const portRim = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.055, 5, 14), makeToon(0xf0c463));
+    portRim.position.copy(port.position);
+    group.add(portRim);
+
+    // the porthole lamp comes on with everything else at dusk
+    this._bell = { group, ph: Math.random() * TAU, port: port.material, lamp: this._addLamp(0.9) };
+    this.obstacles.push({ x: BELL.x, z: BELL.z, r: 0.55 });
+
+    this.hotspots.push({
+      // deliberately NOT an 'exit-' id: the dock end is where people fish, and
+      // walking past a hotspot must never drop them in the sea
+      id: 'dive-bell',
+      // the prompt rides high so it never lands on top of the Reel Rush one
+      position: new THREE.Vector3(BELL.x, DECK_Y + 2.1, BELL.z - 0.35),
+      // wide enough that stepping off the bell (spawn from_drift) already shows
+      // the way back down
+      radius: 2.9,
+      label: 'Take the dive bell down',
+      action: (g) => g.goToRoom('drift', 'beach'),
+    });
+  }
+
+  // ---- rain ----------------------------------------------------------------
+  /**
+   * Weather 'rain': instanced streaks falling in a column that follows the
+   * player, plus gloss decals that darken the sand. Everything is dormant
+   * (visible = false, zero cost) whenever _rainAmt is 0.
+   */
+  _buildRain(scene) {
+    const streak = new THREE.PlaneGeometry(0.05, 0.9);
+    const mat = this._followSky(glowTex(0xbcd8ea, texStreak(), {
+      transparent: true, depthWrite: false, opacity: 0, side: THREE.DoubleSide, fog: false,
+    }), 0xbcd8ea);
+    const rain = new THREE.InstancedMesh(streak, mat, RAIN_N);
+    rain.frustumCulled = false;
+    rain.visible = false;
+    scene.add(rain);
+    const drops = new Float32Array(RAIN_N * 4); // x, y, z, speed
+    for (let i = 0; i < RAIN_N; i++) {
+      drops[i * 4] = (Math.random() - 0.5) * 22;
+      drops[i * 4 + 1] = Math.random() * 13;
+      drops[i * 4 + 2] = (Math.random() - 0.5) * 22;
+      drops[i * 4 + 3] = 15 + Math.random() * 9;
+    }
+    this._rain = { mesh: rain, drops, cx: 0, cz: 0 };
+
+    // puddles: flat decals, no colliders, so they can lie anywhere walkable
+    const pud = [];
+    const puddleTex = texPuddle();
+    for (const [px, pz, s] of [
+      [2.6, 3.9, 1.5], [-2.2, 4.6, 1.1], [5.4, 1.2, 1.3], [0.4, 0.2, 0.9],
+      [7.4, 3.2, 1.2], [-1.4, -3.4, 1.0], [4.6, -3.2, 1.1], [9.2, 5.6, 0.9],
+    ]) {
+      const g = new THREE.CircleGeometry(0.9 * s, 14);
+      g.rotateX(-Math.PI / 2);
+      pud.push({ g: xf(g, px, sandY(px, pz) + 0.03, pz), c: 0xffffff });
+    }
+    const pm = this._followSky(glowTex(0xffffff, puddleTex, {
+      transparent: true, depthWrite: false, opacity: 0, vertexColors: true,
+    }), 0xffffff);
+    const puddles = new THREE.Mesh(merge(pud), pm);
+    puddles.renderOrder = 3;
+    puddles.visible = false;
+    scene.add(puddles);
+    this._puddles = puddles;
   }
 
   // ---- crabs + gulls -------------------------------------------------------
@@ -1337,7 +2127,15 @@ export class BeachRoom extends Room {
       const flame = new THREE.Mesh(new THREE.ConeGeometry(0.17, 0.5, 7), makeGlow(0xffa53a, { unique: true }));
       flame.position.set(t.x, ty + 2.72, t.z);
       scene.add(flame);
-      this.anim.torches.push({ obj: flame, ph: Math.random() * TAU });
+      // a warm pool under each torch, alive only after dusk (no shadow caster)
+      const glow = new THREE.PointLight(0xffa145, 0, 8, 2);
+      glow.position.set(t.x, ty + 2.6, t.z);
+      scene.add(glow);
+      this.anim.torches.push({
+        obj: flame, light: glow, ph: Math.random() * TAU,
+        // whoever lights the torches walks from one to the other
+        lamp: this._addLamp(0.6 + Math.random() * 1.4),
+      });
       this.obstacles.push({ x: t.x, z: t.z, r: 0.4 });
     }
 
@@ -1355,7 +2153,7 @@ export class BeachRoom extends Room {
       plank.rotation.y = yaw;
       plank.castShadow = true;
       scene.add(plank);
-      const face = new THREE.Mesh(new THREE.PlaneGeometry(2.5, 0.62), glowTex(0xf7ead2, tex));
+      const face = new THREE.Mesh(new THREE.PlaneGeometry(2.5, 0.62), this._followSky(glowTex(0xf7ead2, tex), 0xf7ead2));
       face.position.set(sign.x + nx * dir * 0.08, y, sign.z + nz * dir * 0.08);
       face.rotation.y = dir > 0 ? yaw : yaw + Math.PI;
       scene.add(face);
@@ -1452,7 +2250,7 @@ export class BeachRoom extends Room {
     })), { castShadow: true, receiveShadow: true }));
 
     const face = new THREE.Mesh(new THREE.PlaneGeometry(2.3, 0.58),
-      glowTex(0xf7ead2, texSign('TANGLE JUNGLE', 'vines, ruins & doodles', '#4e8a34')));
+      this._followSky(glowTex(0xf7ead2, texSign('TANGLE JUNGLE', 'vines, ruins & doodles', '#4e8a34')), 0xf7ead2));
     face.position.set(sp.x + Math.sin(-0.2) * 0.08, spy + 2.1, sp.z + Math.cos(-0.2) * 0.08);
     face.rotation.y = -0.2;
     scene.add(face);
@@ -1521,11 +2319,449 @@ export class BeachRoom extends Room {
     });
   }
 
+  // ---- beach ball: prediction, bops, water -------------------------------
+  /**
+   * One integration step of the shared ball, plus the walk-into bop test.
+   * The server's frames arrive at 10Hz and are eased in by _onBallFrame; with
+   * no server at all (offline, solo) this is simply the whole simulation.
+   */
+  _updateBall(dt) {
+    const b = this._ball;
+    if (!b) return;
+    const game = this._game;
+    b.cool = Math.max(0, b.cool - dt);
+
+    // bleed off whatever error the last authoritative frame left us with
+    if (b.ex || b.ey || b.ez) {
+      const k = Math.min(1, dt * 6);
+      b.x += b.ex * k; b.ex -= b.ex * k;
+      b.y += b.ey * k; b.ey -= b.ey * k;
+      b.z += b.ez * k; b.ez -= b.ez * k;
+    }
+
+    const t = this.t;
+    const th = Math.atan2(b.z - CZ, b.x - CX);
+    const rr = Math.hypot(b.x - CX, b.z - CZ);
+    const inSea = rr > shoreR(th) - 0.5;
+    const surf = WATER_Y + waveY(b.x, b.z, t) + BALL_R * 0.45;
+    const sand = sandY(b.x, b.z) + BALL_R;
+
+    b.vy -= BALL_G * dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.z += b.vz * dt;
+    const air = Math.exp(-BALL_AIR * dt);
+    b.vx *= air; b.vz *= air;
+
+    if (inSea) {
+      if (!b.wet && b.y <= surf + 0.1) {
+        b.wet = true;
+        this._splash(b.x, surf, b.z, Math.min(2.4, Math.abs(b.vy) * 0.4 + 0.6));
+      }
+      if (b.y < surf) {
+        // buoyancy: bob up to the waterline, kill the fall, drift shoreward so
+        // the toy always comes back to the people
+        b.y += (surf - b.y) * Math.min(1, dt * 6);
+        b.vy = Math.max(b.vy * 0.2, -0.4);
+        const drag = Math.exp(-2.4 * dt);
+        b.vx *= drag; b.vz *= drag;
+        b.vx -= Math.cos(th) * 0.9 * dt;
+        b.vz -= Math.sin(th) * 0.9 * dt;
+      }
+    } else {
+      b.wet = false;
+      if (b.y <= sand) {
+        b.y = sand;
+        if (b.vy < -0.8) {
+          b.squash = Math.min(1, b.squash + Math.min(1, -b.vy / 7));
+          const hard = b.vy < -2.6;
+          b.vy = -b.vy * BALL_BOUNCE;
+          if (Math.abs(b.vy) < 1.1) b.vy = 0;
+          if (hard) this._game?.audio?.play?.('pop'); // only the landings you feel
+        } else {
+          b.vy = 0;
+          const roll = Math.exp(-BALL_ROLL * dt);
+          b.vx *= roll; b.vz *= roll;
+          if (Math.hypot(b.vx, b.vz) < 0.08) { b.vx = 0; b.vz = 0; }
+        }
+      }
+    }
+
+    // nothing may knock the ball out of the cove for good
+    if (rr > 26) {
+      b.x = BALL_HOME.x; b.z = BALL_HOME.z; b.y = sandY(b.x, b.z) + BALL_R;
+      b.vx = b.vy = b.vz = 0;
+    }
+
+    // walking into it counts as a bop: no menu, no button, just contact
+    const av = game?.engine?.playerAvatar;
+    if (av && !game.activeMinigame && b.cool <= 0) {
+      const p = av.group.position;
+      const d = Math.hypot(p.x - b.x, p.z - b.z);
+      if (d < BALL_R + 0.66 && b.y - sand < 1.1) {
+        this._bopBall(p.x, p.z, game.engine.controller?.moving ? 1 : 0.5);
+      }
+    }
+
+    // ---- render state ------------------------------------------------------
+    b.pivot.position.set(b.x, b.y, b.z);
+    const speed = Math.hypot(b.vx, b.vz);
+    if (speed > 0.02) {
+      _dir.set(-b.vz, 0, b.vx).normalize();
+      _q.setFromAxisAngle(_dir, (speed / BALL_R) * dt);
+      b.obj.quaternion.premultiply(_q);
+    }
+    b.squash = Math.max(0, b.squash - dt * 3.4);
+    const sq = b.squash;
+    // squash lives on the pivot so it stays world-aligned while the ball rolls
+    b.pivot.scale.set(1 + sq * 0.3, 1 - sq * 0.34, 1 + sq * 0.3);
+
+    const shadowY = inSea ? WATER_Y + waveY(b.x, b.z, t) + 0.03 : sandY(b.x, b.z) + 0.03;
+    const drop = Math.max(0, b.y - BALL_R - shadowY);
+    b.blob.position.set(b.x, shadowY, b.z);
+    b.blob.scale.setScalar(Math.max(0.35, 1 - drop * 0.12));
+    b.blob.material.opacity = Math.max(0.05, 0.26 - drop * 0.03);
+
+    this._updateSplash(dt);
+  }
+
+  /**
+   * Send an impulse and apply it at once. The server clamps the magnitude
+   * (BALL_IMPULSE_MAX) and checks you were within arm's reach, so this is a
+   * request, not an authority; one bop at power 1 is |7.25|, well inside it.
+   * Applying locally first is what makes the bop feel like yours: the
+   * authoritative frame lands ~a frame later and agrees.
+   */
+  _bopBall(fromX, fromZ, power = 1, send = true) {
+    const b = this._ball;
+    if (!b || b.cool > 0) return;
+    let dx = b.x - fromX, dz = b.z - fromZ;
+    const d = Math.hypot(dx, dz);
+    if (d < 1e-3) { dx = 0; dz = 1; } else { dx /= d; dz /= d; }
+    const ix = dx * BOP_H * power;
+    const iz = dz * BOP_H * power;
+    const iy = BOP_V * power;
+    b.vx += ix; b.vz += iz;
+    b.vy = Math.max(b.vy, 0) + iy;
+    b.cool = BOP_COOLDOWN;
+    b.squash = Math.min(1, b.squash + 0.55);
+    this._game?.audio?.play?.('pop');
+    if (send) {
+      this._game?.net?.send?.({
+        t: 'ball',
+        impulse: { x: +ix.toFixed(2), y: +iy.toFixed(2), z: +iz.toFixed(2) },
+      });
+    }
+  }
+
+  /**
+   * Authoritative ball frame. Read tolerantly: position as {x,y,z} or p:[..],
+   * velocity as {vx,vy,vz} or v:[..], and derived from consecutive frames when
+   * the server only ships a position.
+   */
+  _onBallFrame(m) {
+    const b = this._ball;
+    if (!b || !m || this._game?.roomId !== this.id) return;
+    const p = Array.isArray(m.p) ? m.p : null;
+    const x = Number(p ? p[0] : m.x);
+    const z = Number(p ? p[2] : m.z);
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return;
+    let y = Number(p ? p[1] : m.y);
+    if (!Number.isFinite(y)) y = b.y;
+
+    const v = Array.isArray(m.v) ? m.v : null;
+    let vx = Number(v ? v[0] : m.vx);
+    let vy = Number(v ? v[1] : m.vy);
+    let vz = Number(v ? v[2] : m.vz);
+    if (!Number.isFinite(vx) || !Number.isFinite(vz)) {
+      const last = b.lastNet;
+      const dtn = last ? Math.max(0.06, this.t - last.t) : 0;
+      vx = last ? (x - last.x) / dtn : 0;
+      vy = last ? (y - last.y) / dtn : 0;
+      vz = last ? (z - last.z) / dtn : 0;
+    }
+    if (!Number.isFinite(vy)) vy = 0;
+    b.lastNet = { x, y, z, t: this.t };
+
+    if (Math.hypot(x - b.x, z - b.z) > 3) {          // way off: take it whole
+      b.x = x; b.y = y; b.z = z;
+      b.ex = b.ey = b.ez = 0;
+    } else {
+      b.ex = x - b.x; b.ey = y - b.y; b.ez = z - b.z;
+    }
+    b.vx = vx; b.vy = vy; b.vz = vz;
+    b.authAt = this.t;
+    // somebody else just hit it: give the ball a squash so the bop reads
+    if (Math.hypot(vx, vz) > 3.5) b.squash = Math.min(1, b.squash + 0.35);
+  }
+
+  /** Water entry: a ring of droplets plus the sfx, if anyone is near enough. */
+  _splash(x, y, z, power) {
+    const b = this._ball;
+    if (!b) return;
+    let spawned = 0;
+    for (const d of b.dropData) {
+      if (d.life > 0) continue;
+      const a = Math.random() * TAU;
+      const sp = (0.9 + Math.random() * 1.6) * power;
+      d.life = 0.45 + Math.random() * 0.35;
+      d.max = d.life;
+      d.x = x + Math.cos(a) * 0.14; d.y = y + 0.1; d.z = z + Math.sin(a) * 0.14;
+      d.vx = Math.cos(a) * sp * 0.6; d.vz = Math.sin(a) * sp * 0.6;
+      d.vy = 1.6 + Math.random() * 2.2 * power;
+      if (++spawned >= 12) break;
+    }
+    b.drops.visible = true;
+    const p = this._game?.engine?.playerAvatar?.group.position;
+    if (!p || Math.hypot(p.x - x, p.z - z) < 24) this._game?.audio?.play?.('splash');
+  }
+
+  _updateSplash(dt) {
+    const b = this._ball;
+    if (!b || !b.drops.visible) return;
+    let alive = 0;
+    for (let i = 0; i < b.dropData.length; i++) {
+      const d = b.dropData[i];
+      if (d.life <= 0) { instAt(b.drops, i, 0, -50, 0, 0, 0, 0, 0); continue; }
+      d.life -= dt;
+      d.vy -= 11 * dt;
+      d.x += d.vx * dt; d.y += d.vy * dt; d.z += d.vz * dt;
+      const u = Math.max(0, d.life / d.max);
+      instAt(b.drops, i, d.x, d.y, d.z, 0, 0, 0, 0.5 + u * 0.9);
+      alive++;
+    }
+    b.drops.instanceMatrix.needsUpdate = true;
+    b.drops.material.opacity = 0.85;
+    if (!alive) b.drops.visible = false;
+  }
+
+  // ---- the fire ------------------------------------------------------------
+  _updateFire(dt) {
+    const f = this._fire;
+    if (!f) return;
+    const t = this.t;
+    // rain knocks the flames down but never puts the gathering out
+    const k = this._fireLit * (1 - this._rainAmt * 0.4);
+    const on = k > 0.01;
+    f.flames.visible = on;
+    f.embers.visible = on;
+    f.pool.visible = on;
+    f.light.intensity = k * (17 + Math.sin(t * 9.1) * 2.4 + Math.sin(t * 3.7) * 1.7);
+    f.pool.material.opacity = k * 0.26;
+    if (!on) return;
+
+    f.flames.material.opacity = 0.58 * k;
+    for (let i = 0; i < f.tongues.length; i++) {
+      const g = f.tongues[i];
+      const w = 0.76 + Math.sin(t * g.sp + g.ph) * 0.17 + Math.sin(t * 2.3 + g.ph) * 0.07;
+      const sy = g.h * w * k;
+      const sx = (0.8 + (1 - w) * 0.35) * (0.7 + k * 0.3);
+      instAt(f.flames, i, g.x, f.y + 0.32 + 0.575 * sy, g.z,
+        t * 0.7 + g.ph, 0, Math.sin(t * 2.4 + g.ph) * 0.13, sx, sy, sx);
+    }
+    f.flames.instanceMatrix.needsUpdate = true;
+
+    // embers: a steady drift of sparks going up into the dark
+    f.spawn += dt * 9 * k;
+    for (const e of f.emberData) {
+      if (e.life <= 0 && f.spawn >= 1) {
+        f.spawn -= 1;
+        e.life = 1.1 + Math.random() * 1.4;
+        e.max = e.life;
+        e.x = FIRE.x + (Math.random() - 0.5) * 0.55;
+        e.y = f.y + 0.65;
+        e.z = FIRE.z + (Math.random() - 0.5) * 0.55;
+        e.vx = (Math.random() - 0.5) * 0.55;
+        e.vy = 1.1 + Math.random() * 1.2;
+        e.vz = (Math.random() - 0.5) * 0.55;
+      }
+    }
+    for (let i = 0; i < f.emberData.length; i++) {
+      const e = f.emberData[i];
+      if (e.life <= 0) { instAt(f.embers, i, 0, -50, 0, 0, 0, 0, 0); continue; }
+      e.life -= dt;
+      e.x += e.vx * dt; e.y += e.vy * dt; e.z += e.vz * dt;
+      e.vy += dt * 0.3;
+      e.vx += Math.sin(t * 2 + e.y) * dt * 0.35;
+      const u = Math.max(0, e.life / e.max);
+      instAt(f.embers, i, e.x, e.y, e.z, 0, 0, 0, 0.4 + u * 1.1);
+    }
+    f.embers.instanceMatrix.needsUpdate = true;
+    f.embers.material.opacity = 0.9 * k;
+  }
+
+  /** Is this capybara settled in the glow? (sitting or simply standing still) */
+  _cozy(pos, anim) {
+    if (anim !== 'idle' && anim !== 'sit') return false;
+    return Math.hypot(pos.x - FIRE.x, pos.z - FIRE.z) <= COZY_R;
+  }
+
+  /**
+   * The cozy halo: a slow spiral of embers around everyone idling in the glow,
+   * local and remote alike. It is the visible half of the server's trickle, and
+   * the reason a stranger walks over to see what you are doing.
+   */
+  _updateCozy() {
+    const f = this._fire;
+    if (!f) return;
+    const halo = f.halo;
+    const lit = this._fireLit;
+    const t = this.t;
+    let n = 0;
+    if (lit > 0.25) {
+      const game = this._game;
+      const av = game?.engine?.playerAvatar;
+      if (av && !game.activeMinigame && this._cozy(av.group.position, av.state.anim)) {
+        this._haloAt(av.group.position, n++, t);
+      }
+      const remotes = game?.net?.remotes;
+      if (remotes) {
+        // .values(), not entries: this runs every frame and the [k,v] pairs
+        // would be a per-frame allocation for nothing
+        for (const r of remotes.values()) {
+          if (n >= HALO_SLOTS) break;
+          const g = r?.avatar?.group;
+          if (!g?.parent || !this._cozy(g.position, r.avatar.state.anim)) continue;
+          this._haloAt(g.position, n++, t);
+        }
+      }
+    }
+    for (let s = n; s < HALO_SLOTS; s++) {
+      for (let i = 0; i < HALO_PER; i++) instAt(halo, s * HALO_PER + i, 0, -50, 0, 0, 0, 0, 0);
+    }
+    const show = n > 0;
+    if (show || this._haloWas) halo.instanceMatrix.needsUpdate = true;
+    halo.visible = show;
+    halo.material.opacity = 0.75 * lit;
+    this._haloWas = show;
+  }
+
+  _haloAt(pos, slot, t) {
+    const halo = this._fire.halo;
+    const base = slot * HALO_PER;
+    for (let i = 0; i < HALO_PER; i++) {
+      const a = t * 0.8 + (i / HALO_PER) * TAU + slot * 1.7;
+      const rad = 0.66 + Math.sin(t * 1.3 + i) * 0.14;
+      const y = 0.25 + ((t * 0.4 + i * 0.37) % 1) * 1.6;
+      const s = 0.75 + Math.sin(t * 3 + i * 2) * 0.4;
+      instAt(halo, base + i, pos.x + Math.cos(a) * rad, pos.y + y, pos.z + Math.sin(a) * rad,
+        0, 0, 0, Math.max(0.15, s));
+    }
+  }
+
+  /**
+   * The bonfire trickle is paid by the server; all we do is show it. No toast:
+   * a cozy fire should never nag, it should just quietly hand you a coin.
+   */
+  _onCoins(delta, reason) {
+    const game = this._game;
+    if (!(delta > 0) || delta > 6) return;
+    if (!game || game.roomId !== this.id || game.activeMinigame) return;
+    const av = game.engine?.playerAvatar;
+    if (!av) return;
+    const r = String(reason || '').toLowerCase();
+    const near = Math.hypot(av.group.position.x - FIRE.x, av.group.position.z - FIRE.z) <= COZY_R + 0.8;
+    if (!near && !r.includes('fire') && !r.includes('cozy') && !r.includes('warm')) return;
+    this._spawnMote(av.group.position, `+${delta}`);
+  }
+
+  _spawnMote(pos, text) {
+    const m = this._mote;
+    if (!m) return;
+    const cv = m.tex.image;
+    if (cv?.getContext) {
+      drawMote(cv.getContext('2d'), cv.width, cv.height, text);
+      m.tex.needsUpdate = true;
+    }
+    m.x = pos.x; m.y = pos.y + 2.1; m.z = pos.z;
+    m.t = 0;
+    m.mesh.visible = true;
+  }
+
+  _updateMote(dt) {
+    const m = this._mote;
+    if (!m || m.t > 1.5) return;
+    m.t += dt;
+    const u = m.t / 1.5;
+    if (u >= 1) { m.mesh.visible = false; return; }
+    m.mesh.position.set(m.x, m.y + u * 1.05, m.z);
+    const cam = this._game?.engine?.camera;
+    if (cam) m.mesh.quaternion.copy(cam.quaternion);
+    m.mesh.material.opacity = u < 0.7 ? 1 : 1 - (u - 0.7) / 0.3;
+    m.mesh.scale.setScalar(u < 0.16 ? 0.5 + (u / 0.16) * 0.6 : 1.1 - (u - 0.16) * 0.1);
+  }
+
+  // ---- rain ----------------------------------------------------------------
+  _updateRain(dt) {
+    const r = this._rain;
+    if (!r) return;
+    const amt = this._rainAmt;
+    const mesh = r.mesh;
+    if (amt < 0.01) {
+      if (mesh.visible) { mesh.visible = false; this._puddles.visible = false; }
+      return;
+    }
+    mesh.visible = true;
+    mesh.material.opacity = 0.5 * amt;
+    this._puddles.visible = true;
+    this._puddles.material.opacity = 0.5 * amt;
+
+    const p = this._game?.engine?.playerAvatar?.group.position;
+    const cx = p ? p.x : 0, cz = p ? p.z : 0;
+    const d = r.drops;
+    const shown = Math.max(24, Math.round(RAIN_N * Math.min(1, amt * 1.3)));
+    for (let i = 0; i < RAIN_N; i++) {
+      if (i >= shown) { instAt(mesh, i, 0, -50, 0, 0, 0, 0, 0); continue; }
+      let x = d[i * 4], y = d[i * 4 + 1], z = d[i * 4 + 2];
+      const sp = d[i * 4 + 3];
+      y -= sp * dt;
+      x += dt * 2.4;   // slanted by the same onshore wind that bends the palms
+      z += dt * 0.8;
+      if (y < -1.2 || Math.abs(x - cx) > 13 || Math.abs(z - cz) > 13) {
+        x = cx + (Math.random() - 0.5) * 22;
+        z = cz + (Math.random() - 0.5) * 22;
+        y = 9 + Math.random() * 5;
+      }
+      d[i * 4] = x; d[i * 4 + 1] = y; d[i * 4 + 2] = z;
+      instAt(mesh, i, x, y, z, 0, 0, -0.17, 1, 1.3 + sp * 0.03, 1);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  // ---- input ---------------------------------------------------------------
+  /**
+   * Capture-phase press. We only ever take a press that lands on the ball while
+   * the player is close enough to reach it; everything else falls through to
+   * the engine untouched (a click on a ball across the cove walks you to it,
+   * which is exactly what you wanted anyway).
+   */
+  _pointerDown(e) {
+    const game = this._game;
+    const eng = game?.engine;
+    const b = this._ball;
+    if (!eng || !b || e.button !== 0 || eng.paused || game.activeMinigame) return;
+    if (e.target !== (eng.canvas || eng.renderer?.domElement)) return;
+    const p = eng.playerAvatar?.group.position;
+    if (!p || Math.hypot(p.x - b.x, p.z - b.z) > 6.5) return;
+    if (b.cool > 0) return;
+    _v2.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+    this._ballRay.setFromCamera(_v2, eng.camera);
+    if (!this._ballRay.intersectObject(b.obj, false).length) return;
+    e.stopPropagation();
+    this._bopBall(p.x, p.z, 1);
+  }
+
   // ---- per-frame -----------------------------------------------------------
   update(dt, game) {
     const t = (this.t += dt);
     const a = this.anim;
     if (!a) return;
+    if (game) this._game = game;
+
+    // world clock first: everything below reads the phase it paints
+    this._advanceClock(dt);
+    this._relight(dt);
+    const wind = 1 + this._windAmt * 0.9;
 
     // sea surface: height + analytic normal (plane local z is world y)
     const wpos = a.water.geometry.attributes.position;
@@ -1556,23 +2792,24 @@ export class BeachRoom extends Room {
     a.foam.material.map.offset.x = t * 0.014;
     a.foam.material.opacity = 0.78 + Math.sin(t * 0.85) * 0.16;
 
-    // glints
+    // glints: the sun's own glitter, so the clock owns their amplitude
     const gm = a.glintMesh;
+    const ga = this._glintAmt;
     for (let i = 0; i < a.glints.length; i++) {
       const g = a.glints[i];
       const pulse = Math.sin(t * g.sp + g.ph);
-      const s = pulse > 0 ? pulse * pulse * pulse * g.sc : 0;
+      const s = pulse > 0 ? pulse * pulse * pulse * g.sc * ga : 0;
       instAt(gm, i, g.x, WATER_Y + waveY(g.x, g.z, t) + 0.035, g.z, t * 0.4 + g.ph, 0, 0, s);
     }
     gm.instanceMatrix.needsUpdate = true;
 
-    // palm fronds sway
+    // palm fronds sway (harder in a breeze, per the weather state)
     const fm = a.frondMesh;
     for (const f of a.fronds) {
       instAt(fm, f.i, f.x, f.y, f.z,
-        f.yaw + Math.sin(t * 0.85 + f.ph) * 0.06,
-        f.pitch + Math.sin(t * 1.25 + f.ph) * 0.075,
-        Math.sin(t * 1.6 + f.ph) * 0.05, f.sc);
+        f.yaw + Math.sin(t * 0.85 + f.ph) * 0.06 * wind,
+        f.pitch + Math.sin(t * 1.25 + f.ph) * 0.075 * wind,
+        Math.sin(t * 1.6 + f.ph) * 0.05 * wind, f.sc);
     }
     fm.instanceMatrix.needsUpdate = true;
 
@@ -1580,9 +2817,9 @@ export class BeachRoom extends Room {
     if (a.jFernMesh) {
       for (const f of a.jFerns) {
         instAt(a.jFernMesh, f.i, f.x, f.y, f.z,
-          f.yaw + Math.sin(t * 0.9 + f.ph) * 0.08,
-          Math.sin(t * 1.3 + f.ph) * 0.06,
-          Math.sin(t * 1.05 + f.ph * 1.4) * 0.07, f.sc);
+          f.yaw + Math.sin(t * 0.9 + f.ph) * 0.08 * wind,
+          Math.sin(t * 1.3 + f.ph) * 0.06 * wind,
+          Math.sin(t * 1.05 + f.ph * 1.4) * 0.07 * wind, f.sc);
       }
       a.jFernMesh.instanceMatrix.needsUpdate = true;
     }
@@ -1607,16 +2844,20 @@ export class BeachRoom extends Room {
     }
     a.floatMesh.instanceMatrix.needsUpdate = true;
 
-    // lantern flicker
+    // lantern flicker: a low pilot light by day, full flame after dusk
     const flick = 0.9 + Math.sin(t * 7.3) * 0.06 + Math.sin(t * 3.1) * 0.05;
-    a.lamp.scale.setScalar(flick);
-    a.lampLight.intensity = 8 + flick * 2.5;
+    const dockOn = this._lampDock ? this._lampDock.on : 1;
+    a.lamp.scale.setScalar(flick * (0.72 + dockOn * 0.28));
+    a.lampLight.intensity = (1.4 + flick * 1.2) + dockOn * (7 + flick * 2.5);
 
-    // torches
+    // torches: unlit sticks in daylight, proper flames once the lamps come on
     for (const tc of a.torches) {
+      const on = tc.lamp ? tc.lamp.on : 1;
       const s = 0.85 + Math.sin(t * 11 + tc.ph) * 0.14 + Math.sin(t * 4.3 + tc.ph) * 0.1;
-      tc.obj.scale.set(0.9 + (1 - s) * 0.3, s * 1.15, 0.9 + (1 - s) * 0.3);
+      const k = 0.28 + on * 0.72;
+      tc.obj.scale.set((0.9 + (1 - s) * 0.3) * k, s * 1.15 * k, (0.9 + (1 - s) * 0.3) * k);
       tc.obj.rotation.z = Math.sin(t * 5 + tc.ph) * 0.09;
+      if (tc.light) tc.light.intensity = on * (5.5 + s * 2.2);
     }
 
     // castle flag ripple
@@ -1630,10 +2871,19 @@ export class BeachRoom extends Room {
       a.flag.rotation.y = Math.sin(t * 0.7) * 0.25;
     }
 
-    // beach ball
-    if (a.ball) {
-      a.ball.rotation.y += dt * 0.35;
-      a.ball.rotation.z = Math.sin(t * 1.4) * 0.12;
+    // the social cove: shared toys, the fire, weather, the bell
+    this._updateBall(dt);
+    this._updateFire(dt);
+    this._updateCozy();
+    this._updateMote(dt);
+    this._updateRain(dt);
+    if (this._bell) {
+      // the bell swings a little on its chain, more when the wind is up
+      const sw = 0.05 + this._windAmt * 0.05;
+      this._bell.group.rotation.z = Math.sin(t * 0.9 + this._bell.ph) * sw;
+      this._bell.group.rotation.x = Math.sin(t * 0.7 + this._bell.ph * 1.7) * sw * 0.7;
+      const bl = this._bell.lamp ? this._bell.lamp.on : 0;
+      this._bell.port.color.setHex(0x9fd8ec).lerp(_mixB.setHex(0xffd489), bl * 0.85);
     }
 
     // crabs
@@ -1680,7 +2930,33 @@ export class BeachRoom extends Room {
   }
 
   dispose() {
+    // event handles and the window listener are the only things living outside
+    // the scene graph; everything else is disposed by the engine.
+    this._offBall?.();
+    this._offCoins?.();
+    this._offBall = this._offCoins = null;
+    if (this._onDown) removeEventListener('pointerdown', this._onDown, true);
+    this._onDown = null;
+
     this.anim = null;
+    this._fire = null;
+    this._fireLamp = null;
+    this._ball = null;
+    this._ballRay = null;
+    this._bell = null;
+    this._rain = null;
+    this._puddles = null;
+    this._mote = null;
+    this._dome = null;
+    this._domeT = null;
+    this._orb = null;
+    this._unlit = null;
+    this._lamps = null;
+    this._lampDock = null;
+    this._sun = this._hemi = this._amb = null;
+    this._waterMat = this._deepMat = this._cloudMat = null;
+    this._scene = null;
+    this._game = null;
     this.hotspots.length = 0;
     this.obstacles.length = 0;
     this.groundMeshes.length = 0;

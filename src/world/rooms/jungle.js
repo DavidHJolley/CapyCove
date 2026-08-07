@@ -103,6 +103,12 @@ function mulberry32(seed) {
   };
 }
 
+/** World clock (wave 7): 1 at noon, 0 at midnight, 0.5 at dawn and dusk.
+ *  dayT is 0 dawn, 0.25 noon, 0.5 dusk, 0.75 midnight. */
+function daylight(dayT) {
+  return 0.5 + 0.5 * Math.cos(((((dayT % 1) + 1) % 1) - 0.25) * Math.PI * 2);
+}
+
 function smoothstep(a, b, x) {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
   return t * t * (3 - 2 * t);
@@ -788,6 +794,19 @@ export class JungleRoom extends Room {
 
     scene.background = new THREE.Color(0x2a4426);
     scene.fog = new THREE.Fog(0x33502c, 20, 64);
+    // world clock (wave 7): the canopy light dims after dusk and the fireflies
+    // take the clearing over. Preallocated so onClock never allocates.
+    this._bg = scene.background;
+    this._fog = scene.fog;
+    // all three neutral until a clock frame lands, so an offline visit looks
+    // exactly like it always has
+    this._dayK = 1;   // god rays / shafts
+    this._lampK = 1;  // the ruin uplight
+    this._flyK = 1;   // firefly brightness (onClock makes them shy by day)
+    this._dayCol = new THREE.Color(0x2a4426);
+    this._nightCol = new THREE.Color(0x0c1620);
+    this._fogDay = new THREE.Color(0x33502c);
+    this._fogNight = new THREE.Color(0x11202a);
 
     this._lights(scene);
     this._sky(scene);
@@ -1070,8 +1089,10 @@ export class JungleRoom extends Room {
 
   _lights(scene) {
     // green bounce off a million leaves, warm gold coming through the gaps
-    scene.add(new THREE.HemisphereLight(0xbdea86, 0x28401e, 1.25));
-    scene.add(new THREE.AmbientLight(0x93c86a, 0.3));
+    this._hemi = new THREE.HemisphereLight(0xbdea86, 0x28401e, 1.25);
+    scene.add(this._hemi);
+    this._amb = new THREE.AmbientLight(0x93c86a, 0.3);
+    scene.add(this._amb);
 
     const sun = new THREE.DirectionalLight(0xfff3c4, 1.75);
     sun.position.set(15, 26, -17); // high and north-east, with the god rays
@@ -1086,6 +1107,7 @@ export class JungleRoom extends Room {
     sc.updateProjectionMatrix();
     scene.add(sun);
     scene.add(sun.target);
+    this._sun = sun;
 
     // the ruin gets its own warm uplight, the pool a cold one off the spray
     this._ruinLight = new THREE.PointLight(0xffd98a, 5.5, 15, 2);
@@ -1109,6 +1131,39 @@ export class JungleRoom extends Room {
     dome.material.needsUpdate = true;
     dome.renderOrder = -10;
     scene.add(dome);
+    this._domeMat = dome.material;
+  }
+
+  /* --- world clock (wave 7) ------------------------------------------------ */
+
+  /** What time of day changes here is the light, nothing else. The sun through
+   *  the canopy fades out after dusk, the shafts go with it, and the fireflies
+   *  (which have always been here, blinking at the rim) come up to carry the
+   *  clearing. Deliberate scope note: this pass is a light touch, so the
+   *  `weather` argument is ignored: no rain streaks, no puddles, no new props
+   *  and no layout changes under the canopy. */
+  onClock(dayT) {
+    const lit = daylight(dayT);
+    const night = 1 - lit;
+    this._sun.intensity = 0.08 + 1.67 * lit;
+    this._sun.color.setHex(lit > 0.55 ? 0xfff3c4 : lit > 0.25 ? 0xffc98a : 0xb9c8ee);
+    // hemisphere fill never falls past the playability floor: the clearing has
+    // to stay readable at 2am (LIVING-COVE budgets, "never fully dark")
+    this._hemi.intensity = 0.5 + 0.75 * lit;
+    this._amb.intensity = 0.16 + 0.14 * lit;
+    this._bg.copy(this._nightCol).lerp(this._dayCol, lit);
+    this._fog.color.copy(this._fogNight).lerp(this._fogDay, lit);
+    // the canopy is unlit (flatMat), so it only darkens if we tint it
+    const k = 0.28 + 0.72 * lit;
+    this._domeMat.color.setRGB(k * 0.86, k, k * 0.94);
+    this._dayK = 0.08 + 0.92 * lit;      // update() rides these two
+    this._lampK = 1 + 0.8 * night;
+    // fireflies: shy and few by day, the whole swarm out and burning at night
+    this._flyK = 0.22 + 1.4 * night;
+    if (this._fireflies) {
+      const n = Math.max(6, Math.round(this._fireflyData.length * (0.25 + 0.75 * night)));
+      this._fireflies.geometry.setDrawRange(0, n);
+    }
   }
 
   /* --- ground ------------------------------------------------------------- */
@@ -2328,7 +2383,7 @@ export class JungleRoom extends Room {
         pos[i * 3 + 1] = f.y + Math.sin(t * 0.8 + f.ph) * 0.35;
         pos[i * 3 + 2] = f.cz + Math.sin(f.a * 1.3) * f.rr;
         const blink = Math.sin(t * f.blink + f.ph);
-        const g = blink > 0 ? blink * blink : 0;
+        const g = (blink > 0 ? blink * blink : 0) * this._flyK; // brighter at night
         cols[i * 3] = g * 0.95; cols[i * 3 + 1] = g; cols[i * 3 + 2] = g * 0.4;
       }
       this._fireflies.geometry.attributes.position.needsUpdate = true;
@@ -2376,8 +2431,9 @@ export class JungleRoom extends Room {
     }
 
     // ---- light: the shafts drift, the ruin lamp and pool bounce breathe
-    if (this._rayMat) this._rayMat.opacity = 0.26 + 0.1 * (0.5 + 0.5 * Math.sin(t * 0.5));
-    if (this._ruinLight) this._ruinLight.intensity = 8.4 + Math.sin(t * 1.7) * 1.1;
+    // (_dayK fades the shafts out after dusk, _lampK turns the ruin lamp up)
+    if (this._rayMat) this._rayMat.opacity = (0.26 + 0.1 * (0.5 + 0.5 * Math.sin(t * 0.5))) * this._dayK;
+    if (this._ruinLight) this._ruinLight.intensity = (8.4 + Math.sin(t * 1.7) * 1.1) * this._lampK;
     if (this._poolLight) this._poolLight.intensity = 6.4 + Math.sin(t * 2.9) * 1.3;
 
     this._updateLobby(dt, t);
@@ -2478,6 +2534,12 @@ export class JungleRoom extends Room {
     this._flutter = null;
     this._bird = null;
     this._rayMat = null;
+    this._domeMat = null;
+    this._sun = null;
+    this._hemi = null;
+    this._amb = null;
+    this._bg = null;
+    this._fog = null;
     this._ruinLight = null;
     this._poolLight = null;
     this._treeTops = null;

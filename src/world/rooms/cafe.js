@@ -64,6 +64,55 @@ function rng(seed) {
 }
 
 // ---------------------------------------------------------------------------
+// world clock (wave 7). LIVING-COVE.md interiors rule: an interior keeps its
+// layout and only swaps the painted view past its glass, then reverses the
+// window glow (daylight out, lamplight in). No new systems here.
+// ---------------------------------------------------------------------------
+
+/** dayT: 0 dawn, 0.25 noon, 0.5 dusk, 0.75 midnight -> which view to hang. */
+function clockPhase(dayT) {
+  const t = ((dayT % 1) + 1) % 1;
+  if (t < 0.06 || (t >= 0.42 && t < 0.6) || t >= 0.9) return 'dusk'; // low sun, both ends
+  return t < 0.42 ? 'day' : 'night';
+}
+
+/** 1 at noon, 0 at midnight, 0.5 at dawn and dusk. */
+function daylight(dayT) {
+  return 0.5 + 0.5 * Math.cos(((((dayT % 1) + 1) % 1) - 0.25) * Math.PI * 2);
+}
+
+/** Wash laid over a daytime painted view: multiply the art down to the right
+ *  key, then add back the low sun (dusk) or a moon and stars (night). */
+function washPhase(g, w, h, phase) {
+  if (phase === 'day') return;
+  const night = phase === 'night';
+  g.globalCompositeOperation = 'multiply';
+  g.fillStyle = night ? '#3c4a7e' : '#f0a072';
+  g.fillRect(0, 0, w, h);
+  if (night) {
+    g.globalCompositeOperation = 'source-over';
+    g.fillStyle = '#fdf6e0';
+    g.beginPath();
+    g.arc(w * 0.78, h * 0.15, Math.max(6, h * 0.055), 0, 7);
+    g.fill();
+    for (let i = 0; i < 46; i++) {
+      const s = 1 + (i % 2);
+      g.globalAlpha = 0.4 + (i % 3) * 0.2;
+      g.fillRect((i * 173) % w, (i * 59) % Math.round(h * 0.46), s, s);
+    }
+    g.globalAlpha = 1;
+  } else {
+    g.globalCompositeOperation = 'lighter';
+    const gl = g.createLinearGradient(0, h * 0.62, 0, 0);
+    gl.addColorStop(0, 'rgba(255,120,40,0.34)');
+    gl.addColorStop(1, 'rgba(255,80,110,0.08)');
+    g.fillStyle = gl;
+    g.fillRect(0, 0, w, h * 0.62);
+  }
+  g.globalCompositeOperation = 'source-over';
+}
+
+// ---------------------------------------------------------------------------
 // instanced batch: one draw call for every prop sharing a primitive
 // ---------------------------------------------------------------------------
 class Batch {
@@ -162,7 +211,7 @@ function texDeck() {
   return t;
 }
 
-function texView(flip) {
+function texView(flip, phase = 'day') {
   return canvasTexture(512, 256, (g, w, h) => {
     const sky = g.createLinearGradient(0, 0, 0, h * 0.55);
     sky.addColorStop(0, '#7ec8ef');
@@ -259,10 +308,12 @@ function texView(flip) {
       const y = h * 0.83 + ((i * 47) % Math.round(h * 0.15));
       g.fillRect(x, y, 3, 2);
     }
+
+    washPhase(g, w, h, phase);
   });
 }
 
-function texGarden() {
+function texGarden(phase = 'day') {
   return canvasTexture(256, 256, (g, w, h) => {
     const sky = g.createLinearGradient(0, 0, 0, h);
     sky.addColorStop(0, '#8fd3f2');
@@ -298,6 +349,8 @@ function texGarden() {
       g.arc(x, y, 4, 0, 7);
       g.fill();
     }
+
+    washPhase(g, w, h, phase);
   });
 }
 
@@ -654,6 +707,8 @@ export class CafeRoom extends Room {
     this.t = 0;
     this._dummy = new THREE.Object3D();
     this._col = new THREE.Color();
+    this._phase = 'day';   // world clock: repainted by onClock (wave 7)
+    this._glowK = 1;       // how hard the string lights burn
     const rand = rng(9137);
     const grad = makeToon(0xffffff).gradientMap;
     const toonMap = (map, color = 0xffffff, extra = {}) =>
@@ -721,6 +776,9 @@ export class CafeRoom extends Room {
       flat(texSky(), { side: THREE.BackSide, fog: false }),
     );
     scene.add(sky);
+    // the walls stop at 6.2 and the camera rides above them, so the dome is in
+    // shot: it gets tinted with the views rather than staying noon-blue all night
+    this._skyMat = sky.material;
 
     const sand = new THREE.Mesh(new THREE.PlaneGeometry(140, 140), makeToon(PAL.sand));
     sand.rotation.x = -Math.PI / 2;
@@ -806,6 +864,12 @@ export class CafeRoom extends Room {
     const vn = new THREE.Mesh(new THREE.PlaneGeometry(20, 4.4), flat(texGarden()));
     vn.position.set(0, 3.4, ZN - 0.5);
     scene.add(vn);
+    // repainted (never re-hung) when the cove clock rolls over to dusk/night
+    this._views = [
+      [vw.material, (p) => texView(false, p)],
+      [ve.material, (p) => texView(true, p)],
+      [vn.material, (p) => texGarden(p)],
+    ];
 
     // wainscot band + chair rail + top plate on all three walls
     const rails = [
@@ -857,9 +921,12 @@ export class CafeRoom extends Room {
 
   // -------------------------------------------------------------------------
   _buildLights(scene) {
-    scene.add(new THREE.HemisphereLight(0xffe9c8, 0x6b4a2e, 0.42));
-    scene.add(new THREE.AmbientLight(0xfff0d6, 0.2));
+    this._hemi = new THREE.HemisphereLight(0xffe9c8, 0x6b4a2e, 0.42);
+    scene.add(this._hemi);
+    this._amb = new THREE.AmbientLight(0xfff0d6, 0.2);
+    scene.add(this._amb);
 
+    this._lamps = [];
     for (const [x, y, z, col, i, d] of [
       [0, 3.9, -4.6, 0xffd8ac, 15, 16],
       [-6.6, 3.8, 2.2, 0xffd2a4, 13, 15],
@@ -867,7 +934,9 @@ export class CafeRoom extends Room {
     ]) {
       const p = new THREE.PointLight(col, i, d, 2);
       p.position.set(x, y, z);
+      p.userData.base = i;
       scene.add(p);
+      this._lamps.push(p);
     }
 
     // one soft sun raking in through the west window
@@ -886,6 +955,37 @@ export class CafeRoom extends Room {
     sun.shadow.normalBias = 0.03;
     scene.add(sun);
     scene.add(sun.target);
+    this._sun = sun;
+  }
+
+  // -------------------------------------------------------------------------
+  /** World clock (wave 7). The shack never changes shape: the sea past the
+   *  glass goes from afternoon to sunset to moonlight, the daylight raking in
+   *  through the west window fades with it, and the shack's own string lights
+   *  and lamps take the room over after dusk. */
+  onClock(dayT) {
+    const lit = daylight(dayT);
+    const phase = clockPhase(dayT);
+    if (phase !== this._phase) {
+      this._phase = phase;
+      for (const [mat, paint] of this._views) {
+        mat.map?.dispose();      // the engine only ever disposes the current one
+        mat.map = paint(phase);
+        mat.needsUpdate = true;
+      }
+      this._skyMat.color.setHex(
+        phase === 'night' ? 0x2c3d72 : phase === 'dusk' ? 0xffab74 : 0xffffff,
+      );
+    }
+    // the window glow reverses: daylight out, lamplight in
+    this._sun.intensity = 0.1 + 0.7 * lit;
+    this._sun.color.setHex(
+      phase === 'night' ? 0x9fb4e8 : phase === 'dusk' ? 0xffb87a : 0xffe7c4,
+    );
+    this._hemi.intensity = 0.16 + 0.26 * lit;
+    this._amb.intensity = 0.1 + 0.1 * lit;
+    for (const p of this._lamps) p.intensity = p.userData.base * (1.55 - 0.55 * lit);
+    this._glowK = 1.3 - 0.5 * lit;
   }
 
   // -------------------------------------------------------------------------
@@ -1650,9 +1750,10 @@ export class CafeRoom extends Room {
     }
     this._puffs.instanceMatrix.needsUpdate = true;
 
-    // string lights twinkle
+    // string lights twinkle (harder after dusk: see onClock)
+    const gk = this._glowK;
     for (let i = 0; i < this._bulbSeed.length; i++) {
-      const k = 0.68 + 0.32 * Math.sin(t * 2.1 + this._bulbSeed[i]);
+      const k = (0.68 + 0.32 * Math.sin(t * 2.1 + this._bulbSeed[i])) * gk;
       this._bulbs.setColorAt(i, this._col.setRGB(k, k * 0.88, k * 0.62));
     }
     this._bulbs.instanceColor.needsUpdate = true;
@@ -1712,6 +1813,10 @@ export class CafeRoom extends Room {
     this._clockHand = null;
     this._lantern = null;
     this._batches = null;
+    this._views = null;
+    this._skyMat = null;
+    this._sun = null;
+    this._lamps = null;
   }
 
   _writeFrond(d, mesh, i, f, sway) {

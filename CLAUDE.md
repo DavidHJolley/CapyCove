@@ -69,6 +69,29 @@ the plaza no longer references it. Known/accepted: two colluding accounts can
 farm the 30-coin match bonus (hourly backstop bounds it); a match-move relayed
 between match-start and the game chunk's mount is dropped (harmless for
 current games).
+Shipped wave 7 (the Social Cove, docs/LIVING-COVE.md):
+`clock` (server->all every 10s, on hello and on every room join)
+`{dayT, day, weather, snow, aurora, dayMs}`. `weather` is a WORD
+('clear'|'breeze'|'rain'), never an envelope: engine.applyClock hands it
+straight to `room.onClock(dayT, weather, aurora)`. `dayMs` is the authoritative
+cove-day length; any client countdown must read it rather than assume 40 min.
+`move` gained optional `y` (clamped -40..40) and `ride`; `ride` is STICKY, so a
+frame that omits the key leaves the flag alone (the net client's own 10Hz move
+frames carry neither, and only The Drift ever sets them). `snow` {to:[x,z] or
+{x,y,z}} -> relayed as `{id, from:{x,y,z}, to:{x,y,z}}`, 1/s per capy.
+`ball` {impulse:{x,y,z}} -> `{room,x,y,z,vx,vy,vz,by,r}` at 10Hz while it moves,
+silent while it sleeps; reach- and magnitude-clamped. `party-start`
+(refusal rides the same name as `{ok:false,msg,retryIn}`) / `party-end` /
+`party` ({active,parties[]} + the newest party flattened). `mural` {x,y,c} ->
+op `{x,y,c,by,id}`, refusal `{ok:false,msg,wait}`; `mural-grid` -> `{w,h,colors,
+cooldown,rle}` ("count:index" runs); `mural-report`. `quests` -> board with BOTH
+`n`/`count` and `progress`/`target`; `quest-done` {id,name,coins,all?};
+`stamps` -> album (+`id` only when it answers about someone else); `stamp` ->
+one earned stamp. `bottle` / `bottle-found` (The Drift's daily bottle).
+Milestone rewards reuse the EXISTING `shop`/`furn`/`toast` frames; the title and
+unlocked dye colours ride the welcome profile (publicProfile) and the world tag
+snapshot. Milestone cosmetics are `milestone:true` in shared/constants.js with
+price 0: the shop hides them AND the server refuses to sell them.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.
@@ -88,7 +111,17 @@ this list.
 - Visual work is verified visually: capture screenshots from the actual room
   camera and spawn points (see DESIGN.md process lessons).
 
-## Current roadmap state (2026-08-06)
+## Current roadmap state (2026-08-07)
+
+Waves 1-7 are SHIPPED (see the registry above for the full protocol). Wave 7
+(the Social Cove, docs/LIVING-COVE.md) landed last: world clock + weather +
+aurora, snowballs/beach ball/bonfire, parties, the plaza mural, daily quests +
+stamp album + milestone cosmetics, and The Drift (swimming, shaders, Big
+Blue). Wave 8 (Capy Clash Spectacle, docs/CARDGAME.md section 10) is PARKED
+pending an explicit user go-ahead. Remaining: PUBLIC DEPLOYMENT (configs in
+repo: Dockerfile, render.yaml, fly.toml; needs the user's hosting account).
+
+## Historical roadmap notes (2026-08-06)
 
 Shipped: 5 rooms, 3 minigames, accounts + guest play, chat/emotes/shop sync,
 server bots, security hardening pass, wave 1 (3-player seeded sled racing with

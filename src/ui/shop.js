@@ -32,6 +32,9 @@ const COLOR_NAMES = {
   0x4fb3e8: 'Sky',
   0x9b6bd4: 'Grape',
   0x42d6c8: 'Lagoon',
+  // milestone dye (12 stamps, docs/LIVING-COVE.md section D). Not in
+  // BODY_COLORS on purpose: coins must never reach it.
+  0x7ff0d0: 'Aurora',
 };
 
 const HAT_BLURBS = {
@@ -81,6 +84,18 @@ const TIERS = [
 function tierLabel(price) {
   for (const t of TIERS) if (price <= t.max) return t.label;
   return 'Common';
+}
+
+/**
+ * Milestone cosmetics ({milestone: true} in the shared catalogs) are handed out
+ * by the stamp album, never sold: coins must not be able to reach them or they
+ * stop being proof of play (docs/LIVING-COVE.md section D). They stay listed
+ * once you own one, because a reward you cannot wear or place is no reward.
+ */
+function shopEntries(catalog, owns) {
+  return Object.entries(catalog)
+    .filter(([id, item]) => !item.milestone || owns(id))
+    .sort((a, b) => a[1].price - b[1].price);
 }
 
 function hexCss(c) {
@@ -715,8 +730,17 @@ export function openShop(game) {
   }
 
   // ---- colors --------------------------------------------------------------
+  // The buyable ten, plus any dye the stamp album has unlocked for this account
+  // (server/progress.js writes rec.unlockedColors; it rides the welcome profile
+  // through publicProfile, so game.state carries it). Deduped and clamped: a
+  // stray value from an old record must not paint a swatch of NaN.
+  const bonusColors = (Array.isArray(game.state.unlockedColors) ? game.state.unlockedColors : [])
+    .map((v) => Math.floor(Number(v)))
+    .filter((v) => Number.isFinite(v) && v >= 0 && v <= 0xffffff && !BODY_COLORS.includes(v));
+  const paletteColors = [...BODY_COLORS, ...new Set(bonusColors)];
+
   const swatchRefs = [];
-  BODY_COLORS.forEach((c, i) => {
+  paletteColors.forEach((c, i) => {
     const b = elm('button', 'shop-swatch');
     b.type = 'button';
     b.style.setProperty('--sw', hexCss(c));
@@ -745,7 +769,7 @@ export function openShop(game) {
   }
 
   // ---- hats ----------------------------------------------------------------
-  const hatEntries = Object.entries(HATS).sort((a, b) => a[1].price - b[1].price);
+  const hatEntries = shopEntries(HATS, (id) => game.state.ownedHats.includes(id));
   const hatRefs = new Map();
   let pendingId = null;
   let pendingTimer = 0;
@@ -887,7 +911,7 @@ export function openShop(game) {
   }
 
   // ---- furniture -----------------------------------------------------------
-  const furnEntries = Object.entries(FURNITURE).sort((a, b) => a[1].price - b[1].price);
+  const furnEntries = shopEntries(FURNITURE, (id) => ownedCount(id) > 0);
   const furnRefs = new Map();
   const thumbJobs = [];
   let furnPendingId = null;

@@ -60,8 +60,11 @@ export function openMenu(game) {
       <div class="menu-list">
         <button class="menu-item is-primary" type="button" data-act="resume">Resume</button>
         <button class="menu-item" type="button" data-act="den"></button>
+        <button class="menu-item" type="button" data-act="quests"></button>
+        <button class="menu-item" type="button" data-act="party"></button>
       </div>
       <div class="menu-sub menu-den-note" hidden style="margin: 10px 4px 0;"></div>
+      <div class="menu-party" hidden style="margin-top: 10px;"></div>
       <div class="menu-how">
         <h3>How to play</h3>
         <ul></ul>
@@ -79,6 +82,9 @@ export function openMenu(game) {
   const list = root.querySelector('.menu-how ul');
   const denBtn = root.querySelector('[data-act="den"]');
   const denNote = root.querySelector('.menu-den-note');
+  const questBtn = root.querySelector('[data-act="quests"]');
+  const partyBtn = root.querySelector('[data-act="party"]');
+  const partyPanel = root.querySelector('.menu-party');
   const soundBtn = root.querySelector('[data-act="sound"]');
   const logoutBtn = root.querySelector('[data-act="logout"]');
   const exitBtn = root.querySelector('[data-act="exit"]');
@@ -113,6 +119,151 @@ export function openMenu(game) {
     }
     close();
     visitHouse(game, game.state.name);
+  });
+
+  // ---- quest board ---------------------------------------------------------
+  // The plaza notice board is the front door to this; the menu is the shortcut
+  // for anyone who is nowhere near the plaza when they wonder about the dailies.
+  questBtn.innerHTML = '<span class="menu-ico">&#128220;</span>';
+  questBtn.appendChild(document.createTextNode('Quest Board'));
+  questBtn.title = 'Today\'s three jobs and how far along you are.';
+  questBtn.addEventListener('click', () => {
+    disarm();
+    close();
+    import('./quests.js')
+      .then((m) => m.openQuests(game))
+      .catch((e) => {
+        console.error('[menu] quest board failed to load:', e);
+        game.toast('The notice board blew away in the wind, try again');
+      });
+  });
+
+  // ---- throw a party -------------------------------------------------------
+  // Two taps to start one: pick a venue, then confirm. A den party forces the
+  // door open for the duration, which is a thing an owner must actually agree
+  // to (docs/LIVING-COVE.md A3), so it gets its own line of small print.
+  const PARTY_MIN = 30;
+  const cooldownLeft = () => Math.max(0, (game.__partyCooldownUntil || 0) - Date.now());
+
+  function labelParty() {
+    const guest = isGuest(game);
+    const wait = cooldownLeft();
+    partyBtn.innerHTML = '<span class="menu-ico">&#127881;</span>';
+    partyBtn.appendChild(document.createTextNode('Throw a party'));
+    partyBtn.classList.toggle('is-off', guest || wait > 0 || !game.net?.connected);
+    partyBtn.title = guest
+      ? 'Parties come with a (free) account.'
+      : !game.net?.connected
+        ? 'The cove is offline for a moment.'
+        : wait > 0
+          ? `You threw one recently. Ready again in about ${Math.ceil(wait / 60000)} min.`
+          : `Thirty minutes, island-wide invitation, your choice of venue.`;
+  }
+  labelParty();
+
+  function partyNote(text) {
+    partyPanel.hidden = false;
+    partyPanel.textContent = '';
+    const p = document.createElement('div');
+    p.className = 'menu-sub';
+    p.style.margin = '0 4px';
+    p.textContent = text;
+    partyPanel.appendChild(p);
+  }
+
+  function venuePicker() {
+    partyPanel.hidden = false;
+    partyPanel.textContent = '';
+
+    const lead = document.createElement('div');
+    lead.className = 'menu-sub';
+    lead.style.margin = '0 4px 8px';
+    lead.textContent = `Where is it? The whole island gets told, and it runs for ${PARTY_MIN} minutes.`;
+    partyPanel.appendChild(lead);
+
+    const row = document.createElement('div');
+    row.className = 'menu-list';
+    partyPanel.appendChild(row);
+
+    for (const [venue, icon, name, blurb] of [
+      ['den', '&#127968;', 'My den', 'Your place, your furniture, doors open to everyone.'],
+      ['club', '&#127908;', 'The Groove Grotto', 'Neon, bass, and room for the whole cove.'],
+    ]) {
+      const b = document.createElement('button');
+      b.className = 'menu-item';
+      b.type = 'button';
+      b.innerHTML = `<span class="menu-ico">${icon}</span>`;
+      b.appendChild(document.createTextNode(name));
+      b.title = blurb;
+      b.addEventListener('click', () => { game.audio?.play?.('click'); confirmVenue(venue, name, blurb); });
+      row.appendChild(b);
+    }
+  }
+
+  function confirmVenue(venue, name, blurb) {
+    partyPanel.textContent = '';
+
+    const lead = document.createElement('div');
+    lead.className = 'menu-sub';
+    lead.style.margin = '0 4px 8px';
+    lead.textContent = venue === 'den'
+      // the confirmation dialog A3 asks for: say the consequence in plain words
+      ? `Your den will be set to OPEN for the next ${PARTY_MIN} minutes so anyone can walk in, `
+        + 'and it goes back to how you had it the moment the party ends. Still on?'
+      : `${blurb} Everyone gets a toast, and the map lights up. Still on?`;
+    partyPanel.appendChild(lead);
+
+    const row = document.createElement('div');
+    row.className = 'menu-list';
+    partyPanel.appendChild(row);
+
+    const go = document.createElement('button');
+    go.className = 'menu-item is-primary';
+    go.type = 'button';
+    go.textContent = venue === 'den' ? `Open my den and start the party` : `Start the party at ${name}`;
+    go.addEventListener('click', () => {
+      go.disabled = true;
+      // 'force' is the owner's explicit yes to the door being propped open
+      game.net?.send?.({ t: 'party-start', venue, force: true });
+      game.audio?.play?.('success');
+      // optimistic: the server's own frame overwrites this the moment it lands
+      game.__partyCooldownUntil = Date.now() + 90 * 60 * 1000;
+      partyNote('Sent! Watch for the island-wide toast, then go and be a host.');
+      setTimeout(() => close(), 1400);
+    });
+    row.appendChild(go);
+
+    const back = document.createElement('button');
+    back.className = 'menu-item is-quiet';
+    back.type = 'button';
+    back.textContent = 'Pick somewhere else';
+    back.addEventListener('click', () => { game.audio?.play?.('click'); venuePicker(); });
+    row.appendChild(back);
+  }
+
+  partyBtn.addEventListener('click', () => {
+    disarm();
+    if (isGuest(game)) {
+      game.audio?.play?.('pop');
+      partyNote('Parties need an account: the cove has to know whose name goes on the invitation. '
+        + 'Sign up from the title screen and the Grotto is yours for half an hour.');
+      game.toast('Sign up to throw parties!');
+      return;
+    }
+    if (!game.net?.connected) {
+      game.audio?.play?.('pop');
+      partyNote('The cove is offline for a moment. Invitations will go out once it is back.');
+      return;
+    }
+    const wait = cooldownLeft();
+    if (wait > 0) {
+      game.audio?.play?.('pop');
+      partyNote(`You threw one not long ago. The cove needs about ${Math.ceil(wait / 60000)} more minutes `
+        + 'to sweep up before the next one.');
+      return;
+    }
+    game.audio?.play?.('click');
+    venuePicker();
   });
 
   // ---- sound ---------------------------------------------------------------

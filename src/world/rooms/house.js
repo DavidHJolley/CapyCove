@@ -208,8 +208,57 @@ function texPlanks() {
   return t;
 }
 
+// ---------------------------------------------------------------------------
+// world clock (wave 7). LIVING-COVE.md interiors rule: the den keeps its
+// layout and only swaps the garden past its glass, then reverses the window
+// glow (daylight out, hearth and lamplight in).
+// ---------------------------------------------------------------------------
+
+/** dayT: 0 dawn, 0.25 noon, 0.5 dusk, 0.75 midnight -> which view to hang. */
+function clockPhase(dayT) {
+  const t = ((dayT % 1) + 1) % 1;
+  if (t < 0.06 || (t >= 0.42 && t < 0.6) || t >= 0.9) return 'dusk'; // low sun, both ends
+  return t < 0.42 ? 'day' : 'night';
+}
+
+/** 1 at noon, 0 at midnight, 0.5 at dawn and dusk. */
+function daylight(dayT) {
+  return 0.5 + 0.5 * Math.cos(((((dayT % 1) + 1) % 1) - 0.25) * Math.PI * 2);
+}
+
+/** Wash laid over a daytime painted view: multiply the art down to the right
+ *  key, then add back the low sun (dusk) or a moon and stars (night). */
+function washPhase(g, w, h, phase) {
+  if (phase === 'day') return;
+  const night = phase === 'night';
+  g.globalCompositeOperation = 'multiply';
+  g.fillStyle = night ? '#3c4a7e' : '#f0a072';
+  g.fillRect(0, 0, w, h);
+  if (night) {
+    g.globalCompositeOperation = 'source-over';
+    g.fillStyle = '#fdf6e0';
+    g.beginPath();
+    g.arc(w * 0.78, h * 0.15, Math.max(6, h * 0.055), 0, 7);
+    g.fill();
+    for (let i = 0; i < 46; i++) {
+      const s = 1 + (i % 2);
+      g.globalAlpha = 0.4 + (i % 3) * 0.2;
+      g.fillRect((i * 173) % w, (i * 59) % Math.round(h * 0.46), s, s);
+    }
+    g.globalAlpha = 1;
+  } else {
+    g.globalCompositeOperation = 'lighter';
+    const gl = g.createLinearGradient(0, h * 0.62, 0, 0);
+    gl.addColorStop(0, 'rgba(255,120,40,0.34)');
+    gl.addColorStop(1, 'rgba(255,80,110,0.08)');
+    g.fillStyle = gl;
+    g.fillRect(0, 0, w, h * 0.62);
+  }
+  g.globalCompositeOperation = 'source-over';
+}
+
 /** The world outside a window: hedges, blooms, a lazy afternoon. */
-function texGarden(flip) {
+function texGarden(flip, phase = 'day') {
   return canvasTexture(512, 256, (g, w, h) => {
     const sky = g.createLinearGradient(0, 0, 0, h);
     sky.addColorStop(0, '#7fc9ef');
@@ -296,6 +345,8 @@ function texGarden(flip) {
       g.ellipse(bx + s * 7, h * 0.44, 7, 10, s * 0.5, 0, 7);
       g.fill();
     }
+
+    washPhase(g, w, h, phase);
   });
 }
 
@@ -485,6 +536,7 @@ export class HouseRoom extends Room {
     this._unsubs = [];
     this._editing = false;
     this._editor = null;
+    this._phase = 'day';   // world clock: repainted by onClock (wave 7)
 
     // ---- who lives here ----------------------------------------------------
     const ctx = (game && game.__houseCtx) || null;
@@ -631,6 +683,17 @@ export class HouseRoom extends Room {
     ge.rotation.y = -Math.PI / 2;
     ge.position.set(WX + 0.6, 2.5, -1.2);
     scene.add(ge);
+    // Repainted (never re-hung) when the cove clock rolls over to dusk/night.
+    // NOTE (wave 7): the cottage's outer cladding in _buildOutside sits flush
+    // against these planes, so from inside the openings currently read as the
+    // painted wall rather than the garden. Left exactly as built (no layout
+    // changes in this pass): the den's visible night cue is the sky dome plus
+    // the daylight-out / lamplight-in swing in onClock. Unhide the planes and
+    // the dusk and night variants are already waiting for them.
+    this._views = [
+      [gw.material, (p) => texGarden(false, p)],
+      [ge.material, (p) => texGarden(true, p)],
+    ];
 
     // skirting, chair rail, picture rail on the three solid walls
     const runs = [
@@ -953,6 +1016,9 @@ export class HouseRoom extends Room {
       new THREE.MeshBasicMaterial({ map: texSky(), side: THREE.BackSide, fog: false }),
     );
     scene.add(sky);
+    // the den is a cutaway (eaves only, no roof), so the dome is in shot: it
+    // gets tinted with the glass rather than staying noon-blue all night
+    this._skyMat = sky.material;
 
     const grass = new THREE.Mesh(new THREE.PlaneGeometry(150, 150), makeToon(PAL.grass));
     grass.rotation.x = -Math.PI / 2;
@@ -994,8 +1060,10 @@ export class HouseRoom extends Room {
 
   // -------------------------------------------------------------------------
   _buildLights(scene) {
-    scene.add(new THREE.HemisphereLight(0xfff1da, 0x7d6144, 0.66));
-    scene.add(new THREE.AmbientLight(0xfff4e2, 0.28));
+    this._hemi = new THREE.HemisphereLight(0xfff1da, 0x7d6144, 0.66);
+    scene.add(this._hemi);
+    this._amb = new THREE.AmbientLight(0xfff4e2, 0.28);
+    scene.add(this._amb);
 
     // afternoon light leaning in through the big west window
     const sun = new THREE.DirectionalLight(0xffe4bd, 0.95);
@@ -1013,6 +1081,7 @@ export class HouseRoom extends Room {
     sun.shadow.normalBias = 0.03;
     scene.add(sun);
     scene.add(sun.target);
+    this._sun = sun;
 
     // lamp fills: one under the lantern, one by the door
     const lamp = new THREE.PointLight(0xffd6a0, 11, 20, 2);
@@ -1021,6 +1090,38 @@ export class HouseRoom extends Room {
     const porch = new THREE.PointLight(0xffcf9a, 6, 12, 2);
     porch.position.set(0, 2.7, 6.2);
     scene.add(porch);
+    lamp.userData.base = 11;
+    porch.userData.base = 6;
+    this._lamps = [lamp, porch];
+  }
+
+  // -------------------------------------------------------------------------
+  /** World clock (wave 7). The den never changes shape: the garden past the
+   *  glass goes from afternoon to sunset to moonlight, the light leaning in
+   *  through the big west window fades with it, and the hearth and the lantern
+   *  carry the room after dusk. */
+  onClock(dayT) {
+    const lit = daylight(dayT);
+    const phase = clockPhase(dayT);
+    if (phase !== this._phase) {
+      this._phase = phase;
+      for (const [mat, paint] of this._views) {
+        mat.map?.dispose();      // the engine only ever disposes the current one
+        mat.map = paint(phase);
+        mat.needsUpdate = true;
+      }
+      this._skyMat.color.setHex(
+        phase === 'night' ? 0x2c3d72 : phase === 'dusk' ? 0xffab74 : 0xffffff,
+      );
+    }
+    // the window glow reverses: daylight out, lamplight in
+    this._sun.intensity = 0.12 + 0.83 * lit;
+    this._sun.color.setHex(
+      phase === 'night' ? 0xa2b6e8 : phase === 'dusk' ? 0xffb279 : 0xffe4bd,
+    );
+    this._hemi.intensity = 0.26 + 0.4 * lit;
+    this._amb.intensity = 0.14 + 0.14 * lit;
+    for (const p of this._lamps) p.intensity = p.userData.base * (1.6 - 0.6 * lit);
   }
 
   // -------------------------------------------------------------------------
@@ -1449,6 +1550,10 @@ export class HouseRoom extends Room {
     }
     this._items.length = 0;
     this._ticking.length = 0;
+    this._views = null;
+    this._skyMat = null;
+    this._sun = null;
+    this._lamps = null;
     this.game = null;
     this.scene = null;
   }

@@ -312,6 +312,55 @@ function tint(hex, amt) {
 }
 
 // ---------------------------------------------------------------------------
+// world clock (wave 7). LIVING-COVE.md interiors rule: the lodge keeps its
+// layout and only swaps the mountainside past its glass, then reverses the
+// window glow (daylight out, hearth and string lights in).
+// ---------------------------------------------------------------------------
+
+/** dayT: 0 dawn, 0.25 noon, 0.5 dusk, 0.75 midnight -> which view to hang. */
+function clockPhase(dayT) {
+  const t = ((dayT % 1) + 1) % 1;
+  if (t < 0.06 || (t >= 0.42 && t < 0.6) || t >= 0.9) return 'dusk'; // low sun, both ends
+  return t < 0.42 ? 'day' : 'night';
+}
+
+/** 1 at noon, 0 at midnight, 0.5 at dawn and dusk. */
+function daylight(dayT) {
+  return 0.5 + 0.5 * Math.cos(((((dayT % 1) + 1) % 1) - 0.25) * Math.PI * 2);
+}
+
+/** Wash laid over a daytime painted view: multiply the art down to the right
+ *  key, then add back the low sun (dusk) or a moon and stars (night). */
+function washPhase(g, w, h, phase) {
+  if (phase === 'day') return;
+  const night = phase === 'night';
+  g.globalCompositeOperation = 'multiply';
+  g.fillStyle = night ? '#3c4a7e' : '#f0a072';
+  g.fillRect(0, 0, w, h);
+  if (night) {
+    g.globalCompositeOperation = 'source-over';
+    g.fillStyle = '#fdf6e0';
+    g.beginPath();
+    g.arc(w * 0.78, h * 0.15, Math.max(6, h * 0.055), 0, 7);
+    g.fill();
+    for (let i = 0; i < 46; i++) {
+      const s = 1 + (i % 2);
+      g.globalAlpha = 0.4 + (i % 3) * 0.2;
+      g.fillRect((i * 173) % w, (i * 59) % Math.round(h * 0.46), s, s);
+    }
+    g.globalAlpha = 1;
+  } else {
+    g.globalCompositeOperation = 'lighter';
+    const gl = g.createLinearGradient(0, h * 0.62, 0, 0);
+    gl.addColorStop(0, 'rgba(255,120,40,0.34)');
+    gl.addColorStop(1, 'rgba(255,80,110,0.08)');
+    g.fillStyle = gl;
+    g.fillRect(0, 0, w, h * 0.62);
+  }
+  g.globalCompositeOperation = 'source-over';
+}
+
+// ---------------------------------------------------------------------------
 // canvas painters
 // ---------------------------------------------------------------------------
 function texPlanks() {
@@ -407,7 +456,7 @@ function texRug(kind) {
 }
 
 /** The mountainside past the glass: ridges, pines, drifts, drifting flakes. */
-function texAlps(flip) {
+function texAlps(flip, phase = 'day') {
   return canvasTexture(512, 256, (g, w, h) => {
     const sky = g.createLinearGradient(0, 0, 0, h);
     sky.addColorStop(0, '#8fc7ea');
@@ -520,6 +569,8 @@ function texAlps(flip) {
     }
     g.fillStyle = 'rgba(214,236,255,0.14)';
     g.fillRect(0, 0, w, h);
+
+    washPhase(g, w, h, phase);
   });
 }
 
@@ -1103,12 +1154,16 @@ export class LoungeRoom extends Room {
       new THREE.MeshToonMaterial({ color, map, gradientMap: grad, ...extra });
     this._flat = (map, extra = {}) => new THREE.MeshBasicMaterial({ map, ...extra });
 
+    this._phase = 'day';   // world clock: repainted by onClock (wave 7)
+    this._glowK = 1;       // how hard the string lights burn
+
     scene.background = new THREE.Color(0x2b1e14);
     // Snow haze, not the old brown murk. Nothing indoors is more than ~30 from
     // the camera so the room never sees it; everything the camera catches over
     // the walls is mountainside, and brown fog turned the far snowfield into a
     // slab of mud.
     scene.fog = new THREE.Fog(0xd8e8f6, 44, 108);
+    this._fog = scene.fog;
 
     const B = {
       box: new Batch(new THREE.BoxGeometry(1, 1, 1)),
@@ -1481,6 +1536,9 @@ export class LoungeRoom extends Room {
       new THREE.MeshBasicMaterial({ color: 0xc3dcf1, side: THREE.BackSide, fog: false }),
     );
     scene.add(sky);
+    // The den is a cutaway with no roof, so this dome and the snow haze are in
+    // frame from every seat: they follow the glass rather than staying noon-blue.
+    this._skyMat = sky.material;
     const snowfield = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), makeToon(PAL.snow));
     snowfield.rotation.x = -Math.PI / 2;
     snowfield.position.y = -0.06;
@@ -1586,11 +1644,14 @@ export class LoungeRoom extends Room {
 
     // the painted mountainside, hung just outside each run of glass: tall and
     // long enough to fill the loft windows as well as the ones downstairs
+    this._views = [];
     for (const s of [-1, 1]) {
       const v = new THREE.Mesh(new THREE.PlaneGeometry(17.6, 6.8), this._flat(texAlps(s > 0)));
       v.rotation.y = s > 0 ? -Math.PI / 2 : Math.PI / 2;
       v.position.set(s * (HW + 0.8), 3.5, 1.6);
       scene.add(v);
+      // repainted (never re-hung) when the cove clock rolls over to dusk/night
+      this._views.push([v.material, (p) => texAlps(s > 0, p)]);
     }
 
     // frames, sills, mullions, sill plants: every storey off one loop
@@ -1685,9 +1746,12 @@ export class LoungeRoom extends Room {
 
   // -------------------------------------------------------------------------
   _buildLights(scene) {
-    scene.add(new THREE.HemisphereLight(0xffe3ba, 0x5a3c24, 0.5));
-    scene.add(new THREE.AmbientLight(0xffeacd, 0.24));
+    this._hemi = new THREE.HemisphereLight(0xffe3ba, 0x5a3c24, 0.5);
+    scene.add(this._hemi);
+    this._amb = new THREE.AmbientLight(0xffeacd, 0.24);
+    scene.add(this._amb);
 
+    this._lamps = [];
     // Two storeys, six fills: one per ground station cluster, one per loft
     // table, and a dim one under the balcony so the undercroft is shadow with
     // something in it rather than a black band. The hearth light upstairs (in
@@ -1703,7 +1767,9 @@ export class LoungeRoom extends Room {
     ]) {
       const p = new THREE.PointLight(col, i, dist, 2);
       p.position.set(x, y, z);
+      p.userData.base = i;
       scene.add(p);
+      this._lamps.push(p);
     }
 
     // one sun raking in through the west windows
@@ -1722,6 +1788,37 @@ export class LoungeRoom extends Room {
     sun.shadow.normalBias = 0.03;
     scene.add(sun);
     scene.add(sun.target);
+    this._sun = sun;
+  }
+
+  // -------------------------------------------------------------------------
+  /** World clock (wave 7). The lodge never changes shape: the mountainside
+   *  past the glass goes from afternoon to alpenglow to moonlit snow, the
+   *  daylight raking in through the west windows fades with it, and the hearth,
+   *  the lamps and the string lights carry the room after dusk. */
+  onClock(dayT) {
+    const lit = daylight(dayT);
+    const phase = clockPhase(dayT);
+    if (phase !== this._phase) {
+      this._phase = phase;
+      for (const [mat, paint] of this._views) {
+        mat.map?.dispose();      // the engine only ever disposes the current one
+        mat.map = paint(phase);
+        mat.needsUpdate = true;
+      }
+      const sky = phase === 'night' ? 0x1d2748 : phase === 'dusk' ? 0xe6a074 : 0xc3dcf1;
+      this._skyMat.color.setHex(sky);
+      if (this._fog) this._fog.color.setHex(phase === 'night' ? 0x2b3a5e : phase === 'dusk' ? 0xe0ae8c : 0xd8e8f6);
+    }
+    // the window glow reverses: daylight out, lamplight in
+    this._sun.intensity = 0.08 + 0.67 * lit;
+    this._sun.color.setHex(
+      phase === 'night' ? 0xa8bcea : phase === 'dusk' ? 0xffb279 : 0xffe2b4,
+    );
+    this._hemi.intensity = 0.2 + 0.3 * lit;
+    this._amb.intensity = 0.12 + 0.12 * lit;
+    for (const p of this._lamps) p.intensity = p.userData.base * (1.55 - 0.55 * lit);
+    this._glowK = 1.3 - 0.5 * lit;
   }
 
   // -------------------------------------------------------------------------
@@ -2938,9 +3035,9 @@ export class LoungeRoom extends Room {
     }
     for (const k of this._trophy) k.mesh.instanceMatrix.needsUpdate = true;
 
-    // string lights twinkle
+    // string lights twinkle (harder after dusk: see onClock)
     for (let i = 0; i < this._bulbSeed.length; i++) {
-      const k = 0.7 + 0.3 * Math.sin(t * 2.0 + this._bulbSeed[i]);
+      const k = (0.7 + 0.3 * Math.sin(t * 2.0 + this._bulbSeed[i])) * this._glowK;
       this._col.setRGB(k, k * 0.86, k * 0.6);
       this._bulbs.setColorAt(i, this._col);
     }
@@ -3089,6 +3186,11 @@ export class LoungeRoom extends Room {
     this._trophies = null;
     this._bulbs = null;
     this._bulbSeed = null;
+    this._views = null;
+    this._skyMat = null;
+    this._fog = null;
+    this._sun = null;
+    this._lamps = null;
     this._halo = null;
     this._haloLight = null;
     this._c4Disc = null;

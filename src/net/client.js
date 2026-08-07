@@ -8,6 +8,22 @@ const REMOTE_ANIMS = new Set(['idle', 'walk', 'dance', 'sit']);
 const safeAnim = (a) => (REMOTE_ANIMS.has(a) ? a : 'idle');
 
 /**
+ * Milestone titles ("Legend of the Cove", 40 stamps) ride under the name on the
+ * tag. The engine's attachNameTag paints a single line, so the second one is
+ * added here: it appends the tag element to overlayRoot synchronously, so the
+ * element it just made is the last child. Styling lives with the HUD.
+ */
+function addTagTitle(engine, title) {
+  const el = engine.overlayRoot?.lastElementChild;
+  if (!el || !el.classList?.contains('name-tag')) return;
+  el.classList.add('has-title');
+  const line = document.createElement('span');
+  line.className = 'name-title';
+  line.textContent = title;
+  el.appendChild(line);
+}
+
+/**
  * WebSocket client. Owns remote-player entities (avatar + interpolation +
  * name tag + chat bubbles). The engine renders whatever is in
  * engine.remoteGroup; we populate it.
@@ -307,6 +323,8 @@ export class NetClient {
     avatar.setAnim(anim);
     this.engine.remoteGroup.add(avatar.group);
     const tag = this.engine.attachNameTag(avatar.group, p.name, p.bot);
+    const title = typeof p.title === 'string' ? p.title.trim() : '';
+    if (title) addTagTitle(this.engine, title.slice(0, 24));
     this.remotes.set(p.id, {
       p, avatar, tag, target: { x: p.x, z: p.z, rot: p.rot || 0 }, anim,
       // last position we raycast the ground for; Infinity so the first snap runs

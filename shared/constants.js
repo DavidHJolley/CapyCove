@@ -45,6 +45,12 @@ export const HATS = {
   propeller: { name: 'Propeller Cap', price: 300 },
   chef: { name: 'Chef Toque', price: 150 },
   pirate: { name: 'Pirate Tricorn', price: 350 },
+  // Milestone rewards (see MILESTONES): earned from the stamp album, never
+  // bought. price 0 is a placeholder, NOT a free hat: the shop must hide every
+  // entry flagged `milestone: true` from the buy list, and server/progress.js is
+  // the only thing that ever puts one in ownedHats.
+  snorkel: { name: 'Diver Snorkel', price: 0, milestone: true },
+  golden_pick: { name: 'Golden Pickaxe', price: 0, milestone: true },
 };
 
 // Avatar body colors offered at signup / wardrobe.
@@ -92,6 +98,9 @@ export const FURNITURE = {
   wall_surfboard: { name: 'Wall Surfboard', price: 120 },
   capy_portrait: { name: 'Capy Portrait', price: 100 },
   cocoa_station: { name: 'Cocoa Station', price: 280 },
+  // Milestone reward (see MILESTONES): same rule as the milestone hats, the
+  // Furniture tab must hide anything flagged `milestone: true`.
+  gramophone: { name: 'Whale-Song Gramophone', price: 0, milestone: true },
 };
 
 export const HOUSE_MAX_ITEMS = 60;
@@ -103,6 +112,158 @@ export const NAME_MAX_LEN = 16;
 
 export const NET_TICK_MS = 100; // server broadcast + client send cadence
 export const WALK_SPEED = 5.2; // units/sec, shared so server bots match players
+
+// ---------------------------------------------------------------------------
+// Progression: daily quests, stamp album, milestone track (wave 7, section D of
+// docs/LIVING-COVE.md). Pure data: all of the logic lives in server/progress.js,
+// which is the ONLY thing allowed to decide that a quest or stamp is earned.
+// The client reads these tables for names/descriptions and nothing else.
+// ---------------------------------------------------------------------------
+
+/**
+ * Daily quest pool. The server picks 3 per account per cove-day (seeded, so a
+ * reconnect never rerolls the board), weighted to include at least one `social`
+ * and at least one `minigame` quest.
+ *
+ * Fields:
+ *  - id/name/desc : identity + board copy
+ *  - signal       : the server-side progression signal that advances it (see the
+ *                   contract at the top of server/progress.js). A quest can only
+ *                   ever be advanced by a signal one of the hardened handlers in
+ *                   server/index.js already accepted: nothing here is claimable
+ *                   by the client.
+ *  - count        : how many matching signals finish it
+ *  - coins        : payout (30-60; all three in a day pays a further +50)
+ *  - kind         : 'minigame' | 'social' | 'world' (drives the daily weighting)
+ * Optional filters, all matched against the signal's data payload:
+ *  - game         : data.game must equal this
+ *  - minCoins     : data.coins must reach this (server-clamped payout, so a
+ *                   "big run" quest cannot be faked by a client-reported score)
+ *  - place        : data.placed must be this or better (1 = won it)
+ *  - riders       : data.riders must reach this
+ *  - room         : data.room must equal this
+ *  - flag         : that field of the payload must be truthy (e.g. 'gem')
+ *  - distinct     : count DIFFERENT payload values instead of repeats
+ */
+export const QUESTS = [
+  // --- minigames -----------------------------------------------------------
+  { id: 'q_fish', name: 'Gone Fishing', desc: 'Bank 40+ coins in one Reel Rush run.', signal: 'score', game: 'fishing', minCoins: 40, count: 1, coins: 45, kind: 'minigame' },
+  { id: 'q_sled', name: 'Downhill Dash', desc: 'Take a run down Summit Sprint.', signal: 'score', game: 'sled', count: 1, coins: 35, kind: 'minigame' },
+  { id: 'q_smoothie', name: 'Blend It Well', desc: 'Bank 50+ coins in one Smoothie Scramble shift.', signal: 'score', game: 'smoothie', minCoins: 50, count: 1, coins: 45, kind: 'minigame' },
+  { id: 'q_three_runs', name: 'Triple Feature', desc: 'Play three minigame runs today.', signal: 'score', count: 3, coins: 50, kind: 'minigame' },
+  { id: 'q_hunt', name: 'Prop Shop', desc: 'Play a round of Prop Hunt in the mine.', signal: 'score', game: 'prophunt', count: 1, coins: 40, kind: 'minigame' },
+  { id: 'q_match', name: 'Take a Seat', desc: 'Win any duel at the Game Den.', signal: 'match-win', count: 1, coins: 50, kind: 'minigame' },
+  { id: 'q_pong', name: 'Paddle Up', desc: 'Win a round of Paddle Panic.', signal: 'match-win', game: 'pong', count: 1, coins: 40, kind: 'minigame' },
+  { id: 'q_chess', name: 'Mind Games', desc: 'Win a game of Grand Capy Chess.', signal: 'match-win', game: 'chess', count: 1, coins: 60, kind: 'minigame' },
+  { id: 'q_cards', name: 'Clash Day', desc: 'Win a Capy Clash duel.', signal: 'match-win', game: 'cards', count: 1, coins: 55, kind: 'minigame' },
+  { id: 'q_connect4', name: 'Four Up', desc: 'Win a game of Four in a Row.', signal: 'match-win', game: 'connect4', count: 1, coins: 40, kind: 'minigame' },
+  { id: 'q_shuffle', name: 'Slide On', desc: 'Win a round of Shuffle Showdown.', signal: 'match-win', game: 'shuffle', count: 1, coins: 40, kind: 'minigame' },
+  { id: 'q_race', name: 'Three Sleds', desc: 'Finish a three-capy sled race.', signal: 'race-done', count: 1, coins: 40, kind: 'minigame' },
+  { id: 'q_race_win', name: 'First Down', desc: 'Come first in a sled race.', signal: 'race-done', place: 1, count: 1, coins: 60, kind: 'minigame' },
+  { id: 'q_doodle', name: 'Good Guess', desc: 'Guess three doodles right in the jungle.', signal: 'doodle-correct', count: 3, coins: 45, kind: 'minigame' },
+  // --- social --------------------------------------------------------------
+  { id: 'q_party_go', name: 'Crash the Party', desc: "Turn up at somebody else's party.", signal: 'party-attend', count: 1, coins: 50, kind: 'social' },
+  { id: 'q_party_host', name: 'Your Place', desc: 'Throw a party of your own.', signal: 'party-host', count: 1, coins: 60, kind: 'social' },
+  { id: 'q_mural', name: 'Three Dabs', desc: 'Add three pixels to the plaza mural.', signal: 'mural-pixel', count: 3, coins: 40, kind: 'social' },
+  { id: 'q_chat', name: 'Say Hello', desc: 'Chat five times with the cove.', signal: 'chat', count: 5, coins: 30, kind: 'social' },
+  { id: 'q_wave', name: 'Friendly Paw', desc: 'Wave at the cove three times.', signal: 'wave', count: 3, coins: 30, kind: 'social' },
+  { id: 'q_ball', name: 'Keep It Up', desc: 'Bop the beach ball ten times.', signal: 'ball', count: 10, coins: 40, kind: 'social' },
+  { id: 'q_snow', name: 'Snowball Season', desc: 'Land five snowballs on the peak.', signal: 'snow', count: 5, coins: 40, kind: 'social' },
+  { id: 'q_bonfire', name: 'Warm Circle', desc: 'Settle in by the beach bonfire after dusk.', signal: 'bonfire', count: 1, coins: 35, kind: 'social' },
+  { id: 'q_pod', name: 'Buddy System', desc: 'Ride Big Blue with another capy aboard.', signal: 'whale-ride', riders: 2, count: 1, coins: 55, kind: 'social' },
+  // --- world ---------------------------------------------------------------
+  { id: 'q_tour', name: 'Grand Tour', desc: 'Visit five different corners of the cove.', signal: 'room', distinct: true, count: 5, coins: 40, kind: 'world' },
+  { id: 'q_drift', name: 'Down the Bell', desc: 'Take the dive bell down to The Drift.', signal: 'room', room: 'drift', count: 1, coins: 30, kind: 'world' },
+  { id: 'q_dig', name: 'Pick Away', desc: 'Prospect ten times in the Glimmer Mine.', signal: 'dig', count: 10, coins: 35, kind: 'world' },
+  { id: 'q_gem', name: 'Glitter Strike', desc: 'Strike a gem in the mine.', signal: 'dig', flag: 'gem', count: 1, coins: 60, kind: 'world' },
+  { id: 'q_bottle', name: 'Message Received', desc: 'Find the bottle drifting in the deep.', signal: 'bottle', count: 1, coins: 60, kind: 'world' },
+];
+
+/**
+ * The stamp album: authored feats, not grind. `how` is the requirement line the
+ * album prints under the (procedural) stamp art; `desc` is the flavour. The
+ * award rules live in server/progress.js keyed by these ids, and every stamp is
+ * idempotent: it can only ever be earned once, per account, from server signals.
+ *
+ * There are deliberately more than 40 of these so the 40-stamp "Legend of the
+ * Cove" milestone does not require literally every single one (a few depend on
+ * other players showing up, which no solo player can force).
+ */
+export const STAMPS = [
+  // --- getting around ------------------------------------------------------
+  { id: 'first_hello', name: 'First Hello', desc: 'Every friendship starts somewhere.', how: 'Say something in chat' },
+  { id: 'explorer', name: 'Explorer', desc: 'You had a look around.', how: 'Visit five different rooms' },
+  { id: 'globetrotter', name: 'Globetrotter', desc: 'No corner left unvisited.', how: 'Visit every room in the cove' },
+  { id: 'regular', name: 'Regular', desc: 'The cove knows your face.', how: 'Play on seven different days' },
+  { id: 'veteran', name: 'Cove Veteran', desc: 'Practically staff at this point.', how: 'Play on thirty different days' },
+  { id: 'night_owl', name: 'Night Owl', desc: 'Green ribbons over Frosty Peak.', how: 'Watch the aurora from the peak' },
+  // --- the drift -----------------------------------------------------------
+  { id: 'deep_breath', name: 'Deep Breath', desc: 'You just kept swimming.', how: 'Spend ten minutes in The Drift' },
+  { id: 'whale_rider', name: 'Whale Rider', desc: 'She did not seem to mind.', how: 'Ride Big Blue' },
+  { id: 'pod', name: 'Pod', desc: 'Best group photo in the game.', how: 'Ride Big Blue with three others aboard' },
+  { id: 'bottler', name: 'Bottled Note', desc: 'Somebody wrote to nobody.', how: 'Find a message in a bottle' },
+  { id: 'beachcomber', name: 'Beachcomber', desc: 'You know where they wash up.', how: 'Find three messages in bottles' },
+  // --- minigames -----------------------------------------------------------
+  { id: 'angler', name: 'Angler', desc: 'The rod finally behaved.', how: 'Bank 40+ coins in one Reel Rush run' },
+  { id: 'reel_master', name: 'Reel Master', desc: 'The fish have filed a complaint.', how: 'Bank 90+ coins in one Reel Rush run' },
+  { id: 'downhill', name: 'Downhill', desc: 'Snow in the whiskers.', how: 'Finish a Summit Sprint run' },
+  { id: 'speed_demon', name: 'Speed Demon', desc: 'Steering is optional.', how: 'Bank 100+ coins in one Summit Sprint run' },
+  { id: 'barista', name: 'Barista', desc: 'Blend it like you mean it.', how: 'Bank 60+ coins in one Smoothie Scramble shift' },
+  { id: 'shift_lead', name: 'Shift Lead', desc: 'The blender fears you.', how: 'Work ten Smoothie Scramble shifts' },
+  { id: 'all_rounder', name: 'All Rounder', desc: 'A bit of everything.', how: 'Play fifty minigame runs' },
+  { id: 'racer', name: 'On Your Marks', desc: 'Three sleds, one hill.', how: 'Finish a sled race' },
+  { id: 'photo_finish', name: 'Photo Finish', desc: 'By a whisker.', how: 'Win a sled race' },
+  { id: 'hat_trick', name: 'Hat Trick', desc: 'The hill belongs to you.', how: 'Win three sled races' },
+  { id: 'hider', name: 'Sneaky Prop', desc: 'That barrel was not there before.', how: 'Play three rounds of Prop Hunt' },
+  { id: 'doodler', name: 'Doodler', desc: 'You saw it before the last line.', how: 'Guess ten doodles right' },
+  { id: 'prospector', name: 'Prospector', desc: 'Patience and a pickaxe.', how: 'Prospect twenty-five times in the mine' },
+  { id: 'gem_hunter', name: 'Gem Hunter', desc: 'That glitter was real.', how: 'Strike a gem in the mine' },
+  { id: 'motherlode', name: 'Motherlode', desc: 'The wall keeps giving.', how: 'Strike five gems in the mine' },
+  // --- the game den --------------------------------------------------------
+  { id: 'duelist', name: 'Duelist', desc: 'First blood, cosily.', how: 'Win a duel at the Game Den' },
+  { id: 'sweep', name: 'Sweep', desc: 'Not a single point conceded.', how: 'Win a den duel without dropping a point' },
+  { id: 'grandmaster', name: 'Grandmaster', desc: 'Four moves ahead.', how: 'Win a game of Grand Capy Chess' },
+  { id: 'card_shark', name: 'Card Shark', desc: 'The deck likes you.', how: 'Win five Capy Clash duels' },
+  { id: 'paddle_pro', name: 'Paddle Pro', desc: 'Reflexes of a very calm rodent.', how: 'Win five rounds of Paddle Panic' },
+  { id: 'four_up', name: 'Four Up', desc: 'Diagonals count.', how: 'Win a game of Four in a Row' },
+  { id: 'shuffler', name: 'Shuffler', desc: 'Just the right nudge.', how: 'Win a round of Shuffle Showdown' },
+  { id: 'den_regular', name: 'Den Regular', desc: 'Your stool has a dent in it.', how: 'Win ten duels at the Game Den' },
+  // --- the social cove -----------------------------------------------------
+  { id: 'first_dab', name: 'First Dab', desc: 'One pixel, forever.', how: 'Paint your first mural pixel' },
+  { id: 'muralist', name: 'Muralist', desc: 'You can see your bit from here.', how: 'Paint fifty mural pixels' },
+  { id: 'cove_painter', name: 'Cove Painter', desc: 'The wall is basically yours.', how: 'Paint two hundred and fifty mural pixels' },
+  { id: 'party_planner', name: 'Party Planner', desc: 'You sent the invite.', how: 'Throw a party' },
+  { id: 'host_most', name: 'Host With the Most', desc: 'Standing room only.', how: 'Get five capys to your party' },
+  { id: 'party_animal', name: 'Party Animal', desc: 'You heard the music.', how: 'Turn up at three parties' },
+  { id: 'socialite', name: 'Socialite', desc: 'That paw never stops.', how: 'Wave twenty-five times' },
+  { id: 'chatterbox', name: 'Chatterbox', desc: 'Never short of a word.', how: 'Send a hundred chat messages' },
+  { id: 'snow_fight', name: 'Snow Fight', desc: 'Direct hit, no hard feelings.', how: 'Land twenty-five snowballs' },
+  { id: 'volley', name: 'Volley', desc: 'Nobody agreed on the rules.', how: 'Bop the beach ball fifty times' },
+  { id: 'toasty', name: 'Toasty', desc: 'Warm paws, quiet talk.', how: 'Spend ten minutes at the bonfire' },
+  // --- the long game -------------------------------------------------------
+  { id: 'quester', name: 'Quester', desc: 'The board had a job for you.', how: 'Finish a daily quest' },
+  { id: 'clean_sweep', name: 'Clean Sweep', desc: 'All three, no leftovers.', how: 'Finish all three dailies in one day' },
+  { id: 'devoted', name: 'Devoted', desc: 'A habit, at this point.', how: 'Finish all three dailies on five days' },
+  { id: 'collector', name: 'Collector', desc: 'A hat for every mood.', how: 'Own five hats' },
+  { id: 'decorator', name: 'Decorator', desc: 'The den is coming along.', how: 'Place ten pieces of furniture in your den' },
+];
+
+/**
+ * Total-stamp milestones. These cosmetics are NOT buyable at any price: that is
+ * the whole point, they are visible proof of play. server/progress.js grants
+ * them (hats -> ownedHats, furniture -> ownedFurniture, color -> unlockedColors,
+ * title -> rec.title) and pushes the album so the UI can celebrate.
+ */
+// `stamps` is the threshold and `reward` is the grant; `name`/`kind` are
+// repeated at the top level because the album's milestone bar (src/ui/profile.js)
+// reads them from there.
+export const MILESTONES = [
+  { stamps: 5, name: 'Diver Snorkel', kind: 'hat', reward: { type: 'hat', id: 'snorkel', name: 'Diver Snorkel' } },
+  { stamps: 12, name: 'Aurora dye', kind: 'color', reward: { type: 'color', id: 0x7ff0d0, name: 'Aurora Dye' } },
+  { stamps: 20, name: 'Whale-song gramophone', kind: 'furniture', reward: { type: 'furniture', id: 'gramophone', name: 'Whale-Song Gramophone' } },
+  { stamps: 30, name: 'Golden pickaxe', kind: 'hat', reward: { type: 'hat', id: 'golden_pick', name: 'Golden Pickaxe' } },
+  { stamps: 40, name: '"Legend of the Cove" title', kind: 'title', reward: { type: 'title', id: 'legend', name: 'Legend of the Cove' } },
+];
 
 export function clampCoinsForGame(gameId, coins) {
   // own-property lookup: MINIGAMES['constructor'] is truthy and would yield NaN

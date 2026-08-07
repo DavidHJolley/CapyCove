@@ -160,18 +160,20 @@ export class Engine {
       // world clock: rooms that react to time of day get the current state
       // immediately on build, then live updates via the same hook (wave 7)
       if (this.lastClock && this.room.onClock) {
-        try { this.room.onClock(this.lastClock.dayT, this.lastClock.weather, this.lastClock.aurora); }
+        const c = this.lastClock;
+        try { this.room.onClock(c.dayT, c.weather, c.aurora, c); }
         catch (e) { console.error('[engine] onClock:', e); }
       }
       fade.classList.remove('on');
     }, 220);
   }
 
-  /** Called by the net client on every 'clock' frame. */
+  /** Called by the net client on every 'clock' frame. The full frame rides as
+   *  the 4th arg so rooms can read extras (peak snowfall lives in m.snow). */
   applyClock(m) {
     this.lastClock = m;
     if (this.room?.onClock) {
-      try { this.room.onClock(m.dayT, m.weather, m.aurora); }
+      try { this.room.onClock(m.dayT, m.weather, m.aurora, m); }
       catch (e) { console.error('[engine] onClock:', e); }
     }
   }

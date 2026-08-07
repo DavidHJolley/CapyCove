@@ -43,6 +43,12 @@ export function publicProfile(rec) {
     // used to share a single ownedHats reference (free hats + coin rollback).
     ownedHats: [...(rec.ownedHats || ['none'])],
     bests: { ...(rec.bests || {}) },
+    // wave 7 milestone rewards (server/progress.js writes both onto the record):
+    // the "Legend of the Cove" title that rides under the name tag, and the
+    // dye colours the stamp track has unlocked. Without them here the 12- and
+    // 40-stamp milestones were granted but never visible to any client.
+    title: typeof rec.title === 'string' ? rec.title : '',
+    unlockedColors: [...(rec.unlockedColors || [])],
   };
 }
 

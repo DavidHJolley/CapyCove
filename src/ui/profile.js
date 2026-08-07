@@ -1,5 +1,9 @@
 import * as THREE from 'three';
 import { HATS, MINIGAMES, ROOM_INFO } from '../../shared/constants.js';
+// Namespace import on purpose: STAMPS / MILESTONES are wave-7 additions owned by
+// the progression agent, and a named import of a binding that has not landed yet
+// is a link-time error. Reading them off the namespace degrades to a fallback.
+import * as SHARED from '../../shared/constants.js';
 import { createAvatar } from '../player/avatar.js';
 import { makeToon, makeGlow, disposeObject } from '../core/materials.js';
 import { visitHouse } from '../net/client.js';
@@ -94,6 +98,619 @@ function flavorTitle(bests, isBot, isSelf) {
 }
 
 // ---------------------------------------------------------------------------
+// stamp album (wave 7, docs/LIVING-COVE.md section D)
+//
+// The catalog is contract data and belongs in shared/constants.js as STAMPS
+// (and MILESTONES); this module owns the ART. Until the progression agent lands
+// those exports, FALLBACK_STAMPS/MILESTONES keep the tab, the slam and the
+// milestone bar honest instead of shipping an empty box. Shared always wins.
+// ---------------------------------------------------------------------------
+
+// id, name, what it is for, glyph, hue. Feats, not grind: every line here is a
+// thing you did in front of other capybaras.
+const FALLBACK_STAMPS = [
+  ['first_splash', 'First Splash', 'Finish your very first minigame run.', 'splash', 0x4fb3e8],
+  ['reel_it_in', 'Reel It In', 'Land 40 or more in Reel Rush.', 'fish', 0x42d6c8],
+  ['deep_pockets', 'Deep Pockets', 'Have 1000 coins in your purse at once.', 'coin', 0xf2b64a],
+  ['sweep', 'Sweep', 'Win a game of Paddle Panic 5-0.', 'paddle', 0xe8657a],
+  ['checkmate', 'Checkmate', 'Beat another capybara at Grand Capy Chess.', 'pawn', 0x9b6bd4],
+  ['four_up', 'Four Up', 'Win Four in a Row against a real opponent.', 'grid4', 0xf2a541],
+  ['clash', 'Clash Champion', 'Take a Capy Clash duel off another player.', 'card', 0xe8657a],
+  ['shuffler', 'Shuffle Master', 'Park every disc in the scoring zone.', 'disc', 0x7ac74f],
+  ['downhill', 'Downhill', 'Finish a three capybara sled race.', 'sled', 0x4fb3e8],
+  ['photo_finish', 'Photo Finish', 'Win a sled race by less than a second.', 'flag', 0xf2b64a],
+  ['blend_master', 'Blend Master', 'Score 350 in Smoothie Scramble.', 'blender', 0xf29ab0],
+  ['prop_star', 'Prop Star', 'Survive a whole Prop Hunt as a prop.', 'prop', 0x8a6642],
+  ['seeker', 'Seeker', 'Find every hider in one Prop Hunt.', 'eye', 0x2f7fb0],
+  ['quick_draw', 'Quick Draw', 'Have three capys guess your doodle.', 'brush', 0xe8657a],
+  ['good_guess', 'Good Guess', 'Guess five doodles in a single round.', 'bulb', 0xf2b64a],
+  ['glimmer', 'Glimmer', 'Dig a gem out of the Glimmer Mine.', 'gem', 0x42d6c8],
+  ['first_pixel', 'First Pixel', 'Add your first pixel to the plaza mural.', 'pixel', 0x7ac74f],
+  ['muralist', 'Muralist', 'Place fifty mural pixels, lifetime.', 'mural', 0xe8657a],
+  ['host_with_most', 'Host With the Most', 'Get five capys to a party you threw.', 'party', 0xf2b64a],
+  ['party_animal', 'Party Animal', 'Turn up to five parties.', 'confetti', 0x9b6bd4],
+  ['night_owl', 'Night Owl', 'See the aurora over Frosty Peak.', 'aurora', 0x42d6c8],
+  ['sunriser', 'Sunriser', 'Be in the plaza when the sun comes up.', 'sun', 0xf2a541],
+  ['rain_dance', 'Rain Dance', 'Dance outdoors in the rain.', 'rain', 0x4fb3e8],
+  ['snowballer', 'Snowballer', 'Land ten snowballs on willing victims.', 'snowball', 0xbfe6f5],
+  ['volley', 'Volley', 'Bop the beach ball ten times.', 'ball', 0xe8657a],
+  ['campfire', 'Campfire Capy', 'Sit out a whole night at the bonfire.', 'bonfire', 0xf2a541],
+  ['deep_breath', 'Deep Breath', 'Spend ten minutes down in The Drift.', 'bubbles', 0x2f7fb0],
+  ['pod', 'Pod', 'Ride Big Blue with three other capys aboard.', 'whale', 0x4fb3e8],
+  ['lantern', 'Lantern Light', 'Drift with the jellies after dark.', 'jelly', 0x9b6bd4],
+  ['message', 'Message in a Bottle', 'Be first to the day\'s bottle.', 'bottle', 0xf2b64a],
+  ['slow_steady', 'Slow and Steady', 'Follow the sea turtle a full lap.', 'turtle', 0x7ac74f],
+  ['decorator', 'Decorator', 'Place twenty things in your own den.', 'chair', 0x8a6642],
+  ['open_house', 'Open House', 'Have five visitors in your den at once.', 'door', 0xf2b64a],
+  ['social', 'Social Butterfly', 'Make five friends.', 'friends', 0xe8657a],
+  ['chatterbox', 'Chatterbox', 'Say a hundred things out loud.', 'bubble', 0x4fb3e8],
+  ['explorer', 'Explorer', 'Visit every room in a single cove day.', 'compass', 0xf2a541],
+  ['clean_sweep', 'Clean Sweep', 'Finish all three dailies in one day.', 'check', 0x7ac74f],
+  ['regular', 'Regular', 'Play on seven different days.', 'calendar', 0x9b6bd4],
+  ['hat_trick', 'Hat Trick', 'Own ten different hats.', 'hat', 0xf29ab0],
+  ['legend', 'Legend of the Cove', 'Earn every other stamp in the album.', 'crown', 0xf2c744],
+].map(([id, name, desc, glyph, hue]) => ({ id, name, desc, glyph, hue }));
+
+// total stamps -> exclusive reward coins cannot buy
+const FALLBACK_MILESTONES = [
+  { at: 5, name: 'Snorkel', kind: 'hat', glyph: 'bubbles', hue: 0xe8657a },
+  { at: 12, name: 'Aurora coat', kind: 'color', glyph: 'aurora', hue: 0x42d6c8 },
+  { at: 20, name: 'Whale-song gramophone', kind: 'furniture', glyph: 'gramo', hue: 0xf2b64a },
+  { at: 30, name: 'Golden pickaxe', kind: 'hat', glyph: 'pick', hue: 0xf2c744 },
+  { at: 40, name: '"Legend of the Cove" title', kind: 'title', glyph: 'ribbon', hue: 0x9b6bd4 },
+];
+
+const GLYPHS = ['splash', 'fish', 'coin', 'paddle', 'pawn', 'grid4', 'card', 'disc', 'sled',
+  'flag', 'blender', 'prop', 'eye', 'brush', 'bulb', 'gem', 'pixel', 'mural', 'party',
+  'confetti', 'aurora', 'sun', 'rain', 'snowball', 'ball', 'bonfire', 'bubbles', 'whale',
+  'jelly', 'bottle', 'turtle', 'chair', 'door', 'friends', 'bubble', 'compass', 'check',
+  'calendar', 'hat', 'crown'];
+
+const HUES = [0xe8657a, 0x4fb3e8, 0x7ac74f, 0xf2b64a, 0x9b6bd4, 0x42d6c8, 0xf2a541, 0xf29ab0];
+
+const FALLBACK_BY_ID = new Map(FALLBACK_STAMPS.map((s) => [s.id, s]));
+
+/** Stable per-id pick so a server-only stamp still gets consistent art. */
+function hashOf(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+function decorate(id, raw) {
+  const known = FALLBACK_BY_ID.get(id);
+  const h = hashOf(id);
+  const glyph = typeof raw?.glyph === 'string' && GLYPHS.includes(raw.glyph)
+    ? raw.glyph : (known?.glyph || GLYPHS[h % GLYPHS.length]);
+  const hue = Number.isFinite(Number(raw?.hue)) ? Number(raw.hue)
+    : (known?.hue ?? HUES[(h >> 5) % HUES.length]);
+  // shared STAMPS carry both a flavour line (desc) and the actual condition
+  // (how); the album shows the flavour once earned and the condition until then
+  const how = (typeof raw?.how === 'string' && raw.how.trim())
+    || (typeof raw?.desc === 'string' && raw.desc.trim()) || known?.desc || 'A cove secret.';
+  return {
+    id,
+    name: (typeof raw?.name === 'string' && raw.name.trim()) || known?.name || id,
+    desc: (typeof raw?.desc === 'string' && raw.desc.trim()) || how,
+    how,
+    glyph,
+    hue,
+  };
+}
+
+let _catalog = null;
+
+/** The stamp catalog: shared STAMPS when it exists, this module's list until then. */
+export function stampCatalog() {
+  if (_catalog) return _catalog;
+  const shared = SHARED.STAMPS;
+  if (Array.isArray(shared) && shared.length) {
+    _catalog = shared
+      .filter((s) => s && (typeof s.id === 'string'))
+      .map((s) => decorate(s.id, s));
+  } else if (shared && typeof shared === 'object') {
+    _catalog = Object.keys(shared).map((id) => decorate(id, shared[id]));
+  } else {
+    _catalog = FALLBACK_STAMPS.slice();
+  }
+  if (!_catalog.length) _catalog = FALLBACK_STAMPS.slice();
+  return _catalog;
+}
+
+export function stampById(id) {
+  if (typeof id !== 'string' || !id) return null;
+  for (const s of stampCatalog()) if (s.id === id) return s;
+  return decorate(id, null); // an unknown id still deserves a stamp, not a hole
+}
+
+/** Milestone rewards keyed by total stamps: shared MILESTONES when it exists. */
+export function milestoneTrack() {
+  const shared = SHARED.MILESTONES;
+  const list = Array.isArray(shared) ? shared : null;
+  if (!list || !list.length) return FALLBACK_MILESTONES;
+  return list
+    .map((m, i) => {
+      const at = Math.max(1, Math.floor(Number(m?.at ?? m?.stamps ?? 0)) || 0);
+      const fb = FALLBACK_MILESTONES[Math.min(i, FALLBACK_MILESTONES.length - 1)];
+      return {
+        at: at || fb.at,
+        name: (typeof m?.name === 'string' && m.name.trim()) || fb.name,
+        kind: typeof m?.kind === 'string' ? m.kind : fb.kind,
+        glyph: typeof m?.glyph === 'string' ? m.glyph : fb.glyph,
+        hue: Number.isFinite(Number(m?.hue)) ? Number(m.hue) : fb.hue,
+      };
+    })
+    .sort((a, b) => a.at - b.at);
+}
+
+/**
+ * Parse a 'stamps' frame (or a stamps blob hanging off a profile).
+ * Accepts [ids], {stamps:[ids]}, {earned:[ids]}, {stamps:{id:true}}.
+ */
+export function normalizeStamps(raw) {
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw.stamps ?? raw.earned ?? raw.ids ?? raw.list) : raw;
+  const ids = [];
+  if (Array.isArray(body)) {
+    for (const v of body) {
+      if (typeof v === 'string' && v) ids.push(v);
+      else if (v && typeof v === 'object' && typeof v.id === 'string') ids.push(v.id);
+    }
+  } else if (body && typeof body === 'object') {
+    for (const k of Object.keys(body)) if (body[k]) ids.push(k);
+  }
+  const owner = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw.id ?? raw.playerId ?? null) : null;
+  return { id: owner == null ? null : String(owner), ids: [...new Set(ids)] };
+}
+
+// ---- procedural stamp art -------------------------------------------------
+// Everything is drawn into a 100x100 unit box and scaled by the caller, so one
+// routine serves the 72px album tiles and the 260px slam without a second set
+// of numbers. No assets, same rules as the rest of the world.
+
+const INK = '#2d2417';
+const PAPER = '#fffaf0';
+
+const hex = (c) => `#${(c >>> 0).toString(16).padStart(6, '0')}`;
+
+/** Mix toward white (k>0) or ink (k<0) so one hue makes a whole little scene. */
+function shade(c, k) {
+  const r = (c >> 16) & 255; const g = (c >> 8) & 255; const b = c & 255;
+  const t = k > 0 ? 255 : 45;
+  const a = Math.abs(k);
+  const m = (v) => Math.round(v + (t - v) * a);
+  return `rgb(${m(r)},${m(g)},${m(b)})`;
+}
+
+function makePen(c) {
+  const pen = {
+    c,
+    dot(x, y, r, fill) { c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fillStyle = fill; c.fill(); return pen; },
+    oval(x, y, rx, ry, fill, rot = 0) {
+      c.beginPath(); c.ellipse(x, y, rx, ry, rot, 0, Math.PI * 2); c.fillStyle = fill; c.fill(); return pen;
+    },
+    box(x, y, w, h, r, fill) {
+      const rr = Math.min(r, w / 2, h / 2);
+      c.beginPath();
+      c.moveTo(x - w / 2 + rr, y - h / 2);
+      c.arcTo(x + w / 2, y - h / 2, x + w / 2, y + h / 2, rr);
+      c.arcTo(x + w / 2, y + h / 2, x - w / 2, y + h / 2, rr);
+      c.arcTo(x - w / 2, y + h / 2, x - w / 2, y - h / 2, rr);
+      c.arcTo(x - w / 2, y - h / 2, x + w / 2, y - h / 2, rr);
+      c.closePath(); c.fillStyle = fill; c.fill(); return pen;
+    },
+    poly(pts, fill) {
+      c.beginPath();
+      c.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+      c.closePath(); c.fillStyle = fill; c.fill(); return pen;
+    },
+    line(x1, y1, x2, y2, w, col) {
+      c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2);
+      c.strokeStyle = col; c.lineWidth = w; c.stroke(); return pen;
+    },
+    arc(x, y, r, a0, a1, w, col) {
+      c.beginPath(); c.arc(x, y, r, a0, a1);
+      c.strokeStyle = col; c.lineWidth = w; c.stroke(); return pen;
+    },
+    star(x, y, r, points, fill) {
+      c.beginPath();
+      for (let i = 0; i < points * 2; i++) {
+        const a = (i / (points * 2)) * Math.PI * 2 - Math.PI / 2;
+        const rr = i % 2 ? r * 0.45 : r;
+        const px = x + Math.cos(a) * rr; const py = y + Math.sin(a) * rr;
+        if (i === 0) c.moveTo(px, py); else c.lineTo(px, py);
+      }
+      c.closePath(); c.fillStyle = fill; c.fill(); return pen;
+    },
+  };
+  return pen;
+}
+
+/* eslint-disable no-unused-vars */
+const GLYPH_ART = {
+  splash: (p, h) => {
+    p.oval(50, 66, 30, 13, shade(h, 0.15));
+    p.poly([[34, 62], [50, 26], [66, 62]], shade(h, -0.1));
+    for (const [x, y, r] of [[30, 40, 5], [70, 36, 6], [50, 22, 4]]) p.dot(x, y, r, shade(h, 0.5));
+  },
+  fish: (p, h) => {
+    p.oval(46, 50, 26, 16, hex(h));
+    p.poly([[70, 50], [88, 34], [88, 66]], shade(h, -0.15));
+    p.dot(32, 45, 4, INK);
+    p.arc(46, 56, 12, 0.25, Math.PI - 0.25, 3, shade(h, -0.25));
+  },
+  coin: (p, h) => {
+    p.dot(50, 52, 28, shade(h, -0.1));
+    p.dot(50, 48, 28, hex(h));
+    p.dot(50, 48, 20, shade(h, 0.3));
+    p.star(50, 48, 12, 5, shade(h, -0.2));
+  },
+  paddle: (p, h) => {
+    p.box(34, 50, 12, 44, 6, hex(h));
+    p.box(68, 56, 12, 34, 6, shade(h, -0.2));
+    p.dot(52, 36, 8, PAPER);
+    p.dot(52, 36, 8, shade(h, 0.55));
+  },
+  pawn: (p, h) => {
+    p.dot(50, 32, 13, hex(h));
+    p.poly([[38, 46], [62, 46], [68, 74], [32, 74]], hex(h));
+    p.box(50, 78, 46, 10, 5, shade(h, -0.2));
+  },
+  grid4: (p, h) => {
+    p.box(50, 52, 62, 62, 12, shade(h, -0.15));
+    const cols = [shade(h, 0.6), hex(h), shade(h, 0.6), hex(h)];
+    let i = 0;
+    for (const y of [36, 68]) for (const x of [36, 68]) p.dot(x, y, 12, cols[i++]);
+  },
+  card: (p, h) => {
+    p.box(40, 54, 44, 60, 8, shade(h, -0.3));
+    p.box(56, 48, 44, 60, 8, PAPER);
+    p.poly([[56, 34], [70, 50], [56, 64], [42, 50]], hex(h));
+  },
+  disc: (p, h) => {
+    p.oval(50, 60, 34, 14, shade(h, -0.2));
+    p.oval(50, 52, 34, 14, hex(h));
+    p.oval(50, 52, 16, 6, shade(h, 0.5));
+  },
+  sled: (p, h) => {
+    p.poly([[24, 58], [76, 58], [70, 44], [30, 44]], hex(h));
+    p.arc(50, 62, 30, Math.PI * 0.15, Math.PI * 0.85, 6, shade(h, -0.3));
+    for (const x of [36, 64]) p.line(x, 58, x, 68, 5, shade(h, -0.3));
+    p.dot(50, 32, 9, shade(h, 0.4));
+  },
+  flag: (p, h) => {
+    p.line(34, 78, 34, 22, 6, INK);
+    p.poly([[34, 24], [78, 36], [34, 50]], hex(h));
+    p.dot(34, 20, 6, shade(h, 0.4));
+  },
+  blender: (p, h) => {
+    p.box(50, 72, 44, 20, 7, shade(h, -0.35));
+    p.poly([[34, 62], [66, 62], [62, 24], [38, 24]], shade(h, 0.55));
+    p.poly([[38, 62], [62, 62], [59, 40], [41, 40]], hex(h));
+    p.dot(50, 20, 7, shade(h, -0.2));
+  },
+  prop: (p, h) => {
+    p.box(50, 58, 46, 44, 8, hex(h));
+    p.box(50, 34, 52, 12, 6, shade(h, -0.25));
+    p.dot(40, 54, 4, INK);
+    p.dot(60, 54, 4, INK);
+    p.arc(50, 62, 9, 0.2, Math.PI - 0.2, 3, INK);
+  },
+  eye: (p, h) => {
+    p.poly([[16, 50], [50, 24], [84, 50], [50, 76]], PAPER);
+    p.dot(50, 50, 18, hex(h));
+    p.dot(50, 50, 9, INK);
+    p.dot(44, 44, 4, PAPER);
+  },
+  brush: (p, h) => {
+    p.line(26, 76, 62, 32, 8, shade(h, -0.35));
+    p.poly([[56, 26], [74, 40], [64, 52], [50, 38]], hex(h));
+    p.dot(24, 78, 8, shade(h, 0.35));
+  },
+  bulb: (p, h) => {
+    p.dot(50, 44, 22, hex(h));
+    p.box(50, 70, 20, 16, 5, shade(h, -0.35));
+    for (const a of [-1.1, -0.5, 0.5, 1.1]) {
+      p.line(50 + Math.sin(a) * 30, 44 - Math.cos(a) * 30, 50 + Math.sin(a) * 40, 44 - Math.cos(a) * 40, 5, shade(h, 0.25));
+    }
+  },
+  gem: (p, h) => {
+    p.poly([[50, 18], [80, 44], [50, 82], [20, 44]], hex(h));
+    p.poly([[50, 18], [80, 44], [50, 44]], shade(h, 0.45));
+    p.poly([[50, 44], [80, 44], [50, 82]], shade(h, -0.2));
+  },
+  pixel: (p, h) => {
+    p.box(50, 50, 66, 66, 8, shade(h, 0.65));
+    p.box(38, 38, 22, 22, 2, hex(h));
+    p.box(62, 62, 22, 22, 2, shade(h, -0.15));
+  },
+  mural: (p, h) => {
+    p.box(50, 50, 74, 58, 6, shade(h, -0.35));
+    const cols = [hex(h), shade(h, 0.5), '#7ac74f', '#4fb3e8', '#f2b64a', shade(h, 0.2)];
+    let i = 0;
+    for (const y of [36, 52, 68]) for (const x of [30, 50, 70]) p.box(x, y, 16, 12, 2, cols[i++ % cols.length]);
+  },
+  party: (p, h) => {
+    p.poly([[50, 16], [72, 72], [28, 72]], hex(h));
+    p.poly([[50, 16], [72, 72], [50, 72]], shade(h, -0.2));
+    p.dot(50, 14, 7, shade(h, 0.5));
+    for (const [x, y] of [[42, 44], [58, 56], [46, 62]]) p.dot(x, y, 5, PAPER);
+  },
+  confetti: (p, h) => {
+    const cols = [hex(h), '#4fb3e8', '#7ac74f', '#f2b64a', '#e8657a'];
+    let i = 0;
+    for (const [x, y, r] of [[26, 30, 0.4], [50, 22, -0.6], [74, 34, 0.8], [34, 62, -0.3], [62, 68, 0.5], [50, 48, 0.1]]) {
+      p.c.save(); p.c.translate(x, y); p.c.rotate(r);
+      p.box(0, 0, 18, 9, 3, cols[i++ % cols.length]);
+      p.c.restore();
+    }
+  },
+  aurora: (p, h) => {
+    p.box(50, 74, 84, 26, 6, shade(h, -0.45));
+    for (let i = 0; i < 3; i++) {
+      p.c.save();
+      p.c.beginPath();
+      p.c.moveTo(18, 60 - i * 6);
+      p.c.bezierCurveTo(38, 24 - i * 8, 62, 62 - i * 6, 84, 22 - i * 7);
+      p.c.strokeStyle = [hex(h), '#7ac74f', '#e8657a'][i];
+      p.c.lineWidth = 8 - i * 2;
+      p.c.lineCap = 'round';
+      p.c.stroke();
+      p.c.restore();
+    }
+    p.dot(24, 22, 3, PAPER); p.dot(76, 46, 3, PAPER);
+  },
+  sun: (p, h) => {
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      p.line(50 + Math.cos(a) * 24, 50 + Math.sin(a) * 24, 50 + Math.cos(a) * 38, 50 + Math.sin(a) * 38, 6, shade(h, 0.3));
+    }
+    p.dot(50, 50, 22, hex(h));
+    p.dot(43, 44, 6, shade(h, 0.5));
+  },
+  rain: (p, h) => {
+    p.dot(38, 40, 16, shade(h, 0.5));
+    p.dot(58, 36, 20, shade(h, 0.55));
+    p.dot(68, 46, 13, shade(h, 0.45));
+    for (const [x, y] of [[34, 66], [50, 72], [66, 64]]) {
+      p.poly([[x, y], [x + 5, y + 12], [x - 5, y + 12]], hex(h));
+    }
+  },
+  snowball: (p, h) => {
+    p.dot(52, 52, 24, shade(h, 0.45));
+    p.dot(44, 44, 8, PAPER);
+    for (const [x, y, r] of [[20, 26, 5], [80, 30, 4], [24, 78, 4]]) p.dot(x, y, r, shade(h, 0.2));
+  },
+  ball: (p, h) => {
+    p.dot(50, 50, 30, PAPER);
+    p.c.save();
+    p.c.beginPath(); p.c.arc(50, 50, 30, 0, Math.PI * 2); p.c.clip();
+    p.poly([[50, 50], [92, 22], [92, 54]], hex(h));
+    p.poly([[50, 50], [12, 62], [58, 88]], '#4fb3e8');
+    p.poly([[50, 50], [22, 14], [58, 12]], '#f2b64a');
+    p.c.restore();
+    p.arc(50, 50, 30, 0, Math.PI * 2, 4, INK);
+  },
+  bonfire: (p, h) => {
+    p.line(26, 74, 74, 62, 9, '#8a6642');
+    p.line(26, 62, 74, 74, 9, '#6b4f35');
+    p.poly([[50, 18], [66, 50], [50, 62], [34, 50]], hex(h));
+    p.poly([[50, 30], [59, 52], [50, 60], [41, 52]], shade(h, 0.5));
+  },
+  bubbles: (p, h) => {
+    p.dot(40, 62, 20, hex(h));
+    p.dot(33, 55, 6, PAPER);
+    p.dot(68, 38, 12, shade(h, 0.35));
+    p.dot(74, 66, 8, shade(h, 0.5));
+  },
+  whale: (p, h) => {
+    p.oval(46, 54, 32, 19, hex(h));
+    p.poly([[74, 52], [92, 36], [88, 62]], shade(h, -0.2));
+    p.oval(42, 64, 22, 9, shade(h, 0.5));
+    p.dot(26, 50, 4, INK);
+    p.line(40, 34, 40, 20, 5, shade(h, 0.5));
+    p.dot(40, 18, 5, shade(h, 0.6));
+  },
+  jelly: (p, h) => {
+    p.c.beginPath(); p.c.arc(50, 44, 24, Math.PI, 0); p.c.closePath();
+    p.c.fillStyle = hex(h); p.c.fill();
+    for (const x of [34, 44, 56, 66]) {
+      p.c.beginPath(); p.c.moveTo(x, 44);
+      p.c.quadraticCurveTo(x + 8, 60, x - 3, 78);
+      p.c.strokeStyle = shade(h, 0.35); p.c.lineWidth = 5; p.c.lineCap = 'round'; p.c.stroke();
+    }
+    p.dot(42, 36, 5, PAPER);
+  },
+  bottle: (p, h) => {
+    p.box(50, 60, 34, 44, 12, shade(h, 0.3));
+    p.box(50, 28, 14, 24, 5, shade(h, 0.3));
+    p.box(50, 16, 16, 8, 3, '#8a6642');
+    p.box(50, 60, 20, 26, 3, PAPER);
+    p.line(43, 54, 57, 54, 3, shade(h, -0.3));
+    p.line(43, 62, 53, 62, 3, shade(h, -0.3));
+  },
+  turtle: (p, h) => {
+    p.oval(50, 52, 30, 22, hex(h));
+    p.oval(50, 52, 12, 9, shade(h, -0.25));
+    for (const [x, y] of [[32, 38], [68, 38], [32, 66], [68, 66]]) p.oval(x, y, 9, 6, shade(h, 0.35));
+    p.dot(80, 46, 9, shade(h, 0.35));
+    p.dot(83, 44, 3, INK);
+  },
+  chair: (p, h) => {
+    p.box(50, 58, 52, 20, 8, hex(h));
+    p.box(28, 44, 12, 34, 6, shade(h, -0.2));
+    p.box(72, 44, 12, 34, 6, shade(h, -0.2));
+    p.box(50, 34, 40, 12, 6, shade(h, 0.3));
+    for (const x of [32, 68]) p.box(x, 74, 8, 14, 3, shade(h, -0.35));
+  },
+  door: (p, h) => {
+    p.box(50, 52, 50, 70, 10, shade(h, -0.3));
+    p.box(50, 54, 38, 58, 8, hex(h));
+    p.dot(64, 56, 5, shade(h, 0.55));
+    p.box(50, 26, 26, 10, 4, shade(h, 0.5));
+  },
+  friends: (p, h) => {
+    p.dot(36, 40, 14, hex(h));
+    p.c.beginPath(); p.c.arc(36, 76, 20, Math.PI, 0); p.c.closePath(); p.c.fillStyle = hex(h); p.c.fill();
+    p.dot(66, 44, 12, shade(h, 0.4));
+    p.c.beginPath(); p.c.arc(66, 78, 17, Math.PI, 0); p.c.closePath(); p.c.fillStyle = shade(h, 0.4); p.c.fill();
+  },
+  bubble: (p, h) => {
+    p.box(50, 44, 70, 46, 16, hex(h));
+    p.poly([[36, 64], [52, 64], [34, 80]], hex(h));
+    for (const x of [36, 50, 64]) p.dot(x, 44, 5, PAPER);
+  },
+  compass: (p, h) => {
+    p.dot(50, 50, 32, shade(h, 0.55));
+    p.arc(50, 50, 32, 0, Math.PI * 2, 5, INK);
+    p.poly([[50, 20], [58, 50], [50, 50], [42, 50]], hex(h));
+    p.poly([[50, 80], [42, 50], [50, 50], [58, 50]], shade(h, -0.25));
+    p.dot(50, 50, 5, INK);
+  },
+  check: (p, h) => {
+    p.dot(50, 50, 32, hex(h));
+    p.c.beginPath();
+    p.c.moveTo(32, 52); p.c.lineTo(45, 66); p.c.lineTo(70, 34);
+    p.c.strokeStyle = PAPER; p.c.lineWidth = 10; p.c.lineCap = 'round'; p.c.lineJoin = 'round'; p.c.stroke();
+  },
+  calendar: (p, h) => {
+    p.box(50, 54, 64, 60, 8, PAPER);
+    p.box(50, 32, 64, 16, 8, hex(h));
+    for (const x of [36, 64]) p.line(x, 20, x, 30, 6, shade(h, -0.3));
+    let i = 0;
+    for (const y of [50, 66]) for (const x of [32, 50, 68]) p.box(x, y, 12, 10, 2, i++ === 4 ? hex(h) : shade(h, 0.6));
+  },
+  hat: (p, h) => {
+    p.box(50, 66, 72, 12, 6, shade(h, -0.25));
+    p.c.beginPath(); p.c.arc(50, 60, 26, Math.PI, 0); p.c.closePath(); p.c.fillStyle = hex(h); p.c.fill();
+    p.box(50, 52, 54, 10, 5, shade(h, 0.5));
+  },
+  crown: (p, h) => {
+    p.poly([[22, 68], [28, 30], [40, 48], [50, 24], [60, 48], [72, 30], [78, 68]], hex(h));
+    p.box(50, 72, 58, 12, 5, shade(h, -0.2));
+    for (const [x, y] of [[28, 28], [50, 22], [72, 28]]) p.dot(x, y, 6, shade(h, 0.5));
+    p.dot(50, 60, 7, '#e8657a');
+  },
+  // milestone-only glyphs
+  gramo: (p, h) => {
+    p.box(50, 74, 56, 18, 6, '#8a6642');
+    p.oval(46, 64, 20, 7, shade(h, -0.3));
+    p.c.save(); p.c.translate(62, 44); p.c.rotate(0.5);
+    p.poly([[-6, 22], [6, 22], [24, -20], [-24, -20]], hex(h));
+    p.c.restore();
+    p.dot(46, 64, 4, PAPER);
+  },
+  pick: (p, h) => {
+    p.line(28, 76, 72, 30, 8, '#8a6642');
+    p.c.save(); p.c.translate(70, 28); p.c.rotate(-0.5);
+    p.poly([[-30, 0], [0, -10], [30, 0], [0, 8]], hex(h));
+    p.c.restore();
+    p.dot(38, 62, 5, shade(h, 0.5));
+  },
+  ribbon: (p, h) => {
+    p.dot(50, 40, 22, hex(h));
+    p.dot(50, 40, 13, shade(h, 0.5));
+    p.poly([[34, 56], [46, 56], [42, 86], [30, 76]], shade(h, -0.15));
+    p.poly([[54, 56], [66, 56], [70, 76], [58, 86]], shade(h, -0.15));
+  },
+};
+/* eslint-enable no-unused-vars */
+
+/**
+ * Draw one stamp into a 2D context that has already been scaled so the drawing
+ * box is `size` across. `earned` false gives the ghost: paper turned to dust,
+ * art reduced to a silhouette, a dashed edge where the perforation would be.
+ */
+export function drawStamp(ctx, size, stamp, earned) {
+  const s = size / 100;
+  ctx.save();
+  ctx.scale(s, s);
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+
+  const hue = stamp?.hue ?? 0xe8657a;
+  const art = stamp?.glyph && Object.prototype.hasOwnProperty.call(GLYPH_ART, stamp.glyph)
+    ? GLYPH_ART[stamp.glyph] : null;
+
+  // paper
+  const pen = makePen(ctx);
+  pen.box(50, 50, 92, 92, 10, earned ? PAPER : '#efe7d6');
+  // a tinted field so each stamp reads as its own little poster
+  ctx.save();
+  pen.box(50, 50, 82, 82, 7, earned ? shade(hue, 0.6) : '#e6ddca');
+  ctx.restore();
+
+  if (earned) {
+    ctx.save();
+    ctx.translate(50, 50);
+    // the glyph fills the field: these are read at 46px on a quest card
+    ctx.scale(0.86, 0.86);
+    ctx.translate(-50, -50);
+    if (art) art(pen, hue);
+    else pen.star(50, 50, 30, 5, hex(hue));
+    ctx.restore();
+    // postmark: two rings in the corner, like the cove's own franking
+    ctx.save();
+    ctx.globalAlpha = 0.17;
+    pen.arc(79, 25, 12, 0, Math.PI * 2, 3, INK);
+    pen.arc(79, 25, 7, 0, Math.PI * 2, 3, INK);
+    ctx.restore();
+  } else {
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    pen.box(50, 50, 30, 44, 14, '#b9ae95');
+    pen.dot(50, 40, 9, '#efe7d6');
+    ctx.fillStyle = '#8f846c';
+    ctx.font = '900 34px "Trebuchet MS", "Segoe UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('?', 50, 54);
+    ctx.restore();
+  }
+
+  // ink edge inside the paper
+  ctx.globalAlpha = earned ? 0.75 : 0.35;
+  pen.box(50, 50, 84, 84, 8, 'rgba(0,0,0,0)');
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2;
+  ctx.setLineDash(earned ? [] : [5, 5]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+
+  // punch the perforation last so it eats paper, not background: this is the
+  // one thing that makes the shape read as a stamp rather than a rounded tile
+  ctx.globalCompositeOperation = 'destination-out';
+  const N = 8;
+  for (let i = 0; i < N; i++) {
+    const t = 6 + (i / (N - 1)) * 88;
+    for (const [x, y] of [[t, 5], [t, 95], [5, t], [95, t]]) {
+      ctx.beginPath();
+      ctx.arc(x, y, 5.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+}
+
+/** Size a canvas for the display and paint one stamp into it. */
+export function paintStampCanvas(canvas, stamp, earned, px) {
+  const dpr = Math.min(globalThis.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(px * dpr);
+  canvas.height = Math.round(px * dpr);
+  canvas.style.width = `${px}px`;
+  canvas.style.height = `${px}px`;
+  const ctx = canvas.getContext && canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, px, px);
+  drawStamp(ctx, px, stamp, earned);
+}
+
+// ---------------------------------------------------------------------------
 // payload parsing (server shapes are tolerated loosely on purpose)
 // ---------------------------------------------------------------------------
 
@@ -178,7 +795,8 @@ const CSS = `
   animation: pf-rise 0.3s cubic-bezier(0.18, 1.15, 0.4, 1);
 }
 .pf-card:focus, .fr-card:focus { outline: none; }
-.pf-card { width: min(540px, 94vw); padding: 22px 24px 18px; }
+/* wide enough that the 50-stamp album gets four columns next to the turntable */
+.pf-card { width: min(608px, 94vw); padding: 22px 24px 18px; }
 .fr-card { width: min(430px, 94vw); padding: 22px 22px 16px; }
 .pf-x, .fr-x { position: absolute; top: 14px; right: 14px; z-index: 2; }
 
@@ -358,6 +976,74 @@ const CSS = `
   animation: pf-pop 0.34s var(--spring);
 }
 
+/* ---- stamp album (wave 7) ---- */
+.pf-tabs { display: flex; gap: 6px; margin-top: 6px; }
+.pf-tab {
+  flex: 1; border: 0; cursor: pointer; font-family: var(--font); color: #a3906c;
+  font-size: 10px; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase;
+  padding: 7px 8px; border-radius: 999px; background: rgba(45, 36, 23, 0.06);
+  transition: background 0.16s ease, color 0.16s ease, scale 0.12s ease;
+}
+.pf-tab:hover { background: rgba(45, 36, 23, 0.11); }
+.pf-tab:active { scale: 0.96; }
+.pf-tab.is-on { background: var(--gold); color: #6b4c0c; box-shadow: 0 3px 0 rgba(158, 111, 20, 0.28); }
+.pf-tab:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
+.pf-pane[hidden] { display: none; }
+
+.pf-album-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  font-size: 11.5px; font-weight: 800; color: #a3906c;
+}
+.pf-album-head b { font-size: 15px; color: var(--ink); }
+.pf-mile {
+  margin: 8px 0 10px; background: var(--card); border-radius: 15px; padding: 11px 13px 9px;
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.06);
+}
+.pf-mile-top { font-size: 11px; font-weight: 800; color: var(--muted); margin-bottom: 8px; }
+.pf-mile-top b { color: var(--accent); }
+.pf-mile-bar {
+  position: relative; height: 9px; border-radius: 999px; background: rgba(45, 36, 23, 0.1);
+  margin: 0 6px 4px;
+}
+.pf-mile-fill {
+  position: absolute; inset: 0 auto 0 0; border-radius: 999px; width: 0;
+  background: linear-gradient(90deg, var(--gold) 0%, var(--accent) 100%);
+  transition: width 0.6s var(--spring);
+}
+.pf-mile-nodes { position: relative; height: 44px; margin: 0 6px; }
+.pf-mile-node {
+  position: absolute; top: -12px; translate: -50% 0; width: 30px; text-align: center;
+}
+.pf-mile-node canvas { display: block; margin: 0 auto; filter: grayscale(1) opacity(0.42); }
+.pf-mile-node.is-hit canvas { filter: none; }
+.pf-mile-node span {
+  display: block; font-size: 9.5px; font-weight: 900; color: #b6a688; margin-top: 1px;
+}
+.pf-mile-node.is-hit span { color: var(--accent); }
+
+.pf-album {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(66px, 1fr));
+  gap: 7px; max-height: 40vh; overflow-y: auto; padding: 3px;
+}
+.pf-stamp {
+  position: relative; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 5px 3px 6px; border-radius: 13px; background: var(--card); border: 0;
+  font-family: var(--font); cursor: default; color: var(--ink);
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.06);
+  animation: pf-pop 0.3s backwards var(--spring); animation-delay: calc(var(--i) * 18ms);
+}
+.pf-stamp.is-earned { cursor: help; }
+.pf-stamp canvas { display: block; }
+.pf-stamp-name {
+  font-size: 9.5px; font-weight: 900; line-height: 1.15; text-align: center;
+  color: #a3906c; overflow-wrap: anywhere;
+}
+.pf-stamp.is-earned .pf-stamp-name { color: var(--ink); }
+.pf-album-empty {
+  grid-column: 1 / -1; text-align: center; font-size: 12px; font-weight: 700;
+  color: var(--muted); padding: 16px 10px; line-height: 1.5;
+}
+
 @keyframes pf-fade { from { opacity: 0; } }
 @keyframes pf-rise { from { opacity: 0; transform: translateY(16px) scale(0.95); } }
 @keyframes pf-pop { from { opacity: 0; transform: translateY(9px) scale(0.92); } }
@@ -371,7 +1057,8 @@ const CSS = `
 }
 @media (prefers-reduced-motion: reduce) {
   .pf-card, .fr-card, .pf-row, .fr-row, .fr-den, .fr-dot.is-on::after,
-  .fr-hud-badge, .fr-empty-art { animation: none; }
+  .fr-hud-badge, .fr-empty-art, .pf-stamp { animation: none; }
+  .pf-mile-fill { transition: none; }
 }
 `;
 
@@ -528,6 +1215,11 @@ export function openProfile(game, playerId) {
     online: isSelf ? true : (local ? true : null),
     bests: isSelf ? game.state.bests || {} : {},
     isFriend: null,
+    // null means "not answered yet", which is not the same as an empty album
+    stamps: isSelf && game.state.stamps ? normalizeStamps(game.state.stamps).ids : null,
+    // the 40-stamp milestone title, when the server has one for them: it beats
+    // the flavour line below, because it was actually earned
+    title: (isSelf && typeof game.state.title === 'string' && game.state.title) || '',
     loaded: isSelf,
   };
 
@@ -549,8 +1241,20 @@ export function openProfile(game, playerId) {
             <div class="pf-title"></div>
           </div>
           <div class="pf-where"></div>
-          <div class="pf-section">Achievements</div>
-          <div class="pf-medals"></div>
+          <div class="pf-tabs">
+            <button class="pf-tab is-on" type="button" data-tab="medals">Achievements</button>
+            <button class="pf-tab" type="button" data-tab="album">Stamp album</button>
+          </div>
+          <div class="pf-pane" data-pane="medals"><div class="pf-medals"></div></div>
+          <div class="pf-pane" data-pane="album" hidden>
+            <div class="pf-album-head"><span>Stamps in the album</span><b class="pf-album-count">-</b></div>
+            <div class="pf-mile">
+              <div class="pf-mile-top"></div>
+              <div class="pf-mile-bar"><i class="pf-mile-fill"></i></div>
+              <div class="pf-mile-nodes"></div>
+            </div>
+            <div class="pf-album"></div>
+          </div>
           <div class="pf-actions"></div>
         </div>
       </div>
@@ -569,6 +1273,11 @@ export function openProfile(game, playerId) {
   const outfitDot = q('.pf-dot-color');
   const outfitTxt = q('.pf-outfit-txt');
   const canvas = q('.pf-canvas');
+  const albumEl = q('.pf-album');
+  const albumCount = q('.pf-album-count');
+  const mileTop = q('.pf-mile-top');
+  const mileFill = q('.pf-mile-fill');
+  const mileNodes = q('.pf-mile-nodes');
 
   // ---- 3D stage ------------------------------------------------------------
   let stage = null;
@@ -589,7 +1298,7 @@ export function openProfile(game, playerId) {
     if (isSelf) nameRow.appendChild(elm('span', 'pf-chip is-self', 'You'));
     else if (who.bot) nameRow.appendChild(elm('span', 'pf-chip', 'Cove local'));
     else if (who.isFriend) nameRow.appendChild(elm('span', 'pf-chip is-friend', 'Friend'));
-    titleEl.textContent = flavorTitle(who.bests, who.bot, isSelf);
+    titleEl.textContent = who.title || flavorTitle(who.bests, who.bot, isSelf);
 
     const roomName = who.room && Object.prototype.hasOwnProperty.call(ROOM_INFO, who.room)
       ? ROOM_INFO[who.room].name : null;
@@ -630,6 +1339,89 @@ export function openProfile(game, playerId) {
       const score = elm('div', `pf-row-score${best == null ? ' is-empty' : ''}`, best == null ? '-' : String(best));
       row.append(medal, txt, score);
       medalsEl.appendChild(row);
+    });
+  }
+
+  // ---- stamp album ---------------------------------------------------------
+  // The milestone rail is built once (the thresholds never move); only the
+  // "reached" state and the fill width change as stamps land.
+  const track = milestoneTrack();
+  const trackMax = track.length ? track[track.length - 1].at : 40;
+  const mileRefs = track.map((m) => {
+    const node = elm('div', 'pf-mile-node');
+    node.style.left = `${Math.min(100, (m.at / trackMax) * 100)}%`;
+    const c = document.createElement('canvas');
+    paintStampCanvas(c, m, true, 26);
+    node.append(c, elm('span', null, String(m.at)));
+    node.title = `${m.at} stamps: ${m.name}`;
+    mileNodes.appendChild(node);
+    return { node, m };
+  });
+
+  function renderAlbum() {
+    const cat = stampCatalog();
+    const known = who.stamps != null;
+    const earned = new Set(who.stamps || []);
+    const count = earned.size;
+
+    albumCount.textContent = known ? `${count} / ${cat.length}` : '-';
+
+    const next = track.find((m) => m.at > count);
+    mileTop.textContent = '';
+    if (!known) {
+      mileTop.textContent = 'Reading the album...';
+    } else if (next) {
+      mileTop.append(
+        document.createTextNode(`${Math.max(0, next.at - count)} more for `),
+        elm('b', null, next.name),
+      );
+    } else {
+      mileTop.append(elm('b', null, 'Every milestone claimed.'));
+      mileTop.append(document.createTextNode(' Nothing left to unlock, everything left to show off.'));
+    }
+    mileFill.style.width = `${Math.min(100, (count / trackMax) * 100)}%`;
+    for (const r of mileRefs) r.node.classList.toggle('is-hit', known && count >= r.m.at);
+
+    albumEl.textContent = '';
+    if (!known) {
+      albumEl.appendChild(elm('div', 'pf-album-empty',
+        isSelf ? 'Fetching your album from the cove...' : 'Asking around about their album...'));
+      return;
+    }
+    cat.forEach((s, i) => {
+      const got = earned.has(s.id);
+      const tile = elm('div', `pf-stamp${got ? ' is-earned' : ''}`);
+      tile.style.setProperty('--i', String(i));
+      const c = document.createElement('canvas');
+      paintStampCanvas(c, s, got, 62);
+      tile.appendChild(c);
+      tile.appendChild(elm('div', 'pf-stamp-name', got ? s.name : 'Locked'));
+      tile.title = got ? `${s.name} : ${s.desc}` : `Not yet : ${s.how || s.desc}`;
+      albumEl.appendChild(tile);
+    });
+  }
+
+  let askedStamps = false;
+  let stampsTimer = 0;
+  function askStamps() {
+    if (askedStamps || who.stamps != null) return;
+    askedStamps = true;
+    game.net?.send?.({ t: 'stamps', id: isSelf ? undefined : who.id });
+    // the server may not answer at all (older build, guest); an empty album
+    // reads honestly, a spinner that never stops does not
+    stampsTimer = setTimeout(() => {
+      stampsTimer = 0;
+      if (who.stamps == null) { who.stamps = []; renderAlbum(); }
+    }, 4000);
+  }
+
+  for (const tab of root.querySelectorAll('.pf-tab')) {
+    tab.addEventListener('click', () => {
+      const which = tab.dataset.tab;
+      for (const t of root.querySelectorAll('.pf-tab')) t.classList.toggle('is-on', t === tab);
+      for (const p of root.querySelectorAll('.pf-pane')) p.hidden = p.dataset.pane !== which;
+      game.audio?.play?.('click');
+      if (which === 'album') askStamps();
     });
   }
 
@@ -728,6 +1520,7 @@ export function openProfile(game, playerId) {
   function renderAll() {
     renderHead();
     renderMedals();
+    renderAlbum();
     renderActions();
   }
 
@@ -751,10 +1544,38 @@ export function openProfile(game, playerId) {
       if (p.room != null) who.room = p.room;
       if (p.online != null) who.online = p.online;
       if (p.isFriend != null) who.isFriend = p.isFriend;
+      if (raw && typeof raw === 'object' && typeof raw.title === 'string') {
+        who.title = raw.title.trim().slice(0, 32);
+      }
       who.bests = { ...who.bests, ...p.bests };
+      // the album can ride along on the profile frame; if it does, no second ask
+      if (raw && typeof raw === 'object' && raw.stamps != null) {
+        who.stamps = normalizeStamps(raw).ids;
+      }
       who.loaded = true;
       stage?.setLook(who.color, who.hat);
       renderAll();
+    }),
+    game.events.on('stamps', (payload) => {
+      const s = normalizeStamps(payload);
+      // an unkeyed frame is the server answering about us
+      if (s.id != null && s.id !== who.id) return;
+      if (s.id == null && !isSelf) return;
+      who.stamps = s.ids;
+      // the album frame carries the milestone title; adopt it so the card (and
+      // our own state, for the next card we open) is right straight away
+      if (typeof payload?.title === 'string') {
+        who.title = payload.title.trim().slice(0, 32);
+        if (isSelf) game.state.title = who.title;
+      }
+      renderAlbum();
+      renderHead();
+    }),
+    // a stamp earned while the card is open lands in the album straight away
+    game.events.on('stamp', (m) => {
+      if (!isSelf || !m || typeof m.id !== 'string') return;
+      who.stamps = [...new Set([...(who.stamps || []), m.id])];
+      renderAlbum();
     }),
     game.events.on('friends-data', (payload) => {
       if (isSelf || who.bot) return;
@@ -773,6 +1594,7 @@ export function openProfile(game, playerId) {
     game.net?.send?.({ t: 'inspect', id: who.id });
     if (game.state.registered) game.net?.send?.({ t: 'friends' });
   }
+  askStamps(); // the album tab should be warm the moment it is clicked
   // never leave the card stuck on "Checking..."
   const settle = setTimeout(() => {
     if (who.loaded) return;
@@ -787,6 +1609,7 @@ export function openProfile(game, playerId) {
     closed = true;
     if (openInstance?.id === id) openInstance = null;
     clearTimeout(settle);
+    if (stampsTimer) { clearTimeout(stampsTimer); stampsTimer = 0; }
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
     root.removeEventListener('pointerdown', onBackdrop);

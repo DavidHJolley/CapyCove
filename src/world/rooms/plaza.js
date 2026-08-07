@@ -2,6 +2,16 @@ import * as THREE from 'three';
 import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
+// The mural overlay publishes the grid size, the palette and the decoder for
+// exactly this reason: the in-world wall must paint the SAME pixels the overlay
+// paints, and an index is the wire contract, so a second copy of the palette
+// here would be a silent recolouring bug the first time either side changed.
+// (openMural comes in on the same static import: the module is already in this
+// chunk because of the four helpers above, so a dynamic import of it bought
+// nothing and only made the bundler warn about the double edge.)
+import {
+  MURAL_W, MURAL_H, MURAL_PALETTE, decodeMuralGrid, muralImageData, openMural,
+} from '../../ui/mural.js';
 
 /**
  * Sunny Plaza: the central hub of Capy Cove.
@@ -56,6 +66,83 @@ const NOTICES = [
   'Please do not nibble the topiary. He is a friend, not a snack.',
   'Lost sock in the fountain. Third one this week. Be better, cove.',
 ];
+
+// ---------------------------------------------------------- world clock ----
+// docs/LIVING-COVE.md section A. One cove day = 40 real minutes; `dayT` is a
+// continuous phase in [0,1) with 0 dawn / 0.25 noon / 0.5 dusk / 0.75 midnight.
+// The server owns it and broadcasts every 10s; onClock() takes the frame and
+// update() interpolates between frames so the sky never steps. Every colour
+// below is preallocated and lerped in place: the clock adds zero per-frame
+// allocations and no new shadow casters (the one directional light doubles as
+// sun by day and moon by night).
+const DAY_SECONDS = 40 * 60;
+const TAU = Math.PI * 2;
+
+/** 4-stop sky/light LUT, indexed by quarter-day: dawn, noon, dusk, night.
+ *  Stop 1 (noon) reproduces the room's shipped daylight look exactly. */
+const SKY_LUT = [
+  { // 0.00 dawn: peach haze, long warm light
+    sky: new THREE.Color(0xf7c69c), fog: new THREE.Color(0xf6d9c2),
+    sun: new THREE.Color(0xffcf96), sunI: 1.05,
+    hemiSky: new THREE.Color(0xffe3c4), hemiGnd: new THREE.Color(0x9a9a72), hemiI: 0.86,
+    ambI: 0.24,
+  },
+  { // 0.25 noon: the shipped look (SKY / FOG / the original sun + fills)
+    sky: new THREE.Color(SKY), fog: new THREE.Color(FOG),
+    sun: new THREE.Color(0xfff3d2), sunI: 1.55,
+    hemiSky: new THREE.Color(0xfff6e2), hemiGnd: new THREE.Color(0x8fae6a), hemiI: 1.0,
+    ambI: 0.2,
+  },
+  { // 0.50 dusk: coral sky, the hour the lamps come on
+    sky: new THREE.Color(0xef9a72), fog: new THREE.Color(0xe8a98f),
+    sun: new THREE.Color(0xff9a58), sunI: 0.95,
+    hemiSky: new THREE.Color(0xffc2a0), hemiGnd: new THREE.Color(0x6f6a55), hemiI: 0.7,
+    ambI: 0.26,
+  },
+  { // 0.75 midnight: deep blue, moonlit. Fills never drop below the ~0.45
+    // playability floor called out in LIVING-COVE.md.
+    sky: new THREE.Color(0x1b2747), fog: new THREE.Color(0x2a3a63),
+    sun: new THREE.Color(0xa8c0f0), sunI: 0.42,
+    hemiSky: new THREE.Color(0x4b5f92), hemiGnd: new THREE.Color(0x2c3a38), hemiI: 0.5,
+    ambI: 0.3,
+  },
+];
+
+const RAIN_TINT = new THREE.Color(0x93a3b0);
+const LAMP_DAY = new THREE.Color(0xefe6cd);   // cold glass in daylight
+const LAMP_NIGHT = new THREE.Color(0xffeeb0); // lit filament after dusk
+const BEAD_DAY = new THREE.Color(0x7d5f42);   // unlit bulbs read as wooden beads
+const BEAD_NIGHT = new THREE.Color(0xffdf9a);
+const WIN_DAY = new THREE.Color(0x9fdcf5);    // shop glass reflecting the sky
+const WIN_NIGHT = new THREE.Color(0xffcd7e);  // a warm room behind it
+const DOOR_DAY = new THREE.Color(0xffdca8);
+const DOOR_NIGHT = new THREE.Color(0xffe9bd);
+
+// scratch colours: reused every frame, never allocated inside update()
+const _cA = new THREE.Color();
+const _cB = new THREE.Color();
+
+const sm = (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
+
+/** Lamps/bunting/windows glow level for a phase: on dusk-to-dawn, eased. */
+function nightMix(u) {
+  if (u < 0.07) return 1 - sm(u / 0.07);        // fading out through sunrise
+  if (u < 0.40) return 0;
+  if (u < 0.52) return sm((u - 0.40) / 0.12);   // coming on through sunset
+  return 1;
+}
+
+// ------------------------------------------------------------ the mural ----
+// docs/LIVING-COVE.md section A4: a 96x54 collaborative pixel canvas on a
+// framed wall beside the quest board. The overlay (src/ui/mural.js) owns
+// painting and the palette; this wall is the always-on public view of the same
+// grid, so it listens to the same frames and never keeps its own copy of the
+// contract data. Wire shapes (server/index.js): out {t:'mural-grid'} asks for
+// the wall, in {t:'mural-grid', rle} answers, in {t:'mural', x, y, c} is one
+// placed pixel broadcast to everyone. Refusals ride the same 'mural' name with
+// {ok:false, wait} and NO cell, which is why _muralPaint insists on numbers.
+// The A4 "report mural" affordance lives in the overlay (out {t:'mural-report'})
+// rather than as a second world hotspot on the board.
 
 // ------------------------------------------------------------------ utils --
 const _o = new THREE.Object3D();
@@ -125,6 +212,13 @@ function glowFade(color, opacity) {
   m.transparent = true;
   m.opacity = opacity;
   m.depthWrite = false;
+  return m;
+}
+/** Additive variant for light pools: adds nothing at opacity 0, so a lamp that
+ *  has not come on yet costs a blend and no visible quad. */
+function glowAdd(color, opacity) {
+  const m = glowFade(color, opacity);
+  m.blending = THREE.AdditiveBlending;
   return m;
 }
 
@@ -253,7 +347,10 @@ function stripeTex() {
   });
 }
 
-function noticeTex() {
+// The old cove notice board, redressed as the Quest Board (LIVING-COVE.md D).
+// The pinned notes keep their flavour; two of them gained tick boxes so the
+// board reads as "there are things to do here" from across the plaza.
+function questBoardTex() {
   const w = 512, h = 384;
   return canvasTexture(w, h, (ctx) => {
     ctx.fillStyle = '#d9b98a';
@@ -263,24 +360,27 @@ function noticeTex() {
     ctx.fillStyle = '#5b3a1e';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    fitFont(ctx, 'COVE NOTICES', w - 60, 52);
-    ctx.fillText('COVE NOTICES', w / 2, 42);
+    fitFont(ctx, 'QUEST BOARD', w - 60, 54);
+    ctx.fillText('QUEST BOARD', w / 2, 40);
+    ctx.fillStyle = '#8a5c2c';
+    fitFont(ctx, 'three fresh every dawn', w - 120, 22, 'normal');
+    ctx.fillText('three fresh every dawn', w / 2, 72);
     ctx.strokeStyle = '#8a5c2c';
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.moveTo(60, 72);
-    ctx.lineTo(w - 60, 72);
+    ctx.moveTo(60, 90);
+    ctx.lineTo(w - 60, 90);
     ctx.stroke();
 
     const notes = [
-      ['#fffbe8', -0.03, 'Fishing derby', 'Driftwood Beach, all day'],
-      ['#eaf6ff', 0.04, 'Sled races', 'Frosty Peak, hourly'],
-      ['#ffeef2', -0.02, 'Kelpberry Crush', 'smoothie of the week'],
-      ['#f2ffe8', 0.03, 'Hat sale!', 'wardrobe, east side'],
+      ['#fffbe8', -0.03, 'Fishing derby', 'Driftwood Beach, all day', true],
+      ['#eaf6ff', 0.04, 'Sled races', 'Frosty Peak, hourly', true],
+      ['#ffeef2', -0.02, 'Kelpberry Crush', 'smoothie of the week', false],
+      ['#f2ffe8', 0.03, 'Paint the mural', 'right next door', true],
     ];
     notes.forEach((n, i) => {
       ctx.save();
-      ctx.translate(140 + (i % 2) * 232, 165 + ((i / 2) | 0) * 128);
+      ctx.translate(140 + (i % 2) * 232, 175 + ((i / 2) | 0) * 128);
       ctx.rotate(n[1]);
       ctx.fillStyle = 'rgba(60,40,20,0.18)';
       rrect(ctx, -96, -50, 196, 104, 6);
@@ -289,11 +389,24 @@ function noticeTex() {
       rrect(ctx, -100, -54, 196, 104, 6);
       ctx.fill();
       ctx.fillStyle = '#4a2f16';
-      fitFont(ctx, n[2], 172, 32);
-      ctx.fillText(n[2], -2, -18);
+      fitFont(ctx, n[2], 150, 30);
+      ctx.fillText(n[2], 8, -18);
       ctx.fillStyle = '#7a5836';
       fitFont(ctx, n[3], 176, 21, 'normal');
       ctx.fillText(n[3], -2, 18);
+      if (n[4]) {
+        ctx.strokeStyle = '#7a5836';
+        ctx.lineWidth = 3;
+        rrect(ctx, -84, -32, 26, 26, 5);
+        ctx.stroke();
+        ctx.strokeStyle = '#7ac74f';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(-79, -20);
+        ctx.lineTo(-72, -12);
+        ctx.lineTo(-60, -30);
+        ctx.stroke();
+      }
       ctx.fillStyle = '#e8657a';
       ctx.beginPath();
       ctx.arc(-2, -44, 7, 0, Math.PI * 2);
@@ -385,34 +498,65 @@ export class PlazaRoom extends Room {
     this.t = 0;
     this.anim = null;
     this.noticeIdx = 0;
+    // world clock (LIVING-COVE.md A). null until the server's first frame: with
+    // no clock the plaza keeps its shipped noon look exactly, so offline/solo
+    // sessions are unchanged.
+    this._dayT = null;
+    this._serverT = 0;
+    this.weather = 'clear';
+    this.aurora = false;
+    this._rainLevel = 0;
+    this.mural = null;
+    this._muralReqT = 0;
+    this._muralTries = 0;
+    this._off = [];
   }
 
-  build(scene) {
+  build(scene, game) {
     const rand = rng(20260806);
     this.t = 0;
     this.groundMeshes = [];
     this.hotspots = [];
     this.obstacles = [];
     this.anim = {};
+    this.game = game || null;
+    this._dayT = null;
+    this._rainLevel = 0;
+    this.weather = 'clear';
+    this.aurora = false;
+    this.mural = null;
+    for (const off of this._off) { try { off(); } catch { /* already gone */ } }
+    this._off = [];
 
     scene.background = new THREE.Color(SKY);
     scene.fog = new THREE.Fog(FOG, 42, 118);
 
-    scene.add(new THREE.HemisphereLight(0xfff6e2, 0x8fae6a, 1.0));
-    scene.add(new THREE.AmbientLight(0xdfefff, 0.2));
+    const hemi = new THREE.HemisphereLight(0xfff6e2, 0x8fae6a, 1.0);
+    scene.add(hemi);
+    const amb = new THREE.AmbientLight(0xdfefff, 0.2);
+    scene.add(amb);
     const sun = new THREE.DirectionalLight(0xfff3d2, 1.55);
     sun.position.set(14, 22, 9);
     sun.castShadow = true;
     sun.shadow.mapSize.set(1024, 1024);
-    sun.shadow.camera.left = -21;
-    sun.shadow.camera.right = 21;
-    sun.shadow.camera.top = 21;
-    sun.shadow.camera.bottom = -21;
+    // widened from +-21/62 for the clock: a dawn or dusk sun sits ~17 degrees
+    // above the horizon and the plaza's shadows stretch well past the old
+    // frustum. Still ONE shadow caster, still a 1024 map.
+    sun.shadow.camera.left = -25;
+    sun.shadow.camera.right = 25;
+    sun.shadow.camera.top = 25;
+    sun.shadow.camera.bottom = -25;
     sun.shadow.camera.near = 1;
-    sun.shadow.camera.far = 62;
+    sun.shadow.camera.far = 86;
+    sun.shadow.camera.updateProjectionMatrix();
     sun.shadow.bias = -0.0006;
     sun.shadow.normalBias = 0.02;
     scene.add(sun);
+    this.anim.sun = sun;
+    this.anim.hemi = hemi;
+    this.anim.amb = amb;
+    this.anim.skyColor = scene.background;
+    this.anim.fog = scene.fog;
 
     this._buildGround(scene, rand);
     this._buildHorizon(scene, rand);
@@ -421,12 +565,14 @@ export class PlazaRoom extends Room {
     this._buildBenches(scene);
     this._buildFlowerBeds(scene, rand);
     this._buildTopiary(scene);
-    this._buildNoticeBoard(scene);
+    this._buildQuestBoard(scene);
+    this._buildMural(scene, game);
     this._buildShop(scene);
     this._buildGates(scene);
     this._buildClubEntrance(scene);
     this._buildScatter(scene, rand);
     this._buildCritters(scene, rand);
+    this._buildRain(scene);
 
     // just inside each gate, a step beyond its hotspot radius so arriving from
     // a room does not immediately re-prompt the way back
@@ -631,9 +777,28 @@ export class PlazaRoom extends Room {
     inst(scene, new THREE.CylinderGeometry(0.34, 0.44, 0.26, 10), makeToon(C.stoneDark), base, true, true);
     inst(scene, new THREE.CylinderGeometry(0.1, 0.14, 3.4, 8), makeToon(C.iron), post);
     inst(scene, new THREE.ConeGeometry(0.36, 0.4, 6), makeToon(C.gold), cap);
-    const globeMesh = inst(scene, new THREE.SphereGeometry(0.26, 12, 9), makeGlow(C.lampGlow), globe, false, false);
-    const haloMesh = inst(scene, new THREE.SphereGeometry(0.44, 10, 8), glowFade(C.lampGlow, 0.2), halo, false, false);
-    this.anim.lamps = { pts, globeMesh, haloMesh };
+    // unique (not the shared glow cache) so the clock may lerp their colour;
+    // the gate lamps below reuse this same material and light with them
+    const lampMat = makeGlow(C.lampGlow, { unique: true });
+    const haloMat = glowFade(C.lampGlow, 0.2);
+    const globeMesh = inst(scene, new THREE.SphereGeometry(0.26, 12, 9), lampMat, globe, false, false);
+    const haloMesh = inst(scene, new THREE.SphereGeometry(0.44, 10, 8), haloMat, halo, false, false);
+
+    // Warm pool on the cobbles under each lamp. LIVING-COVE.md asks for "a warm
+    // point light where one already exists": the plaza's only point light is the
+    // grotto mouth, so rather than add six new lights (and six more shadow-free
+    // but still per-frame-lit surfaces) the spill is one additive instanced
+    // decal. Same read, one draw call, no new casters.
+    const poolMat = glowAdd(0xffd88f, 0);
+    const poolGeo = new THREE.CircleGeometry(1.55, 16);
+    const poolMesh = inst(scene, poolGeo, poolMat, pts.map(([x, z]) =>
+      T([x, 0.11, z], [-Math.PI / 2, 0, 0], 0.25)), false, false);
+    poolMesh.visible = false;
+
+    // per-lamp 0-2s stagger so the row does not snap on in lockstep at dusk
+    const lr = rng(7717); // own stream: never disturb the layout rand sequence
+    const lit = pts.map(() => ({ v: 0, t: 0, delay: lr() * 2 }));
+    this.anim.lamps = { pts, globeMesh, haloMesh, poolMesh, lampMat, haloMat, poolMat, lit, on: false };
 
     // bunting strung between neighbouring lamps
     const spans = [[1, 5], [5, 2], [2, 3], [3, 4], [4, 0]];
@@ -641,6 +806,7 @@ export class PlazaRoom extends Room {
     const flagCols = [C.coral, C.cream];
     const flags = [[], []];
     const flagData = [];
+    const beads = [], beadPts = [];
     for (const [ia, ib] of spans) {
       const a = pts[ia], b = pts[ib];
       const top = 3.25, sag = 0.7; // low point 2.55: clears avatar + name tags
@@ -654,6 +820,11 @@ export class PlazaRoom extends Room {
           const k = flagData.length % 2;
           flagData.push({ p, k, i: flags[k].length, phase: flagData.length * 0.7 });
           flags[k].push(T([p[0], p[1] - 0.2, p[2]], [Math.PI, 0, 0]));
+        } else if (s > 0 && s < 14) {
+          // a bulb between every pair of flags: dark beads by day, the string
+          // lights that come on at dusk (LIVING-COVE.md A)
+          beadPts.push(p);
+          beads.push(T([p[0], p[1] - 0.07, p[2]], null, 0.8));
         }
       }
     }
@@ -662,7 +833,10 @@ export class PlazaRoom extends Room {
     scene.add(new THREE.LineSegments(cordGeo, new THREE.LineBasicMaterial({ color: 0x6b4f35 })));
     const flagGeo = new THREE.ConeGeometry(0.19, 0.4, 3);
     const flagMeshes = flagCols.map((c, i) => inst(scene, flagGeo, makeGlow(c), flags[i], false, false));
-    this.anim.bunting = { flagMeshes, flagData };
+    const beadMat = makeGlow(BEAD_DAY.getHex(), { unique: true });
+    const beadMesh = inst(scene, new THREE.SphereGeometry(0.11, 8, 6), beadMat, beads, false, false);
+    const beadLit = beadPts.map((_, i) => ({ v: 0, t: 0, delay: (i * 0.29) % 2 }));
+    this.anim.bunting = { flagMeshes, flagData, beadMesh, beadMat, beadPts, beadLit };
   }
 
   // ------------------------------------------------------------- benches --
@@ -748,24 +922,36 @@ export class PlazaRoom extends Room {
     this.anim.topiary = sway;
   }
 
-  // -------------------------------------------------------- notice board --
-  _buildNoticeBoard(scene) {
+  // --------------------------------------------------------- quest board --
+  _buildQuestBoard(scene) {
     // Set back on the west lawn: at (-8.6, 3.0) its collider reached to within
     // 0.47 of the spawn -> beach-gate walk line. Its hotspot still overlaps the
     // route, so passers-by are offered the read without being herded into it.
+    // Wave 7 (LIVING-COVE.md D): the cove notice board IS the Quest Board now.
     const x = -9.9, z = 4.4;
     const g = new THREE.Group();
     g.position.set(x, 0, z);
-    g.rotation.y = Math.atan2(-x, 1 - z);
+    // It used to face the plaza centre (yaw 1.90), which put its BACK to the
+    // follow camera whenever you stood at its own hotspot: you walked up to a
+    // plank wall. Now that it is the Quest Board that matters, so it is swung
+    // round to face south-east and read face-on from the play camera. The
+    // hotspot is pinned below rather than derived from the yaw, so the walk
+    // line from spawn to the beach gate still passes through it.
+    g.rotation.y = 0.95;
     scene.add(g);
 
     const wood = makeToon(C.wood), woodD = makeToon(C.woodDark);
     inst(g, new THREE.BoxGeometry(0.17, 2.5, 0.17), woodD,
       [T([-1.15, 1.25, 0]), T([1.15, 1.25, 0])], true, true);
     put(g, new THREE.BoxGeometry(2.7, 1.75, 0.14), woodD, 0, 1.85, 0);
-    put(g, new THREE.PlaneGeometry(2.42, 1.5), toonMap(0xffffff, noticeTex()), 0, 1.85, 0.09, { cast: false });
+    put(g, new THREE.PlaneGeometry(2.42, 1.5), toonMap(0xffffff, questBoardTex()), 0, 1.85, 0.09, { cast: false });
     put(g, new THREE.BoxGeometry(3.1, 0.12, 0.62), wood, 0, 2.84, 0.12, { rot: [0.34, 0, 0] });
     put(g, new THREE.BoxGeometry(0.6, 0.5, 0.5), wood, 0, 0.28, 0.34, { recv: true });
+
+    // gold "there is something for you here" marker, bobbing over the shingle
+    const star = put(g, new THREE.OctahedronGeometry(0.3, 0), makeGlow(C.gold), 0, 3.5, 0.18, { cast: false });
+    star.scale.set(1, 1.5, 1);
+    this.anim.questStar = star;
 
     const papers = [], pdata = [];
     [[-1.02, 0.95], [1.05, 1.15], [-0.9, 2.85]].forEach((s, i) => {
@@ -777,15 +963,163 @@ export class PlazaRoom extends Room {
 
     this.obstacles.push({ x, z, r: 1.1 });
     this.hotspots.push({
-      id: 'notice-board',
-      position: new THREE.Vector3(x + Math.sin(g.rotation.y) * 1.7, 0, z + Math.cos(g.rotation.y) * 1.7),
+      id: 'quest-board',
+      position: new THREE.Vector3(-8.29, 0, 3.85),
       radius: 2.4,
-      label: 'Read the Notice Board',
+      label: 'Quest Board',
+      // The old cove-notice toast survives as the offline fallback: if the
+      // quests overlay is missing or fails to load, the board still reads.
+      action: (gm) => import('../../ui/quests.js')
+        .then((m) => m.openQuests(gm))
+        .catch(() => this._readNotice(gm)),
+    });
+  }
+
+  /** Pre-wave-7 behaviour of this board: cycle a flavour notice as a toast. */
+  _readNotice(gm) {
+    gm.toast(NOTICES[this.noticeIdx % NOTICES.length]);
+    this.noticeIdx++;
+  }
+
+  // ---------------------------------------------------------- mural wall --
+  _buildMural(scene, game) {
+    // Same civic corner of the west lawn as the quest board (6.6 apart, both in
+    // one frame from the plaza). It faces roughly due south because that is the
+    // only orientation here that reads from BOTH the follow camera and the
+    // static camera; swinging it tangential to the shore would have pointed it
+    // at the sea, and widening it past ~6.6 walks the far post off the grass.
+    // HEIGHT IS A CAMERA CONSTRAINT, not a taste call: the follow camera sits
+    // 20 back and 15 up, so the sight line to a player's feet at the quest
+    // board clears y=5.36 where this wall stands. The first pass topped out at
+    // 5.68 and cut the player's legs off. Everything here stays under ~5.1.
+    const x = -9.9, z = 11.0;
+    const yaw = 0.304;                     // normal ~ (0.30, 0.95)
+    const g = new THREE.Group();
+    g.position.set(x, 0, z);
+    g.rotation.y = yaw;
+    scene.add(g);
+
+    const wood = makeToon(C.wood), woodD = makeToon(C.woodDark), stone = makeToon(C.stone);
+    put(g, new THREE.BoxGeometry(6.9, 0.4, 1.2), stone, 0, 0.2, 0, { recv: true });
+    inst(g, new THREE.BoxGeometry(0.4, 4.6, 0.5), woodD,
+      [T([-3.15, 2.4, 0]), T([3.15, 2.4, 0])], true, true);
+    put(g, new THREE.BoxGeometry(6.3, 3.9, 0.3), woodD, 0, 2.5, 0, { recv: true });
+    put(g, new THREE.BoxGeometry(7.2, 0.42, 0.7), wood, 0, 4.7, 0);
+    put(g, new THREE.BoxGeometry(7.5, 0.2, 0.95), makeToon(C.coral), 0, 4.98, 0);
+
+    // the canvas itself: one texel per cell, magnified with NearestFilter so the
+    // pixels stay chunky and square instead of smearing into watercolour
+    const tex = canvasTexture(MURAL_W, MURAL_H, (ctx, w, h) => {
+      ctx.fillStyle = MURAL_PALETTE[0];
+      ctx.fillRect(0, 0, w, h);
+    });
+    tex.magFilter = THREE.NearestFilter;
+    const cells = new Uint8Array(MURAL_W * MURAL_H);
+    this.mural = { cells, tex, ctx: tex.image.getContext('2d'), dirty: false, got: false };
+    this._muralRepaint();
+    tex.needsUpdate = true;
+    // The artwork lights itself after dusk via its own emissiveMap rather than
+    // an additive wash over the top: one fewer draw call, and the cove's
+    // colours stay their own colours instead of bleaching toward the lamp.
+    const canvasMat = toonMap(0xffffff, tex);
+    canvasMat.emissiveMap = tex;
+    canvasMat.emissive = new THREE.Color(0x000000);
+    put(g, new THREE.PlaneGeometry(5.9, 3.32), canvasMat, 0, 2.55, 0.17, { cast: false });
+
+    put(g, new THREE.PlaneGeometry(3.3, 0.74),
+      toonMap(0xffffff, woodSignTex('The Cove Mural', 'one pixel each, be nice')),
+      0, 4.7, 0.37, { cast: false });
+
+    // hooded picture lights: they come on with the plaza lamps so the artwork
+    // still reads after dusk (they share the lamp material, no extra lights)
+    const lampMat = this.anim.lamps?.lampMat || makeGlow(C.lampGlow, { unique: true });
+    inst(g, new THREE.CylinderGeometry(0.22, 0.3, 0.26, 8), makeToon(C.iron),
+      [T([-1.9, 4.45, 0.5], [0.7, 0, 0]), T([1.9, 4.45, 0.5], [0.7, 0, 0])], false, false);
+    // bulbs sit UNDER the shade rims: level with the hood they were swallowed
+    inst(g, new THREE.SphereGeometry(0.13, 8, 6), lampMat,
+      [T([-1.9, 4.21, 0.63]), T([1.9, 4.21, 0.63])], false, false);
+
+    // paint pots on the plinth: the wall says "you may touch this". Instanced
+    // pots + one lid mesh per colour keeps this whole prop to 4 draw calls.
+    const potXs = [-2.3, -1.75, -1.2];
+    inst(g, new THREE.CylinderGeometry(0.17, 0.15, 0.3, 10), makeToon(0xdedede),
+      potXs.map((px) => T([px, 0.55, 0.36])), true, false);
+    const lidGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.05, 10);
+    [C.coral, C.sky, C.leaf].forEach((c, i) => {
+      put(g, lidGeo, makeGlow(c), potXs[i], 0.71, 0.36, { cast: false });
+    });
+    put(g, new THREE.CylinderGeometry(0.03, 0.05, 0.7, 6), makeToon(C.wood), 2.2, 0.72, 0.36,
+      { rot: [0.25, 0, 0.4] });
+
+    this.obstacles.push(
+      { x: x - 2.1, z: z + 0.66, r: 1.0 },
+      { x, z, r: 1.0 },
+      { x: x + 2.1, z: z - 0.66, r: 1.0 },
+    );
+    this.hotspots.push({
+      id: 'mural',
+      position: new THREE.Vector3(x + Math.sin(yaw) * 2.9, 0, z + Math.cos(yaw) * 2.9),
+      radius: 2.6,
+      label: 'Paint the Cove Mural',
       action: (gm) => {
-        gm.toast(NOTICES[this.noticeIdx % NOTICES.length]);
-        this.noticeIdx++;
+        try { openMural(gm); }
+        catch { gm.toast('The mural is drying. Try again in a moment.'); }
       },
     });
+
+    // Live wiring: ops are painted straight onto this texture, so the wall shows
+    // the current artwork even with nobody's overlay open. The server already
+    // pushes the grid to anyone joining the plaza, so the request below is only
+    // the belt to that braces, and it retries at most twice (the handler is
+    // socialLimited, and burning a player's social budget on a redraw is rude).
+    this._muralReqT = 3;
+    this._muralTries = 0;
+    if (game?.events) {
+      this._off.push(game.events.on('mural', (m) => {
+        if (m) this._muralPaint(m.x, m.y, m.c);
+      }));
+      this._off.push(game.events.on('mural-grid', (m) => this._muralApplyGrid(m)));
+    }
+    this._muralRequest();
+    this.anim.muralMat = canvasMat;
+  }
+
+  _muralRequest() {
+    try { this.game?.net?.send?.({ t: 'mural-grid' }); } catch { /* offline: the wall just stays blank */ }
+  }
+
+  /** Paint one cell. Cheap enough to call once per broadcast op. */
+  _muralPaint(px, py, ci) {
+    const m = this.mural;
+    if (!m) return;
+    // a refusal frame ({ok:false, wait}) rides the same 'mural' name and has no
+    // cell at all: coercing undefined would repaint (0,0) cream on every miss
+    if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(ci)) return;
+    px = Math.floor(px); py = Math.floor(py); ci = Math.floor(ci);
+    if (px < 0 || py < 0 || px >= MURAL_W || py >= MURAL_H) return;
+    if (ci < 0 || ci >= MURAL_PALETTE.length) return;
+    m.cells[py * MURAL_W + px] = ci;
+    m.ctx.fillStyle = MURAL_PALETTE[ci];
+    m.ctx.fillRect(px, py, 1, 1);
+    m.dirty = true;
+  }
+
+  /** Redraw the whole texture from `cells` (one full-grid blit). */
+  _muralRepaint() {
+    const m = this.mural;
+    if (!m) return;
+    m.ctx.putImageData(muralImageData(m.cells, m.ctx), 0, 0);
+    m.dirty = true;
+  }
+
+  _muralApplyGrid(msg) {
+    const m = this.mural;
+    if (!m || !msg) return;
+    const grid = decodeMuralGrid(msg); // null on anything malformed
+    if (!grid || grid.length !== m.cells.length) return;
+    m.cells.set(grid);
+    m.got = true;
+    this._muralRepaint();
   }
 
   // ---------------------------------------------------------------- shop --
@@ -810,7 +1144,8 @@ export class PlazaRoom extends Room {
 
     // door
     put(g, new THREE.BoxGeometry(0.24, 2.5, 1.7), makeToon(C.woodDark), fw, 1.3, 0);
-    put(g, new THREE.PlaneGeometry(1.4, 2.15), glowFade(0xffdca8, 0.85), fw - 0.14, 1.25, 0,
+    const doorMat = glowFade(0xffdca8, 0.85);
+    put(g, new THREE.PlaneGeometry(1.4, 2.15), doorMat, fw - 0.14, 1.25, 0,
       { rot: [0, -Math.PI / 2, 0], cast: false });
     put(g, new THREE.BoxGeometry(1.1, 0.14, 2.1), makeToon(C.stone), fw - 0.6, 0.09, 0, { recv: true });
 
@@ -824,7 +1159,10 @@ export class PlazaRoom extends Room {
       for (let i = 0; i < 5; i++) dots.push(T([fw - 0.24, 1.56, wz - 0.55 + i * 0.28], null, 0.15));
     }
     inst(g, new THREE.BoxGeometry(0.2, 1.5, 1.7), frame, frames);
-    inst(g, new THREE.PlaneGeometry(1.4, 1.24), glowFade(0x9fdcf5, 0.9), glasses, false, false);
+    // glass reflects the sky by day and the warm shop interior after dusk
+    const glassMat = glowFade(0x9fdcf5, 0.9);
+    inst(g, new THREE.PlaneGeometry(1.4, 1.24), glassMat, glasses, false, false);
+    this.anim.windows = { glassMat, doorMat };
     inst(g, new THREE.BoxGeometry(0.42, 0.3, 1.5), makeToon(C.wood), boxes);
     inst(g, new THREE.IcosahedronGeometry(1, 0), makeToon(C.coral), dots, false, false);
 
@@ -931,7 +1269,9 @@ export class PlazaRoom extends Room {
     }
     inst(scene, new THREE.CylinderGeometry(0.3, 0.36, 3.2, 9), stone, posts, true, true);
     inst(scene, new THREE.TorusGeometry(1.45, 0.28, 8, 18, Math.PI), stone, arches);
-    inst(scene, new THREE.SphereGeometry(0.2, 10, 8), makeGlow(C.lampGlow), lamps, false, false);
+    // the gate lanterns share the plaza lamp material, so they light together
+    inst(scene, new THREE.SphereGeometry(0.2, 10, 8),
+      this.anim.lamps?.lampMat || makeGlow(C.lampGlow), lamps, false, false);
     inst(scene, new THREE.BoxGeometry(2.55, 0.9, 0.16), makeToon(C.woodDark), boards);
     inst(scene, new THREE.CylinderGeometry(0.05, 0.05, 0.9, 6), makeToon(C.iron), poles, false, false);
     inst(scene, new THREE.ConeGeometry(0.3, 0.55, 3), makeGlow(C.coral), pennants, false, false);
@@ -1019,6 +1359,7 @@ export class PlazaRoom extends Room {
       { x: -6.9, z: 6.9, r: 3.0 }, { x: -9.9, z: 4.4, r: 3.0 },
       { x: -9.4, z: 6.6, r: 2.4 }, { x: 9.6, z: 5.6, r: 2.4 },
       { x: -4.6, z: 12.4, r: 2.2 }, // clearing around the lawn bench
+      { x: -9.9, z: 11.0, r: 5.6 }, // mural wall: nothing grows in front of it
     ];
     const segs = [
       [-8, 0, -16, 0], [0, -8, 0, -16], [8, 1.2, 16, 2.5], [5.2, 6.4, 10.2, 12.4],
@@ -1119,6 +1460,134 @@ export class PlazaRoom extends Room {
     };
   }
 
+  // ---------------------------------------------------------------- rain --
+  _buildRain(scene) {
+    // Weather 'rain' (LIVING-COVE.md A): one instanced streak field over the
+    // island plus gloss decals on the cobbles. Both start hidden and cost
+    // nothing until the clock says it is raining.
+    const r = rng(90210);
+    const drops = [], mats = [];
+    for (let i = 0; i < 260; i++) {
+      drops.push({
+        x: -23 + r() * 46, y: r() * 17, z: -21 + r() * 42,
+        sp: 15 + r() * 10, len: 0.7 + r() * 0.8,
+      });
+      mats.push(T([0, -99, 0]));
+    }
+    const mat = glowFade(0xcfeaff, 0.42);
+    const mesh = inst(scene, new THREE.BoxGeometry(0.035, 1, 0.035), mat, mats, false, false);
+    mesh.visible = false;
+    mesh.frustumCulled = false; // the field is bigger than its origin-anchored box
+
+    const pud = [];
+    for (let i = 0; i < 40 && pud.length < 14; i++) {
+      const a = r() * Math.PI * 2, rr = 1.4 + r() * 7.2;
+      const px = Math.cos(a) * rr, pz = Math.sin(a) * rr;
+      if (Math.hypot(px - FX, pz - FZ) < 3.5) continue; // not inside the fountain
+      pud.push(T([px, 0.105, pz], [-Math.PI / 2, 0, r() * 3],
+        [0.55 + r() * 0.9, 0.42 + r() * 0.8, 1]));
+    }
+    const pudMat = glowFade(0xdff1ff, 0);
+    const pudMesh = inst(scene, new THREE.CircleGeometry(1, 14), pudMat, pud, false, false);
+    pudMesh.visible = false;
+    this.anim.rain = { mesh, mat, drops, pudMesh, pudMat };
+  }
+
+  // --------------------------------------------------------- world clock --
+  /** Room API added in wave 7: called once right after build and on every
+   *  server 'clock' frame (every 10s). Stores the target; update() eases the
+   *  local phase toward it so nothing ever snaps. */
+  onClock(dayT, weather, aurora) {
+    if (!this.anim) return;
+    const u = (((Number(dayT) || 0) % 1) + 1) % 1;
+    const first = this._dayT === null;
+    this._serverT = u;
+    if (first) this._dayT = u;
+    this.weather = weather === 'rain' || weather === 'breeze' ? weather : 'clear';
+    // the plaza has no aurora (peak only, LIVING-COVE.md A); kept for the API
+    this.aurora = !!aurora;
+    if (first) {
+      // arriving at night must not replay the dusk light-up cascade
+      const lit = nightMix(u) > 0.5 ? 1 : 0;
+      const L = this.anim.lamps;
+      if (L) { L.on = !!lit; for (const s of L.lit) { s.v = lit; s.t = 9; } }
+      const B = this.anim.bunting;
+      if (B?.beadLit) for (const s of B.beadLit) { s.v = lit; s.t = 9; }
+      this._rainLevel = this.weather === 'rain' ? 1 : 0;
+    }
+    this._applyClock();
+  }
+
+  /** Writes the current phase into the sky, fog, lights and emissive props.
+   *  Every colour target below is preallocated; nothing here allocates. */
+  _applyClock() {
+    const a = this.anim;
+    if (!a || this._dayT === null) return;
+    const u = this._dayT;
+    const rain = this._rainLevel;
+
+    const f = u * 4;
+    const fi = Math.floor(f);
+    const kk = f - fi;
+    const i = ((fi % 4) + 4) % 4;
+    const A = SKY_LUT[i], B = SKY_LUT[(i + 1) % 4];
+    const k = kk * kk * (3 - 2 * kk);
+
+    if (a.skyColor) {
+      _cA.copy(A.sky).lerp(B.sky, k);
+      if (rain > 0) _cA.lerp(RAIN_TINT, rain * 0.55).multiplyScalar(1 - rain * 0.2);
+      a.skyColor.copy(_cA);
+    }
+    if (a.fog) {
+      _cB.copy(A.fog).lerp(B.fog, k);
+      if (rain > 0) _cB.lerp(RAIN_TINT, rain * 0.6).multiplyScalar(1 - rain * 0.14);
+      a.fog.color.copy(_cB);
+      a.fog.near = 42 - rain * 16;   // rain closes the horizon in
+      a.fog.far = 118 - rain * 44;
+    }
+
+    // One caster all day: it is the sun while it is up and the moon after, so
+    // the light always comes from above and the shadow budget never changes.
+    if (a.sun) {
+      const s = Math.sin(u * TAU);
+      const c = Math.cos(u * TAU);
+      const up = Math.abs(s);
+      const hx = s < 0 ? -c : c;    // the moon rises where the sun set
+      a.sun.position.set(4 + hx * 15, 7 + up * 18, 8 + hx * 5);
+      a.sun.color.copy(A.sun).lerp(B.sun, k);
+      a.sun.intensity = (A.sunI + (B.sunI - A.sunI) * k) * (1 - rain * 0.45);
+    }
+    if (a.hemi) {
+      a.hemi.color.copy(A.hemiSky).lerp(B.hemiSky, k);
+      a.hemi.groundColor.copy(A.hemiGnd).lerp(B.hemiGnd, k);
+      // playability floor: the plaza never goes darker than you can walk in
+      a.hemi.intensity = Math.max(0.45, (A.hemiI + (B.hemiI - A.hemiI) * k) * (1 - rain * 0.22));
+    }
+    if (a.amb) a.amb.intensity = A.ambI + (B.ambI - A.ambI) * k;
+
+    // emissives: lamps, string lights and windows come on dusk-to-dawn
+    const nm = nightMix(u);
+    const L = a.lamps;
+    if (L) {
+      L.on = nm > 0.5;
+      L.lampMat.color.copy(LAMP_DAY).lerp(LAMP_NIGHT, nm);
+      L.haloMat.opacity = 0.06 + nm * 0.4;
+      L.poolMat.opacity = nm * 0.55;
+      L.poolMesh.visible = nm > 0.01;
+    }
+    const Bu = a.bunting;
+    if (Bu?.beadMat) {
+      Bu.beadMat.color.copy(BEAD_DAY).lerp(BEAD_NIGHT, nm);
+    }
+    if (a.muralMat) a.muralMat.emissive.setScalar(nm * 0.42);
+    if (a.windows) {
+      a.windows.glassMat.color.copy(WIN_DAY).lerp(WIN_NIGHT, nm);
+      a.windows.glassMat.opacity = 0.9 + nm * 0.1;
+      a.windows.doorMat.color.copy(DOOR_DAY).lerp(DOOR_NIGHT, nm);
+      a.windows.doorMat.opacity = 0.85 + nm * 0.15;
+    }
+  }
+
   // --------------------------------------------------------------- frame --
   update(dt) {
     const a = this.anim;
@@ -1126,12 +1595,35 @@ export class PlazaRoom extends Room {
     this.t += dt;
     const t = this.t;
 
+    // ---- world clock: run the phase locally, ease onto the server's value.
+    // Frames land every 10s; interpolating between them keeps the sky moving
+    // instead of stepping (LIVING-COVE.md A).
+    const clocked = this._dayT !== null;
+    if (clocked) {
+      let err = this._serverT - this._dayT;
+      if (err > 0.5) err -= 1; else if (err < -0.5) err += 1;
+      this._dayT = (this._dayT + dt / DAY_SECONDS + err * Math.min(1, dt * 0.6) + 1) % 1;
+      const wantRain = this.weather === 'rain' ? 1 : 0;
+      this._rainLevel += (wantRain - this._rainLevel) * Math.min(1, dt * 0.4);
+      this._applyClock();
+    }
+    // a couple of retries in case the build-time request beat the socket open
+    if (this.mural && !this.mural.got && this._muralTries < 2) {
+      this._muralReqT -= dt;
+      if (this._muralReqT <= 0) {
+        this._muralReqT = 4;
+        this._muralTries++;
+        this._muralRequest();
+      }
+    }
+    const wind = this.weather === 'breeze' ? 1.8 : this.weather === 'rain' ? 1.35 : 1;
+
     if (a.sea) a.sea.position.y = -1.35 + Math.sin(t * 0.5) * 0.05;
     if (a.foam) {
       a.foam.rotation.z += dt * 0.05;
       a.foam.position.y = -0.95 + Math.sin(t * 0.8) * 0.06;
     }
-    if (a.clouds) a.clouds.rotation.y += dt * 0.006;
+    if (a.clouds) a.clouds.rotation.y += dt * 0.006 * wind;
 
     // fountain
     if (a.waterTex) {
@@ -1166,28 +1658,43 @@ export class PlazaRoom extends Room {
       a.jets.mesh.instanceMatrix.needsUpdate = true;
     }
 
-    // lamps breathe
+    // lamps breathe, and light up one by one after dusk
     if (a.lamps) {
-      const pts = a.lamps.pts;
+      const L = a.lamps;
+      const pts = L.pts;
+      const want = L.on ? 1 : 0;
+      const ease = Math.min(1, dt * 3.2);
       for (let i = 0; i < pts.length; i++) {
+        const st = L.lit[i];
+        st.t += dt;
+        if (st.t >= st.delay) st.v += (want - st.v) * ease;
+        const lv = clocked ? st.v : 1;
         const p = Math.sin(t * 1.6 + i * 1.1);
         _o2.position.set(pts[i][0], 3.28, pts[i][1]);
         _o2.rotation.set(0, 0, 0);
-        _o2.scale.setScalar(1 + p * 0.05);
+        _o2.scale.setScalar((clocked ? 0.88 + lv * 0.12 : 1) * (1 + p * 0.05));
         _o2.updateMatrix();
-        a.lamps.globeMesh.setMatrixAt(i, _o2.matrix);
-        _o2.scale.setScalar(1 + p * 0.14);
+        L.globeMesh.setMatrixAt(i, _o2.matrix);
+        _o2.scale.setScalar((clocked ? 0.25 + lv * 0.75 : 1) * (1 + p * 0.14));
         _o2.updateMatrix();
-        a.lamps.haloMesh.setMatrixAt(i, _o2.matrix);
+        L.haloMesh.setMatrixAt(i, _o2.matrix);
+        if (L.poolMesh.visible) {
+          _o2.position.set(pts[i][0], 0.11, pts[i][1]);
+          _o2.rotation.set(-Math.PI / 2, 0, 0);
+          _o2.scale.setScalar(lv * (0.98 + p * 0.03));
+          _o2.updateMatrix();
+          L.poolMesh.setMatrixAt(i, _o2.matrix);
+        }
       }
-      a.lamps.globeMesh.instanceMatrix.needsUpdate = true;
-      a.lamps.haloMesh.instanceMatrix.needsUpdate = true;
+      L.globeMesh.instanceMatrix.needsUpdate = true;
+      L.haloMesh.instanceMatrix.needsUpdate = true;
+      if (L.poolMesh.visible) L.poolMesh.instanceMatrix.needsUpdate = true;
     }
 
-    // bunting
+    // bunting: flags flutter, bulbs pop on one at a time at dusk
     if (a.bunting) {
       for (const f of a.bunting.flagData) {
-        const s = Math.sin(t * 2.1 + f.phase) * 0.22;
+        const s = Math.sin(t * 2.1 * wind + f.phase) * 0.22 * wind;
         _o2.position.set(f.p[0], f.p[1] - 0.2, f.p[2]);
         _o2.rotation.set(Math.PI + s * 0.5, 0, s);
         _o2.scale.setScalar(1);
@@ -1196,6 +1703,29 @@ export class PlazaRoom extends Room {
         if (m) m.setMatrixAt(f.i, _o2.matrix);
       }
       for (const m of a.bunting.flagMeshes) if (m) m.instanceMatrix.needsUpdate = true;
+      const bm = a.bunting.beadMesh;
+      if (bm && clocked) {
+        const want = a.lamps?.on ? 1 : 0;
+        const ease = Math.min(1, dt * 3.2);
+        const pts = a.bunting.beadPts;
+        for (let i = 0; i < pts.length; i++) {
+          const st = a.bunting.beadLit[i];
+          st.t += dt;
+          if (st.t >= st.delay) st.v += (want - st.v) * ease;
+          _o2.position.set(pts[i][0], pts[i][1] - 0.07, pts[i][2]);
+          _o2.rotation.set(0, 0, 0);
+          _o2.scale.setScalar(0.8 + st.v * (0.6 + Math.sin(t * 2.3 + i) * 0.08));
+          _o2.updateMatrix();
+          bm.setMatrixAt(i, _o2.matrix);
+        }
+        bm.instanceMatrix.needsUpdate = true;
+      }
+    }
+
+    // quest board marker
+    if (a.questStar) {
+      a.questStar.position.y = 3.5 + Math.sin(t * 2.0) * 0.11;
+      a.questStar.rotation.y += dt * 1.3;
     }
 
     // topiary + pinned papers
@@ -1266,7 +1796,7 @@ export class PlazaRoom extends Room {
       const d = a.petals.data;
       for (let i = 0; i < d.length; i++) {
         const p = d[i];
-        p.x += dt * p.sp;
+        p.x += dt * p.sp * wind;
         if (p.x > 20) {
           p.x = -20;
           p.z += 7.3;
@@ -1280,9 +1810,49 @@ export class PlazaRoom extends Room {
       }
       a.petals.mesh.instanceMatrix.needsUpdate = true;
     }
+
+    // rain streaks + puddle gloss (hidden and skipped entirely when dry)
+    if (a.rain) {
+      const R = a.rain;
+      const lv = this._rainLevel;
+      if (lv > 0.01) {
+        R.mesh.visible = true;
+        R.pudMesh.visible = true;
+        R.mat.opacity = 0.42 * lv;
+        R.pudMat.opacity = 0.28 * lv;
+        const d = R.drops;
+        for (let i = 0; i < d.length; i++) {
+          const p = d[i];
+          p.y -= dt * p.sp;
+          p.x += dt * 1.6;
+          if (p.y < 0) p.y += 17;
+          if (p.x > 23) p.x -= 46;
+          _o2.position.set(p.x, p.y, p.z);
+          _o2.rotation.set(0, 0, 0.1);
+          _o2.scale.set(1, p.len * lv, 1);
+          _o2.updateMatrix();
+          R.mesh.setMatrixAt(i, _o2.matrix);
+        }
+        R.mesh.instanceMatrix.needsUpdate = true;
+      } else if (R.mesh.visible) {
+        R.mesh.visible = false;
+        R.pudMesh.visible = false;
+      }
+    }
+
+    // mural: one texture upload per frame no matter how many ops landed
+    if (this.mural?.dirty) {
+      this.mural.tex.needsUpdate = true;
+      this.mural.dirty = false;
+    }
   }
 
   dispose() {
+    for (const off of this._off) { try { off(); } catch { /* already gone */ } }
+    this._off = [];
+    this.mural = null;
+    this.game = null;
+    this._dayT = null;
     this.anim = null;
     this.groundMeshes = [];
     this.hotspots = [];

@@ -180,6 +180,14 @@ function fxMat(color, { opacity = 0.12, side = THREE.DoubleSide, additive = true
   return m;
 }
 
+/** World clock (wave 7): 1 at noon, 0 at midnight, 0.5 at dawn and dusk.
+ *  The grotto is a cave with no windows, so per LIVING-COVE.md it ignores
+ *  weather entirely; the only thing time of day can reach is the daylight
+ *  falling down the stairwell from the plaza (see onClock). */
+function daylight(dayT) {
+  return 0.5 + 0.5 * Math.cos(((((dayT % 1) + 1) % 1) - 0.25) * Math.PI * 2);
+}
+
 /** Soft round sprite for dust motes. */
 function dotTexture() {
   return canvasTexture(64, 64, (c, w, h) => {
@@ -208,6 +216,12 @@ export class ClubRoom extends Room {
     this._dummy = new THREE.Object3D();
     this._col = new THREE.Color();
     this._instanced = [];
+    // world clock (wave 7): how much daylight is falling down the stairwell,
+    // and the two ends the portal tint lerps between. Preallocated: onClock
+    // must not allocate.
+    this._portalK = 1;
+    this._sunSpill = new THREE.Color(0xffd9a0);
+    this._moonSpill = new THREE.Color(0x8f7ce0);
 
     scene.background = new THREE.Color(0x090612);
     scene.fog = new THREE.FogExp2(0x110a20, 0.017);
@@ -1139,11 +1153,25 @@ export class ClubRoom extends Room {
     const stairLight = new THREE.PointLight(0xffd2a0, 26, 16, 2);
     stairLight.position.set(0, LANDING_Y + 2, STAIR_Z0 + STEP_N * STEP_D + 1.2);
     scene.add(stairLight);
+    this.stairLight = stairLight;
 
     // keeps the entrance side of the cave from going dead black
     this.entryLight = new THREE.PointLight(0x9a6bff, 20, 20, 2);
     this.entryLight.position.set(0, 4.5, 10.5);
     scene.add(this.entryLight);
+  }
+
+  /** World clock (wave 7). No windows down here and no weather: the grotto's
+   *  own rig never changes. What does change is the stairwell, where the plaza
+   *  pours in: warm daylight by day, and after dusk a dim violet spill with the
+   *  cave's entry glow deepened underneath it so the arch still reads. */
+  onClock(dayT) {
+    const lit = daylight(dayT);
+    this._portalK = 0.3 + 0.7 * lit;          // update() rides this, see below
+    this.portal.color.copy(this._moonSpill).lerp(this._sunSpill, lit);
+    this.stairLight.intensity = 7 + 19 * lit;
+    this.stairLight.color.copy(this._moonSpill).lerp(this._sunSpill, lit);
+    this.entryLight.intensity = 20 + 15 * (1 - lit);
   }
 
   // ---- interaction ---------------------------------------------------------
@@ -1299,7 +1327,7 @@ export class ClubRoom extends Room {
       this.signFrame.setColorAt(i, col);
     }
     this.signFrame.instanceColor.needsUpdate = true;
-    this.portal.opacity = 0.45 + Math.sin(t * 1.6) * 0.06;
+    this.portal.opacity = (0.45 + Math.sin(t * 1.6) * 0.06) * this._portalK;
 
     // haze + dust drift
     for (const h of this.haze) {
@@ -1401,5 +1429,8 @@ export class ClubRoom extends Room {
     this.records = null;
     this.dj = null;
     this.haze = null;
+    this.portal = null;
+    this.stairLight = null;
+    this.entryLight = null;
   }
 }

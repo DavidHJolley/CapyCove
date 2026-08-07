@@ -1,7 +1,254 @@
 import { ROOM_INFO, GAME_NAME } from '../../shared/constants.js';
+import { stampById, paintStampCanvas } from './profile.js';
+import { visitHouse } from '../net/client.js';
 
 /** Chat lines kept for the scrollback card above the chat box. */
 const HISTORY_MAX = 150;
+
+// ---------------------------------------------------------------------------
+// wave 7 shell: live parties on the island map, and the stamp-slam moment.
+// Styles live here rather than styles.css so the whole feature is one file.
+// ---------------------------------------------------------------------------
+
+const COVE_STYLE_ID = 'capy-cove7-styles';
+
+const COVE_CSS = `
+/* a milestone title rides under the name on the world tag (net/client.js) */
+.name-tag.has-title { white-space: normal; text-align: center; line-height: 1.15; padding-bottom: 3px; }
+.name-title {
+  display: block; font-size: 9px; font-weight: 900; letter-spacing: 0.1em;
+  text-transform: uppercase; color: #ffdf9a; margin-top: 1px;
+}
+
+/* the venue's map pill wears a party hat while a party is on */
+.map-spot .map-hat { display: none; }
+.map-spot.is-party {
+  background: linear-gradient(180deg, #ffd3dd 0%, #f5879b 100%);
+  box-shadow: 0 0 0 3px rgba(232, 101, 122, 0.45),
+    0 4px 0 rgba(45, 36, 23, 0.25), 0 10px 22px rgba(16, 52, 78, 0.4);
+  animation: party-bob 1.5s ease-in-out infinite;
+}
+.map-spot.is-party .map-hat {
+  display: block; position: absolute; right: -7px; top: -15px; width: 0; height: 0;
+  border: 9px solid transparent; border-bottom: 17px solid var(--accent);
+  rotate: 18deg; filter: drop-shadow(0 2px 2px rgba(16, 52, 78, 0.4));
+}
+.map-spot.is-party .map-hat::after {
+  content: ''; position: absolute; left: -4px; top: -6px; width: 8px; height: 8px;
+  border-radius: 50%; background: var(--cream);
+}
+@keyframes party-bob { 50% { translate: -50% calc(-50% - 3px); } }
+
+.map-party {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 9px 12px;
+  border-radius: 16px; background: rgba(232, 101, 122, 0.13);
+  box-shadow: inset 0 0 0 2px rgba(232, 101, 122, 0.26);
+  animation: party-in 0.25s ease;
+}
+@keyframes party-in { from { opacity: 0; translate: 0 -5px; } }
+/* the class sets display:flex, which would otherwise beat the [hidden] default */
+.map-party[hidden] { display: none; }
+.map-party-txt { flex: 1; min-width: 0; text-align: left; font-size: 12.5px; font-weight: 800; }
+.map-party-txt small { display: block; font-size: 11px; font-weight: 700; color: var(--muted); }
+.map-party-go {
+  border: 0; cursor: pointer; font-family: var(--font); font-weight: 900; font-size: 12px;
+  padding: 7px 15px; border-radius: 999px; color: #fff; flex: none;
+  background: linear-gradient(180deg, #f07f90 0%, var(--accent) 100%);
+  box-shadow: 0 4px 0 rgba(150, 55, 72, 0.32);
+  transition: scale 0.12s ease, filter 0.16s ease;
+}
+.map-party-go:hover { scale: 1.06; filter: brightness(1.05); }
+.map-party-go:active { scale: 0.95; }
+.map-party-go:focus-visible { outline: 3px solid var(--accent2); outline-offset: 3px; }
+
+/* ---- stamp slam ---- */
+.slam {
+  position: absolute; inset: 0; z-index: 58; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 4px; cursor: pointer;
+  background: radial-gradient(ellipse 70% 60% at 50% 46%, rgba(45, 36, 23, 0.42) 0%, rgba(20, 32, 44, 0.78) 100%);
+  animation: slam-in 0.25s ease;
+}
+.slam.is-out { opacity: 0; transition: opacity 0.4s ease; pointer-events: none; }
+.slam-rays {
+  position: absolute; width: 150vmax; height: 150vmax; pointer-events: none; opacity: 0.5;
+  background: repeating-conic-gradient(from 0deg,
+    rgba(255, 236, 190, 0.24) 0deg 7deg, rgba(255, 236, 190, 0) 7deg 14deg);
+  animation: slam-spin 22s linear infinite;
+}
+.slam-art {
+  position: relative; filter: drop-shadow(0 16px 26px rgba(0, 0, 0, 0.45));
+  animation: slam-stamp 0.62s cubic-bezier(0.2, 1.5, 0.35, 1);
+}
+.slam-art canvas { display: block; }
+.slam-kicker {
+  position: relative; margin-top: 16px; font-size: 12px; font-weight: 900;
+  letter-spacing: 0.28em; text-transform: uppercase; color: var(--gold);
+  animation: slam-rise 0.5s 0.16s backwards ease;
+}
+.slam-name {
+  position: relative; font-size: clamp(26px, 6vw, 42px); font-weight: 900; color: #fff;
+  text-align: center; padding: 0 20px; line-height: 1.1;
+  text-shadow: 0 4px 0 rgba(45, 36, 23, 0.45);
+  animation: slam-rise 0.5s 0.22s backwards ease;
+}
+.slam-desc {
+  position: relative; margin-top: 6px; font-size: 13.5px; font-weight: 700; color: #ffe9c4;
+  text-align: center; padding: 0 24px; max-width: 460px; line-height: 1.45;
+  animation: slam-rise 0.5s 0.3s backwards ease;
+}
+.slam-tap {
+  position: absolute; bottom: 8%; font-size: 11px; font-weight: 800; letter-spacing: 0.16em;
+  text-transform: uppercase; color: rgba(255, 246, 227, 0.65);
+}
+.slam-spark {
+  position: absolute; width: 12px; height: 12px; border-radius: 50%; pointer-events: none;
+  animation: slam-spark 1.1s ease-out backwards;
+}
+@keyframes slam-in { from { opacity: 0; } }
+@keyframes slam-spin { to { rotate: 360deg; } }
+@keyframes slam-stamp {
+  0% { opacity: 0; scale: 2.6; rotate: -14deg; }
+  60% { opacity: 1; scale: 0.94; rotate: 3deg; }
+  100% { opacity: 1; scale: 1; rotate: -2deg; }
+}
+@keyframes slam-rise { from { opacity: 0; translate: 0 12px; } }
+@keyframes slam-spark {
+  0% { opacity: 1; scale: 0.3; }
+  100% { opacity: 0; scale: 1; translate: var(--dx) var(--dy); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .slam-rays, .slam-art, .slam-kicker, .slam-name, .slam-desc, .slam-spark,
+  .map-spot.is-party { animation: none; }
+}
+`;
+
+function ensureCoveStyles() {
+  if (typeof document === 'undefined' || document.getElementById(COVE_STYLE_ID)) return;
+  const s = document.createElement('style');
+  s.id = COVE_STYLE_ID;
+  s.textContent = COVE_CSS;
+  document.head.appendChild(s);
+}
+
+/**
+ * The live party, if any: {host, room, label, endsAt, count}. Module level
+ * because the island painter is a plain function with no game handle, and the
+ * beacon has to pulse on the venue itself.
+ */
+let party = null;
+
+/** Read a 'party' / 'party-start' frame. Returns null for "no party on". */
+function parseParty(m) {
+  if (!m || typeof m !== 'object') return null;
+  if (m.t === 'party-end' || m.active === false || m.over === true || m.ok === false) return null;
+  const host = typeof m.host === 'string' && m.host.trim() ? m.host.trim() : null;
+  if (!host) return null;
+  const room = typeof m.room === 'string' && m.room
+    ? m.room
+    : (m.venue === 'club' ? 'club' : `house:${host.toLowerCase()}`);
+  const secs = Number(m.endsIn ?? m.remaining ?? m.secondsLeft);
+  // the server names the venue (dens have no ROOM_INFO entry); this is only the
+  // fallback for a frame that leaves it out
+  const label = (typeof m.roomName === 'string' && m.roomName.trim())
+    || (Object.prototype.hasOwnProperty.call(ROOM_INFO, room) ? ROOM_INFO[room].name : `${host}'s Den`);
+  const count = Number(m.count ?? m.guests);
+  return {
+    host,
+    room,
+    label,
+    endsAt: Date.now() + (Number.isFinite(secs) && secs > 0 ? secs : 30 * 60) * 1000,
+    count: Number.isFinite(count) ? Math.max(0, Math.floor(count)) : null,
+  };
+}
+
+const partyLive = () => !!party && party.endsAt > Date.now();
+
+// ---- stamp slam -----------------------------------------------------------
+// A stamp is the game saying "that thing you just did was worth doing", so it
+// gets the whole screen for four seconds. Queued: two at once would stack.
+
+const slamQueue = [];
+let slamBusy = false;
+let slamWaiting = false;
+
+function queueSlam(game, m) {
+  const id = typeof m?.id === 'string' ? m.id
+    : typeof m?.stamp === 'string' ? m.stamp : null;
+  if (!id) return;
+  slamQueue.push(id);
+  if (!slamBusy) nextSlam(game);
+}
+
+function nextSlam(game) {
+  if (!slamQueue.length) { slamBusy = false; return; }
+  // never land on top of a running minigame: it would eat the screen mid-run
+  if (game.activeMinigame) {
+    slamBusy = false;
+    if (!slamWaiting) {
+      slamWaiting = true;
+      const off = game.events.on('minigame', (id) => {
+        if (id) return;
+        try { off(); } catch { /* already gone */ }
+        slamWaiting = false;
+        if (!slamBusy) nextSlam(game);
+      });
+    }
+    return;
+  }
+  slamBusy = true;
+  showStampSlam(game, slamQueue.shift(), () => nextSlam(game));
+}
+
+function showStampSlam(game, id, done) {
+  ensureCoveStyles();
+  const stamp = stampById(id);
+  const host = document.getElementById('hud-root') || document.body;
+
+  const root = document.createElement('div');
+  root.className = 'slam';
+  root.setAttribute('role', 'status');
+  root.innerHTML = `
+    <div class="slam-rays"></div>
+    <div class="slam-art"><canvas></canvas></div>
+    <div class="slam-kicker">Stamp earned</div>
+    <div class="slam-name"></div>
+    <div class="slam-desc"></div>
+    <div class="slam-tap">Click to carry on</div>`;
+  root.querySelector('.slam-name').textContent = stamp.name;
+  root.querySelector('.slam-desc').textContent = stamp.desc;
+  const size = Math.max(180, Math.min(300, Math.round(Math.min(innerWidth, innerHeight) * 0.36)));
+  paintStampCanvas(root.querySelector('.slam-art canvas'), stamp, true, size);
+
+  // sparks thrown off the moment the stamp lands
+  for (let i = 0; i < 14; i++) {
+    const s = document.createElement('i');
+    s.className = 'slam-spark';
+    const a = (i / 14) * Math.PI * 2 + Math.random() * 0.4;
+    const d = size * (0.55 + Math.random() * 0.5);
+    s.style.setProperty('--dx', `${Math.cos(a) * d}px`);
+    s.style.setProperty('--dy', `${Math.sin(a) * d}px`);
+    s.style.background = ['#f2b64a', '#fff6e3', '#e8657a', '#4fb3e8'][i % 4];
+    s.style.animationDelay = `${0.24 + (i % 5) * 0.03}s`;
+    root.appendChild(s);
+  }
+  host.appendChild(root);
+
+  game.audio?.play?.('levelup');
+  const chime = setTimeout(() => game.audio?.play?.('sparkle'), 420);
+
+  let gone = false;
+  const bye = () => {
+    if (gone) return;
+    gone = true;
+    clearTimeout(chime);
+    clearTimeout(timer);
+    root.removeEventListener('click', bye);
+    root.classList.add('is-out');
+    setTimeout(() => { root.remove(); done(); }, 420);
+  };
+  const timer = setTimeout(bye, 4600);
+  root.addEventListener('click', bye);
+}
 
 /** In-world HUD: coins, room name, chat, emotes, map, mute, shop, menu. */
 export function initHud(game) {
@@ -257,6 +504,64 @@ export function initHud(game) {
     setTimeout(() => { t.classList.add('fade-out'); setTimeout(() => t.remove(), 500); }, ms);
   });
 
+  // ---- the social cove (wave 7) --------------------------------------------
+  ensureCoveStyles();
+
+  // Parties: one island-wide at a time. These listeners are registered BEFORE
+  // buildMap so the map's own party listener always sees fresh state.
+  game.events.on('party', (m) => { party = parseParty(m); });
+  game.events.on('party-start', (m) => {
+    // a refusal carries the wait, which is what the menu's throw button reads
+    if (m?.ok === false) {
+      const wait = Number(m.retryIn ?? m.cooldown ?? m.wait);
+      // The menu locks the button optimistically the moment it sends, so a
+      // refusal that carries no wait (guest, missing den confirm) has to RELEASE
+      // that lock: otherwise one refused request hid the button for 90 minutes.
+      game.__partyCooldownUntil = Number.isFinite(wait) && wait > 0 ? Date.now() + wait * 1000 : 0;
+      if (m.msg) game.toast(m.msg, 4200);
+      return;
+    }
+    const p = parseParty(m);
+    if (!p) return;
+    party = p;
+    if (String(game.state?.name || '').trim().toLowerCase() === p.host.toLowerCase()) {
+      const cd = Number(m.cooldown);
+      game.__partyCooldownUntil = Date.now() + (Number.isFinite(cd) && cd > 0 ? cd : 90 * 60) * 1000;
+    }
+    const mine = String(game.state?.name || '').trim().toLowerCase() === p.host.toLowerCase();
+    game.audio?.play?.('sparkle');
+    game.toast(mine
+      ? `Your party is on at ${p.label}. Go and be a good host!`
+      : `${p.host} is throwing a party at ${p.label}!`, 5200);
+  });
+  game.events.on('party-end', (m) => {
+    const host = party?.host || (typeof m?.host === 'string' ? m.host : null);
+    const label = party?.label;
+    const mine = !!host && String(game.state?.name || '').trim().toLowerCase() === host.toLowerCase();
+    party = null;
+    const count = Number(m?.count ?? m?.guests);
+    // the host's bragging rights: capys who came, never coins
+    if (mine && Number.isFinite(count)) {
+      game.toast(count > 0
+        ? `Party over: ${count} cap${count === 1 ? 'y' : 'ys'} came by. Nicely hosted.`
+        : 'Party over. A quiet one, but the cove noticed you tried.', 5200);
+    } else if (label) {
+      game.toast(`The party at ${label} has wound down.`, 3000);
+    }
+  });
+
+  // Quest ticks and stamps happen wherever the player is, so the juice lives in
+  // the shell rather than inside the board and album overlays.
+  game.events.on('quest-done', (m) => {
+    const name = typeof m?.name === 'string' && m.name.trim() ? m.name.trim() : null;
+    const coins = Number(m?.reward ?? m?.coins);
+    game.audio?.play?.('levelup');
+    game.toast(name
+      ? `Quest done: ${name}${Number.isFinite(coins) && coins > 0 ? ` (+${coins} coins)` : ''}`
+      : 'Daily quest done!', 3600);
+  });
+  game.events.on('stamp', (m) => queueSlam(game, m));
+
   // map
   buildMap(game, $('map-overlay'));
   $('btn-map').onclick = () => { $('map-overlay').classList.toggle('hidden'); game.audio.play('click'); };
@@ -296,6 +601,11 @@ const ART = {
   club: [0.690, 0.700],
   mine: [0.458, 0.252],
   jungle: [0.334, 0.582],
+  // The Drift is under the water off the west coast, so it gets painted art
+  // and a "you are here" pin but NO pill and no warp: eight labels is what
+  // this island holds (see MAP_SPOTS), and you go down by taking the dive bell
+  // at the end of the Driftwood dock, not by clicking the open sea.
+  drift: [0.062, 0.600],
 };
 
 // Label pills sit just under their landmark so the art stays readable.
@@ -329,6 +639,58 @@ const DEN_CHIMNEY = [-0.024, -0.040];
 const MINE_LAMP = [-0.0315, -0.006];
 const JUNGLE_POOL = [-0.030, 0.030];
 const JUNGLE_FALL = [-0.030, 0.004];
+
+// ---- the world clock, as the map sees it ----------------------------------
+// The server owns the clock and sends {t:'clock', dayT, weather, aurora} every
+// 10s (docs/LIVING-COVE.md section A). Between frames the map advances dayT
+// itself, one cove day = 40 real minutes, so the light never steps. dayT < 0
+// means "no clock frame has landed yet": every painter below is then a no-op
+// and the map paints exactly as it did before this wave.
+// (the frame carries the real length as `dayMs`; the constant is only the value
+// used until the first one lands, so a server on a different day length still
+// interpolates at the right rate)
+let COVE_DAY_MS = 40 * 60 * 1000;
+const MAP_CLOCK = { dayT: -1, at: 0, weather: 'clear', aurora: false };
+
+function mapDayT() {
+  if (MAP_CLOCK.dayT < 0) return -1;
+  const d = MAP_CLOCK.dayT + (performance.now() - MAP_CLOCK.at) / COVE_DAY_MS;
+  return d - Math.floor(d);
+}
+
+/**
+ * Dusk-to-dawn strength, 0..1, ramped at both ends so nothing snaps on.
+ * The bonfire burns on it and the dive bell's lamp brightens on it.
+ */
+function nightK(dayT) {
+  if (dayT < 0) return 0;
+  const d = dayT < 0.5 ? dayT + 1 : dayT;      // 0.50 dusk .. 1.50 next dusk
+  if (d <= 0.98) return 1;                     // dusk and all night
+  if (d < 1.02) return 1 - (d - 0.98) / 0.04;  // dawn: it dies down
+  if (d < 1.44) return 0;                      // day: cold logs, brass in sun
+  return (d - 1.44) / 0.06;                    // dusk: it catches
+}
+
+// The sky wash, in dayT order: dawn, noon, dusk, midnight. Alphas stay low on
+// purpose. This is the hour changing on a paper map, not a night filter: the
+// pills are DOM above the canvas so labels never dim, and at 0.30 every
+// landmark still reads at midnight.
+const MAP_TINT = [
+  [255, 170, 118, 0.17],
+  [255, 246, 214, 0.00],
+  [255, 132, 92, 0.20],
+  [40, 54, 116, 0.30],
+];
+
+// The bonfire sits on the open sand north of the dock, as an R() offset from
+// the beach landmark so it holds its distance from the dock at every card
+// size: R is min(w, h), and the island box is 400px tall at every viewport
+// that matters, so only the map's width moves under it.
+const BEACH_FIRE = [-0.008, -0.070];
+
+// The dive-bell buoy (see the ART comment). Same array, one source of truth,
+// so the painted buoy and the "you are here" pin can never drift apart.
+const DRIFT_BUOY = ART.drift;
 
 const MAP_HINT = 'Pick a spot to waddle over. Press M to close the map.';
 
@@ -1616,6 +1978,57 @@ function paintLive(c, w, h, t) {
     c.fill();
   }
   c.restore();
+
+  // --- the social cove ----------------------------------------------------
+  // Order matters. The buoy and the cold logs are objects, so they take the
+  // hour's light with the rest of the island; the flames and the bell's lamp
+  // are drawn ON TOP of the wash so they read as the things making light after
+  // dark. The party beacon below is painted after all of it, at full strength:
+  // it is a "look here", not a thing the sun sets on. dayT is -1 until the
+  // first clock frame and all five calls are then no-ops.
+  const dayT = mapDayT();
+  driftBell(c, R, X, Y, t);
+  bonfirePile(c, R, X, Y, dayT);
+  paintSkyTint(c, w, h, dayT);
+  bonfireGlow(c, R, X, Y, t, dayT);
+  driftGlint(c, R, X, Y, t, dayT);
+
+  // a party is on somewhere: the venue gets a beacon nobody can miss (wave 7).
+  // Dens are not painted on this island, so those parties live in the banner
+  // under the map instead.
+  const venue = partyLive() ? ART[party.room] : null;
+  if (venue) {
+    const px = X(venue[0]);
+    // lifted off the landmark centre: the label pill sits right on top of some
+    // of these, and a beacon nobody can see is not a beacon
+    const py = Y(venue[1]) - R(0.03);
+    c.save();
+    for (let i = 0; i < 2; i++) {
+      const p = (t * 0.85 + i * 0.5) % 1;
+      c.globalAlpha = 0.6 * (1 - p);
+      circle(c, px, py, R(0.018) + R(0.078) * p);
+      outline(c, '#ffd0da', R(0.008) * (1 - p * 0.5));
+    }
+    const beat = 0.5 + 0.5 * Math.sin(t * 5.2);
+    c.globalAlpha = 1;
+    const pg = c.createRadialGradient(px, py, R(0.004), px, py, R(0.05 + 0.014 * beat));
+    pg.addColorStop(0, 'rgba(255,214,225,0.95)');
+    pg.addColorStop(1, 'rgba(232,101,122,0)');
+    c.fillStyle = pg;
+    circle(c, px, py, R(0.072));
+    c.fill();
+    circle(c, px, py, R(0.013 + 0.004 * beat));
+    fillStroke(c, C.coral, C.cream, R(0.005));
+    for (let i = 0; i < 5; i++) {
+      const p = (t * 0.7 + i * 0.2) % 1;
+      c.globalAlpha = 0.9 * (1 - p);
+      c.fillStyle = [C.gold, C.cream, C.purpleLight, C.coral, C.water][i];
+      const a = i * 1.3 + t * 0.6;
+      circle(c, px + Math.cos(a) * R(0.055) * p, py - R(0.012) - R(0.085) * p, R(0.0048));
+      c.fill();
+    }
+    c.restore();
+  }
 }
 
 function cloud(c, x, y, s) {
@@ -1669,6 +2082,189 @@ function gull(c, x, y, s, phase) {
   c.quadraticCurveTo(x - s * 0.4, y - s * 0.5, x, y);
   c.quadraticCurveTo(x + s * 0.4, y - s * 0.5, x + s, y + s * flap);
   c.stroke();
+  c.restore();
+}
+
+// ---- the social cove: clock light, the bonfire, the dive-bell buoy --------
+// docs/LIVING-COVE.md gives the world the clock (A), the beach its bonfire
+// (A2) and the cove The Drift (C); how those read on the island map is this
+// file's business, and this is that reading.
+
+/** One flat wash over the whole card: the island takes the hour's light. */
+function paintSkyTint(c, w, h, dayT) {
+  if (dayT < 0) return;
+  const f = dayT * 4;
+  const i = Math.floor(f) % 4;
+  const a = MAP_TINT[i];
+  const b = MAP_TINT[(i + 1) % 4];
+  const u = f - Math.floor(f);
+  const k = u * u * (3 - 2 * u); // smoothstep: no seam at the stops
+  const al = a[3] + (b[3] - a[3]) * k;
+  if (al > 0.004) {
+    c.fillStyle = `rgba(${Math.round(a[0] + (b[0] - a[0]) * k)},${Math.round(a[1] + (b[1] - a[1]) * k)},${Math.round(a[2] + (b[2] - a[2]) * k)},${al.toFixed(3)})`;
+    c.fillRect(0, 0, w, h);
+  }
+  // rain greys the card off a little: weather is per outdoor room family, and
+  // the map shows the island's, which beach/plaza/jungle share.
+  if (MAP_CLOCK.weather === 'rain') {
+    c.fillStyle = 'rgba(122,144,166,0.15)';
+    c.fillRect(0, 0, w, h);
+  }
+}
+
+/**
+ * Cold logs and a ring of stones on the sand: there whether it burns or not.
+ * This lives in the live layer rather than paintBase because the pile changes
+ * with the clock and the base canvas is only repainted on resize.
+ */
+function bonfirePile(c, R, X, Y, dayT) {
+  const x = X(ART.beach[0]) + R(BEACH_FIRE[0]);
+  const y = Y(ART.beach[1]) + R(BEACH_FIRE[1]);
+  const k = nightK(dayT);
+  c.save();
+  // scorched sand
+  c.save();
+  c.translate(x, y);
+  c.scale(1, 0.5);
+  circle(c, 0, 0, R(0.026));
+  c.restore();
+  c.globalAlpha = 0.55;
+  c.fillStyle = C.sandDark;
+  c.fill();
+  c.globalAlpha = 1;
+  // the stone ring
+  for (let i = 0; i < 7; i++) {
+    const ang = (i / 7) * Math.PI * 2 + 0.3;
+    circle(c, x + Math.cos(ang) * R(0.022), y + Math.sin(ang) * R(0.011), R(0.0048));
+    fillStroke(c, C.cobbleStone, C.ink, R(0.0022));
+  }
+  // three logs leaning together (charred once it is alight)
+  for (const [ang, dx] of [[-0.55, -0.004], [0.42, 0.003], [1.5, 0.001]]) {
+    c.save();
+    c.translate(x + R(dx), y - R(0.002));
+    c.rotate(ang);
+    roundBox(c, -R(0.016), -R(0.0035), R(0.032), R(0.007), R(0.003));
+    fillStroke(c, k > 0.02 ? C.woodDark : C.wood, C.ink, R(0.0026));
+    c.restore();
+  }
+  c.restore();
+}
+
+/** Flames, a warm pool on the sand and embers, from dusk to dawn. */
+function bonfireGlow(c, R, X, Y, t, dayT) {
+  const k = nightK(dayT);
+  if (k <= 0.02) return;
+  const x = X(ART.beach[0]) + R(BEACH_FIRE[0]);
+  const y = Y(ART.beach[1]) + R(BEACH_FIRE[1]);
+  const fl = 0.72 + 0.28 * Math.sin(t * 7.3) * Math.sin(t * 3.1 + 1.2);
+  const s = 0.5 + 0.5 * k;
+  c.save();
+  const g = c.createRadialGradient(x, y, R(0.004), x, y, R(0.046 + 0.012 * fl) * s);
+  g.addColorStop(0, `rgba(255,196,116,${(0.46 + 0.20 * fl) * k})`);
+  g.addColorStop(1, 'rgba(232,101,122,0)');
+  c.fillStyle = g;
+  circle(c, x, y, R(0.058) * s);
+  c.fill();
+  const hh = R(0.030) * s * (0.82 + 0.18 * fl);
+  for (const [dx, ww, col, ph] of [[-0.0035, 0.010, C.gold, 0], [0.0035, 0.008, '#ffd98a', 1.7]]) {
+    const sway = Math.sin(t * 5.5 + ph) * R(0.004);
+    c.beginPath();
+    c.moveTo(x + R(dx) - R(ww), y - R(0.002));
+    c.quadraticCurveTo(x + R(dx) - R(ww) * 0.4, y - hh * 0.6, x + R(dx) + sway, y - hh);
+    c.quadraticCurveTo(x + R(dx) + R(ww) * 0.4, y - hh * 0.6, x + R(dx) + R(ww), y - R(0.002));
+    c.closePath();
+    c.fillStyle = col;
+    c.globalAlpha = 0.92 * k;
+    c.fill();
+  }
+  c.fillStyle = C.gold;
+  for (let i = 0; i < 3; i++) {
+    const p = (t * 0.5 + i / 3) % 1;
+    c.globalAlpha = 0.8 * k * (1 - p);
+    circle(c, x + Math.sin(t * 1.6 + i * 2.1) * R(0.010), y - R(0.012) - R(0.062) * p, R(0.0038) * (1 - p * 0.4));
+    c.fill();
+  }
+  c.restore();
+}
+
+/**
+ * The Drift's marker: a brass dive bell in a coral float, riding the swell off
+ * the end of the dock, with bubbles coming up from whatever is down there.
+ * Drawn live (not in paintBase) so it can bob.
+ */
+function driftBell(c, R, X, Y, t) {
+  const x = X(DRIFT_BUOY[0]);
+  const y = Y(DRIFT_BUOY[1]) + Math.sin(t * 1.1) * R(0.005);
+  c.save();
+  // bubbles
+  c.fillStyle = '#ffffff';
+  for (let i = 0; i < 3; i++) {
+    const p = (t * 0.42 + i / 3) % 1;
+    c.globalAlpha = 0.65 * (1 - p);
+    circle(c, x - R(0.016) + Math.sin(p * 6 + i * 2) * R(0.004), y + R(0.030) - R(0.042) * p, R(0.0035) * (0.5 + p));
+    c.fill();
+  }
+  c.globalAlpha = 1;
+  // the swell it sits in
+  for (let i = 0; i < 2; i++) {
+    const p = (t * 0.55 + i * 0.5) % 1;
+    c.globalAlpha = 0.55 * (1 - p);
+    c.save();
+    c.translate(x, y + R(0.012));
+    c.scale(1, 0.4);
+    circle(c, 0, 0, R(0.012) + R(0.030) * p);
+    c.restore();
+    outline(c, '#ffffff', R(0.003));
+  }
+  c.globalAlpha = 1;
+  c.translate(x, y + R(0.012));
+  c.rotate(Math.sin(t * 0.9) * 0.08);
+  // float: a coral drum with a cream waterline band
+  roundBox(c, -R(0.017), -R(0.020), R(0.034), R(0.024), R(0.008));
+  fillStroke(c, C.coral, C.ink, R(0.006));
+  c.save();
+  roundBox(c, -R(0.017), -R(0.020), R(0.034), R(0.024), R(0.008));
+  c.clip();
+  c.fillStyle = C.cream;
+  c.fillRect(-R(0.02), -R(0.010), R(0.04), R(0.008));
+  c.restore();
+  // the bell itself, brass, sitting in the float's collar
+  c.beginPath();
+  c.moveTo(-R(0.013), -R(0.020));
+  c.quadraticCurveTo(-R(0.013), -R(0.045), 0, -R(0.045));
+  c.quadraticCurveTo(R(0.013), -R(0.045), R(0.013), -R(0.020));
+  c.closePath();
+  fillStroke(c, C.gold, C.ink, R(0.0055));
+  circle(c, 0, -R(0.032), R(0.005));      // porthole
+  fillStroke(c, '#a8e0f2', C.ink, R(0.0035));
+  circle(c, 0, -R(0.050), R(0.006));      // lifting eye
+  outline(c, C.ink, R(0.0045));
+  c.restore();
+}
+
+/**
+ * The brass catches the light: a slow flash by day, a lamp after dark. Drawn
+ * after the sky wash so it reads as a thing MAKING light. The bob term has to
+ * match driftBell's.
+ */
+function driftGlint(c, R, X, Y, t, dayT) {
+  const x = X(DRIFT_BUOY[0]);
+  const y = Y(DRIFT_BUOY[1]) + Math.sin(t * 1.1) * R(0.005) - R(0.038);
+  const k = nightK(dayT);
+  const s = Math.max(0, Math.sin(t * 1.6));
+  const flash = s * s * s * s;
+  c.save();
+  const g = c.createRadialGradient(x, y, R(0.002), x, y, R(0.020 + 0.018 * flash));
+  g.addColorStop(0, `rgba(255,226,150,${(0.22 + 0.42 * k) * (0.35 + 0.65 * flash)})`);
+  g.addColorStop(1, 'rgba(242,182,74,0)');
+  c.fillStyle = g;
+  circle(c, x, y, R(0.040));
+  c.fill();
+  const r = R(0.005) * (0.55 + 0.75 * flash);
+  c.globalAlpha = 0.55 + 0.45 * flash;
+  c.fillStyle = '#ffffff';
+  poly(c, [[x, y - r * 2.6], [x + r, y], [x, y + r * 2.6], [x - r, y]]);
+  c.fill();
   c.restore();
 }
 
@@ -1752,11 +2348,18 @@ function buildMap(game, el) {
         <div class="map-here hidden" id="map-here"><i></i><i></i><b></b></div>
       </div>
       <div class="map-hint" id="map-hint">${MAP_HINT}</div>
+      <div class="map-party" id="map-party" hidden>
+        <div class="map-party-txt"></div>
+        <button class="map-party-go" type="button">Head over</button>
+      </div>
       <button class="hud-btn map-close" id="map-close">&#10005;</button>
     </div>`;
   const island = el.querySelector('#map-island');
   const here = el.querySelector('#map-here');
   const hint = el.querySelector('#map-hint');
+  const partyRow = el.querySelector('#map-party');
+  const partyTxt = partyRow.querySelector('.map-party-txt');
+  const partyGo = partyRow.querySelector('.map-party-go');
   const painter = createIslandPainter(el.querySelector('#map-canvas'));
   const buttons = [];
 
@@ -1777,9 +2380,40 @@ function buildMap(game, el) {
     };
     b.addEventListener('pointerenter', () => setHint(`${ROOM_INFO[id].name} : ${ROOM_INFO[id].desc || ''}`));
     b.addEventListener('pointerleave', () => setHint(null));
+    const hat = document.createElement('i'); // party hat, shown only by .is-party
+    hat.className = 'map-hat';
+    b.appendChild(hat);
     island.appendChild(b);
     buttons.push(b);
   }
+
+  /** Pill hat + banner for the live party (wave 7). */
+  function refreshParty() {
+    const live = partyLive();
+    for (const b of buttons) {
+      b.classList.toggle('is-party', live && b.dataset.room === party.room);
+    }
+    partyRow.hidden = !live;
+    if (!live) return;
+    const onMap = Object.prototype.hasOwnProperty.call(ROOM_INFO, party.room);
+    partyTxt.textContent = '';
+    const line = document.createElement('span');
+    line.textContent = `${party.host} is throwing a party at ${party.label}`;
+    const sub = document.createElement('small');
+    const mins = Math.max(1, Math.round((party.endsAt - Date.now()) / 60000));
+    sub.textContent = party.count
+      ? `${party.count} already there : about ${mins} min left`
+      : `About ${mins} min left. Turning up is the whole gift.`;
+    partyTxt.append(line, sub);
+    partyGo.textContent = onMap ? 'Head over' : 'Knock on the door';
+    partyGo.onclick = () => {
+      el.classList.add('hidden');
+      game.audio?.play?.('whoosh');
+      if (onMap) { if (game.roomId !== party.room) game.goToRoom(party.room); }
+      else visitHouse(game, party.host);
+    };
+  }
+  for (const ev of ['party', 'party-start', 'party-end']) game.events.on(ev, refreshParty);
 
   function refreshHere() {
     const spot = ART[game.roomId];
@@ -1800,6 +2434,7 @@ function buildMap(game, el) {
     if (open) {
       setHint(null);
       refreshHere();
+      refreshParty();
       painter.refresh();
       painter.start();
     } else {
@@ -1813,6 +2448,20 @@ function buildMap(game, el) {
     new ResizeObserver(() => { if (open) painter.refresh(); }).observe(island);
   }
   game.events.on('room', () => { refreshHere(); });
+  // The clock lands every 10s; the painters advance dayT themselves in
+  // between. Repaint on arrival so a reduced-motion map (which never runs the
+  // rAF loop) still keeps up with the light.
+  game.events.on('clock', (m) => {
+    const span = Number(m && m.dayMs);
+    if (Number.isFinite(span) && span > 1000) COVE_DAY_MS = span;
+    const d = Number(m && m.dayT);
+    if (!Number.isFinite(d)) return;
+    MAP_CLOCK.dayT = d - Math.floor(d);
+    MAP_CLOCK.at = performance.now();
+    MAP_CLOCK.weather = (m && m.weather) || 'clear';
+    MAP_CLOCK.aurora = !!(m && m.aurora);
+    if (open) painter.refresh();
+  });
 
   el.querySelector('#map-close').onclick = () => el.classList.add('hidden');
   el.addEventListener('click', (e) => { if (e.target === el) el.classList.add('hidden'); });

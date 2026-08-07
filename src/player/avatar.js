@@ -4,6 +4,9 @@ import { buildHat } from './hats.js';
 
 // Chibi capybara avatar. Face points +Z. Feet at y=0, total height ~1.72 (the
 // old model measured 1.71, so seats, name tags and sled rigs still line up).
+// Anim states: idle | walk | dance | sit | swim | ride (+ playWave() on top of
+// any of them). 'swim'/'ride' belong to The Drift; everything on the wire is
+// still one of idle/walk/dance/sit (see src/world/rooms/drift.js).
 // Used for the local player, remote players, server bots, den/chairlift seats,
 // race riders and the shop/profile turntables, so keep this file self-contained
 // and cheap (no lights, no shadows config here).
@@ -347,6 +350,11 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
     }
     tail.rotation.set(0, 0, 0);
 
+    // the blob shadow fakes ground contact, so it has nothing to land on in a
+    // room with no floor: it would hang in the water column under a swimmer
+    const afloat = state.anim === 'swim' || state.anim === 'ride';
+    if (blob.visible === afloat) blob.visible = !afloat;
+
     if (state.anim === 'walk') {
       // springy waddle: bounce with a squash at each footfall, ears lag behind
       const p = t * 9.2;
@@ -396,6 +404,59 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
       ears[0].rotation.x = -0.25 * aB * n - 0.3 * bH * m;
       ears[1].rotation.x = ears[0].rotation.x;
       tail.rotation.z = aS * 0.3 * n + bS * 0.4 * m;
+    } else if (state.anim === 'swim' || state.anim === 'ride') {
+      // The Drift (docs/LIVING-COVE.md C). Both states tip the WHOLE body onto
+      // its front: local +Y becomes world forward and local +Z becomes world
+      // down, so the rig's existing fore/aft joints paddle underneath the chest
+      // exactly like a real capybara's dog-paddle. The head counter-rotates so
+      // the face still looks where the capy is going.
+      // Trailing bubbles are the room's job, not the avatar's: one recycled
+      // Points cloud for every swimmer in the room beats a per-capy emitter and
+      // keeps this file at 16 draw calls.
+      if (state.anim === 'swim') {
+        const p = t * 7;
+        const s = Math.sin(p);
+        body.rotation.x = 1.3 + Math.sin(t * 2.1) * 0.05;   // horizontal
+        body.rotation.z = Math.sin(t * 1.7) * 0.07;         // lazy roll
+        body.rotation.y = Math.sin(t * 3.5) * 0.055;        // fishy wag
+        body.position.y = 0.32 + Math.sin(t * 2.1) * 0.05;
+        body.scale.y = 1.06;                                // streamlined
+        body.scale.x = body.scale.z = 0.98;
+        headG.rotation.x = -1.05 + Math.sin(t * 2.1) * 0.06;
+        headG.rotation.y = Math.sin(t * 0.9) * 0.13;
+        arms[0].rotation.x = -0.55 + s * 0.75;
+        arms[1].rotation.x = -0.55 - s * 0.75;
+        arms[0].rotation.z = -(ARM_SPLAY + 0.3);
+        arms[1].rotation.z = ARM_SPLAY + 0.3;
+        legs[0].rotation.x = -0.35 + Math.sin(p + 1.1) * 0.6;
+        legs[1].rotation.x = -0.35 - Math.sin(p + 1.1) * 0.6;
+        legs[0].rotation.z = -0.2;
+        legs[1].rotation.z = 0.2;
+        ears[0].rotation.x = 0.28;
+        ears[1].rotation.x = 0.28;
+        tail.rotation.x = Math.sin(t * 5.2) * 0.4;
+      } else {
+        // riding Big Blue: astride her back, paws planted, head sightseeing
+        body.position.y = -0.12 + Math.sin(t * 1.7) * 0.03;
+        body.rotation.x = -0.08;
+        body.rotation.z = Math.sin(t * 0.85) * 0.06;
+        body.scale.y = 1 + Math.sin(t * 2) * 0.012;
+        legs[0].rotation.x = -0.95;
+        legs[1].rotation.x = -0.95;
+        legs[0].rotation.z = -0.5;
+        legs[1].rotation.z = 0.5;
+        legs[0].position.z += 0.06;
+        legs[1].position.z += 0.06;
+        arms[0].rotation.x = -1.0;
+        arms[1].rotation.x = -1.0;
+        arms[0].rotation.z = -0.34;
+        arms[1].rotation.z = 0.34;
+        headG.rotation.y = Math.sin(t * 0.7) * 0.22;
+        headG.rotation.x = -0.12 + Math.sin(t * 1.9) * 0.05;
+        ears[0].rotation.x = -0.12 + Math.sin(t * 2.6) * 0.06;
+        ears[1].rotation.x = -0.12 + Math.sin(t * 2.6 + 1) * 0.06;
+        tail.rotation.x = 0.45 + Math.sin(t * 1.1) * 0.12;
+      }
     } else if (state.anim === 'sit') {
       // seated: settled low, legs forward, tail curled up, gentle look-around
       body.position.y = -0.16;

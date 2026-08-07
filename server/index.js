@@ -12,7 +12,7 @@ import { signup, login, verifyToken, publicProfile } from './auth.js';
 import { BotManager } from './bots.js';
 import * as progress from './progress.js';
 import {
-  ROOM_IDS, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
+  ROOM_IDS, ROOM_INFO, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
   NAME_MAX_LEN, NAME_MIN_LEN, clampCoinsForGame, MINIGAMES,
   FURNITURE, HOUSE_MAX_ITEMS, HOUSE_ACCESS_MODES,
 } from '../shared/constants.js';
@@ -68,6 +68,104 @@ const DD_GUESS_LIMIT = 4; // guesses per second, per player
 const DD_DRAWER_POINTS = 15; // per capy who guesses your doodle
 const DD_GUESS_POINTS = [100, 85, 75, 65, 55, 45, 40]; // by finishing order
 const DD_PODIUM_COINS = [20, 10, 5];
+
+// ---- wave 7: the Social Cove (docs/LIVING-COVE.md) -------------------------
+// Test hooks: every duration below that a test would otherwise have to WAIT
+// for is read from the environment first. Unset (production, dev) they are the
+// spec values; the headless ws suite runs a 40-minute cove day in two seconds.
+const envMs = (name, spec) => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : spec;
+};
+
+const COVE_DAY_MS = envMs('COVE_DAY_MS', 40 * 60 * 1000); // one cove day
+const CLOCK_MS = envMs('COVE_CLOCK_MS', 10_000); // broadcast cadence
+// shifts the phase without touching the wall clock, so a test can stand the
+// island at midnight; production never sets it
+const CLOCK_OFFSET_MS = Number(process.env.COVE_CLOCK_OFFSET_MS) || 0;
+const WEATHER_MIN_MS = envMs('COVE_WEATHER_MIN_MS', 3 * 60 * 1000);
+const WEATHER_MAX_MS = envMs('COVE_WEATHER_MAX_MS', 8 * 60 * 1000);
+const AURORA_FROM_T = 0.65; // night only
+const AURORA_TO_T = 0.90;
+const AURORA_CHANCE = Number.isFinite(Number(process.env.COVE_AURORA_CHANCE))
+  ? Math.max(0, Math.min(1, Number(process.env.COVE_AURORA_CHANCE)))
+  : 0.15; // ~15% of nights
+const AURORA_MIN_MS = 180_000;
+const AURORA_MAX_MS = 300_000;
+
+const SNOW_ROOM = 'peak';
+const SNOW_THROW_MS = 1_000; // one snowball a second, per capy (spec A2)
+
+// The beach ball. Every constant here mirrors src/world/rooms/beach.js so the
+// client's local prediction and the server's authority describe the same toy:
+// the room eases onto each frame, and matching physics keeps that ease down to
+// a nudge instead of a rubber band.
+const BALL_ROOM = 'beach';
+const BALL_TICK_MS = 100; // 10Hz integration, so every client agrees
+const BALL_R = 0.42; // the room's mesh radius
+const BALL_GRAVITY = -15;
+const BALL_AIR_DRAG = 0.16; // per second, horizontal
+const BALL_GROUND_DRAG = 1.7; // per second, once it is rolling on the sand
+const BALL_WATER_DRAG = 2.4; // per second, while it is bobbing in the surf
+const BALL_BOUNCE = 0.62;
+const BALL_MAX_SPEED = 18;
+const BALL_IMPULSE_MAX = 9; // one clamped bop; a bigger ask is trimmed, not dropped
+// The room lets you click the ball from 6.5 units away and bops it on contact;
+// this is that gate plus a pace of slack for the move frame in flight. It is
+// still a gate: nobody volleys the ball from the end of the dock.
+const BALL_REACH = 7.5;
+const BALL_BOP_MS = 300; // just under the room's own 0.35s bop cooldown
+// Where the toy lives: the cove centre (beach.js CX/CZ) is the middle of the
+// bowl, the shore is roughly 9.5 out, and past that it is in the surf, where
+// the water drags it and the swell walks it back to the sand. Nothing is
+// clamped until 16, which is well out to sea and only there so a pathological
+// frame cannot lose the ball forever.
+const BALL_HOME = { x: 1.2, z: 3.4 }; // beach.js BALL_HOME: open sand
+const BALL_COVE = { x: 1, z: 1 }; // beach.js CX/CZ
+const BALL_SHORE = 9.5;
+const BALL_LOST = 16;
+
+// The beach bonfire, mirroring src/world/rooms/beach.js's FIRE (the log pile)
+// and COZY_R (the reach of its glow). The room draws the ember halo on anyone
+// inside that circle, so the coin has to be paid for exactly the same circle or
+// the two would tell different stories about who is warm.
+const BONFIRE = { room: 'beach', x: 3.6, z: -5.0, r: 3.0 };
+const BONFIRE_MINUTE_MS = envMs('COVE_BONFIRE_MS', 60_000);
+const BONFIRE_COIN = 1;
+const BONFIRE_CAP = 15; // coins per capy per cove night: a magnet, not an economy
+
+const PARTY_MS = envMs('COVE_PARTY_MS', 30 * 60 * 1000);
+const PARTY_COOLDOWN_MS = envMs('COVE_PARTY_COOLDOWN_MS', 90 * 60 * 1000);
+const PARTY_ABSENCE_MS = envMs('COVE_PARTY_ABSENCE_MS', 5 * 60 * 1000);
+// src/ui/menu.js offers 'den' and 'club'; 'house' is accepted as a synonym so a
+// scripted client using the spec's word ("their den or the club") still works.
+const PARTY_VENUES = ['club', 'den', 'house'];
+const CLUB_ROOM = 'club';
+
+const MURAL_W = 96;
+const MURAL_H = 54;
+const MURAL_COLORS = 14; // the 12 DESIGN.md colours + cream + ink; 0 is the blank cream
+const MURAL_COOLDOWN_MS = envMs('COVE_MURAL_MS', 20_000);
+const MURAL_OPS_CAP = 50_000; // rolling op log, for the operator's report snapshots
+const MURAL_SAVE_MS = envMs('COVE_MURAL_SAVE_MS', 4_000); // debounce: a busy wall writes at most this often
+const MURAL_REPORT_MS = 60_000; // per player: reporting is a disk write
+const MURAL_ROOM = 'plaza';
+
+const DRIFT_ROOM = 'drift';
+const BOTTLE_COINS = 25;
+const BOTTLE_REACH = 4; // how close you have to swim to pick it up
+// The bottle's spawn volume. The Drift renders it wherever the server says, so
+// this only has to sit inside the room's swimmable box (src/world/rooms/
+// drift.js BOUND_MIN/BOUND_MAX: +-30 wide, y 1.3 to 16.5) and clear of the
+// seabed dunes, which crest a little over y=1.
+const BOTTLE_FIELD = { r: 22, yMin: 2.2, yMax: 7 };
+
+// Poses a move frame may claim. Deliberately unchanged for wave 7: The Drift
+// plays 'swim'/'ride' locally but puts 'sit' on the wire (see the header note
+// in src/world/rooms/drift.js), because every other client renders remotes from
+// this list and would fall back to idle on a pose it has never heard of. What
+// travels for swimming is height and the ride flag, not a new anim name.
+const MOVE_ANIMS = ['idle', 'walk', 'dance', 'sit'];
 
 const USERNAME_RE = new RegExp(`^[a-zA-Z0-9_]{${NAME_MIN_LEN},${NAME_MAX_LEN}}$`);
 
@@ -136,11 +234,21 @@ const world = {
 let nextId = 1;
 
 function snapshotFor(p) {
-  return {
+  const snap = {
     id: p.id, name: p.name, bot: !!p.bot,
     x: +p.x.toFixed(2), z: +p.z.toFixed(2), rot: +p.rot.toFixed(2),
     anim: p.anim, color: p.color, hat: p.hat,
   };
+  // Swimming rooms (The Drift) have no ground to raycast onto, so height and
+  // the whale-riding flag have to travel. Both are omitted everywhere else:
+  // this snapshot is on the hot path and bots never have either.
+  if (p.room === DRIFT_ROOM || p.y) snap.y = +(p.y || 0).toFixed(2);
+  if (p.ride) snap.ride = 1;
+  // The 40-stamp milestone title, for the second line on the world name tag
+  // (src/net/client.js addTagTitle reads exactly this field). Only ever present
+  // on the handful of accounts that earned it, so the hot path pays nothing.
+  if (p.title) snap.title = p.title;
+  return snap;
 }
 
 function sendTo(p, msg) {
@@ -157,7 +265,17 @@ function broadcastToRoom(roomId, msg, exceptId = null) {
   }
 }
 
-const bots = new BotManager({ broadcastToRoom, snapshotFor }, { perRoom: 2 });
+/** Island-wide: the clock, party toasts and beacons reach everyone, everywhere. */
+function broadcastAll(msg) {
+  const raw = JSON.stringify(msg);
+  for (const p of world.players.values()) {
+    if (p.ws?.readyState === 1) p.ws.send(raw);
+  }
+}
+
+// The bonfire spot travels with the citizens so section B's fire-keepers and
+// section A2's coin validation cannot drift apart: one constant, two readers.
+const bots = new BotManager({ broadcastToRoom, snapshotFor }, { perRoom: 2, bonfire: BONFIRE });
 
 function roomSnapshot(roomId) {
   const players = [...(world.rooms.get(roomId) || [])]
@@ -203,6 +321,9 @@ function joinRoom(p, roomId) {
   if (p.room === JUNGLE_ROOM) exitDoodle(p);
   if (p.room) leaveRoomSet(p);
   p.room = roomId;
+  // whatever you were riding, you are not riding it in the next room: the flag
+  // would otherwise ride along in this join's snapshot
+  p.ride = false;
   world.rooms.get(roomId).add(p.id);
   sendTo(p, { t: 'room', room: roomId, players: roomSnapshot(roomId) });
   broadcastToRoom(roomId, { t: 'pjoin', p: snapshotFor(p) }, p.id);
@@ -213,6 +334,17 @@ function joinRoom(p, roomId) {
   if (roomId === LOUNGE_ROOM) sendTables(p);
   // ...and the party boards in the mine and the jungle
   for (const lob of Object.values(partyLobbies)) if (roomId === lob.room) sendTo(p, partyPayload(lob));
+  // wave 7: the room you just walked into has to arrive already running. The
+  // clock frame first (the room rebuild reads it for sky/lamps), then whatever
+  // this particular room owns.
+  sendTo(p, clockFrame());
+  // always, even with nothing running: it is also how a stale beacon clears
+  sendTo(p, partiesFrame());
+  if (roomId === BALL_ROOM) sendBall(p);
+  if (roomId === MURAL_ROOM) sendMuralGrid(p);
+  if (roomId === DRIFT_ROOM) sendBottle(p);
+  markPartyAttendance(p);
+  signal('room', p, { room: roomId });
 }
 
 function leaveWorld(p) {
@@ -273,6 +405,19 @@ function grantCoins(p, amount, reason) {
 
 // progression module boot (quests/stamps/milestones live in server/progress.js)
 progress.install({ users, saveSoon, grantCoins, sendTo, broadcastToRoom, has });
+
+/**
+ * Every scoring moment the island produces, handed to the progression module.
+ * Wrapped because the quest board must never be able to take down a chat
+ * message, a coin payout or the world tick with it: see the name list in
+ * server/progress.js's header comment.
+ */
+function signal(name, p, data) {
+  if (!p || p.bot) return;
+  try { progress.signal(name, p, data); } catch (e) {
+    console.error(`[progress] signal '${name}' failed:`, e?.message || e);
+  }
+}
 
 /**
  * Budget for the social messages (cards, friends, lobby): each one either fans
@@ -560,6 +705,11 @@ function endRace(race) {
     if (p && p.race === race) { p.race = null; finalists.push(p); }
   }
   for (const p of finalists) sendTo(p, { t: 'race-end', standings });
+  // every finisher's placing, for the quest board ("finish a 3-capy race")
+  standings.forEach((row, i) => {
+    const racer = finalists.find((x) => x.id === row.id);
+    if (racer) signal('race-done', racer, { placed: i + 1, of: standings.length, score: row.score });
+  });
   // a real head-to-head pays out; a race that emptied out does not. Paid after
   // the standings so the coin pop lands on top of the results screen.
   const champ = standings[0];
@@ -720,7 +870,15 @@ function endMatch(match, reason, forfeitWinner = null) {
   // Paid after the results so the coin pop lands on top of the win screen.
   if (winner && winner !== 'draw') {
     const champ = world.players.get(winner);
-    if (champ) grantCoins(champ, MATCH_WIN_COINS, 'match win');
+    if (champ) {
+      grantCoins(champ, MATCH_WIN_COINS, 'match win');
+      // an agreed win (or a forfeit): the only den result the server ever sees.
+      // `sweep` is the loser's own reported score being zero, which is the
+      // closest thing to "without dropping a point" that both sides signed off.
+      const beaten = match.reports.get(otherSeat(match, winner));
+      const sweep = reason === 'done' && !!beaten && beaten.score === 0;
+      signal('match-win', champ, { game: match.game, reason, sweep });
+    }
   }
 }
 
@@ -746,6 +904,7 @@ function digTick() {
     // must not fire when the backstop paid nothing: the animation would lie
     if (grantCoins(p, gem ? GEM_COINS : DIG_COINS, gem ? 'gem!' : 'mining') > 0) {
       sendTo(p, { t: 'dig-tick', gem });
+      signal('dig', p, { gem });
     }
   }
 }
@@ -1156,6 +1315,8 @@ function scoreDoodleGuess(g, p) {
     // the answer is the reward: only the capy who earned it gets it early
     sendTo(other, other.id === p.id ? { ...base, word: g.word, you: true } : base);
   }
+  // the server refereed this one itself, so it is worth something to the board
+  signal('doodle-correct', p, { points, order: g.correct - 1, round: g.round });
   if (allGuessed(g)) revealDoodle(g, 'solved');
 }
 
@@ -1205,6 +1366,760 @@ function exitDoodle(p) {
   if (p.id === g.drawerId) { revealDoodle(g, 'left'); return; }
   sendDoodleState(g); // the scoreboard loses a row for everyone else
   if (g.phase === 'draw' && allGuessed(g)) revealDoodle(g, 'solved');
+}
+
+// ===========================================================================
+// The Social Cove (wave 7, docs/LIVING-COVE.md). Everything below is server
+// authority for things several capys share: the sky, a ball, a bonfire, a
+// party, a wall of pixels and one bottle a day.
+// ===========================================================================
+
+// ---------- A. the world clock, weather and aurora ----------
+// One cove day is 40 real minutes of continuous phase `dayT` in [0,1): 0.0
+// dawn, 0.25 noon, 0.5 dusk, 0.75 midnight. Derived from the wall clock rather
+// than counted up, so a server restart does not teleport the island to dawn and
+// two processes would agree. Clients interpolate between frames and never read
+// their own Date for game time.
+//
+// The frame: { t:'clock', dayT, day, weather, snow, aurora, dayMs }
+//   weather 'clear' | 'breeze' | 'rain' : the island's sky, as a plain word.
+//           A WORD, not an envelope: engine.applyClock hands this straight to
+//           room.onClock(dayT, weather, aurora), and all three outdoor rooms
+//           read it as a string (the plaza compares it directly; the peak maps
+//           the word onto snowfall through its own vocabulary). An object here
+//           would silently read as 'clear' in the plaza forever.
+//   snow    0..2 : the peak's own snowfall walk, for any reader that wants a
+//           number independent of the sky word (the room derives one already)
+//   day     integer cove-day index : what "daily" means here (quests, bottle)
+//   dayMs   one cove day in ms : lets a client tween between frames
+const clock = {
+  day: -1, dayT: 0, aurora: false,
+  weather: { sky: 'clear', snow: 0 },
+  weatherAt: 0, auroraDay: -1, auroraFromT: -1, auroraToT: -1,
+};
+
+/** Wall clock, phase-shifted (the shift is a test hook; production leaves it 0). */
+const coveNow = () => Date.now() + CLOCK_OFFSET_MS;
+
+// Gentle Markov walk: most rolls keep the weather it already had, and rain
+// never arrives out of a clear sky without a breeze in between.
+const SKY_WALK = {
+  clear: [['clear', 0.60], ['breeze', 0.40], ['rain', 0]],
+  breeze: [['breeze', 0.45], ['clear', 0.35], ['rain', 0.20]],
+  rain: [['rain', 0.40], ['breeze', 0.45], ['clear', 0.15]],
+};
+
+function walkWeighted(rows, fallback) {
+  let roll = Math.random();
+  for (const [value, weight] of rows) {
+    roll -= weight;
+    if (roll <= 0) return value;
+  }
+  return fallback;
+}
+
+/** Snowfall drifts one step at a time; it never jumps from still to blizzard. */
+function walkSnow(cur) {
+  const rows = cur === 0 ? [[0, 0.55], [1, 0.45]]
+    : cur === 1 ? [[1, 0.45], [0, 0.3], [2, 0.25]]
+      : [[2, 0.5], [1, 0.5]];
+  return walkWeighted(rows, cur);
+}
+
+/** Recompute the whole sky. Called every CLOCK_MS and before any clock frame. */
+function updateClock() {
+  const now = coveNow();
+  clock.day = Math.floor(now / COVE_DAY_MS);
+  clock.dayT = (now % COVE_DAY_MS) / COVE_DAY_MS;
+
+  if (now >= clock.weatherAt) {
+    clock.weatherAt = now + WEATHER_MIN_MS + Math.random() * (WEATHER_MAX_MS - WEATHER_MIN_MS);
+    clock.weather = {
+      sky: walkWeighted(SKY_WALK[clock.weather.sky] || SKY_WALK.clear, clock.weather.sky),
+      snow: walkSnow(clock.weather.snow),
+    };
+  }
+
+  // The aurora is rolled ONCE per cove day, at the day boundary, so everyone
+  // who looks up during that night sees the same sky: a per-frame roll would
+  // flicker and a per-join roll would disagree between clients.
+  if (clock.auroraDay !== clock.day) {
+    clock.auroraDay = clock.day;
+    clock.auroraFromT = clock.auroraToT = -1;
+    if (Math.random() < AURORA_CHANCE) {
+      const durT = (AURORA_MIN_MS + Math.random() * (AURORA_MAX_MS - AURORA_MIN_MS)) / COVE_DAY_MS;
+      const room = Math.max(0, (AURORA_TO_T - AURORA_FROM_T) - durT);
+      clock.auroraFromT = AURORA_FROM_T + Math.random() * room;
+      clock.auroraToT = clock.auroraFromT + durT;
+    }
+  }
+  clock.aurora = clock.dayT >= clock.auroraFromT && clock.dayT < clock.auroraToT;
+  return clock;
+}
+
+function clockFrame() {
+  // recomputed on the way out: a join frame ten seconds after the last tick
+  // would otherwise hand that client a stale sky to interpolate away from
+  updateClock();
+  return {
+    t: 'clock',
+    dayT: +clock.dayT.toFixed(5),
+    day: clock.day,
+    weather: clock.weather.sky,
+    snow: clock.weather.snow,
+    aurora: clock.aurora,
+    dayMs: COVE_DAY_MS,
+  };
+}
+
+/**
+ * Dusk to dawn: when the lamps are on and the bonfire is burning. The window
+ * mirrors the rooms' own lamp test (beach.js lights everything while the sun
+ * sits below `elev < 0.1`, which is this phase range), so the fire is never
+ * visibly lit while the server quietly refuses to pay for sitting at it.
+ */
+const isCoveNight = () => clock.dayT >= 0.484 || clock.dayT < 0.016;
+
+// ---------- A2. snowballs (Frosty Peak) ----------
+// Pure relay: the server owns nothing but the rate limit. Everyone simulates
+// the same arc from the same two points, and a hit is a puff and a wobble, so
+// there is no state worth defending here.
+
+function throwSnowball(p, m, now) {
+  if (p.room !== SNOW_ROOM) return; // snow is where the snow is
+  if (now - (p.snowAt || 0) < SNOW_THROW_MS) return; // 1/s, per spec A2
+  const to = readPoint(m.to);
+  if (!to) return;
+  p.snowAt = now;
+  // `from` is optional: a client that does not send it gets its own capy's last
+  // known position, which is where the throw came from anyway
+  const from = readPoint(m.from) || { x: +p.x.toFixed(2), y: +(p.y || 0).toFixed(2), z: +p.z.toFixed(2) };
+  broadcastToRoom(p.room, { t: 'snow', id: p.id, from, to }, p.id);
+  // The quest board's "land N snowballs" counts THROWS: the arc is simulated on
+  // every client and the hit is decided there, so a landed snowball is not a
+  // thing the server ever sees. Counting the rate-limited throw is the only
+  // measure here that cannot be claimed by a client.
+  signal('snow', p, { room: p.room });
+}
+
+/**
+ * A client-supplied point, clamped to the world box, or null if it was junk.
+ * Both dialects are read: `{x,y,z}` and the peak's compact `[x,z]` / `[x,y,z]`
+ * (src/world/rooms/peak.js sends the array, and reads either on the way back).
+ */
+function readPoint(v, span = 100) {
+  if (Array.isArray(v)) {
+    if (v.length < 2) return null;
+    const [ax, ay, az] = v.length > 2 ? v : [v[0], 0, v[1]];
+    return readPoint({ x: ax, y: ay, z: az }, span);
+  }
+  if (!v || typeof v !== 'object') return null;
+  const x = Number(v.x), y = Number(v.y), z = Number(v.z);
+  if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+  return {
+    x: +Math.max(-span, Math.min(span, x)).toFixed(2),
+    y: +Math.max(-40, Math.min(40, Number.isFinite(y) ? y : 0)).toFixed(2),
+    z: +Math.max(-span, Math.min(span, z)).toFixed(2),
+  };
+}
+
+// ---------- A2. the beach ball ----------
+// ONE ball, owned by the server, integrated at 10Hz so every client agrees
+// about where it is without anyone being the authority. Clients send bops
+// (clamped impulses, and only from arm's length), the server sends state.
+// The ball sleeps when it stops: an idle beach costs no bandwidth at all.
+//
+// The sea is modelled as one soft radius rather than the beach's real
+// shoreline function: past BALL_SHORE the water drags the ball and walks it
+// back toward the middle, which is the spec's "splashes, floats back" without
+// the server having to carry a copy of the room's coastline (the two would
+// drift apart the first time the beach is re-dressed). The splash itself, the
+// foam and the bobbing are the room's, played off the state it receives.
+
+const ball = {
+  x: BALL_HOME.x, y: BALL_R, z: BALL_HOME.z,
+  vx: 0, vy: 0, vz: 0, sleeping: true, settled: true, by: null,
+};
+
+function ballFrame() {
+  return {
+    t: 'ball', room: BALL_ROOM,
+    x: +ball.x.toFixed(2), y: +ball.y.toFixed(2), z: +ball.z.toFixed(2),
+    vx: +ball.vx.toFixed(2), vy: +ball.vy.toFixed(2), vz: +ball.vz.toFixed(2),
+    by: ball.by, r: BALL_R,
+  };
+}
+
+const sendBall = (p) => sendTo(p, ballFrame());
+
+/** Somebody bopped it: clamp the ask, wake the ball, tell the beach at once. */
+function bopBall(p, m, now) {
+  if (p.room !== BALL_ROOM) return;
+  if (now - (p.ballAt || 0) < BALL_BOP_MS) return;
+  const imp = m.impulse;
+  if (!imp || typeof imp !== 'object' || Array.isArray(imp)) return;
+  let ix = Number(imp.x) || 0, iy = Number(imp.y) || 0, iz = Number(imp.z) || 0;
+  if (!Number.isFinite(ix) || !Number.isFinite(iy) || !Number.isFinite(iz)) return;
+  // you have to be next to the ball to hit it: a client cannot reach across the
+  // cove and volley it into the sea from the dock
+  if (Math.hypot(p.x - ball.x, p.z - ball.z) > BALL_REACH + BALL_R) return;
+  const mag = Math.hypot(ix, iy, iz);
+  if (mag < 0.01) return;
+  if (mag > BALL_IMPULSE_MAX) {
+    const k = BALL_IMPULSE_MAX / mag;
+    ix *= k; iy *= k; iz *= k;
+  }
+  p.ballAt = now;
+  ball.vx += ix;
+  ball.vy += Math.max(0, iy); // a bop always sends it up, never through the sand
+  ball.vz += iz;
+  ball.sleeping = false;
+  ball.by = p.id;
+  broadcastToRoom(BALL_ROOM, ballFrame()); // instant, so the bop feels like yours
+  signal('ball', p, {});
+}
+
+/** One 10Hz step of the shared physics. Returns true while it is still moving. */
+function stepBall(dt) {
+  if (ball.sleeping) return false;
+  const dx = ball.x - BALL_COVE.x, dz = ball.z - BALL_COVE.z;
+  const r = Math.hypot(dx, dz);
+  const inSurf = r > BALL_SHORE;
+
+  ball.vy += BALL_GRAVITY * dt;
+  const grounded = ball.y <= BALL_R + 0.01;
+  const perSec = inSurf ? BALL_WATER_DRAG : grounded ? BALL_GROUND_DRAG : BALL_AIR_DRAG;
+  const drag = Math.max(0, 1 - perSec * dt);
+  ball.vx *= drag;
+  ball.vz *= drag;
+  if (inSurf) {
+    // the swell walks it back to where the people are: gentle at the waterline,
+    // firmer the further out some show-off belted it
+    const push = 1.6 + Math.min(6, r - BALL_SHORE) * 0.4;
+    ball.vx -= (dx / (r || 1)) * push * dt;
+    ball.vz -= (dz / (r || 1)) * push * dt;
+  }
+  const speed = Math.hypot(ball.vx, ball.vy, ball.vz);
+  if (speed > BALL_MAX_SPEED) {
+    const k = BALL_MAX_SPEED / speed;
+    ball.vx *= k; ball.vy *= k; ball.vz *= k;
+  }
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+  ball.z += ball.vz * dt;
+
+  if (ball.y < BALL_R) {
+    ball.y = BALL_R;
+    if (inSurf) {
+      ball.vy = Math.max(ball.vy * 0.2, -0.4); // buoyancy, not a bounce
+    } else {
+      ball.vy = Math.abs(ball.vy) * BALL_BOUNCE;
+      if (ball.vy < 1.1) ball.vy = 0; // done bouncing: it is rolling now
+    }
+  }
+
+  // last resort: a ball somehow out past the horizon comes home rather than
+  // becoming a rumour
+  if (r > BALL_LOST) {
+    ball.x = BALL_HOME.x; ball.z = BALL_HOME.z; ball.y = BALL_R;
+    ball.vx = ball.vy = ball.vz = 0;
+    ball.sleeping = true;
+    return false;
+  }
+
+  // it only ever falls asleep on the sand: a ball bobbing home through the surf
+  // is still moving, however slowly
+  if (!inSurf && grounded && Math.hypot(ball.vx, ball.vz) < 0.12 && Math.abs(ball.vy) < 0.2) {
+    ball.vx = ball.vy = ball.vz = 0;
+    ball.sleeping = true;
+    return false;
+  }
+  return true;
+}
+
+/** The 10Hz tick. Silent while the ball rests or the beach is empty. */
+function ballTick() {
+  const watchers = world.rooms.get(BALL_ROOM);
+  if (!watchers || watchers.size === 0) {
+    // nobody is there to see it: park the ball rather than simulate to an
+    // empty room, and it is where they left it when they come back
+    if (!ball.sleeping) {
+      ball.sleeping = true;
+      ball.vx = ball.vy = ball.vz = 0;
+      ball.y = BALL_R;
+      // a ball abandoned mid-splash would be parked out at sea forever
+      if (Math.hypot(ball.x - BALL_COVE.x, ball.z - BALL_COVE.z) > BALL_SHORE) {
+        ball.x = BALL_HOME.x;
+        ball.z = BALL_HOME.z;
+      }
+    }
+    return;
+  }
+  const moving = stepBall(BALL_TICK_MS / 1000);
+  // one last frame on the way to sleep, so clients land it where the server did
+  if (moving || !ball.settled) broadcastToRoom(BALL_ROOM, ballFrame());
+  ball.settled = !moving;
+}
+
+// ---------- A2. the bonfire (Driftwood Beach, dusk to dawn) ----------
+// Sitting in the firelight pays a coin a minute, capped per night. Validated
+// entirely from the position and pose the player is already broadcasting, so
+// there is no "I am at the fire" message to lie in. Accrual only counts time
+// the server actually observed: a tab that reconnects starts its minute again.
+
+function bonfireTick(dtMs) {
+  if (!isCoveNight()) return;
+  for (const id of world.rooms.get(BONFIRE.room) || []) {
+    const p = world.players.get(id);
+    if (!p || p.bot) continue;
+    const near = Math.hypot(p.x - BONFIRE.x, p.z - BONFIRE.z) <= BONFIRE.r;
+    // sitting, or simply standing still by the fire (the spec's "idle 5s": the
+    // 10s clock tick is the dwell test, since a walker is never idle across one)
+    if (!near || (p.anim !== 'sit' && p.anim !== 'idle')) { p.bonfireMs = 0; continue; }
+    if (p.bonfireDay !== clock.day) { p.bonfireDay = clock.day; p.bonfireCoins = 0; }
+    if (p.bonfireCoins >= BONFIRE_CAP) continue;
+    p.bonfireMs = (p.bonfireMs || 0) + dtMs;
+    while (p.bonfireMs >= BONFIRE_MINUTE_MS && p.bonfireCoins < BONFIRE_CAP) {
+      p.bonfireMs -= BONFIRE_MINUTE_MS;
+      p.bonfireCoins++;
+      grantCoins(p, BONFIRE_COIN, 'bonfire');
+      // one signal per minute observed at the fire, which is what the album's
+      // "ten minutes at the bonfire" stamp counts
+      signal('bonfire', p, { minutes: p.bonfireCoins });
+    }
+  }
+}
+
+// ---------- A3. parties ----------
+// A party is a 30-minute flag on a room: an island-wide toast, a beacon on the
+// map, and a doubled dose of juice for whoever shows up. It mints no coins at
+// all (the host's reward is the head count), so there is nothing to farm here.
+
+const parties = new Map(); // partyId -> party
+let nextPartyId = 1;
+
+/** Who this connection is, for one-party-per-player: an account, or a guest. */
+const partyKey = (p) => (p.username ? p.username.toLowerCase() : p.id);
+
+function partyRoomName(roomId) {
+  if (isHouseRoom(roomId)) {
+    const owner = users.get(houseOwnerKey(roomId) || '');
+    return owner ? houseName(owner) : 'a den';
+  }
+  return has(ROOM_INFO, roomId) ? ROOM_INFO[roomId].name : roomId;
+}
+
+/**
+ * The beacon payload. `endsIn` (seconds) is what the HUD reads to size the
+ * countdown, so a capy who arrives twenty minutes in gets ten minutes of
+ * beacon, not another thirty; `endsAt`/`startedAt` ride along for anything that
+ * would rather have absolute times.
+ */
+function partyPublic(party) {
+  return {
+    id: party.id, host: party.hostName, hostId: party.hostId,
+    room: party.room, roomName: party.roomName, venue: party.venue,
+    startedAt: party.startedAt, endsAt: party.endsAt,
+    endsIn: Math.max(0, Math.round((party.endsAt - Date.now()) / 1000)),
+    count: party.guests.size,
+  };
+}
+
+/**
+ * The party state frame. The HUD reads ONE party (it draws one beacon and one
+ * map pill), so the flat fields describe the newest one and `parties` carries
+ * the full list for anything that wants it. With nothing running the frame says
+ * so out loud rather than going silent, so a stale beacon always clears.
+ */
+function partiesFrame() {
+  const all = [...parties.values()];
+  const newest = all[all.length - 1];
+  const list = all.map(partyPublic);
+  return newest
+    ? { t: 'party', active: true, ...partyPublic(newest), parties: list }
+    : { t: 'party', active: false, parties: [] };
+}
+
+/** The parties running in a room right now (usually none, at most one). */
+function partiesInRoom(roomId) {
+  const out = [];
+  for (const party of parties.values()) if (party.room === roomId) out.push(party);
+  return out;
+}
+
+/**
+ * Count a capy as having been at the party. One head per account however many
+ * tabs it has open, and the host is never their own guest.
+ */
+function markPartyAttendance(p) {
+  if (p.bot) return;
+  const key = partyKey(p);
+  for (const party of partiesInRoom(p.room)) {
+    if (key === party.hostKey || party.guests.has(key)) continue;
+    party.guests.add(key);
+    signal('party-attend', p, { id: party.id, room: party.room, host: party.hostName });
+  }
+}
+
+/**
+ * Every refusal answers on the same frame the request came in on, carrying the
+ * line to show and the seconds left. The HUD toasts `msg` itself, so nothing
+ * here sends a separate toast: it would arrive twice.
+ */
+function refusePartyEvent(p, msg, retryIn = 0) {
+  sendTo(p, { t: 'party-start', ok: false, msg, retryIn: Math.max(0, Math.round(retryIn)) });
+}
+
+function startPartyEvent(p, m) {
+  const rec = p.registered ? recordFor(p) : null;
+  if (!rec) { refusePartyEvent(p, 'Parties come with a (free) account: sign up and the island is yours.'); return; }
+  const key = p.username.toLowerCase();
+  for (const party of parties.values()) {
+    if (party.hostKey === key) {
+      refusePartyEvent(p, 'Your party is already going: go and be a host!', (party.endsAt - Date.now()) / 1000);
+      return;
+    }
+  }
+  const now = Date.now();
+  const last = Number(rec.partyAt) || 0;
+  if (now - last < PARTY_COOLDOWN_MS) {
+    const left = PARTY_COOLDOWN_MS - (now - last);
+    refusePartyEvent(p, `You threw one recently: ready again in about ${Math.ceil(left / 60_000)} min.`, left / 1000);
+    return;
+  }
+  const venue = PARTY_VENUES.includes(m.venue) ? (m.venue === 'house' ? 'den' : m.venue) : 'club';
+  const room = venue === 'den' ? houseRoomId(key) : CLUB_ROOM;
+  let prevAccess = null;
+  if (venue === 'den') {
+    // A den party is a door left open for half an hour: the client asks first
+    // (menu.js's confirmVenue) and sends the answer, and the server refuses to
+    // assume it. 'force' is the menu's word for that yes; 'confirm' is the
+    // spec's, and both are accepted.
+    if (m.force !== true && m.confirm !== true) {
+      refusePartyEvent(p, 'A den party opens your door to everyone: confirm to start.');
+      return;
+    }
+    const house = ensureHouse(rec);
+    prevAccess = house.access;
+    house.access = 'open';
+    saveSoon();
+    broadcastHouse(key);
+  }
+  const party = {
+    id: `party-${nextPartyId++}`,
+    hostKey: key, hostName: p.name, hostId: p.id,
+    venue, room, roomName: partyRoomName(room),
+    startedAt: now, endsAt: now + PARTY_MS,
+    guests: new Set(), awayAt: null, prevAccess,
+  };
+  parties.set(party.id, party);
+  rec.partyAt = now;
+  saveSoon();
+
+  // The island-wide toast is the HUD's (it has a warmer line for the host than
+  // for everyone else, and it owns the beacon and the map pill): this frame
+  // carries everything it needs and no toast of its own, or it would say the
+  // same thing twice.
+  broadcastAll({
+    t: 'party-start',
+    ...partyPublic(party),
+    msg: `${p.name} is throwing a party at ${party.roomName}!`,
+    cooldown: Math.round(PARTY_COOLDOWN_MS / 1000),
+  });
+  // everyone already standing in the venue is at the party
+  for (const id of world.rooms.get(room) || []) {
+    const guest = world.players.get(id);
+    if (guest) markPartyAttendance(guest);
+  }
+}
+
+function endPartyEvent(party, reason) {
+  if (!parties.has(party.id)) return;
+  parties.delete(party.id);
+  const count = party.guests.size;
+  // The den goes back to whatever door it had, unless the owner changed it
+  // themselves while the party ran (their choice wins over ours). Keyed off
+  // prevAccess, which only a den party ever sets: the venue word is the
+  // client's, and this must not depend on which spelling of it arrived.
+  if (party.prevAccess) {
+    const owner = users.get(party.hostKey);
+    if (owner) {
+      const house = ensureHouse(owner);
+      if (house.access === 'open') {
+        house.access = party.prevAccess;
+        saveSoon();
+        broadcastHouse(party.hostKey);
+      }
+    }
+  }
+  // the head count rides the frame; the HUD writes the host's bragging-rights
+  // toast off it (and a quieter line for everyone else)
+  broadcastAll({
+    t: 'party-end', id: party.id, host: party.hostName, hostId: party.hostId,
+    room: party.room, roomName: party.roomName, count, reason,
+  });
+  const hostSessions = sessionsFor(party.hostKey);
+  if (hostSessions[0]) signal('party-host', hostSessions[0], { count, venue: party.venue });
+}
+
+/** The host wandering off ends it early; so does the half hour running out. */
+function partyTick(now) {
+  for (const party of [...parties.values()]) {
+    if (now >= party.endsAt) { endPartyEvent(party, 'time'); continue; }
+    const hostHere = sessionsFor(party.hostKey).some((s) => s.room === party.room);
+    if (hostHere) { party.awayAt = null; continue; }
+    if (!party.awayAt) party.awayAt = now;
+    else if (now - party.awayAt >= PARTY_ABSENCE_MS) endPartyEvent(party, 'host-away');
+  }
+}
+
+// ---------- A4. the plaza mural ----------
+// A 96x54 grid of palette indices, one pixel per player per 20 seconds. The
+// server owns the grid, persists it debounced, and hands newcomers the whole
+// thing RLE-compressed (about 2KB while it is mostly cream). Palette-locked by
+// construction: an op carries an index, never a colour, so there is no way to
+// draw anything the cove's own palette cannot say.
+
+const MURAL_FILE = path.join(ROOT, 'data', 'mural.json');
+const MURAL_REPORT_DIR = path.join(ROOT, 'data', 'mural-reports');
+const mural = {
+  grid: new Uint8Array(MURAL_W * MURAL_H),
+  ops: [], // rolling log, capped: what a report snapshot carries as context
+  painters: new Map(), // account key -> last paint ms (pruned in the clock tick)
+  reports: new Map(), // account key -> last report ms
+  saveTimer: null,
+  dirty: false,
+};
+
+/** Row-major runs as `count:index`, joined by commas. Decoded by the overlay. */
+function muralRLE() {
+  const g = mural.grid;
+  let out = '';
+  let run = 0;
+  let cur = g[0];
+  for (let i = 0; i < g.length; i++) {
+    if (g[i] === cur) { run++; continue; }
+    out += `${out ? ',' : ''}${run}:${cur}`;
+    cur = g[i];
+    run = 1;
+  }
+  return `${out}${out ? ',' : ''}${run}:${cur}`;
+}
+
+function muralFromRLE(rle) {
+  const g = new Uint8Array(MURAL_W * MURAL_H);
+  let at = 0;
+  for (const token of String(rle || '').split(',')) {
+    if (!token) continue;
+    const [countRaw, idxRaw] = token.split(':');
+    const count = Math.floor(Number(countRaw));
+    const idx = Math.floor(Number(idxRaw));
+    if (!Number.isFinite(count) || count <= 0 || !Number.isFinite(idx) || idx < 0 || idx >= MURAL_COLORS) continue;
+    const end = Math.min(g.length, at + count);
+    if (idx) g.fill(idx, at, end);
+    at = end;
+    if (at >= g.length) break;
+  }
+  return g;
+}
+
+function loadMural() {
+  try {
+    if (!fs.existsSync(MURAL_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(MURAL_FILE, 'utf8'));
+    if (saved && saved.w === MURAL_W && saved.h === MURAL_H && typeof saved.rle === 'string') {
+      mural.grid = muralFromRLE(saved.rle);
+    }
+  } catch (e) {
+    console.error('[mural] load failed:', e?.message || e);
+  }
+}
+loadMural();
+
+function saveMuralSoon() {
+  mural.dirty = true;
+  if (mural.saveTimer) return;
+  mural.saveTimer = setTimeout(() => {
+    mural.saveTimer = null;
+    mural.dirty = false;
+    try {
+      fs.mkdirSync(path.dirname(MURAL_FILE), { recursive: true });
+      fs.writeFileSync(MURAL_FILE, JSON.stringify({ w: MURAL_W, h: MURAL_H, saved: Date.now(), rle: muralRLE() }));
+    } catch (e) {
+      console.error('[mural] save failed:', e?.message || e);
+    }
+  }, MURAL_SAVE_MS);
+}
+
+const muralGridFrame = () => ({
+  t: 'mural-grid', w: MURAL_W, h: MURAL_H, colors: MURAL_COLORS,
+  cooldown: MURAL_COOLDOWN_MS, rle: muralRLE(),
+});
+
+const sendMuralGrid = (p) => sendTo(p, muralGridFrame());
+
+/**
+ * One pixel. Registered players only (the mural is the island's guest book and
+ * a guest book wants signatures), one per 20s per account however many tabs
+ * they have open, and the colour is an index into the cove palette or nothing.
+ */
+/**
+ * A refusal rides the same frame the op did: {ok:false, wait} is what the
+ * overlay reads to put its own cooldown back in step (src/ui/mural.js), and
+ * the toast is for the case the overlay is not even open.
+ */
+function refuseMural(p, msg, waitMs = 0) {
+  sendTo(p, { t: 'mural', ok: false, msg, wait: Math.ceil(waitMs / 1000) });
+}
+
+function paintMural(p, m, now) {
+  if (!p.registered) {
+    refuseMural(p, 'Sign up to paint on the mural!');
+    sendTo(p, { t: 'toast', msg: 'Sign up to paint on the mural!' });
+    return;
+  }
+  const x = Math.floor(Number(m.x));
+  const y = Math.floor(Number(m.y));
+  const c = Math.floor(Number(m.c));
+  if (!Number.isFinite(x) || x < 0 || x >= MURAL_W) return;
+  if (!Number.isFinite(y) || y < 0 || y >= MURAL_H) return;
+  if (!Number.isFinite(c) || c < 0 || c >= MURAL_COLORS) return;
+  const key = p.username.toLowerCase();
+  const last = mural.painters.get(key) || 0;
+  if (now - last < MURAL_COOLDOWN_MS) {
+    refuseMural(p, 'That paint is still drying', MURAL_COOLDOWN_MS - (now - last));
+    return;
+  }
+  mural.painters.set(key, now);
+  mural.grid[y * MURAL_W + x] = c;
+  mural.ops.push({ x, y, c, by: p.name, at: now });
+  if (mural.ops.length > MURAL_OPS_CAP) mural.ops.splice(0, mural.ops.length - MURAL_OPS_CAP);
+  saveMuralSoon();
+  const op = { t: 'mural', x, y, c, by: p.name, id: p.id };
+  // The wall and the overlay both live in the plaza, so that is where the op
+  // goes; the painter gets their own copy directly, because an overlay left
+  // open on the way out of the room still deserves to see its pixel land.
+  broadcastToRoom(MURAL_ROOM, op, p.id);
+  sendTo(p, op);
+  signal('mural-pixel', p, { x, y, c });
+}
+
+/** The notice board's "report mural": a snapshot on disk for the operator. */
+function reportMural(p, now) {
+  const key = p.registered ? p.username.toLowerCase() : p.id;
+  const last = mural.reports.get(key) || 0;
+  if (now - last < MURAL_REPORT_MS) return;
+  mural.reports.set(key, now);
+  try {
+    fs.mkdirSync(MURAL_REPORT_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(MURAL_REPORT_DIR, `${stamp}-${String(p.name).replace(/[^\w-]/g, '')}.json`);
+    fs.writeFileSync(file, JSON.stringify({
+      at: Date.now(), by: p.name, w: MURAL_W, h: MURAL_H,
+      rle: muralRLE(), recent: mural.ops.slice(-400),
+    }, null, 1));
+  } catch (e) {
+    console.error('[mural] report failed:', e?.message || e);
+  }
+  sendTo(p, { t: 'toast', msg: 'Thanks: a caretaker will take a look' });
+}
+
+// ---------- C. the Drift's daily bottle ----------
+// One message in a bottle a day, in the same spot for everybody (the position
+// is derived from the cove-day index, so every client agrees without the server
+// having to remember anything), 25 coins to whoever swims into it.
+//
+// DEVIATION from LIVING-COVE C ("first finder gets ... 25 coins"): every
+// account may find the day's bottle once, rather than one lucky capy a day.
+// A once-per-island prize is a race nobody but the first diver can enter, and
+// the spec's own validation line ("once per day per account") reads that way
+// too. A cove day is 40 minutes, so the ceiling is 37 coins an hour: less than
+// a quarter of what standing in the mine pays, and the hourly backstop still
+// bounds it.
+
+const BOTTLE_NOTES = [
+  'the tide always brings something back',
+  'if you are reading this, say hi to Big Blue for me',
+  'day 412: still no idea how the dive bell works',
+  'the best smoothie is the one somebody else made you',
+  'i buried a snack near the third palm. good luck',
+  'sing to the whale. she sings back, eventually',
+  'whoever keeps painting the mural pink: thank you',
+  'the cove looks best from underneath',
+  'lost my hat down here in 2019. it is yours now',
+  'nothing to report. the water is lovely',
+];
+
+/** Deterministic little PRNG, so one integer picks the whole day's bottle. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function bottleFor(day) {
+  const rand = mulberry32(day * 2654435761);
+  const th = rand() * Math.PI * 2;
+  const r = Math.sqrt(rand()) * BOTTLE_FIELD.r; // sqrt: spread evenly over the disc
+  return {
+    day,
+    x: +(Math.cos(th) * r).toFixed(2),
+    y: +(BOTTLE_FIELD.yMin + rand() * (BOTTLE_FIELD.yMax - BOTTLE_FIELD.yMin)).toFixed(2),
+    z: +(Math.sin(th) * r).toFixed(2),
+    note: BOTTLE_NOTES[Math.floor(rand() * BOTTLE_NOTES.length)],
+  };
+}
+
+/** Have they already found today's? Guests have no account to remember it on. */
+function bottleFound(p) {
+  const rec = recordFor(p);
+  return !!rec && Number(rec.bottleDay) === clock.day;
+}
+
+function sendBottle(p) {
+  const b = bottleFor(clock.day);
+  sendTo(p, { t: 'bottle', day: b.day, x: b.x, y: b.y, z: b.z, found: bottleFound(p), reach: BOTTLE_REACH });
+}
+
+function findBottle(p) {
+  if (p.room !== DRIFT_ROOM) return;
+  const b = bottleFor(clock.day);
+  // Validated against the position they are already broadcasting: no "I got it"
+  // from the surface. A refused claim is answered with the bottle's state, or
+  // the room would leave a bottle nobody is allowed to open floating there.
+  if (Math.hypot(p.x - b.x, (p.y || 0) - b.y, p.z - b.z) > BOTTLE_REACH) { sendBottle(p); return; }
+  if (!p.registered) {
+    sendTo(p, { t: 'toast', msg: 'Sign up to keep what you find down here!' });
+    sendBottle(p);
+    return;
+  }
+  const rec = recordFor(p);
+  if (!rec || Number(rec.bottleDay) === clock.day) { sendBottle(p); return; }
+  rec.bottleDay = clock.day;
+  saveSoon();
+  const paid = grantCoins(p, BOTTLE_COINS, 'message in a bottle');
+  // The finder alone: the note is theirs, and the bottle is per account, so
+  // telling the room would clear a bottle their neighbours can still open.
+  sendTo(p, { t: 'bottle-found', ok: true, id: p.id, by: p.name, note: b.note, coins: paid, day: b.day });
+  signal('bottle', p, { day: b.day, coins: paid });
+}
+
+// ---------- C. riding Big Blue ----------
+// The ride flag rides along in the move frame (the client sets it when it
+// parents its capy to the whale). The server passes it through so remotes can
+// parent too, and counts the pod for the progression module.
+
+function ridersIn(roomId) {
+  let n = 0;
+  for (const id of world.rooms.get(roomId) || []) {
+    const other = world.players.get(id);
+    if (other && other.ride) n++;
+  }
+  return n;
 }
 
 // ---------- websocket ----------
@@ -1275,7 +2190,7 @@ wss.on('connection', (ws) => {
           p = {
             ws, id: `p${nextId++}`, bot: false,
             name: profile.name, username, registered: !!username,
-            room: null, x: 0, z: 4, rot: 0, anim: 'idle',
+            room: null, x: 0, y: 0, z: 4, rot: 0, anim: 'idle',
             coins: profile.coins, color: profile.color, hat: profile.hat,
             ownedHats: profile.ownedHats, bests: profile.bests,
             lastChat: 0, joinWindow: 0, joinCount: 0, run: null, earned: [],
@@ -1283,9 +2198,20 @@ wss.on('connection', (ws) => {
             table: null, match: null, matchWindow: 0, matchCount: 0,
             ph: null, phWindow: 0, phCount: 0,
             dd: null, ddWindow: 0, ddCount: 0, ddGuessWindow: 0, ddGuessCount: 0,
+            // wave 7: the shared world (snowball + ball throttles, the bonfire's
+            // observed dwell and nightly cap, the whale-ride flag)
+            ride: false, snowAt: 0, ballAt: 0,
+            bonfireMs: 0, bonfireDay: -1, bonfireCoins: 0,
+            // the milestone title, cached on the connection so snapshotFor
+            // never has to reach into the user record on the movement tick
+            title: typeof profile.title === 'string' ? profile.title : '',
           };
           world.players.set(p.id, p);
           sendTo(p, { t: 'welcome', id: p.id, profile: { ...profile, registered: p.registered } });
+          // the sky and any party in progress travel with the welcome: a client
+          // that joins mid-evening must not open at noon and snap
+          sendTo(p, clockFrame());
+          sendTo(p, partiesFrame());
           console.log(`[ws] ${p.name} connected (${p.registered ? 'account' : 'guest'}), online: ${world.players.size}`);
           break;
         }
@@ -1301,8 +2227,27 @@ wss.on('connection', (ws) => {
         case 'move': {
           p.x = Math.max(-100, Math.min(100, Number(m.x) || 0));
           p.z = Math.max(-100, Math.min(100, Number(m.z) || 0));
+          // height only matters where there is no ground to raycast onto (The
+          // Drift), but it costs nothing to carry and older clients omit it
+          p.y = Math.max(-40, Math.min(40, Number(m.y) || 0));
           p.rot = Number(m.rot) || 0;
-          if (['idle', 'walk', 'dance', 'sit'].includes(m.anim)) p.anim = m.anim;
+          if (MOVE_ANIMS.includes(m.anim)) p.anim = m.anim;
+          // riding Big Blue: relayed so remotes can parent to her back too, and
+          // signalled on the way up only (this frame arrives ten times a second).
+          // VERIFIER FIX (wave 7): the flag is STICKY. src/world/rooms/drift.js
+          // pushes one flagged frame on mount ({ride:1}) and one on dismount
+          // ({ride:0}), but the net client's own 10Hz move frames carry no
+          // `ride` key at all. Reading a missing key as false cleared the flag
+          // ~100ms after every mount, so ridersIn() could never see more than
+          // the one capy who had just climbed on and the "Pod" stamp (four
+          // riders at once) was unreachable. A frame that does not mention the
+          // flag now leaves it alone; joinRoom() still clears it on every move
+          // between rooms, so it can never leak out of The Drift.
+          const ride = (has(m, 'ride') ? !!m.ride : !!p.ride) && p.room === DRIFT_ROOM;
+          if (ride !== !!p.ride) {
+            p.ride = ride;
+            if (ride) signal('whale-ride', p, { riders: ridersIn(p.room) });
+          }
           break;
         }
         case 'chat': {
@@ -1312,12 +2257,14 @@ wss.on('connection', (ws) => {
           const text = String(m.text || '').slice(0, CHAT_MAX_LEN).trim();
           if (!text) return;
           broadcastToRoom(p.room, { t: 'chat', id: p.id, name: p.name, text }, p.id);
+          signal('chat', p, { room: p.room });
           break;
         }
         case 'emote':
           if (['wave', 'dance'].includes(m.kind)) {
             if (m.kind === 'dance') p.anim = p.anim === 'dance' ? 'idle' : 'dance';
             broadcastToRoom(p.room, { t: 'emote', id: p.id, kind: m.kind }, p.id);
+            if (m.kind === 'wave') signal('wave', p, { room: p.room });
           }
           break;
         case 'custom': {
@@ -1337,7 +2284,9 @@ wss.on('connection', (ws) => {
           p.run = null; // single use
           if (!run || run.game !== m.game) break;
           if (t0 - run.startedAt < MIN_RUN_MS) break;
-          grantCoins(p, clampCoinsForGame(m.game, Number(m.coins) || 0), m.game);
+          const paid = grantCoins(p, clampCoinsForGame(m.game, Number(m.coins) || 0), m.game);
+          // the quest board only ever sees a run the coin road already accepted
+          signal('score', p, { game: m.game, coins: paid, score: Math.floor(Number(m.score) || 0) });
           break;
         }
         case 'best': {
@@ -1352,6 +2301,14 @@ wss.on('connection', (ws) => {
         case 'buy': {
           const hat = has(HATS, m.hat) ? HATS[m.hat] : null;
           if (!hat || !Number.isFinite(hat.price)) return sendTo(p, { t: 'shop', ok: false, msg: 'Unknown hat' });
+          // VERIFIER FIX (wave 7): stamp-album cosmetics carry price 0 so the
+          // catalogue can list them, and src/ui/shop.js hides them until owned.
+          // Nothing on the WIRE was stopping a scripted client from buying one
+          // for nothing, which is the whole exclusivity of the milestone track
+          // (docs/LIVING-COVE.md section D: "cosmetics that coins cannot buy").
+          if (hat.milestone) {
+            return sendTo(p, { t: 'shop', ok: false, msg: 'That one is earned, not bought. Fill your stamp album!' });
+          }
           // read the live record, not this connection's snapshot, so a second
           // session cannot buy against a balance another one already spent
           const rec = recordFor(p);
@@ -1386,6 +2343,9 @@ wss.on('connection', (ws) => {
             hat: target.hat,
             bests: target.bot ? {} : { ...(rec?.bests || target.bests || {}) },
             registered: !target.bot && !!target.registered,
+            // the 40-stamp milestone title, so the card shows what the name tag
+            // shows (src/ui/profile.js prefers it over its own flavour line)
+            title: (!target.bot && typeof rec?.title === 'string' && rec.title) || '',
           });
           break;
         }
@@ -1512,6 +2472,11 @@ wss.on('connection', (ws) => {
           if (socialLimited(p, t0)) break;
           const item = has(FURNITURE, m.id) ? FURNITURE[m.id] : null;
           if (!item || !Number.isFinite(item.price)) return sendTo(p, { t: 'furn', ok: false, msg: 'Unknown furniture' });
+          // same rule as the milestone hats above: the gramophone is a 20-stamp
+          // reward, and a 0-coin price tag must not become a 0-coin purchase
+          if (item.milestone) {
+            return sendTo(p, { t: 'furn', ok: false, msg: 'That one is earned, not bought. Fill your stamp album!' });
+          }
           const rec = recordFor(p);
           if (!rec) return sendTo(p, { t: 'furn', ok: false, msg: 'Sign up to get your own den!' });
           // unlike hats, furniture stacks: buying again adds another copy, and
@@ -1709,6 +2674,55 @@ wss.on('connection', (ws) => {
           // a second chat channel, so nothing unmoderated fans out from here.
           break;
         }
+
+        // ---- the Social Cove (wave 7) ---------------------------------------
+        // Play toys carry their own throttles (a snowball is one a second, a bop
+        // is a swing not a stream); everything that writes a record or fans out
+        // island-wide takes the social budget.
+        case 'snow':
+          throwSnowball(p, m, t0);
+          break;
+        case 'ball':
+          bopBall(p, m, t0);
+          break;
+        case 'party-start':
+          if (socialLimited(p, t0)) break;
+          startPartyEvent(p, m);
+          break;
+        case 'party-end': {
+          if (socialLimited(p, t0)) break;
+          // only your own party is yours to call off
+          const key = p.username ? p.username.toLowerCase() : null;
+          if (!key) break;
+          for (const party of [...parties.values()]) {
+            if (party.hostKey === key) endPartyEvent(party, 'host-ended');
+          }
+          break;
+        }
+        case 'party':
+          if (socialLimited(p, t0)) break;
+          sendTo(p, partiesFrame());
+          break;
+        case 'mural':
+          if (socialLimited(p, t0)) break;
+          paintMural(p, m, t0);
+          break;
+        case 'mural-grid':
+          if (socialLimited(p, t0)) break;
+          sendMuralGrid(p);
+          break;
+        case 'mural-report':
+          if (socialLimited(p, t0)) break;
+          reportMural(p, t0);
+          break;
+        case 'bottle':
+          if (socialLimited(p, t0)) break;
+          sendBottle(p);
+          break;
+        case 'bottle-found':
+          if (socialLimited(p, t0)) break;
+          findBottle(p);
+          break;
       }
     } catch (e) {
       console.error(`[ws] handler error on '${m.t}':`, e?.message || e);
@@ -1749,7 +2763,13 @@ setInterval(() => {
   // world.rooms, not ROOM_IDS: occupied dens are room sets too, and their
   // visitors would otherwise never see each other move
   for (const roomId of world.rooms.keys()) {
-    const players = roomSnapshot(roomId).map(({ id, x, z, rot, anim }) => ({ id, x, z, rot, anim }));
+    // y and ride only ride along where they exist (The Drift): everywhere else
+    // the client raycasts the ground itself and these would be dead weight
+    const players = roomSnapshot(roomId).map(({ id, x, y, z, rot, anim, ride }) => (
+      y === undefined && ride === undefined
+        ? { id, x, z, rot, anim }
+        : { id, x, y, z, rot, anim, ride }
+    ));
     if (players.length) broadcastToRoom(roomId, { t: 'state', players });
   }
 }, NET_TICK_MS);
@@ -1758,6 +2778,47 @@ setInterval(() => {
 setInterval(() => {
   try { digTick(); } catch (e) { console.error('[mine] dig tick failed:', e?.message || e); }
 }, DIG_TICK_MS);
+
+// ---------- tick: the world clock (wave 7) ----------
+// One interval for everything that moves on cove time: the sky goes out to the
+// island, the bonfire pays whoever is sitting at it, parties expire, the
+// citizens get the hour, and the progression module gets its rollover beat.
+updateClock();
+bots.setClock(clock); // the citizens' schedules run on cove time from boot
+// ...and so does the quest board. VERIFIER FIX (wave 7): server/progress.js
+// derives the cove-day index from the epoch until a clock frame reaches it, and
+// only tick() carries one. Without this priming call, every board handed out in
+// the first CLOCK_MS of uptime is seeded against that fallback day and then
+// silently rerolls (losing any progress on it) on the first tick. The two agree
+// on production settings, so the window was invisible until a test moved the
+// day length; priming closes it for good, on any settings.
+try { progress.tick(0, clockFrame()); } catch (e) {
+  console.error('[progress] clock priming failed:', e?.message || e);
+}
+setInterval(() => {
+  try {
+    updateClock();
+    broadcastAll(clockFrame());
+    bots.setClock(clock);
+    bonfireTick(CLOCK_MS);
+    partyTick(Date.now());
+    // a painter half an hour past their cooldown is not waiting on anything any
+    // more, and their entry would otherwise sit in the map forever
+    const stale = Date.now() - 30 * 60_000;
+    for (const [key, at] of mural.painters) if (at < stale) mural.painters.delete(key);
+    for (const [key, at] of mural.reports) if (at < stale) mural.reports.delete(key);
+  } catch (e) {
+    console.error('[clock] tick failed:', e?.message || e);
+  }
+  try { progress.tick(CLOCK_MS / 1000, clockFrame()); } catch (e) {
+    console.error('[progress] tick failed:', e?.message || e);
+  }
+}, CLOCK_MS);
+
+// ---------- tick: the beach ball (wave 7) ----------
+setInterval(() => {
+  try { ballTick(); } catch (e) { console.error('[ball] tick failed:', e?.message || e); }
+}, BALL_TICK_MS);
 
 server.listen(PORT, () => {
   console.log(`Capy Cove server on http://localhost:${PORT} (rooms: ${ROOM_IDS.join(', ')}, default: ${DEFAULT_ROOM})`);

@@ -140,6 +140,97 @@ const SEAT_LIFT = 0.38;
 const SLOT_COLORS = [0xe8657a, 0x4fb3e8, 0xf2b64a];
 const DEFAULT_FUR = 0xb08a5a; // lobby payload is id+name only; brown until we know better
 
+/* --- the social cove (wave 7): clock, aurora, snowballs -------------------
+ * docs/LIVING-COVE.md sections A (world clock) and A2 (ambient play toys).
+ * Everything below is dormant until the first onClock frame arrives: a room
+ * built against a server with no clock looks exactly as it shipped.
+ * ------------------------------------------------------------------------- */
+
+const DAY_SECONDS = 40 * 60;           // one cove day, matching the server clock
+const SUN_R = Math.hypot(22, 27);      // keep the shipped noon sun's distance...
+const NOON_AZ = Math.atan2(-27, -22);  // ...and its shipped noon bearing, so
+                                       // dayT 0.25 reproduces the authored look
+const SNOW_N = 900;                    // snowfall particle pool (drawRange scales it)
+
+// Day palette. Everything is lerped into preallocated colours in _relight, so
+// the clock costs zero allocations per frame (LIVING-COVE "budgets and safety").
+const P = {
+  bgDay: new THREE.Color(0xc3dcf1), bgNight: new THREE.Color(0x151d33),
+  bgDawn: new THREE.Color(0xefbcb2), bgDusk: new THREE.Color(0xe9a276),
+  fogDay: new THREE.Color(0xd9e9f7), fogNight: new THREE.Color(0x1c2540),
+  fogDawn: new THREE.Color(0xf2c9c2), fogDusk: new THREE.Color(0xefb68c),
+  skyDay: new THREE.Color(0xffffff), skyNight: new THREE.Color(0x2c3c66),
+  skyDawn: new THREE.Color(0xffcac1), skyDusk: new THREE.Color(0xffb584),
+  sunDay: new THREE.Color(0xffe6bd), sunWarm: new THREE.Color(0xffa864),
+  moon: new THREE.Color(0xaec6ff),
+  hemiSkyDay: new THREE.Color(0xdcefff), hemiSkyNight: new THREE.Color(0x44578a),
+  hemiGndDay: new THREE.Color(0x93aec9), hemiGndNight: new THREE.Color(0x2f3d5c),
+  ambDay: new THREE.Color(0xa9c9e8), ambNight: new THREE.Color(0x6b86bd),
+  discDay: new THREE.Color(0xfff6dc), discNight: new THREE.Color(0xe6eeff),
+};
+const _lc = new THREE.Color();  // scratch colour + vector for _relight
+const _lv = new THREE.Vector3();
+
+// Aurora ribbons: three bands hung across the north sky, additive, vertex-waved.
+const AUR_COLS = 40;   // columns per band (vertices are COLS+1 wide)
+const AUR_ROWS = 4;    // rows per band (ROWS+1 tall); row 0 and ROWS fade to black
+const AUR_BANDS = 3;
+
+// Snowball toy. The server allows one throw a second; the local cooldown sits a
+// beat outside that so a throw is never eaten by the rate limiter.
+const SNOW_HOLD_CAP = 1.0;    // seconds of hold = full power
+const SNOW_MIN_HOLD = 0.17;   // shorter than this was an ordinary walk click
+const SNOW_RANGE_MIN = 3.5;
+const SNOW_RANGE_MAX = 13.0;
+const SNOW_COOLDOWN = 1.15;
+const SNOW_HIT_R = 0.8;       // LIVING-COVE: a capy within 0.8 of the landing
+const SNOW_MAX_BALLS = 10;
+const SNOW_PUFFS = 44;        // landing puff particle pool
+const AIM_BEADS = 16;
+const BOOP_DUR = 0.9;
+const CAP_LIFE = 4.2;         // seconds of snowcap before it melts off
+const _ndc = new THREE.Vector2();
+const _aimV = new THREE.Vector3();
+
+// Shown once per session, the first time someone stands around in the snow:
+// nobody discovers a hold-to-aim toy on their own (module scope so a second
+// visit to the peak does not nag).
+let _hintShown = false;
+
+/** Flight time and apex of a thrown snowball. Every client runs these on the
+ *  same endpoints, so everybody watches the same arc. */
+function flightTime(dist) { return Math.min(1.5, 0.5 + dist * 0.055); }
+function arcHeight(dist) { return 1.1 + dist * 0.26; }
+function arcPoint(b, u, out) {
+  out.x = b.ox + (b.tx - b.ox) * u;
+  out.z = b.oz + (b.tz - b.oz) * u;
+  out.y = b.oy + (b.ty - b.oy) * u + b.h * 4 * u * (1 - u);
+  return out;
+}
+// the preview arc reuses one throw record rather than allocating per frame
+const _pv = { ox: 0, oy: 0, oz: 0, tx: 0, ty: 0, tz: 0, h: 0 };
+
+/**
+ * Peak weather is snowfall intensity 0..2 (LIVING-COVE section A). Numbers pass
+ * through; a word from the outdoor-family vocabulary, or a {snow:n} envelope,
+ * is understood too, so one server dialect can serve every room. Anything
+ * unrecognised means "the usual snow".
+ */
+const SNOW_WORDS = { clear: 0.25, calm: 0.4, breeze: 0.9, snow: 1.3, rain: 1.3, storm: 2, blizzard: 2 };
+function snowIntensity(w) {
+  if (typeof w === 'number') return Number.isFinite(w) ? Math.max(0, Math.min(2, w)) : 1;
+  if (typeof w === 'string') {
+    const n = Number(w);
+    if (w.trim() !== '' && Number.isFinite(n)) return Math.max(0, Math.min(2, n));
+    return Object.prototype.hasOwnProperty.call(SNOW_WORDS, w) ? SNOW_WORDS[w] : 1;
+  }
+  if (w && typeof w === 'object') {
+    const n = Number(w.snow ?? w.peak ?? w.intensity);
+    if (Number.isFinite(n)) return Math.max(0, Math.min(2, n));
+  }
+  return 1;
+}
+
 /* --- tiny math helpers ---------------------------------------------------- */
 
 function mulberry32(seed) {
@@ -1048,11 +1139,38 @@ export class PeakRoom extends Room {
     this._localSlot = null;
     this._offLobby = null;
     this._offRaceStart = null;
+    this._offSnow = null;
     this._wasOnline = !!game?.net?.connected;
     this._reconcileT = 0;
 
+    // ---- world clock state (dormant until the first onClock frame) ---------
+    this._hasClock = false;
+    this._litOnce = false;   // first relight lands on the phase, then it eases
+    this._dayT = 0.25;       // noon: the light the room was authored under
+    this._dayness = 1;       // 1 full day .. 0 deep night
+    this._nightK = 0;
+    this._auroraOn = false;
+    this._auroraK = 0;       // eased 0..1 curtain opacity
+    this._snowWant = 1;      // weather intensity 0..2 the server last asked for
+    this._snowNow = 2;       // ...eased; 2 is the full pool the room ships with
+    this._snowShown = SNOW_N;
+    this._snowSpeedK = 1;
+    // Lamp channels ease onto their night level with different lags, so the
+    // lodge, the den lanterns, the gallows and the mine do not all come up as
+    // one switch (LIVING-COVE asks for a per-lamp stagger).
+    this._lampK = [1, 1, 1, 1];
+    this._lampLag = [0.9, 1.6, 0.5, 1.2];
+
+    // ---- snowball toy state ------------------------------------------------
+    this._ray = new THREE.Raycaster();
+    this._aim = null;        // { t, x, z, cx, cz } while a throw is charging
+    this._cool = 0;          // seconds left of the 1/s rate limit
+    this._hintT = _hintShown ? -1 : 0;
+
     scene.background = new THREE.Color(0xc3dcf1);
     scene.fog = new THREE.Fog(0xd9e9f7, 26, 82);
+    this._bgColor = scene.background; // mutated in place by the clock
+    this._fog = scene.fog;
 
     this._lights(scene);
     this._sky(scene);
@@ -1076,6 +1194,8 @@ export class PeakRoom extends Room {
     this._trailFence(scene);
     this._snowfall(scene);
     this._sparkle(scene);
+    this._aurora(scene);
+    this._snowToy(scene);
 
     // arrival spots sit a step BEYOND the exit hotspot's radius, so walking in
     // from the plaza does not immediately pop the "go back" prompt over you
@@ -1179,11 +1299,32 @@ export class PeakRoom extends Room {
     // static camera: the sled gate up top, the lodge door east, the frozen pond west
     this.staticCamera = { position: new THREE.Vector3(0, 24, 31), lookAt: new THREE.Vector3(0, 1.5, -2) };
 
-    // Live only while this room is: both handles are dropped in dispose().
+    // Live only while this room is: every handle is dropped in dispose().
     if (game?.events?.on) {
       this._offLobby = game.events.on('lobby', (m) => this._onLobby(m));
       this._offRaceStart = game.events.on('race-start', (m) => this._onRaceStart(m));
+      this._offSnow = game.events.on('snow', (m) => this._onSnowFrame(m));
     }
+
+    /*
+     * Aiming has to see the press BEFORE the engine turns it into a walk
+     * target, and the engine listens on the canvas itself (engine._onPointer).
+     * These sit on window in the CAPTURE phase, so they run first no matter
+     * what; a press we decide to take calls stopPropagation and the canvas
+     * listener never sees it. Everything else - clicks on other capybaras
+     * (profile cards), on hotspot prompt buttons, on any HUD element, and every
+     * press while the throw is cooling down - is passed straight through
+     * untouched, so walking and the whole existing UI behave exactly as before.
+     */
+    this._onDown = (e) => this._pointerDown(e);
+    this._onMove = (e) => this._pointerMove(e);
+    this._onUp = (e) => this._pointerUp(e);
+    this._onCancel = () => this._cancelAim();
+    addEventListener('pointerdown', this._onDown, true);
+    addEventListener('pointermove', this._onMove, true);
+    addEventListener('pointerup', this._onUp, true);
+    addEventListener('pointercancel', this._onCancel, true);
+    addEventListener('blur', this._onCancel);
   }
 
   /* --- race lobby --------------------------------------------------------- */
@@ -1354,6 +1495,7 @@ export class PeakRoom extends Room {
   /** Walk the local capybara into (or out of) their seat. */
   _setLocalSlot(slot) {
     if (slot === this._localSlot) return;
+    if (slot !== null) this._cancelAim?.(); // being seated ends any wind-up
     const game = this._game;
     const engine = game?.engine;
     const avatar = engine?.playerAvatar;
@@ -1374,6 +1516,9 @@ export class PeakRoom extends Room {
   _onRaceStart(m) {
     const game = this._game;
     if (!game || !m) return;
+    // the room stops updating while a minigame owns the screen, so a throw left
+    // charging here would sit frozen and fire itself on the way back
+    this._cancelAim();
     // The server started the race either way, so the board is empty now.
     this._clearLobby();
     // Already inside a minigame (a solo run started from the rack while the
@@ -1417,10 +1562,15 @@ export class PeakRoom extends Room {
   /* --- lighting ----------------------------------------------------------- */
 
   _lights(scene) {
-    scene.add(new THREE.HemisphereLight(0xdcefff, 0x93aec9, 1.15));
-    scene.add(new THREE.AmbientLight(0xa9c9e8, 0.32));
+    // the clock keeps these three (colour + intensity) on the day curve; the
+    // hemisphere never drops below the ~0.45 playability floor
+    this._hemi = new THREE.HemisphereLight(0xdcefff, 0x93aec9, 1.15);
+    scene.add(this._hemi);
+    this._amb = new THREE.AmbientLight(0xa9c9e8, 0.32);
+    scene.add(this._amb);
 
     const sun = new THREE.DirectionalLight(0xffe6bd, 1.55);
+    this._sun = sun; // sun by day, moon by night: still the only shadow caster
     sun.position.set(-22, 14, -27);
     sun.target.position.set(0, 0, 1);
     sun.castShadow = true;
@@ -1457,6 +1607,11 @@ export class PeakRoom extends Room {
     sky.rotation.y = Math.atan2(-d.z, d.x);
     sky.renderOrder = -2;
     scene.add(sky);
+    // the painted glow in the dome tracks the light: the clock spins the dome
+    // and walks the disc round with it, so the sky's warm spot is always where
+    // the sun (or the moon) actually is
+    this._skyMesh = sky;
+    this._skyMat = mat;
 
     // pale sun disc + halo, parked at the painted glow
     const pos = SUN_DIR.clone().normalize().multiplyScalar(96);
@@ -1467,6 +1622,8 @@ export class PeakRoom extends Room {
     disc.lookAt(0, 8, 0);
     disc.renderOrder = -1;
     scene.add(disc);
+    this._sunDisc = disc;
+    this._sunDiscMat = discMat;
 
     const haloMat = makeGlow(0xffffff, { unique: true });
     haloMat.map = canvasTexture(128, 128, (c, w, h) => {
@@ -1488,6 +1645,7 @@ export class PeakRoom extends Room {
     halo.renderOrder = -1;
     scene.add(halo);
     this._halo = halo;
+    this._haloMat = haloMat;
   }
 
   /* --- terrain ------------------------------------------------------------ */
@@ -2876,7 +3034,7 @@ export class PeakRoom extends Room {
   /* --- weather ------------------------------------------------------------ */
 
   _snowfall(scene) {
-    const N = 900;
+    const N = SNOW_N;
     const pos = new Float32Array(N * 3);
     const meta = new Float32Array(N * 3);
     const rng = this._rng;
@@ -2901,7 +3059,10 @@ export class PeakRoom extends Room {
     const pts = new THREE.Points(geo, mat);
     pts.frustumCulled = false;
     scene.add(pts);
-    this._snow = { attr: geo.attributes.position, meta, n: N };
+    // Weather scales the flakes with the geometry's draw range rather than by
+    // rebuilding the buffer: the pool is allocated once and a blizzard is just
+    // more of it drawn, falling faster.
+    this._snow = { attr: geo.attributes.position, meta, n: N, geo, mat };
   }
 
   _sparkle(scene) {
@@ -2941,20 +3102,181 @@ export class PeakRoom extends Room {
     this._sparkles = { attr: geo.attributes.color, arr: col, meta, n };
   }
 
+  /**
+   * The aurora (LIVING-COVE section A): three additive ribbons hung across the
+   * north sky, waved in the vertex shader's input rather than by any shader of
+   * our own (custom GLSL is sanctioned in The Drift only). Green at the hem,
+   * pink at the crown, black at every edge - additive blending turns black into
+   * "not there", so the curtains fade out instead of ending in a hard line.
+   *
+   * Built once, hidden until the server says `aurora` AND it is night; the
+   * per-frame wave only runs while it is on screen. One draw call, fog off (at
+   * 58-72 units out the room's fog would otherwise erase it).
+   */
+  _aurora(scene) {
+    const list = [];
+    for (let b = 0; b < AUR_BANDS; b++) {
+      const geo = new THREE.PlaneGeometry(1, 1, AUR_COLS, AUR_ROWS);
+      const pos = geo.attributes.position;
+      const col = new Float32Array(pos.count * 3);
+      // The play camera looks DOWN (follow: 3/4 from 11.5 up; static: from 24
+      // up), so the visible sky is a low band just above the horizon: measured
+      // by projecting test points, anything above y ~7 at 34 out, or y ~4 at 60
+      // out, is off the top of the frame in both modes. The curtains therefore
+      // hang low and near, rising out of the cloud sea behind the tree ring and
+      // through the distant peaks, instead of high overhead where a real one
+      // would be and nobody in this game would ever see it.
+      const R = 34 + b * 5;
+      const baseY = -3 + b * 0.8;
+      const H = 11 - b * 0.8;
+      const span = 1.7 + b * 0.3;        // radians of sky the band covers
+      const centre = -Math.PI / 2;       // due north: -Z, straight up the camera
+      const phase = b * 2.1;
+      let i = 0;
+      for (let row = 0; row <= AUR_ROWS; row++) {
+        for (let cx = 0; cx <= AUR_COLS; cx++, i++) {
+          const u = cx / AUR_COLS;
+          const v = row / AUR_ROWS;
+          const a = centre + (u - 0.5) * span;
+          const sag = Math.sin(u * 5.6 + phase) * 1.7 + Math.sin(u * 11 - phase) * 0.6;
+          pos.setXYZ(i, Math.cos(a) * R, baseY + sag + v * H, Math.sin(a) * R);
+          // vertical gradient: hem green -> teal -> pink crown, zero at both
+          // edges; horizontal envelope tapers each band to nothing at its ends
+          const env = Math.pow(Math.sin(Math.PI * u), 0.7) * (0.62 - b * 0.11);
+          const fade = Math.sin(Math.PI * v);
+          const g = Math.max(0, 1 - Math.abs(v - 0.3) * 2.1);
+          const p = Math.max(0, (v - 0.45) * 1.8);
+          col[i * 3] = (0.22 * g + 0.95 * p) * env * fade;
+          col[i * 3 + 1] = (1.0 * g + 0.36 * p) * env * fade;
+          col[i * 3 + 2] = (0.62 * g + 0.72 * p) * env * fade;
+        }
+      }
+      pos.needsUpdate = true;
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      list.push(geo);
+    }
+
+    const mat = makeGlow(0xffffff, { unique: true });
+    mat.vertexColors = true;
+    mat.transparent = true;
+    mat.opacity = 0;
+    mat.depthWrite = false;
+    mat.blending = THREE.AdditiveBlending;
+    mat.side = THREE.DoubleSide;
+    mat.fog = false;
+    mat.needsUpdate = true;
+
+    const mesh = new THREE.Mesh(mergeParts(list), mat);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = -1; // after the sky dome, before everything on the ground
+    mesh.visible = false;
+    scene.add(mesh);
+    const attr = mesh.geometry.attributes.position;
+    this._aur = {
+      mesh, mat, attr,
+      base: Float32Array.from(attr.array), // the still pose the wave rides on
+    };
+  }
+
+  /* --- snowballs (LIVING-COVE A2: ambient play toys) ---------------------- */
+
+  /**
+   * Hold a click on the snow, an arc preview grows out of your capybara, let go
+   * and it flies. The frame that goes out is {t:'snow', to:[x,z]}; every client
+   * in the room (the thrower included, locally, so their own throw never waits
+   * on the round trip) runs the SAME arc from the sender's feet to that point,
+   * so everyone watches one snowball, not their own guess at one.
+   *
+   * Five pooled objects, five draw calls, all of them idle until someone plays:
+   * balls in flight, landing puffs, the aim beads, the landing ring, and the
+   * snowcap geometry a booped capybara wears for a few seconds.
+   */
+  _snowToy(scene) {
+    // 0.22 rather than a realistic 0.12: white on white at 20 units out, a
+    // smaller ball simply did not read in a night capture
+    const ballGeo = new THREE.SphereGeometry(0.22, 9, 7);
+    paintGeo(ballGeo, C.snowLit);
+    const balls = new THREE.InstancedMesh(ballGeo, makeToon(0xffffff, VC), SNOW_MAX_BALLS);
+    balls.castShadow = true;
+    balls.frustumCulled = false;
+    balls.count = 0;
+    scene.add(balls);
+    this._ballMesh = balls;
+    this._balls = [];
+
+    const puffGeo = new THREE.SphereGeometry(0.17, 7, 5);
+    paintGeo(puffGeo, C.snowLit);
+    const puffMat = makeToon(0xffffff, { vertexColors: true, unique: true });
+    puffMat.transparent = true;
+    puffMat.opacity = 0.9;
+    puffMat.depthWrite = false;
+    const puffs = new THREE.InstancedMesh(puffGeo, puffMat, SNOW_PUFFS);
+    puffs.frustumCulled = false;
+    puffs.count = 0;
+    scene.add(puffs);
+    this._hitPuffMesh = puffs;
+    this._hitPuffs = [];
+
+    // gold, not cream: the prompt colour reads on white snow at noon and in a
+    // blue midnight alike, and it ties the beads to the landing ring
+    const beadMat = makeGlow(C.gold, { unique: true });
+    beadMat.transparent = true;
+    beadMat.opacity = 0.95;
+    beadMat.depthWrite = false;
+    const beads = new THREE.InstancedMesh(new THREE.SphereGeometry(0.1, 6, 5), beadMat, AIM_BEADS);
+    beads.frustumCulled = false;
+    beads.count = 0;
+    scene.add(beads);
+    this._aimBeads = beads;
+
+    const ringMat = makeGlow(C.gold, { unique: true });
+    ringMat.transparent = true;
+    ringMat.opacity = 0.85;
+    ringMat.depthWrite = false;
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.52, 0.075, 5, 20), ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.renderOrder = 2;
+    ring.visible = false;
+    scene.add(ring);
+    this._aimRing = ring;
+
+    // The snowcap worn by whoever just got booped. Flagged shared so neither
+    // avatar.dispose() nor disposeObject() frees it out from under the other
+    // capybaras wearing one: this room owns it and drops it in dispose().
+    // Sized to the skull it sits on (radius 0.47, crown at y 0.437 in head
+    // space): a 0.44 dome squashed to 0.68 tucks its rim just inside the fur at
+    // y 0.16 and clears the crown by 0.02. The first pass at 0.5 wide swallowed
+    // the whole face and read as a helmet, not as snow.
+    const cap = [];
+    part(cap, new THREE.SphereGeometry(0.44, 12, 7, 0, TAU, 0, Math.PI * 0.55), C.snowLit, { sy: 0.68 });
+    part(cap, new THREE.SphereGeometry(0.12, 7, 5), C.snowLit, { sx: 1.3, sy: 0.8, x: -0.27, y: -0.02, z: 0.12 });
+    part(cap, new THREE.SphereGeometry(0.1, 7, 5), C.snowLit, { sx: 1.2, sy: 0.9, x: 0.26, y: -0.05, z: -0.14 });
+    this._capGeo = mergeParts(cap);
+    this._capGeo.userData.shared = true;
+    this._caps = [];
+    this._booped = [];
+  }
+
   /* --- per-frame ---------------------------------------------------------- */
 
   update(dt, game) {
     const t = (this._t += dt);
     if (game) this._game = game;
 
-    // falling snow
+    // time of day first: everything below reads the factors it leaves behind
+    if (this._hasClock) this._relight(dt);
+
+    // falling snow. Weather scales how many of the pool are drawn (and how hard
+    // they come down); without a clock the whole pool falls, as it always has.
     const snow = this._snow;
     if (snow) {
       const a = snow.attr.array;
       const m = snow.meta;
-      for (let i = 0; i < snow.n; i++) {
+      const speed = this._snowSpeedK;
+      const count = Math.min(snow.n, Math.round(this._snowShown));
+      for (let i = 0; i < count; i++) {
         const i3 = i * 3;
-        a[i3 + 1] -= m[i3] * dt;
+        a[i3 + 1] -= m[i3] * speed * dt;
         a[i3] += Math.sin(t * m[i3 + 2] + m[i3 + 1]) * 0.6 * dt;
         a[i3 + 2] += Math.cos(t * m[i3 + 2] * 0.7 + m[i3 + 1]) * 0.35 * dt;
         if (a[i3 + 1] < -3) {
@@ -2966,14 +3288,15 @@ export class PeakRoom extends Room {
       snow.attr.needsUpdate = true;
     }
 
-    // snow sparkle
+    // snow sparkle: it is sunlight caught on the crust, so it goes out at night
     const sp = this._sparkles;
     if (sp) {
       const arr = sp.arr;
       const m = sp.meta;
+      const day = 0.18 + 0.82 * this._dayness;
       for (let i = 0; i < sp.n; i++) {
         const s = Math.sin(t * m[i * 2] + m[i * 2 + 1]);
-        const v = s > 0.86 ? (s - 0.86) * 7.1 : 0;
+        const v = s > 0.86 ? (s - 0.86) * 7.1 * day : 0;
         arr[i * 3] = v;
         arr[i * 3 + 1] = v * 0.97;
         arr[i * 3 + 2] = v;
@@ -3069,44 +3392,615 @@ export class PeakRoom extends Room {
       this._scarf.rotation.x = Math.sin(t * 2.3 + 1) * 0.12;
     }
 
+    // Every warm thing in the room breathes on its own timer, and the clock
+    // rides on top of that as a multiplier per lamp channel (windows, den door,
+    // gallows path, mine): at noon they sit exactly where they always did, and
+    // dusk-to-dawn each channel eases up to its night level on its own lag.
+    const kWin = this._lampK[0];
+    const kDen = this._lampK[1];
+    const kPath = this._lampK[2];
+    const kMine = this._lampK[3];
+
     // ice shimmer, hearth flicker, sun breathing
-    if (this._sheenMat) this._sheenMat.opacity = 0.32 + 0.18 * (0.5 + 0.5 * Math.sin(t * 0.7));
+    if (this._sheenMat) this._sheenMat.opacity = (0.32 + 0.18 * (0.5 + 0.5 * Math.sin(t * 0.7))) * (0.45 + 0.55 * this._dayness);
     if (this._windowMat) {
-      const f = 0.93 + 0.07 * Math.sin(t * 3.1) * Math.sin(t * 1.7 + 0.6);
+      const f = (0.93 + 0.07 * Math.sin(t * 3.1) * Math.sin(t * 1.7 + 0.6)) * kWin;
       this._windowMat.color.setRGB(1 * f, 0.965 * f, 0.9 * f);
     }
-    if (this._lodgeLight) this._lodgeLight.intensity = 24 + Math.sin(t * 2.6) * 2.4;
+    if (this._lodgeLight) this._lodgeLight.intensity = (24 + Math.sin(t * 2.6) * 2.4) * kWin;
     if (this._lampMat) {
-      const f = 0.9 + 0.1 * Math.sin(t * 4.2 + 1.3);
+      const f = (0.9 + 0.1 * Math.sin(t * 4.2 + 1.3)) * kPath;
       this._lampMat.color.setRGB(1 * f, 0.85 * f, 0.58 * f);
     }
     if (this._halo) {
-      const s = 1 + Math.sin(t * 0.5) * 0.03;
+      const s = (1 + Math.sin(t * 0.5) * 0.03) * (0.42 + 0.58 * this._dayness);
       this._halo.scale.set(s, s, s);
     }
 
     // den doorway: hearth spilling onto the steps, lanterns on the sign
-    if (this._doorLight) this._doorLight.intensity = 10 + Math.sin(t * 2.6 + 1.1) * 1.7;
-    if (this._doorGlowMat) this._doorGlowMat.opacity = 0.34 + 0.11 * (0.5 + 0.5 * Math.sin(t * 1.9));
+    if (this._doorLight) this._doorLight.intensity = (10 + Math.sin(t * 2.6 + 1.1) * 1.7) * kDen;
+    if (this._doorGlowMat) this._doorGlowMat.opacity = (0.34 + 0.11 * (0.5 + 0.5 * Math.sin(t * 1.9))) * kDen;
     // the puddles along the path breathe a beat behind the doorway they lead to
-    if (this._trailGlowMat) this._trailGlowMat.opacity = 0.24 + 0.09 * (0.5 + 0.5 * Math.sin(t * 1.9 - 0.9));
+    if (this._trailGlowMat) this._trailGlowMat.opacity = (0.24 + 0.09 * (0.5 + 0.5 * Math.sin(t * 1.9 - 0.9))) * kPath;
     if (this._denLampMat) {
       // vertex colours already carry C.warm; this only breathes on top of them
-      const f = 0.88 + 0.12 * Math.sin(t * 5.1 + 2.2);
+      const f = (0.88 + 0.12 * Math.sin(t * 5.1 + 2.2)) * kDen;
       this._denLampMat.color.setRGB(1 * f, 0.94 * f, 0.82 * f);
     }
-    if (this._denLight) this._denLight.intensity = 5.4 + Math.sin(t * 3.4) * 0.9;
+    if (this._denLight) this._denLight.intensity = (5.4 + Math.sin(t * 3.4) * 0.9) * kDen;
 
     // the mineshaft: two lanterns burning at the mouth, warm light on the snow
     if (this._mineLampMat) {
-      const f = 0.87 + 0.13 * Math.sin(t * 4.7 + 0.4);
+      const f = (0.87 + 0.13 * Math.sin(t * 4.7 + 0.4)) * kMine;
       this._mineLampMat.color.setRGB(1 * f, 0.9 * f, 0.7 * f);
     }
-    if (this._mineLight) this._mineLight.intensity = 8.4 + Math.sin(t * 3.0 + 0.7) * 1.4;
-    if (this._mineGlowMat) this._mineGlowMat.opacity = 0.3 + 0.1 * (0.5 + 0.5 * Math.sin(t * 1.6));
-    if (this._minePathGlowMat) this._minePathGlowMat.opacity = 0.22 + 0.08 * (0.5 + 0.5 * Math.sin(t * 1.6 - 0.8));
+    if (this._mineLight) this._mineLight.intensity = (8.4 + Math.sin(t * 3.0 + 0.7) * 1.4) * kMine;
+    if (this._mineGlowMat) this._mineGlowMat.opacity = (0.3 + 0.1 * (0.5 + 0.5 * Math.sin(t * 1.6))) * kMine;
+    if (this._minePathGlowMat) this._minePathGlowMat.opacity = (0.22 + 0.08 * (0.5 + 0.5 * Math.sin(t * 1.6 - 0.8))) * kMine;
+
+    this._updateAurora(dt, t);
+    this._updateAim(dt, t);
+    this._updateBalls(dt);
+    this._updateHitPuffs(dt);
+    this._updateBoops(dt);
+    this._updateCaps(dt);
+
+    // one nudge per session, once someone has stood in the snow long enough to
+    // wonder what there is to do out here
+    if (this._hintT >= 0) {
+      this._hintT += dt;
+      if (this._hintT > 7) {
+        this._hintT = -1;
+        _hintShown = true;
+        this._game?.toast?.('Hold a click on the snow to lob a snowball at someone.');
+      }
+    }
 
     this._updateLobby(dt, t);
+  }
+
+  /* --- world clock (LIVING-COVE section A) -------------------------------- */
+
+  /**
+   * Server clock frame, and one call right after build so a night arrival never
+   * flashes noon first. `weather` on the peak is snowfall intensity 0..2; a
+   * word from the outdoor-family vocabulary is understood too, in case the
+   * server speaks one dialect for every room.
+   */
+  onClock(dayT, weather, aurora) {
+    const t = Number(dayT);
+    if (Number.isFinite(t)) {
+      const next = ((t % 1) + 1) % 1;
+      // The local phase runs on between the server's 10s frames, so a frame
+      // that agrees with us to within ~30 cove-seconds is left alone: only a
+      // real disagreement (reconnect, restart, first frame) moves the hands.
+      const drift = Math.abs(((next - this._dayT + 1.5) % 1) - 0.5);
+      if (!this._hasClock || drift > 0.012) this._dayT = next;
+    }
+    this._snowWant = snowIntensity(weather);
+    this._auroraOn = !!aurora;
+    this._hasClock = true;
+  }
+
+  /**
+   * The whole room on the day curve: sky, fog, sun/moon, fills, lamps, snow.
+   * Runs every frame off a locally advanced dayT (never Date), lerping into
+   * preallocated colours so the clock allocates nothing per frame.
+   */
+  _relight(dt) {
+    this._dayT = (this._dayT + dt / DAY_SECONDS) % 1;
+    const h = Math.cos((this._dayT - 0.25) * TAU); // sun elevation: 1 noon, -1 midnight
+    const day = smoothstep(-0.22, 0.16, h);
+    const night = 1 - day;
+    const rising = this._dayT < 0.25 || this._dayT > 0.75;
+    const warm = Math.max(0, 1 - Math.abs(h) / 0.34) * (0.35 + 0.65 * day);
+    this._dayness = day;
+    this._nightK = night;
+
+    // first frame lands on the phase; after that everything eases (~0.4s)
+    const k = this._litOnce ? Math.min(1, dt * 2.5) : 1;
+    this._litOnce = true;
+    const warmK = warm * 0.7;
+
+    _lc.copy(P.skyNight).lerp(P.skyDay, day).lerp(rising ? P.skyDawn : P.skyDusk, warmK);
+    if (this._skyMat) this._skyMat.color.lerp(_lc, k);
+    _lc.copy(P.bgNight).lerp(P.bgDay, day).lerp(rising ? P.bgDawn : P.bgDusk, warmK);
+    if (this._bgColor) this._bgColor.lerp(_lc, k);
+    _lc.copy(P.fogNight).lerp(P.fogDay, day).lerp(rising ? P.fogDawn : P.fogDusk, warmK);
+    if (this._fog) this._fog.color.lerp(_lc, k);
+
+    // sun by day, moon by night: the same single shadow caster, walked round
+    // the sky by dayT. At dayT 0.25 it lands exactly on the authored noon pose.
+    const sun = this._sun;
+    if (sun) {
+      const az = NOON_AZ + (this._dayT - 0.25) * TAU;
+      const ah = Math.abs(h);
+      sun.position.set(Math.cos(az) * SUN_R, 14 * (0.35 + 0.65 * ah), Math.sin(az) * SUN_R);
+      _lc.copy(P.moon).lerp(P.sunDay, day).lerp(P.sunWarm, warm * 0.8);
+      sun.color.lerp(_lc, k);
+      sun.intensity += ((0.42 + 1.13 * day) * (1 - 0.22 * warm) - sun.intensity) * k;
+    }
+    if (this._hemi) {
+      _lc.copy(P.hemiSkyNight).lerp(P.hemiSkyDay, day);
+      this._hemi.color.lerp(_lc, k);
+      _lc.copy(P.hemiGndNight).lerp(P.hemiGndDay, day);
+      this._hemi.groundColor.lerp(_lc, k);
+      // 0.50 floor: a snowfield at midnight still has to be walkable
+      this._hemi.intensity += (0.5 + 0.65 * day - this._hemi.intensity) * k;
+    }
+    if (this._amb) {
+      _lc.copy(P.ambNight).lerp(P.ambDay, day);
+      this._amb.color.lerp(_lc, k);
+      this._amb.intensity += (0.24 + 0.08 * day - this._amb.intensity) * k;
+    }
+
+    // the dome's painted glow, the disc and its halo all follow the same bearing
+    if (sun && this._skyMesh) {
+      _lv.copy(sun.position).normalize();
+      this._skyMesh.rotation.y = Math.atan2(-_lv.z, _lv.x);
+      if (this._sunDisc) {
+        this._sunDisc.position.copy(_lv).multiplyScalar(96);
+        this._sunDisc.lookAt(0, 8, 0);
+      }
+      if (this._halo) {
+        this._halo.position.copy(_lv).multiplyScalar(94.6);
+        this._halo.lookAt(0, 8, 0);
+      }
+    }
+    if (this._sunDiscMat) {
+      _lc.copy(P.discNight).lerp(P.discDay, day);
+      this._sunDiscMat.color.lerp(_lc, k);
+    }
+    if (this._haloMat) this._haloMat.opacity += (0.35 + 0.65 * day - this._haloMat.opacity) * k;
+
+    // lamps: one night target, four lags, so the peak lights up in a ripple
+    const lampWant = 1 + 0.5 * night;
+    for (let i = 0; i < this._lampK.length; i++) {
+      this._lampK[i] += (lampWant - this._lampK[i]) * Math.min(1, dt / this._lampLag[i]);
+    }
+
+    // snowfall: intensity 0..2 scales how much of the pool falls, and how hard
+    const step = 0.5 * dt;
+    this._snowNow += Math.max(-step, Math.min(step, this._snowWant - this._snowNow));
+    this._snowShown = SNOW_N * Math.min(1, 0.08 + 0.46 * this._snowNow);
+    this._snow?.geo.setDrawRange(0, Math.max(0, Math.round(this._snowShown)));
+    this._snowSpeedK += (0.75 + 0.35 * this._snowNow - this._snowSpeedK) * Math.min(1, dt * 1.5);
+  }
+
+  /** Curtains: on only while the server says aurora AND it is properly night. */
+  _updateAurora(dt, t) {
+    const a = this._aur;
+    if (!a) return;
+    const want = this._auroraOn && this._hasClock
+      ? Math.min(1, Math.max(0, (this._nightK - 0.35) / 0.45))
+      : 0;
+    this._auroraK += (want - this._auroraK) * Math.min(1, dt * 0.5); // ~2s either way
+    if (this._auroraK < 0.012) {
+      if (a.mesh.visible) { a.mesh.visible = false; a.mat.opacity = 0; }
+      return;
+    }
+    a.mesh.visible = true;
+    // subtle, not a rave: the bands breathe between roughly a third and a half
+    a.mat.opacity = this._auroraK * (0.4 + 0.1 * Math.sin(t * 0.31) + 0.05 * Math.sin(t * 0.77 + 1.4));
+    const arr = a.attr.array;
+    const base = a.base;
+    for (let i = 0; i < arr.length; i += 3) {
+      const p = base[i] * 0.075 + base[i + 2] * 0.055;
+      arr[i + 1] = base[i + 1] + Math.sin(p + t * 0.5) * 1.9 + Math.sin(p * 2.4 - t * 0.29) * 0.85;
+    }
+    a.attr.needsUpdate = true;
+  }
+
+  /* --- snowballs: aiming and input ---------------------------------------- */
+
+  _setRay(e) {
+    const cam = this._game?.engine?.camera;
+    if (!cam) return false;
+    _ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+    this._ray.setFromCamera(_ndc, cam);
+    return true;
+  }
+
+  /**
+   * Where the pointer meets the snow. Solved against terrainH() instead of
+   * raycasting the ground mesh, because this runs on every pointermove while
+   * aiming and that mesh is 6.7k triangles: two iterations land within a
+   * couple of centimetres of it (the mesh IS terrainH, sampled on a grid).
+   */
+  _groundPoint(out) {
+    const o = this._ray.ray.origin;
+    const d = this._ray.ray.direction;
+    if (d.y > -1e-3) return false; // aimed at the sky
+    let y = this._game?.engine?.playerAvatar?.group?.position.y ?? 0;
+    let x = 0;
+    let z = 0;
+    for (let i = 0; i < 2; i++) {
+      const k = (y - o.y) / d.y;
+      x = o.x + d.x * k;
+      z = o.z + d.z * k;
+      if (!Number.isFinite(x) || !Number.isFinite(z)) return false;
+      y = terrainH(x, z);
+    }
+    if (Math.abs(x) > GROUND_HALF || Math.abs(z) > GROUND_HALF) return false;
+    out.set(x, y, z);
+    return true;
+  }
+
+  _pointerDown(e) {
+    if (e.button !== 0 || this._aim) return;
+    const game = this._game;
+    const engine = game?.engine;
+    if (!engine || engine.paused || game.activeMinigame) return;
+    if (e.target !== engine.canvas) return;   // a HUD or prompt click: not ours
+    if (this._cool > 0) return;               // cooling down: leave it as a walk
+    if (this._localSlot !== null) return;     // seated in the race lineup
+    if (!this._setRay(e)) return;
+    // clicking a capybara opens their profile card; that path is the engine's
+    if (this._ray.intersectObjects(engine.remoteGroup.children, true).length) return;
+    if (!this._groundPoint(_aimV)) return;
+    e.stopPropagation(); // ...so the engine's click-to-walk does not also fire
+    this._aim = { t: 0, x: _aimV.x, z: _aimV.z, cx: _aimV.x, cz: _aimV.z };
+    engine.controller?.stop?.();
+  }
+
+  _pointerMove(e) {
+    if (!this._aim) return;
+    if (!this._setRay(e)) return;
+    if (this._groundPoint(_aimV)) {
+      this._aim.x = _aimV.x;
+      this._aim.z = _aimV.z;
+    }
+  }
+
+  _pointerUp(e) {
+    const a = this._aim;
+    if (!a) return;
+    this._cancelAim();
+    // a flick of a click was never a throw: walk there, exactly as the engine
+    // would have if we had not swallowed the press
+    if (a.t < SNOW_MIN_HOLD) this._walkTo(e);
+    else this._throw(a.cx, a.cz);
+  }
+
+  _cancelAim() {
+    this._aim = null;
+    if (this._aimBeads) this._aimBeads.count = 0;
+    if (this._aimRing) this._aimRing.visible = false;
+  }
+
+  _walkTo(e) {
+    const engine = this._game?.engine;
+    if (!engine?.controller) return;
+    if (e && Number.isFinite(e.clientX) && !this._setRay(e)) return;
+    const hits = this._ray.intersectObjects(this.groundMeshes, false);
+    if (!hits.length) return;
+    engine.controller.setTarget(hits[0].point);
+    const av = engine.playerAvatar;
+    if (av?.state.anim === 'dance') av.setAnim('idle');
+    this._game?.audio?.play?.('step');
+  }
+
+  /** Let go: fly it locally at once, and tell the room. */
+  _throw(x, z) {
+    const game = this._game;
+    const p = game?.engine?.playerAvatar?.group?.position;
+    if (!p) return;
+    this._cool = SNOW_COOLDOWN;
+    this._launch(p.x, p.y, p.z, x, z);
+    // Never wait on the round trip for your own throw; the echo of this frame
+    // is dropped in _onSnowFrame. The local cooldown is a beat longer than the
+    // server's 1/s, so a throw that flew here is a throw everyone else saw.
+    game.net?.send?.({ t: 'snow', to: [Math.round(x * 100) / 100, Math.round(z * 100) / 100] });
+    game.audio?.play?.('whoosh');
+    this._hintT = -1;
+    _hintShown = true; // they found the toy; no need to nag next visit
+  }
+
+  /** Server relay: somebody else's snowball, on the same arc they are watching. */
+  _onSnowFrame(m) {
+    const to = m?.to;
+    let tx = NaN;
+    let tz = NaN;
+    if (Array.isArray(to)) { tx = Number(to[0]); tz = Number(to[1]); }
+    else if (to && typeof to === 'object') { tx = Number(to.x); tz = Number(to.z); }
+    if (!Number.isFinite(tx) || !Number.isFinite(tz)) return;
+    tx = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, tx));
+    tz = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, tz));
+
+    // `from` is the sender: an id to look up, or a launch point if the server
+    // relays coordinates instead. Both shapes are handled; neither is required.
+    const from = m.from ?? m.id ?? m.by ?? null;
+    let ox = NaN;
+    let oy = 0;
+    let oz = NaN;
+    if (Array.isArray(from) && from.length >= 2) {
+      ox = Number(from[0]);
+      oz = Number(from[from.length - 1]);
+      oy = from.length > 2 ? Number(from[1]) : terrainH(ox, oz);
+    } else if (from && typeof from === 'object') {
+      ox = Number(from.x);
+      oz = Number(from.z);
+      oy = Number.isFinite(Number(from.y)) ? Number(from.y) : terrainH(ox, oz);
+    } else if (from !== null && from !== undefined) {
+      const self = this._game?.net?.selfId ?? null;
+      if (self !== null && from === self) return; // our own throw already flew
+      const g = this._game?.net?.remotes?.get?.(from)?.avatar?.group
+        || this._riders.get(from)?.avatar?.group;
+      if (g) { ox = g.position.x; oy = g.position.y; oz = g.position.z; }
+    }
+    if (!Number.isFinite(ox) || !Number.isFinite(oz)) {
+      // thrower already gone (or unnamed): land it anyway, so the puff and the
+      // boop still happen where everyone else in the room saw them happen
+      this._impact(tx, terrainH(tx, tz) + 0.12, tz);
+      return;
+    }
+    this._launch(ox, oy, oz, tx, tz);
+  }
+
+  _launch(ox, oy, oz, tx, tz) {
+    if (!this._balls) return;
+    const dist = Math.hypot(tx - ox, tz - oz);
+    if (this._balls.length >= SNOW_MAX_BALLS) this._balls.shift();
+    this._balls.push({
+      ox, oy: oy + 1.2, oz,                    // leaves at about shoulder height
+      tx, ty: terrainH(tx, tz) + 0.12, tz,
+      t: 0, dur: flightTime(dist), h: arcHeight(dist),
+      spin: 6 + Math.random() * 6,
+    });
+  }
+
+  _updateBalls(dt) {
+    const mesh = this._ballMesh;
+    const list = this._balls;
+    if (!mesh || !list) return;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const b = list[i];
+      b.t += dt;
+      if (b.t >= b.dur) {
+        list.splice(i, 1);
+        this._impact(b.tx, b.ty, b.tz);
+      }
+    }
+    const d = this._dummy;
+    let n = 0;
+    for (let i = 0; i < list.length && n < SNOW_MAX_BALLS; i++) {
+      const b = list[i];
+      arcPoint(b, b.t / b.dur, _aimV);
+      d.position.copy(_aimV);
+      d.rotation.set(b.t * b.spin, b.t * b.spin * 0.7, 0);
+      d.updateMatrix();
+      mesh.setMatrixAt(n++, d.matrix);
+    }
+    d.rotation.set(0, 0, 0);
+    if (n || mesh.count) {
+      mesh.count = n;
+      mesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  /** Landing: a puff of snow, and a boop for anyone standing in it. */
+  _impact(x, y, z) {
+    const game = this._game;
+    const list = this._hitPuffs;
+    if (list) {
+      for (let i = 0; i < 12; i++) {
+        if (list.length >= SNOW_PUFFS) list.shift();
+        const a = Math.random() * TAU;
+        const sp = 0.7 + Math.random() * 2.2;
+        list.push({
+          x, y: y + 0.06, z,
+          vx: Math.cos(a) * sp, vy: 1.5 + Math.random() * 2.4, vz: Math.sin(a) * sp,
+          t: 0, life: 0.45 + Math.random() * 0.4, size: 0.5 + Math.random() * 0.9,
+        });
+      }
+    }
+    game?.audio?.play?.('pop');
+    let hit = false;
+    this._forEachCapy((avatar, pos) => {
+      if (Math.hypot(pos.x - x, pos.z - z) > SNOW_HIT_R) return;
+      hit = true;
+      this._boop(avatar);
+    });
+    // the 'boop': audio.js has no cue by that name, and it is not our file, so
+    // the softest body-thump it does have stands in
+    if (hit) game?.audio?.play?.('thud');
+  }
+
+  /** Every capybara standing in this room: the player, remotes, seated riders. */
+  _forEachCapy(fn) {
+    const game = this._game;
+    const mine = game?.engine?.playerAvatar;
+    if (mine?.group) fn(mine, mine.group.position);
+    const remotes = game?.net?.remotes;
+    if (remotes) {
+      for (const [, r] of remotes) {
+        // a remote parked offscreen is one of ours, seated in a sled below
+        if (r?.avatar?.group?.parent) fn(r.avatar, r.avatar.group.position);
+      }
+    }
+    if (this._riders) {
+      for (const r of this._riders.values()) fn(r.avatar, r.avatar.group.position);
+    }
+  }
+
+  /**
+   * Booped: a wobble and a snowcap, no damage and no score. The wobble rides on
+   * the avatar's ROOT group (rotation x/z and scale), which is the one part of
+   * the rig neither avatar.update() nor the net client's interpolation rewrites
+   * every frame - a wobble on the body would be wiped for remotes.
+   */
+  _boop(avatar) {
+    if (!avatar?.group || !this._booped) return;
+    let w = null;
+    for (const b of this._booped) if (b.avatar === avatar) { w = b; break; }
+    if (w) w.t = 0;
+    else this._booped.push({ avatar, t: 0 });
+    this._capOn(avatar);
+  }
+
+  _updateBoops(dt) {
+    const list = this._booped;
+    if (!list) return;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const b = list[i];
+      const g = b.avatar?.group;
+      b.t += dt;
+      if (!g) { list.splice(i, 1); continue; }
+      if (b.t >= BOOP_DUR) {
+        g.rotation.x = 0;
+        g.rotation.z = 0;
+        g.scale.set(1, 1, 1);
+        list.splice(i, 1);
+        continue;
+      }
+      const damp = Math.exp(-b.t * 4.2) * (1 - b.t / BOOP_DUR);
+      g.rotation.z = Math.sin(b.t * 26) * 0.24 * damp;
+      g.rotation.x = Math.sin(b.t * 21 + 1) * 0.14 * damp;
+      const sq = Math.sin(b.t * 22) * 0.1 * damp;
+      g.scale.set(1 + sq * 0.6, 1 - sq, 1 + sq * 0.6);
+    }
+  }
+
+  _capOn(avatar) {
+    const head = avatar?.headG;
+    if (!head || !this._capGeo) return;
+    for (const c of this._caps) if (c.avatar === avatar) { c.t = 0; return; } // refresh, never stack
+    const m = new THREE.Mesh(this._capGeo, makeToon(0xffffff, VC));
+    m.position.set(0, 0.16, 0.02);
+    m.rotation.set(-0.1, Math.random() * TAU, 0.08);
+    m.scale.setScalar(0.2);
+    head.add(m);
+    this._caps.push({ mesh: m, avatar, t: 0 });
+  }
+
+  _updateCaps(dt) {
+    const list = this._caps;
+    if (!list) return;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const c = list[i];
+      c.t += dt;
+      const m = c.mesh;
+      if (c.t >= CAP_LIFE || !m.parent) {
+        m.parent?.remove(m);
+        list.splice(i, 1);
+        continue;
+      }
+      const pop = Math.min(1, c.t / 0.22);
+      const melt = Math.max(0, (c.t - (CAP_LIFE - 0.7)) / 0.7);
+      const s = Math.max(0.001, (0.25 + 0.75 * pop) * (1 + Math.sin(pop * Math.PI) * 0.22) * (1 - melt));
+      m.scale.set(s, Math.max(0.001, s * (1 - melt * 0.55)), s);
+      m.position.y = 0.16 - melt * 0.12; // it slumps off as it goes
+    }
+  }
+
+  _updateHitPuffs(dt) {
+    const mesh = this._hitPuffMesh;
+    const list = this._hitPuffs;
+    if (!mesh || !list) return;
+    const drag = Math.max(0, 1 - 3 * dt);
+    for (let i = list.length - 1; i >= 0; i--) {
+      const p = list[i];
+      p.t += dt;
+      if (p.t >= p.life) { list.splice(i, 1); continue; }
+      p.vy -= 9 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      p.vx *= drag;
+      p.vz *= drag;
+    }
+    const d = this._dummy;
+    let n = 0;
+    for (let i = 0; i < list.length && n < SNOW_PUFFS; i++) {
+      const p = list[i];
+      const u = p.t / p.life;
+      d.position.set(p.x, p.y, p.z);
+      d.rotation.set(0, 0, 0);
+      d.scale.setScalar(Math.max(0.001, p.size * (1 - u * u)));
+      d.updateMatrix();
+      mesh.setMatrixAt(n++, d.matrix);
+    }
+    d.scale.setScalar(1);
+    if (n || mesh.count) {
+      mesh.count = n;
+      mesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  /** The aim preview: beads along the arc your throw would take, plus a ring. */
+  _updateAim(dt, t) {
+    if (this._cool > 0) this._cool = Math.max(0, this._cool - dt);
+    const a = this._aim;
+    const beads = this._aimBeads;
+    const ring = this._aimRing;
+    if (!a) {
+      if (beads?.count) beads.count = 0;
+      if (ring?.visible) ring.visible = false;
+      return;
+    }
+    const engine = this._game?.engine;
+    const avatar = engine?.playerAvatar;
+    const p = avatar?.group?.position;
+    if (!p || !beads || !ring) return;
+    a.t += dt;
+    const pow = Math.min(1, a.t / SNOW_HOLD_CAP);
+
+    // power caps the range: hold longer, throw further
+    let dx = a.x - p.x;
+    let dz = a.z - p.z;
+    let d = Math.hypot(dx, dz);
+    if (d < 1e-3) { // aimed at your own feet: throw where you are looking
+      dx = Math.sin(avatar.group.rotation.y);
+      dz = Math.cos(avatar.group.rotation.y);
+      d = 1;
+    }
+    const range = SNOW_RANGE_MIN + (SNOW_RANGE_MAX - SNOW_RANGE_MIN) * pow;
+    const s = Math.min(1, range / d);
+    a.cx = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, p.x + dx * s));
+    a.cz = Math.max(-GROUND_HALF, Math.min(GROUND_HALF, p.z + dz * s));
+
+    // Plant, face the throw and wind up. avatar.update() has already rebuilt
+    // its rest pose this frame (the engine runs it before room.update), so the
+    // lean written here paints on top instead of being wiped.
+    const yaw = Math.atan2(a.cx - p.x, a.cz - p.z);
+    const g = avatar.group;
+    const delta = ((((yaw - g.rotation.y) % TAU) + Math.PI * 3) % TAU) - Math.PI;
+    g.rotation.y += delta * Math.min(1, dt * 12);
+    avatar.body.rotation.x = -0.1 - 0.2 * pow;
+    avatar.body.rotation.y = -0.3 * pow;
+
+    // the preview is the flight: same endpoints, same apex, same curve
+    _pv.ox = p.x; _pv.oy = p.y + 1.2; _pv.oz = p.z;
+    _pv.tx = a.cx; _pv.tz = a.cz;
+    _pv.ty = terrainH(a.cx, a.cz) + 0.12;
+    _pv.h = arcHeight(Math.hypot(a.cx - p.x, a.cz - p.z));
+
+    const dmy = this._dummy;
+    for (let i = 0; i < AIM_BEADS; i++) {
+      const u = (i + 1) / (AIM_BEADS + 1);
+      arcPoint(_pv, u, _aimV);
+      dmy.position.copy(_aimV);
+      dmy.rotation.set(0, 0, 0);
+      dmy.scale.setScalar((0.5 + 0.9 * pow) * (1 - u * 0.3) * (0.88 + 0.24 * Math.sin(t * 9 - i * 0.7)));
+      dmy.updateMatrix();
+      beads.setMatrixAt(i, dmy.matrix);
+    }
+    dmy.scale.setScalar(1);
+    beads.count = AIM_BEADS;
+    beads.instanceMatrix.needsUpdate = true;
+
+    ring.visible = true;
+    ring.position.set(a.cx, _pv.ty + 0.02, a.cz);
+    const rs = (0.8 + 0.5 * pow) * (1 + Math.sin(t * 7) * 0.05);
+    ring.scale.set(rs, rs, rs);
+
+    // A pointer released outside the window never reports back, and a stuck aim
+    // would leave the capybara wound up forever: four seconds is three past the
+    // power cap, so let it fly.
+    if (a.t > 4) {
+      this._cancelAim();
+      this._throw(a.cx, a.cz);
+    }
   }
 
   /* --- race lobby, per frame ---------------------------------------------- */
@@ -3159,6 +4053,51 @@ export class PeakRoom extends Room {
   }
 
   dispose() {
+    // Input first: these live on window, and a press landing between here and
+    // the next room's build would have nothing left to aim with.
+    removeEventListener('pointerdown', this._onDown, true);
+    removeEventListener('pointermove', this._onMove, true);
+    removeEventListener('pointerup', this._onUp, true);
+    removeEventListener('pointercancel', this._onCancel, true);
+    removeEventListener('blur', this._onCancel);
+    this._onDown = this._onMove = this._onUp = this._onCancel = null;
+    this._aim = null;
+
+    // The player's avatar (and the remotes') outlive this room, so anything we
+    // hung on them or bent out of shape has to be put back before we go.
+    for (const c of this._caps || []) c.mesh.parent?.remove(c.mesh);
+    for (const b of this._booped || []) {
+      const g = b.avatar?.group;
+      if (!g) continue;
+      g.rotation.x = 0;
+      g.rotation.z = 0;
+      g.scale.set(1, 1, 1);
+    }
+    this._caps = null;
+    this._booped = null;
+    // shared-flagged so the avatar/scene sweeps skip it: ours to free
+    this._capGeo?.dispose();
+    this._capGeo = null;
+    this._balls = null;
+    this._hitPuffs = null;
+    this._ballMesh = null;
+    this._hitPuffMesh = null;
+    this._aimBeads = null;
+    this._aimRing = null;
+    this._aur = null;
+    this._sun = null;
+    this._hemi = null;
+    this._amb = null;
+    this._skyMesh = null;
+    this._skyMat = null;
+    this._sunDisc = null;
+    this._sunDiscMat = null;
+    this._haloMat = null;
+    this._bgColor = null;
+    this._fog = null;
+    this._offSnow?.();
+    this._offSnow = null;
+
     // Walking out of the room while seated must not leave a ghost holding one of
     // the three slots. Harmless if the server already dropped us on room change.
     if (this._localSlot !== null && this._game?.net?.connected) {

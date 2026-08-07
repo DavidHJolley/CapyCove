@@ -1001,6 +1001,71 @@ function buildCocoaStation(g) {
   g.userData.footprint = { w: 1.55, d: 0.85 };
 }
 
+/**
+ * Whale-Song Gramophone: milestone reward at 20 stamps (docs/LIVING-COVE.md
+ * section D), so it is not in any shop listing. Turntable spins, a brass horn
+ * leans over it, and faint song motes rise out of the bell in a slow swell that
+ * matches Big Blue's singing down in The Drift. ~330 tris
+ */
+function buildGramophone(g) {
+  const S = [];
+  // plinth: a squat cabinet with a fluted foot and a little brass catch
+  box(S, PAL.woodDark, 0.86, 0.14, 0.8, { y: 0.07 });
+  box(S, PAL.wood, 0.78, 0.42, 0.72, { y: 0.35 });
+  box(S, PAL.woodLight, 0.84, 0.07, 0.78, { y: 0.59 });
+  box(S, PAL.gold, 0.12, 0.05, 0.03, { y: 0.36, z: 0.37 });
+  for (const s of [-1, 1]) box(S, PAL.woodDark, 0.05, 0.4, 0.05, { x: s * 0.36, y: 0.35, z: 0.34 });
+  // platter + spindle
+  cyl(S, PAL.stoneDark, 0.28, 0.28, 0.04, 16, { y: 0.645 });
+  cyl(S, PAL.gold, 0.02, 0.02, 0.12, 6, { y: 0.71 });
+  // tone arm reaching in from the back-right corner
+  cyl(S, PAL.metal, 0.035, 0.045, 0.1, 8, { x: 0.31, y: 0.68, z: -0.26 });
+  cyl(S, PAL.metal, 0.018, 0.018, 0.42, 6, { rx: 0.1, rz: 1.15, x: 0.16, y: 0.76, z: -0.13 });
+  box(S, PAL.ink, 0.07, 0.05, 0.09, { ry: 0.5, x: -0.01, y: 0.72, z: 0.0 });
+  // the horn: one open flare on a single axis (a stack of separately rotated
+  // rings reads as a zigzag from the play camera), plus a rim at the bell and a
+  // short neck down to the elbow. Tilt: rz leans it left, rx leans it back.
+  const TILT = { rz: 0.5, rx: -0.22 };
+  cyl(S, PAL.gold, 0.44, 0.075, 0.92, 16, { ...TILT, x: -0.24, y: 1.06, z: -0.42 }, true);
+  cyl(S, PAL.amber, 0.47, 0.43, 0.06, 16, { ...TILT, x: -0.44, y: 1.44, z: -0.51 }, true);
+  cyl(S, PAL.gold, 0.075, 0.06, 0.26, 10, { rz: 0.9, rx: -0.1, x: 0.03, y: 0.71, z: -0.3 });
+  g.add(solid(S));
+
+  // the record itself: separate so it can turn
+  const D = [];
+  cyl(D, PAL.ink, 0.26, 0.26, 0.015, 18, { y: 0 });
+  cyl(D, PAL.coral, 0.09, 0.09, 0.017, 12, { y: 0.001 });
+  cyl(D, PAL.cream, 0.021, 0.021, 0.02, 6, { y: 0.002 });
+  box(D, PAL.stoneDark, 0.5, 0.002, 0.012, { y: 0.009 }); // one catch of light on the groove
+  const record = solid(D, { shadow: false });
+  record.name = 'anim';
+  record.position.y = 0.673;
+  g.add(record);
+
+  // song motes: three little notes leaning out of the bell
+  const P = [];
+  for (const [x, y, r] of [[0, 0, 0.05], [0.07, 0.11, 0.04], [-0.05, 0.21, 0.033]]) {
+    sph(P, 0xfff2cf, r, 6, 4, { x, y });
+    box(P, 0xfff2cf, 0.012, 0.09, 0.012, { x: x + r * 0.85, y: y + 0.05 });
+  }
+  const notes = glow(P, { fade: true });
+  notes.name = 'anim';
+  notes.position.set(-0.5, 1.55, -0.55);
+  g.add(notes);
+
+  g.userData.update = (t) => {
+    record.rotation.y = t * 3.1; // 78rpm is 8.2 rad/s; slowed so it reads as a spin
+    const p = (t * 0.3) % 1;
+    // a slow swell rather than a steady drip: the horn breathes with the song
+    const swell = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(t * 0.55));
+    notes.position.set(-0.5 + Math.sin(t * 1.1) * 0.07, 1.55 + p * 0.52, -0.55 - p * 0.16);
+    notes.rotation.z = Math.sin(t * 1.4) * 0.22;
+    notes.scale.setScalar(0.55 + p * 0.5);
+    notes.userData.mat.opacity = Math.min(1, p * 6) * (1 - p) * 0.85 * swell;
+  };
+  g.userData.footprint = { w: 1.0, d: 1.0 };
+}
+
 const BUILDERS = {
   sofa: buildSofa,
   armchair: buildArmchair,
@@ -1022,6 +1087,7 @@ const BUILDERS = {
   wall_surfboard: buildWallSurfboard,
   capy_portrait: buildCapyPortrait,
   cocoa_station: buildCocoaStation,
+  gramophone: buildGramophone,
 };
 
 /**
@@ -1069,4 +1135,5 @@ const FOOTPRINTS = {
   wall_surfboard: { w: 1.0, d: 0.5 },
   capy_portrait: { w: 0.85, d: 0.65 },
   cocoa_station: { w: 1.55, d: 0.85 },
+  gramophone: { w: 1.0, d: 1.0 },
 };
