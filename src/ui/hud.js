@@ -25,22 +25,23 @@ const COVE_CSS = `
 .map-spot.is-party {
   background: linear-gradient(180deg, #ffd3dd 0%, #f5879b 100%);
   box-shadow: 0 0 0 3px rgba(232, 101, 122, 0.45),
-    0 4px 0 rgba(45, 36, 23, 0.25), 0 10px 22px rgba(16, 52, 78, 0.4);
+    0 3px 0 rgba(45, 36, 23, 0.25), 0 8px 18px rgba(16, 52, 78, 0.4);
   animation: party-bob 1.5s ease-in-out infinite;
 }
+/* sized against the smaller map pills (styles.css .map-spot) */
 .map-spot.is-party .map-hat {
-  display: block; position: absolute; right: -7px; top: -15px; width: 0; height: 0;
-  border: 9px solid transparent; border-bottom: 17px solid var(--accent);
+  display: block; position: absolute; right: -6px; top: -12px; width: 0; height: 0;
+  border: 7px solid transparent; border-bottom: 14px solid var(--accent);
   rotate: 18deg; filter: drop-shadow(0 2px 2px rgba(16, 52, 78, 0.4));
 }
 .map-spot.is-party .map-hat::after {
-  content: ''; position: absolute; left: -4px; top: -6px; width: 8px; height: 8px;
+  content: ''; position: absolute; left: -3px; top: -5px; width: 7px; height: 7px;
   border-radius: 50%; background: var(--cream);
 }
 @keyframes party-bob { 50% { translate: -50% calc(-50% - 3px); } }
 
 .map-party {
-  display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 9px 12px;
+  display: flex; align-items: center; gap: 10px; margin-top: 8px; padding: 9px 12px;
   border-radius: 16px; background: rgba(232, 101, 122, 0.13);
   box-shadow: inset 0 0 0 2px rgba(232, 101, 122, 0.26);
   animation: party-in 0.25s ease;
@@ -587,11 +588,10 @@ function popCoins(pill, delta) {
 //
 // Deviation from docs/PARTY-GAMES.md, on purpose: the spec puts the jungle
 // "north of the beach", and the north-west headland is where it was first
-// painted. Nothing can label it there. At a 480px viewport the pills tile the
-// west coast in ~11% bands, the band under that headland belongs to the Game
-// Den (nothing else can label the lodge), and the next one down is the dock
-// itself, which a pill would bury. Moving the canopy to the head of the beach
-// path keeps its pill directly underneath it, which is what a map has to do.
+// painted. Nothing could label it there: that stretch of west coast is spoken
+// for by the lodge and the dock, and a pill over either buries them. Moving the
+// canopy to the head of the beach path gave it open ground of its own, which is
+// what a map has to do (its label now points in at it from the plaza side).
 const ART = {
   plaza: [0.500, 0.465],
   beach: [0.170, 0.570],
@@ -601,32 +601,37 @@ const ART = {
   club: [0.690, 0.700],
   mine: [0.458, 0.252],
   jungle: [0.334, 0.582],
-  // The Drift is under the water off the west coast, so it gets painted art
-  // and a "you are here" pin but NO pill and no warp: eight labels is what
-  // this island holds (see MAP_SPOTS), and you go down by taking the dive bell
-  // at the end of the Driftwood dock, not by clicking the open sea.
+  // The Drift is under the water off the west coast: painted buoy, "you are
+  // here" pin, and (since the map card grew) a pill of its own at the buoy.
   drift: [0.062, 0.600],
 };
 
-// Label pills sit just under their landmark so the art stays readable.
+// Label pills ring the island instead of tiling down it. The old cascade
+// (eight labels in ~11% bands down the west coast) was written for a 680px
+// card whose box went as flat as 628x270; the card now sizes itself off the
+// island box (styles.css .map-card), so the box is 808x440 on a 1280x720
+// screen and 619x335 on a 960x540 one, the pills are 11px instead of 13px,
+// and a label can sit beside its own landmark instead of queueing for a band.
 //
-// Eight pills is what this island holds at a 480px viewport: the card is
-// 441.6px wide there, so the pill row is only 389.6px and the longest label
-// ("The Smoothie Shack") eats 39.7% of it. Two pills only fit in one band when
-// they sit on opposite coasts, so the labels cascade north to south in bands
-// ~11% apart. Peak, Smoothie Shack, Game Den and Driftwood Beach each shifted
-// to open bands for the mine and the jungle; every pair clears by at least 6px
-// at 480px, and no pill covers a landmark (checked at both 400px and 340px
-// island heights).
+// Placement rules, in order: (1) open water or the sand ring wherever the
+// landmark is near a coast, (2) the quietest patch of grass next to it
+// otherwise, (3) never on top of a landmark, the compass rose, the sailboat or
+// the dive buoy. `dir` is the edge the pointer nub sits on, and it always
+// faces the landmark: the peak label hangs over the north water pointing down
+// at the summit, the Glimmer Mine sits below the mountain pointing up at its
+// mouth, and so on. Verified by pairwise getBoundingClientRect: zero overlaps
+// at 1600x900 and 1280x720 (closest pair 32px apart), 960x540 (18px), and,
+// with the phone font steps in styles.css, at 480x800 (18px) and 360x640 (7px).
 const MAP_SPOTS = [
-  { id: 'peak', bx: 66, by: 25 },
-  { id: 'mine', bx: 52, by: 36 },
-  { id: 'lounge', bx: 29.5, by: 47 },
-  { id: 'cafe', bx: 79, by: 49.5 },
-  { id: 'plaza', bx: 56, by: 60.5 },
-  { id: 'jungle', bx: 22.5, by: 68 },
-  { id: 'beach', bx: 19, by: 79 },
-  { id: 'club', bx: 66, by: 81.5 },
+  { id: 'peak', bx: 50, by: 4.5, dir: 'down' },
+  { id: 'lounge', bx: 22, by: 18, dir: 'right' },
+  { id: 'cafe', bx: 81, by: 29.5, dir: 'down' },
+  { id: 'mine', bx: 45, by: 32.5, dir: 'up' },
+  { id: 'plaza', bx: 62, by: 46, dir: 'left' },
+  { id: 'beach', bx: 13, by: 47, dir: 'down' },
+  { id: 'jungle', bx: 48, by: 60, dir: 'left' },
+  { id: 'drift', bx: 9, by: 68, dir: 'up' },
+  { id: 'club', bx: 69, by: 80, dir: 'up' },
 ];
 
 // The lodge window and chimney, as offsets from the lounge landmark centre in
@@ -2339,7 +2344,6 @@ function createIslandPainter(canvas) {
 
 // Stylized island map. (Owned by the UI polish pass; keep the button wiring.)
 function buildMap(game, el) {
-  const spots = MAP_SPOTS.map((s) => [s.id, s.bx, s.by]);
   el.innerHTML = `
     <div class="map-card">
       <h2>${GAME_NAME}</h2>
@@ -2365,12 +2369,12 @@ function buildMap(game, el) {
 
   const setHint = (msg) => { hint.textContent = msg || MAP_HINT; };
 
-  for (const [id, x, y] of spots) {
+  for (const { id, bx, by, dir } of MAP_SPOTS) {
     const b = document.createElement('button');
-    b.className = 'map-spot';
+    b.className = `map-spot nub-${dir || 'up'}`;
     b.dataset.room = id;
-    b.style.left = `${x}%`;
-    b.style.top = `${y}%`;
+    b.style.left = `${bx}%`;
+    b.style.top = `${by}%`;
     b.textContent = ROOM_INFO[id].name;
     b.title = ROOM_INFO[id].desc || '';
     b.onclick = () => {
