@@ -145,15 +145,27 @@ main.js, `src/ui/editor.js`, `Room.editable/editables` in
 
 ## Dev layout editor (Ctrl+E)
 
-Rooms are built from numbers, not scene files, and most scenery is merged
-into shared instanced batches, so props cannot simply be dragged and saved.
-The editor previews a move and EXPORTS the coordinates to paste back into the
-room file, which stays the source of truth (chairs, signs, prompts, colliders
-and hotspots are all derived from it at build time). Rooms opt in with
-`this.editable(id, objs)`; an optional `editorExport(id, delta, entry)` on the
-room returns the pasteable text (the lounge returns the whole STATIONS row
-with the delta applied to all five coordinate pairs). Only the lounge has
-opted in so far; other rooms need one `editable()` call per movable prop.
+Rooms are built from numbers, not scene files, so the editor edits numbers and
+exports them; the room file stays the source of truth. Two modes:
+
+**Handles** (authored, exact): a room publishes its layout numbers through
+`editorHandles(id)` and each becomes a draggable pin. Dropping one calls
+`editorPatch(id, key, value)` (or `editorPatchAll` for a Shift-drag of the
+whole cluster), stores it in `src/world/layout.js`, and calls
+`engine.rebuildRoom()`, so the sign posts, chairs, prompt zones, glow rings
+and obstacle circles derived from that number all move with it. `[`/`]` turns
+a station by patching its `yaw`. `editorExport(id)` returns the pasteable row.
+Rooms opt in with `editable(id, objs)` + those four methods; only the lounge
+has so far (see its STATIONS table for the pattern).
+
+**Free** (works in every room, no opt-in): raycast-pick ANY object, including
+a single instance inside an `InstancedMesh`. Drag to move, `[`/`]` rotate,
+`-`/`=` scale, PgUp/PgDn height, Tab to select the parent, H to hide. This is
+a VISUAL preview: nothing derived from a number follows it, and the change is
+session-only. The panel prints position, rotation and scale plus a scene path
+so the value can be found in the room builder. Irreducible limit: props merged
+into one BufferGeometry at build time move as a whole, since splitting them
+would cost the draw calls the merge was buying.
 
 ## Historical roadmap notes (2026-08-06)
 

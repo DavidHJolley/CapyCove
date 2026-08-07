@@ -3165,8 +3165,10 @@ export class LoungeRoom extends Room {
   editorHandles(id) {
     const s = STATION_BY_ID.get(id);
     if (!s) return [];
+    // effective yaw: stations without an explicit one face their sit prompt
+    const yaw = s.yaw ?? Math.atan2(s.hs[0] - s.at[0], s.hs[1] - s.at[1]);
     const out = [
-      { key: 'at', label: `${id}: prop`, xz: s.at, color: 0xf2b64a },
+      { key: 'at', label: `${id}: prop`, xz: s.at, color: 0xf2b64a, yaw },
       { key: 'sign', label: `${id}: sign`, xz: s.sign, color: 0x7ee0ff },
       { key: 'hs', label: `${id}: sit zone`, xz: s.hs, color: 0xe8657a },
       { key: 'aiAt', label: `${id}: vs-bot zone`, xz: s.aiAt, color: 0xe8657a },
@@ -3202,8 +3204,9 @@ export class LoungeRoom extends Room {
     const s = STATION_BY_ID.get(id);
     if (!s) return null;
     const p = ([x, z]) => `[${x.toFixed(2)}, ${z.toFixed(2)}]`;
+    const yaw = s.yaw != null ? ` yaw: ${s.yaw.toFixed(3)},` : '';
     return `${id} (STATIONS row):\n`
-      + `  at: ${p(s.at)}, hs: ${p(s.hs)}, aiAt: ${p(s.aiAt)}, sign: ${p(s.sign)},\n`
+      + `  at: ${p(s.at)}, hs: ${p(s.hs)}, aiAt: ${p(s.aiAt)}, sign: ${p(s.sign)},${yaw}\n`
       + `  seats: [${s.seats.map(p).join(', ')}],`;
   }
 
