@@ -31,6 +31,7 @@ export class BotManager {
     const shuffled = [...NAMES].sort(() => Math.random() - 0.5);
     let n = 0;
     for (const room of ROOM_IDS) {
+      if (!BOT_ZONES[room]) continue; // rooms with no zone (The Drift) get no bots
       for (let i = 0; i < perRoom; i++) this.spawn(shuffled[n++ % shuffled.length], room);
     }
   }
@@ -116,7 +117,7 @@ export class BotManager {
 
   migrate(bot) {
     const dest = ROOM_IDS[Math.floor(Math.random() * ROOM_IDS.length)];
-    if (dest === bot.room) return;
+    if (dest === bot.room || !BOT_ZONES[dest]) return;
     const oldRoom = bot.room;
     this.hooks.broadcastToRoom(oldRoom, { t: 'pleave', id: bot.id });
     const zone = BOT_ZONES[dest];

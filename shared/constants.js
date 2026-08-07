@@ -2,7 +2,7 @@
 
 export const GAME_NAME = 'Capy Cove';
 
-export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'mine', 'jungle'];
+export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'mine', 'jungle', 'drift'];
 export const DEFAULT_ROOM = 'plaza';
 
 export const ROOM_INFO = {
@@ -14,7 +14,9 @@ export const ROOM_INFO = {
   lounge: { name: 'The Game Den', desc: 'Tables, trophies and tussles' },
   mine: { name: 'The Glimmer Mine', desc: 'Coins in the walls, hiders in the props' },
   jungle: { name: 'The Tangle Jungle', desc: 'Vines, ruins and doodles' },
+  drift: { name: 'The Drift', desc: 'Deep water, soft light, one very big friend' },
 };
+// NOTE: 'drift' deliberately has NO BOT_ZONES entry: citizens do not dive.
 
 // Minigames: id -> reward formula. Server clamps client-reported scores with these.
 export const MINIGAMES = {

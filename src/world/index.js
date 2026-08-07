@@ -10,6 +10,7 @@ export const ROOMS = {
   lounge: () => import('./rooms/lounge.js').then((m) => m.LoungeRoom),
   mine: () => import('./rooms/mine.js').then((m) => m.MineRoom),
   jungle: () => import('./rooms/jungle.js').then((m) => m.JungleRoom),
+  drift: () => import('./rooms/drift.js').then((m) => m.DriftRoom),
   // dynamic per-player houses: any 'house:<owner>' id resolves to this loader
   // (see Engine.switchRoom), parameterized via game.__houseCtx
   house: () => import('./rooms/house.js').then((m) => m.HouseRoom),

@@ -262,6 +262,17 @@ export class NetClient {
       case 'dd-end':
         game.events.emit(m.t, m);
         break;
+      // ---- the social cove (wave 7) ---------------------------------------
+      case 'clock':
+        engine.applyClock(m);
+        game.events.emit('clock', m);
+        break;
+      case 'snow': case 'ball': case 'party-start': case 'party-end':
+      case 'party': case 'mural': case 'mural-grid': case 'quests':
+      case 'quest-done': case 'stamp': case 'stamps': case 'bottle':
+      case 'bottle-found':
+        game.events.emit(m.t, m);
+        break;
       case 'match-start':
         game.events.emit('match-start', m);
         break;
@@ -330,6 +341,10 @@ export class NetClient {
       const g = r.avatar.group;
       g.position.x += (r.target.x - g.position.x) * k;
       g.position.z += (r.target.z - g.position.z) * k;
+      // rooms without ground (The Drift) sync y too; grounded rooms snap below
+      if (!this.engine.room?.groundMeshes?.length && Number.isFinite(r.target.y)) {
+        g.position.y += (r.target.y - g.position.y) * k;
+      }
       const dy = ((((r.target.rot - g.rotation.y) % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
       g.rotation.y += dy * k;
       // snap remote to ground height of current room. Only when it actually
@@ -351,13 +366,14 @@ export class NetClient {
       this.sendTimer = 0;
       const a = this.engine.playerAvatar;
       if (a) {
-        const { x, z } = a.group.position;
+        const { x, y, z } = a.group.position;
         const rot = a.group.rotation.y;
         const anim = a.state.anim;
         const l = this.lastSent;
-        if (Math.abs(x - l.x) > 0.01 || Math.abs(z - l.z) > 0.01 || Math.abs(rot - l.rot) > 0.02 || anim !== l.anim) {
-          this.lastSent = { x, z, rot, anim };
-          this.send({ t: 'move', x: +x.toFixed(2), z: +z.toFixed(2), rot: +rot.toFixed(2), anim });
+        if (Math.abs(x - l.x) > 0.01 || Math.abs(z - l.z) > 0.01 || Math.abs((y || 0) - (l.y || 0)) > 0.02
+          || Math.abs(rot - l.rot) > 0.02 || anim !== l.anim) {
+          this.lastSent = { x, y, z, rot, anim };
+          this.send({ t: 'move', x: +x.toFixed(2), y: +y.toFixed(2), z: +z.toFixed(2), rot: +rot.toFixed(2), anim });
         }
       }
     }

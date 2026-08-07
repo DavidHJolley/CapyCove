@@ -157,8 +157,23 @@ export class Engine {
 
       this.roomAge = 0;
       this.game.audio?.setRoom?.(id);
+      // world clock: rooms that react to time of day get the current state
+      // immediately on build, then live updates via the same hook (wave 7)
+      if (this.lastClock && this.room.onClock) {
+        try { this.room.onClock(this.lastClock.dayT, this.lastClock.weather, this.lastClock.aurora); }
+        catch (e) { console.error('[engine] onClock:', e); }
+      }
       fade.classList.remove('on');
     }, 220);
+  }
+
+  /** Called by the net client on every 'clock' frame. */
+  applyClock(m) {
+    this.lastClock = m;
+    if (this.room?.onClock) {
+      try { this.room.onClock(m.dayT, m.weather, m.aurora); }
+      catch (e) { console.error('[engine] onClock:', e); }
+    }
   }
 
   _teardownRoom() {
@@ -411,7 +426,8 @@ export class Engine {
     const dt = Math.min(this.clock.getDelta(), 0.05);
     if (!this.paused && this.room && this.scene) {
       this.roomAge += dt;
-      this.controller.update(dt, this.room);
+      // rooms with their own movement (The Drift's swim) disable the walker
+      if (this.controller.enabled !== false) this.controller.update(dt, this.room);
       this.playerAvatar.update(dt);
       this.room.update(dt, this.game);
       this.game.net?.update?.(dt);
