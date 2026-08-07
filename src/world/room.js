@@ -30,6 +30,21 @@ export class Room {
     this.hotspots = [];
     this.obstacles = [];
     this.cameraHint = null;
+    // dev layout editor (Ctrl+E): props a designer may drag to try a new spot
+    this.editables = [];
+  }
+
+  /**
+   * Register a draggable cluster for the dev layout editor.
+   * `objs` may be one Object3D or several that move together (a station's
+   * prop, its glow ring, its light). Nothing here affects play: the editor
+   * only previews, and exports coordinates you paste back into this file,
+   * because chairs, signs, colliders and hotspots are all derived from those
+   * numbers at build time and cannot be dragged individually.
+   */
+  editable(id, objs, meta = {}) {
+    const list = (Array.isArray(objs) ? objs : [objs]).filter(Boolean);
+    if (list.length) this.editables.push({ id, objs: list, meta });
   }
 
   build(_scene, _game) {}

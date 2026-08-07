@@ -61,11 +61,35 @@ game.events.on('minigame', async (id) => {
   }
 });
 
+/**
+ * TEMPORARY DEV ACCESS: anyone whose name starts with "david" gets the layout
+ * editor. This is a convenience gate, NOT security: the editor is entirely
+ * client-side (it drags local meshes and prints coordinates, it cannot change
+ * anyone else's world or touch the server), and any player could open devtools
+ * and call the same module. It exists so the owner can art-direct rooms in
+ * place during development.
+ *
+ * !!! REMOVE BEFORE THE GAME GOES PUBLIC !!!
+ * Replace with a real check (an `admin: true` flag on the server record,
+ * verified in the welcome profile) or delete the editor hotkey entirely.
+ * Tracked in the session task list and in CLAUDE.md's roadmap.
+ */
+function isAdmin() {
+  return /^david/i.test(game.state?.name || '');
+}
+
 // keyboard shortcuts (skipped while typing in inputs, and while a minigame owns
 // the screen: Enter used to focus the chat box hidden underneath it, which left
 // the running game with no keyboard at all)
 addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+  // Ctrl+E: dev layout editor. Allowed before the minigame guard so it can be
+  // closed from anywhere. See isAdmin() for the temporary access rule.
+  if (e.key === 'e' && (e.ctrlKey || e.metaKey) && isAdmin()) {
+    e.preventDefault();
+    import('./ui/editor.js').then((m) => m.toggleEditor(game));
+    return;
+  }
   if (game.activeMinigame) return;
   if (e.repeat) return; // held keys must not spam emotes (and net sends)
   // D = groove pop, built for mashing (the HUD button still toggles the

@@ -2310,11 +2310,21 @@ export class LoungeRoom extends Room {
   // -------------------------------------------------------------------------
   _buildStations(scene, B) {
     this._rings = [];
-    this._pong(scene, B, STATION_BY_ID.get('pong'));
-    this._shuffle(scene, B, STATION_BY_ID.get('shuffle'));
-    this._connect4(scene, B, STATION_BY_ID.get('connect4'));
-    this._cards(scene, B, STATION_BY_ID.get('cards'));
-    this._chess(scene, B, STATION_BY_ID.get('chess'));
+    // Register each station's props for the dev layout editor (Ctrl+E) by
+    // diffing what the builder adds to the scene, so no builder has to know
+    // the editor exists. Chairs and sign posts ride shared instanced batches
+    // built later and cannot move at runtime: editorExport() below hands back
+    // the whole table row so they follow on the next build.
+    const reg = (id, fn) => {
+      const n = scene.children.length;
+      fn();
+      this.editable(id, scene.children.slice(n), { table: 'STATIONS' });
+    };
+    reg('pong', () => this._pong(scene, B, STATION_BY_ID.get('pong')));
+    reg('shuffle', () => this._shuffle(scene, B, STATION_BY_ID.get('shuffle')));
+    reg('connect4', () => this._connect4(scene, B, STATION_BY_ID.get('connect4')));
+    reg('cards', () => this._cards(scene, B, STATION_BY_ID.get('cards')));
+    reg('chess', () => this._chess(scene, B, STATION_BY_ID.get('chess')));
 
     // Seated challengers get their own group so dispose() can empty it without
     // hunting through the scene graph.
@@ -3114,6 +3124,24 @@ export class LoungeRoom extends Room {
     const base = new THREE.Vector3(cx, 0, ST_Z0 + 0.7);
     const top = new THREE.Vector3(cx, MZ_Y, MZ_S - 0.5);
     return floorOf(from) === 0 ? [base, top] : [top, base];
+  }
+
+  /**
+   * Dev layout editor hook: hand back the station's STATIONS row with the drag
+   * baked in. Everything a station owns (prop, both chairs, sign post, the two
+   * prompts and their rings, the obstacle circles) is derived from these five
+   * coordinate pairs, so shifting them all by the same delta keeps the cluster
+   * together, which dragging the prop alone cannot do.
+   */
+  editorExport(id, d) {
+    const s = STATION_BY_ID.get(id);
+    if (!s) return null;
+    const p = ([x, z]) => `[${(x + d.dx).toFixed(2)}, ${(z + d.dz).toFixed(2)}]`;
+    const yawLine = Math.abs(d.dyaw) > 0.001
+      ? ` yaw: ${((s.yaw ?? 0) + d.dyaw).toFixed(2)},` : '';
+    return `${id} (STATIONS row):\n`
+      + `  at: ${p(s.at)}, hs: ${p(s.hs)}, aiAt: ${p(s.aiAt)}, sign: ${p(s.sign)},${yawLine}\n`
+      + `  seats: [${s.seats.map(p).join(', ')}],`;
   }
 
   // -------------------------------------------------------------------------

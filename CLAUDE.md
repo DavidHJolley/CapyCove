@@ -129,6 +129,32 @@ docs/CARDGAME.md section 10) is PARKED pending an explicit user go-ahead.
 Remaining after that: PUBLIC DEPLOYMENT (configs in repo: Dockerfile,
 render.yaml, fly.toml; needs the user's hosting account).
 
+### !!! DEPLOYMENT BLOCKER: temporary admin backdoor !!!
+
+`src/main.js` gates the dev layout editor (Ctrl+E) behind `isAdmin()`, which
+is a `/^david/i` test on the player's DISPLAY NAME: anyone who signs up as
+"davidsomething" gets it. It must be removed or replaced with a real
+server-side `admin` flag (on the user record, surfaced through
+publicProfile()) BEFORE the game is public. The editor itself is client-side
+only (it drags local meshes and prints coordinates; it writes nothing to the
+server), so this is a UX gate, not a privilege escalation, but the name test
+must not ship. Everything to unpick: `isAdmin()` + the Ctrl+E block in
+main.js, `src/ui/editor.js`, `Room.editable/editables` in
+`src/world/room.js`, and the `reg()` wrapper + `editorExport()` in
+`src/world/rooms/lounge.js`.
+
+## Dev layout editor (Ctrl+E)
+
+Rooms are built from numbers, not scene files, and most scenery is merged
+into shared instanced batches, so props cannot simply be dragged and saved.
+The editor previews a move and EXPORTS the coordinates to paste back into the
+room file, which stays the source of truth (chairs, signs, prompts, colliders
+and hotspots are all derived from it at build time). Rooms opt in with
+`this.editable(id, objs)`; an optional `editorExport(id, delta, entry)` on the
+room returns the pasteable text (the lounge returns the whole STATIONS row
+with the delta applied to all five coordinate pairs). Only the lounge has
+opted in so far; other rooms need one `editable()` call per movable prop.
+
 ## Historical roadmap notes (2026-08-06)
 
 Shipped: 5 rooms, 3 minigames, accounts + guest play, chat/emotes/shop sync,
