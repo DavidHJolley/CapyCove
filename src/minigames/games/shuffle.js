@@ -5,9 +5,17 @@ import { clampCoinsForGame } from '../../../shared/constants.js';
  * Shuffle Showdown : top-down shuffleboard duel against Waxwell, the Game Den's
  * self-appointed table boss.
  *
- * 2 rounds x 4 pucks each, alternating shots. Pull back from your puck, watch
- * the aim curve bend with the wax, release and pray. Zones 1/2/3 with a 4-point
- * hanger right on the lip; only pucks past the near line count.
+ * 2 rounds x 4 pucks each, alternating shots. Drag out from your puck to point
+ * it (the guide is an arrow and nothing else: no landing ghost, no distance
+ * readout), hold, and time the release against a meter that sweeps 0-100-0
+ * beside the lane. Zones 1/2/3 with a 4-point hanger right on the lip; only
+ * pucks past the near line count.
+ *
+ * The meter is the whole game. Power runs through a curve (see `launchSpeed`)
+ * that is gentle low down and vicious up high, so the table's range has to be
+ * learned by sliding rather than read off an indicator: the gold band at 62-78
+ * is the only landmark the table gives you, and it is worth a satisfying ding
+ * and a solid two, not a three.
  *
  * Canvas 2D for the table (no WebGL), DOM for HUD/overlays, procedural art
  * everywhere. Waxwell is drawn on a 200x200 grid in the same ink-and-gradient
@@ -139,11 +147,56 @@ const SPAWN_Y = { you: LANE_Y[0], ai: LANE_Y[1] };
 const SIDE_COL = { you: '#e8657a', ai: '#4fb3e8' };
 const FIXED = 1 / 120;           // physics step; never varies, never remainders
 const SHOT_CLOCK = 30;           // seconds you get on your turn in a real match
-const V_MIN = 180, V_SPAN = 180; // launch speed = V_MIN + power * V_SPAN
+const V_MIN = 180, V_SPAN = 180; // launch speed = V_MIN + V_SPAN * curve(power)
 // Drag runs FORWARD from the puck (the shooting end is only 52 units from the
-// left edge, so a pull-back slingshot would run off the canvas at full power).
-const MAX_DRAG = 150;            // drag length (units) for a full meter
+// left edge, so a pull-back slingshot would run off the canvas). Its LENGTH is
+// ignored: the drag only points, the meter supplies the push.
 const AIM_LIMIT = 0.4;           // radians either side of straight
+const AIM_ARROW = 82;            // guide arrow length, fixed: direction, never distance
+
+// --- the charge meter -------------------------------------------------------
+const METER_CYCLE = 1.1;         // seconds for one full 0 -> 100 -> 0 sweep
+const METER_EASE = 0.62;         // how much the sweep lingers at each end
+const SWEET_LO = 0.62, SWEET_HI = 0.78;  // the gold band
+const DEFAULT_POWER = 0.66;      // what the table slides for you if time runs out
+const MIN_HOLD = 0.14;           // a twitchy click is not a shot
+const MET_W = 13, MET_H = 92, MET_X = 22; // meter geometry, in table units
+
+/**
+ * Power -> launch speed. NOT linear, and that is the point: the old build drew
+ * a landing ghost, so a shot was arithmetic. Now `0.6p + 0.4p^3` makes the top
+ * of the meter three times as sensitive as the bottom (slope 0.6 at 0, 1.8 at
+ * 1), so five points of slip near 90 costs three times the distance it does
+ * near 30 and the range has to be felt out. Calibrated so a 70 parks mid-table
+ * in the twos, the band starts around 62 and the far lip arrives near 91.
+ *
+ * Multiplication and addition only: this runs inside the shared simulation and
+ * has to land on identical bits for both capybaras (see the note up top).
+ */
+function launchSpeed(pw) {
+  return V_MIN + V_SPAN * (0.6 * pw + 0.4 * pw * pw * pw);
+}
+/** Back-solve the curve by Newton. Waxwell's aim only, never the simulation. */
+function powerForSpeed(v) {
+  const f = clamp((v - V_MIN) / V_SPAN, 0, 1);
+  let p = f;
+  for (let i = 0; i < 12; i++) {
+    const err = 0.6 * p + 0.4 * p * p * p - f;
+    p = clamp(p - err / (0.6 + 1.2 * p * p), 0, 1);
+  }
+  return p;
+}
+/**
+ * The needle, from a 0..1 cycle phase. Triangle wave bent toward smoothstep so
+ * both ends hang for a beat (a full smoothstep loiters far too long; 0.62 of
+ * the way there keeps the sweep honest while still giving the bottom of the
+ * stroke enough dwell to read as a rhythm).
+ */
+function meterAt(t) {
+  const u = t < 0.5 ? t * 2 : 2 - t * 2;
+  const s = u * u * (3 - 2 * u);
+  return u + (s - u) * METER_EASE;
+}
 
 function zoneOf(x) {
   if (x >= HANG) return 4;
@@ -152,7 +205,6 @@ function zoneOf(x) {
   if (x >= FOUL) return 1;
   return 0;
 }
-const ZONE_NAME = { 0: 'SHORT', 1: 'ONE', 2: 'TWO', 3: 'THREE', 4: 'HANGER' };
 
 // ---------------------------------------------------------------------------
 // The opponent portrait (200x200 grid): Waxwell in solo, the other capybara in
@@ -365,9 +417,14 @@ function legendCanvas(w, h) {
   ctx.setLineDash([12, 9]);
   ctx.beginPath(); ctx.moveTo(FOUL, 0); ctx.lineTo(FOUL, TW); ctx.stroke();
   ctx.setLineDash([]);
-  drawPuck(ctx, 96, 116, '#e8657a', 1);
   drawPuck(ctx, 372, 60, '#4fb3e8', 1);
   drawPuck(ctx, 412, 118, '#e8657a', 1);
+  // the shooting end exactly as it plays: puck, pointing arrow, live meter with
+  // the needle sitting in the gold band
+  const px = 1 / sc;
+  drawAimArrow(ctx, SPAWN_X, 116, -0.16, px, 1);
+  drawPuck(ctx, SPAWN_X, 116, '#e8657a', 1);
+  drawChargeMeter(ctx, 116, px, 0.7, 0.5);
   ctx.restore();
   return c;
 }
@@ -395,6 +452,93 @@ function drawPuck(ctx, x, y, col, alpha) {
   ctx.beginPath();
   ctx.arc(0, 0, PR * 0.86, Math.PI * 1.05, Math.PI * 1.5);
   ctx.lineWidth = 2.4; ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * The aim guide: a fixed-length arrow out of the puck. It stops a long way
+ * short of the near line on purpose, so nobody can mistake its tip for a
+ * landing spot. Table units; `px` is one screen pixel in table units.
+ */
+function drawAimArrow(ctx, x, y, angle, px, alpha) {
+  const dx = Math.cos(angle), dy = Math.sin(angle);
+  const x0 = x + dx * (PR + 5), y0 = y + dy * (PR + 5);
+  const x1 = x + dx * AIM_ARROW, y1 = y + dy * AIM_ARROW;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const g = lgrad(ctx, x0, y0, x1, y1, 'rgba(242,182,74,.22)', 'rgba(242,182,74,.95)');
+  ctx.strokeStyle = g;
+  ctx.lineWidth = 7 * px;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  ctx.translate(x1, y1);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(15, 0); ctx.lineTo(-4, -9.5); ctx.lineTo(-0.5, 0); ctx.lineTo(-4, 9.5);
+  ctx.closePath();
+  ctx.fillStyle = '#f2b64a'; ctx.fill();
+  ctx.lineWidth = 2.2 * px; ctx.strokeStyle = 'rgba(58,42,28,.75)'; ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * The charge meter, drawn in table units beside the shooting lane. `value` is
+ * the needle (null while nobody is holding) and `shim` a 0..1 shimmer phase for
+ * the sweet band. The splash legend calls this too, so what the tutorial shows
+ * and what the table shows can never drift apart.
+ */
+function drawChargeMeter(ctx, cy, px, value, shim) {
+  const top = clamp(cy, MET_H / 2 + 5, TW - MET_H / 2 - 5) - MET_H / 2;
+  const x = MET_X - MET_W / 2;
+  const bTop = top + MET_H * (1 - SWEET_HI);
+  const bH = MET_H * (SWEET_HI - SWEET_LO);
+
+  ctx.save();
+  rrect(ctx, x, top, MET_W, MET_H, MET_W / 2);
+  ctx.fillStyle = 'rgba(26,15,8,.66)'; ctx.fill();
+  ctx.lineWidth = 2.4 * px; ctx.strokeStyle = 'rgba(255,246,227,.34)'; ctx.stroke();
+
+  ctx.save();
+  rrect(ctx, x, top, MET_W, MET_H, MET_W / 2);
+  ctx.clip();
+  // fill up to the needle, cold at the bottom and hot at the top
+  if (value != null) {
+    const fh = MET_H * clamp(value, 0, 1);
+    const g = ctx.createLinearGradient(0, top + MET_H, 0, top);
+    g.addColorStop(0, '#7ac74f'); g.addColorStop(0.62, '#f2b64a'); g.addColorStop(1, '#e8657a');
+    ctx.fillStyle = g;
+    ctx.fillRect(x, top + MET_H - fh, MET_W, fh);
+  }
+  // the sweet band, with a slow wipe of light travelling up it
+  ctx.fillStyle = 'rgba(255,236,180,.3)';
+  ctx.fillRect(x, bTop, MET_W, bH);
+  const gy = bTop + bH - (shim % 1) * bH * 2.2;
+  const sg = ctx.createLinearGradient(0, gy, 0, gy + bH * 0.85);
+  sg.addColorStop(0, 'rgba(255,246,227,0)');
+  sg.addColorStop(0.5, 'rgba(255,251,235,.6)');
+  sg.addColorStop(1, 'rgba(255,246,227,0)');
+  ctx.fillStyle = sg;
+  ctx.fillRect(x, bTop, MET_W, bH);
+  ctx.restore();
+
+  // band rails
+  ctx.strokeStyle = 'rgba(255,232,160,.85)';
+  ctx.lineWidth = 2 * px;
+  for (const f of [SWEET_LO, SWEET_HI]) {
+    const yy = top + MET_H * (1 - f);
+    ctx.beginPath(); ctx.moveTo(x - 4, yy); ctx.lineTo(x + MET_W + 4, yy); ctx.stroke();
+  }
+
+  if (value != null) {
+    const ny = top + MET_H * (1 - clamp(value, 0, 1));
+    const hot = value >= SWEET_LO && value <= SWEET_HI;
+    ctx.strokeStyle = hot ? '#fffdf6' : 'rgba(255,246,227,.9)';
+    ctx.lineWidth = (hot ? 3.6 : 2.6) * px;
+    ctx.beginPath(); ctx.moveTo(x - 7, ny); ctx.lineTo(x + MET_W + 7, ny); ctx.stroke();
+    if (hot) {
+      ctx.fillStyle = '#fffdf6';
+      ctx.beginPath(); ctx.arc(x + MET_W + 11, ny, 3, 0, Math.PI * 2); ctx.fill();
+    }
+  }
   ctx.restore();
 }
 
@@ -667,6 +811,7 @@ export class ShuffleGame extends Minigame {
     this._raf = 0;
     this._dead = false;
     this._onKey = null;
+    this._onKeyUp = null;
     this._onUp = null;
     this.phase = 'splash';
     this.el = {};
@@ -674,7 +819,9 @@ export class ShuffleGame extends Minigame {
     this.pucks = [];
     this.dust = [];
     this.sparks = [];
-    this.aim = { angle: 0, power: 0.55 };
+    // aim carries a direction and nothing else now; the push lives in `charge`
+    this.aim = { angle: 0 };
+    this.charge = { on: false, t: 0, held: 0, value: 0, src: null };
     this.dragging = false;
     this.expr = 'idle';
     this._result = null;
@@ -745,7 +892,11 @@ export class ShuffleGame extends Minigame {
     });
 
     this._onKey = (e) => this._key(e);
+    // Space is a hold now, so the release matters as much as the press: a keyup
+    // that arrives after the window lost focus still has to end the charge.
+    this._onKeyUp = (e) => this._keyUp(e);
     window.addEventListener('keydown', this._onKey);
+    window.addEventListener('keyup', this._onKeyUp);
 
     this._rollWax();
     this._seedSparks();
@@ -765,11 +916,13 @@ export class ShuffleGame extends Minigame {
     for (const id of this._timers) clearTimeout(id);
     this._timers.clear();
     if (this._onKey) window.removeEventListener('keydown', this._onKey);
+    if (this._onKeyUp) window.removeEventListener('keyup', this._onKeyUp);
     if (this._onUp) {
       window.removeEventListener('pointerup', this._onUp);
       window.removeEventListener('pointercancel', this._onUp);
     }
     this._onKey = null;
+    this._onKeyUp = null;
     this._onUp = null;
     for (const off of this.subs) { try { off(); } catch (err) { /* already gone */ } }
     this.subs.length = 0;
@@ -852,8 +1005,8 @@ export class ShuffleGame extends Minigame {
     const quit = this.el.wrap?.querySelector('[data-el="quit"]');
     if (quit) quit.textContent = 'FORFEIT';
     if (this.el.tip) {
-      this.el.tip.innerHTML = 'Drag out from your puck, then let go.<br>'
-        + '<b>&larr; &rarr;</b> aim &middot; <b>&uarr; &darr;</b> power &middot; <b>SPACE</b> slide'
+      this.el.tip.innerHTML = 'Drag to aim, hold, release on the meter.<br>'
+        + '<b>&larr; &rarr;</b> aim &middot; hold <b>SPACE</b> &middot; let go to slide'
         + '<br>Their aim stays hidden until they release.';
     }
   }
@@ -911,8 +1064,9 @@ export class ShuffleGame extends Minigame {
           <canvas class="mg-shuffle-face" data-el="face"></canvas>
           <div class="mg-shuffle-name" data-el="oppName">WAXWELL</div>
           <div class="mg-shuffle-turn" data-el="turn">WARMING UP</div>
-          <div class="mg-shuffle-tip" data-el="tip">Drag out from your puck, then let go.<br>
-            <b>&larr; &rarr;</b> aim &middot; <b>&uarr; &darr;</b> power &middot; <b>SPACE</b> slide</div>
+          <div class="mg-shuffle-tip" data-el="tip">Drag to aim, hold, release on the meter.<br>
+            <b>&larr; &rarr;</b> aim &middot; hold <b>SPACE</b> &middot; let go to slide<br>
+            The gold band is a clean two.</div>
         </aside>
       </div>
 
@@ -937,10 +1091,11 @@ export class ShuffleGame extends Minigame {
         </div>
         <div class="mg-shuffle-legend" data-el="legend"></div>
         <div class="mg-shuffle-how">
-          <div><i>1</i><span>Press your coral puck and <b>drag out down the table</b>: the direction aims it, the length loads the meter. Let go to slide. Arrow keys and <b>Space</b> work too.</span></div>
-          <div><i>2</i><span>Past the near line scores <b>1</b>, <b>2</b>, <b>3</b> &mdash; and a puck hanging over the far lip is a <b>4</b>. Short pucks are worth nothing.</span></div>
-          <div><i>3</i><span>Pucks knock pucks. Bump Waxwell off the end, or shove your own puck deeper. Anything that leaves the table is gone.</span></div>
-          <div><i>4</i><span>The wax pulls the lane sideways &mdash; the sparkles show you which way. Two rounds, four pucks each, highest total wins.</span></div>
+          <div><i>1</i><span>Press your coral puck and <b>drag to aim</b>. The arrow only points &mdash; it will never tell you how far.</span></div>
+          <div><i>2</i><span><b>Keep holding.</b> The meter beside your lane sweeps up and back. <b>Let go</b> and wherever the needle sits is your push. Arrows aim, hold <b>Space</b> to charge.</span></div>
+          <div><i>3</i><span>Stop it in the <b>gold band</b> for a clean strike you can hear &mdash; and a solid two. Above it the meter runs away fast: threes and hangers are a nerve game.</span></div>
+          <div><i>4</i><span>Past the near line scores <b>1</b>, <b>2</b>, <b>3</b> &mdash; and a puck hanging over the far lip is a <b>4</b>. Short pucks are worth nothing, and pucks knock pucks off.</span></div>
+          <div><i>5</i><span>The wax pulls the lane sideways &mdash; the sparkles show you which way. Two rounds, four pucks each, highest total wins.</span></div>
         </div>
         <div class="mg-shuffle-stats">
           <div class="mg-shuffle-stat"><b>${best}</b><span>YOUR BEST</span></div>
@@ -988,9 +1143,10 @@ export class ShuffleGame extends Minigame {
         </div>
         <div class="mg-shuffle-legend" data-el="legend"></div>
         <div class="mg-shuffle-how">
-          <div><i>1</i><span>Take turns. Press your coral puck and <b>drag out down the table</b> to aim and load the meter, then let go. Their aim stays hidden until they slide.</span></div>
-          <div><i>2</i><span>Past the near line scores <b>1</b>, <b>2</b>, <b>3</b> &mdash; a puck hanging over the far lip is a <b>4</b>. Pucks knock pucks, and anything off the table is gone.</span></div>
-          <div><i>3</i><span>Two rounds, four pucks each, one shared wax curve. Highest total takes the table &mdash; and you have <b>${SHOT_CLOCK} seconds</b> a shot, so do not go for tea.</span></div>
+          <div><i>1</i><span>Take turns. Press your coral puck and <b>drag to aim</b> &mdash; the arrow points, and that is all it does.</span></div>
+          <div><i>2</i><span><b>Keep holding</b> while the meter sweeps beside your lane, then <b>let go</b>: the needle is your push. The <b>gold band</b> is a clean two; above it gets greedy fast.</span></div>
+          <div><i>3</i><span>Past the near line scores <b>1</b>, <b>2</b>, <b>3</b> &mdash; a puck hanging over the far lip is a <b>4</b>. Pucks knock pucks, and anything off the table is gone. Their aim stays hidden until they slide.</span></div>
+          <div><i>4</i><span>Two rounds, four pucks each, one shared wax curve. Highest total takes the table &mdash; and you have <b>${SHOT_CLOCK} seconds</b> a shot, so do not go for tea.</span></div>
         </div>
         <div class="mg-shuffle-stats">
           <div class="mg-shuffle-stat"><b>${best}</b><span>YOUR BEST</span></div>
@@ -1166,7 +1322,7 @@ export class ShuffleGame extends Minigame {
   _pvpFinish() {
     const pv = this.pvp;
     this.phase = 'over';
-    this.dragging = false;
+    this._resetAim();
     this._live = null;
     const you = this.banked.you, ai = this.banked.ai;
     const margin = you - ai;
@@ -1196,7 +1352,7 @@ export class ShuffleGame extends Minigame {
   _matchCutShort() {
     const pv = this.pvp;
     this.phase = 'over';
-    this.dragging = false;
+    this._resetAim();
     this._live = null;
     this._hideBanner();
     const t = this._tableScore();
@@ -1300,8 +1456,7 @@ export class ShuffleGame extends Minigame {
     this._live = null;
     this.round = 1;
     this.shot = 0;
-    this.aim = { angle: 0, power: 0.55 };
-    this.dragging = false;
+    this._resetAim();
     this._acc = 0;
     if (this.pvp) {
       this.pvp.clock = SHOT_CLOCK;
@@ -1434,12 +1589,19 @@ export class ShuffleGame extends Minigame {
     };
   }
 
+  /** Fresh straight aim, meter parked, nothing held. */
+  _resetAim() {
+    this.aim = { angle: 0 };
+    this.charge = { on: false, t: 0, held: 0, value: 0, src: null };
+    this.dragging = false;
+    this.canvas?.classList.remove('mg-shuffle-drag');
+  }
+
   _beginPlayerTurn() {
     this.phase = 'aim';
     this._live = this._makePuck('you');
     this.pucks.push(this._live);
-    this.aim = { angle: 0, power: 0.55 };
-    this.dragging = false;
+    this._resetAim();
     if (this.pvp) {
       this.pvp.clock = SHOT_CLOCK;
       this.pvp.shown = -1;
@@ -1515,12 +1677,13 @@ export class ShuffleGame extends Minigame {
     const dx = clamp(Number(shot.dirX) || 0, 0.9, 1);
     const dz = clamp(Number(shot.dirZ) || 0, -0.45, 0.45);
     const m = hyp(dx, dz) || 1;
-    const v = V_MIN + pw * V_SPAN;
+    const v = launchSpeed(pw);
     p.vx = (dx / m) * v;
     p.vy = (dz / m) * v;
     p.mu = MU * this._grit(shot.puck);
     p.pending = false;
     p.moving = true;
+    this.charge.on = false;
     this.phase = 'slide';
     this._slideSide = p.side;
     this._slideT = 0;
@@ -1543,7 +1706,7 @@ export class ShuffleGame extends Minigame {
   /** Forward-simulate one shot on an empty table (bias included). */
   _simShot(sy, angle, power) {
     let x = SPAWN_X, y = sy;
-    const v = V_MIN + power * V_SPAN;
+    const v = launchSpeed(power);
     let vx = Math.cos(angle) * v, vy = Math.sin(angle) * v;
     const dt = 1 / 120;
     for (let i = 0; i < 900; i++) {
@@ -1564,9 +1727,12 @@ export class ShuffleGame extends Minigame {
     const dx = tx - SPAWN_X, dy = ty - sy;
     const dTarget = Math.max(30, hyp(dx, dy));
     const aTarget = Math.atan2(dy, dx);
+    // he plans in speed and converts back through the curve, exactly as a
+    // capybara who has played this table for years would: he knows the feel of
+    // the meter rather than the arithmetic behind it
     const naive = {
       angle: aTarget,
-      power: clamp((Math.sqrt(2 * MU * dTarget) - V_MIN) / V_SPAN, 0, 1),
+      power: powerForSpeed(Math.sqrt(2 * MU * dTarget)),
     };
     let angle = naive.angle, power = naive.power;
     for (let it = 0; it < 3; it++) {
@@ -1574,8 +1740,8 @@ export class ShuffleGame extends Minigame {
       const ds = Math.max(20, hyp(s.x - SPAWN_X, s.y - sy));
       const as = Math.atan2(s.y - sy, s.x - SPAWN_X);
       angle = clamp(angle + (aTarget - as), -AIM_LIMIT, AIM_LIMIT);
-      const v = clamp((V_MIN + power * V_SPAN) * Math.sqrt(dTarget / ds), V_MIN, V_MIN + V_SPAN);
-      power = clamp((v - V_MIN) / V_SPAN, 0, 1);
+      const v = clamp(launchSpeed(power) * Math.sqrt(dTarget / ds), V_MIN, V_MIN + V_SPAN);
+      power = powerForSpeed(v);
     }
     // he only half-reads the wax in round one
     const c = this.aiComp;
@@ -1921,11 +2087,15 @@ export class ShuffleGame extends Minigame {
   /** Out of time: slide whatever they had loaded rather than stalling the duel. */
   _autoShot() {
     if (this.phase !== 'aim' || !this._live?.pending) return;
+    const c = this.charge;
+    // mid-sweep when the buzzer goes: you get the needle you had, not a penalty
+    const power = c.on && c.held >= MIN_HOLD ? c.value : DEFAULT_POWER;
     this.dragging = false;
+    c.on = false;
     this.canvas?.classList.remove('mg-shuffle-drag');
     this._say('idle', 'time! the table slides it for you.');
     this.game.audio?.play?.('whoosh');
-    this._launchAim(this.aim.angle, this.aim.power > 0.06 ? this.aim.power : 0.55);
+    this._launchAim(this.aim.angle, power);
   }
 
   _bumpChip(chip) {
@@ -1990,7 +2160,7 @@ export class ShuffleGame extends Minigame {
     this.canvas.classList.add('mg-shuffle-drag');
     try { this.canvas.setPointerCapture(e.pointerId); } catch (err) { /* no capture, no problem */ }
     this._drag(p);
-    this.game.audio?.play?.('hover');
+    this._startCharge('pointer');
   }
 
   _move(e) {
@@ -1998,22 +2168,60 @@ export class ShuffleGame extends Minigame {
     this._drag(this._toTable(e));
   }
 
+  /**
+   * Direction only. The distance you drag no longer means anything: the meter
+   * owns the push, so a long drag is just a comfortable way to point.
+   */
   _drag(p) {
     const dx = p.x - this._live.x;
     const dy = p.y - this._live.y;
-    const len = hyp(dx, dy);
-    if (len < 4) { this.aim.power = 0; return; }
-    this.aim.angle = clamp(Math.atan2(dy, dx), -AIM_LIMIT, AIM_LIMIT);
-    this.aim.power = clamp(len / MAX_DRAG, 0, 1);
+    if (hyp(dx, dy) < 6) return; // too close to read an angle: keep the last one
+    // clamped forward so a backwards drag leans to the near side rather than
+    // whipping the aim through a half turn
+    this.aim.angle = clamp(Math.atan2(dy, Math.max(dx, 0.001)), -AIM_LIMIT, AIM_LIMIT);
   }
 
   _up() {
     if (!this.dragging) return;
     this.dragging = false;
     this.canvas?.classList.remove('mg-shuffle-drag');
-    if (this.phase !== 'aim') return;
-    if (this.aim.power < 0.06) { this.aim.power = 0.55; return; }
-    this._launchAim(this.aim.angle, this.aim.power);
+    this._release('pointer');
+  }
+
+  // ---- the charge meter ---------------------------------------------------
+  /** Start the sweep. Pointer and Space both land here; whichever started it
+   *  is the only one allowed to end it. */
+  _startCharge(src) {
+    const c = this.charge;
+    if (c.on || this.phase !== 'aim' || !this._live?.pending) return;
+    c.on = true; c.t = 0; c.held = 0; c.value = 0; c.src = src;
+    this.game.audio?.play?.('hover');
+  }
+
+  _tickCharge(dt) {
+    const c = this.charge;
+    if (!c.on) return;
+    if (this.phase !== 'aim') { c.on = false; return; }
+    c.held += dt;
+    c.t += dt / METER_CYCLE;
+    if (c.t >= 1) c.t -= Math.floor(c.t);
+    c.value = meterAt(c.t);
+  }
+
+  /** Let go: the needle where it stands is the shot. */
+  _release(src) {
+    const c = this.charge;
+    if (!c.on || c.src !== src) return;
+    c.on = false;
+    if (this.phase !== 'aim' || !this._live?.pending) return;
+    // a stray click while grabbing the puck should not fire a dud
+    if (c.held < MIN_HOLD) { c.value = 0; return; }
+    const power = c.value;
+    if (power >= SWEET_LO && power <= SWEET_HI) {
+      this.game.audio?.play?.('ding');
+      this._float('SWEET SPOT!', this._live.x + 46, this._live.y - 24, 'mg-shuffle-good');
+    }
+    this._launchAim(this.aim.angle, power);
   }
 
   _key(e) {
@@ -2028,12 +2236,14 @@ export class ShuffleGame extends Minigame {
     const fine = e.shiftKey ? 0.35 : 1;
     if (e.key === 'ArrowLeft') { this.aim.angle = clamp(this.aim.angle - 0.022 * fine, -AIM_LIMIT, AIM_LIMIT); e.preventDefault(); }
     else if (e.key === 'ArrowRight') { this.aim.angle = clamp(this.aim.angle + 0.022 * fine, -AIM_LIMIT, AIM_LIMIT); e.preventDefault(); }
-    else if (e.key === 'ArrowUp') { this.aim.power = clamp(this.aim.power + 0.02 * fine, 0, 1); e.preventDefault(); }
-    else if (e.key === 'ArrowDown') { this.aim.power = clamp(this.aim.power - 0.02 * fine, 0, 1); e.preventDefault(); }
     else if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
-      if (this.aim.power > 0.04) this._launchAim(this.aim.angle, this.aim.power);
+      if (!e.repeat) this._startCharge('key'); // held keys autorepeat; ignore that
     }
+  }
+
+  _keyUp(e) {
+    if (e.key === ' ' || e.key === 'Enter') this._release('key');
   }
 
   // ---- loop + draw --------------------------------------------------------
@@ -2063,6 +2273,7 @@ export class ShuffleGame extends Minigame {
       } else {
         this._acc = 0;
       }
+      this._tickCharge(dt);
       this._tickClock(dt);
       for (const p of this.pucks) if (p.off) p.offT += dt;
       for (let i = this.dust.length - 1; i >= 0; i--) {
@@ -2116,7 +2327,7 @@ export class ShuffleGame extends Minigame {
     this._drawPucks(ctx);
     ctx.restore();
 
-    this._drawMeter(ctx, cw, ch, sc);
+    this._drawStrip(ctx, cw, sc);
   }
 
   _drawTable(ctx, sc) {
@@ -2254,6 +2465,11 @@ export class ShuffleGame extends Minigame {
     }
   }
 
+  /**
+   * Your turn, drawn as honestly as theirs: a grab ring, an arrow that says
+   * WHICH WAY and refuses to say how far, and the meter. No trajectory, no
+   * landing ghost, no percentage. The table keeps its range to itself.
+   */
   _drawAim(ctx, sc) {
     const p = this._live;
     const px = 1 / sc;
@@ -2266,75 +2482,8 @@ export class ShuffleGame extends Minigame {
     ctx.arc(p.x, p.y, PR + 6 + pulse * 4, 0, Math.PI * 2);
     ctx.stroke();
 
-    if (this.aim.power <= 0.02) return;
-
-    // predicted path, wax and all
-    const path = [];
-    let x = p.x, y = p.y;
-    const v = V_MIN + this.aim.power * V_SPAN;
-    let vx = Math.cos(this.aim.angle) * v, vy = Math.sin(this.aim.angle) * v;
-    const dt = 1 / 90;
-    for (let i = 0; i < 700; i++) {
-      const sp = hyp(vx, vy);
-      if (sp < 4) break;
-      vy += this._bias(x) * Math.min(1, sp / 200) * dt;
-      const k = Math.max(0, sp - MU * dt) / sp;
-      vx *= k; vy *= k;
-      x += vx * dt; y += vy * dt;
-      if (i % 4 === 0) path.push(x, y);
-      if (x > TL + 6 || x < 0 || y < -6 || y > TW + 6) break;
-    }
-    ctx.setLineDash([9, 8]);
-    ctx.lineWidth = 3 * px;
-    ctx.strokeStyle = 'rgba(255,246,227,.6)';
-    ctx.beginPath();
-    ctx.moveTo(p.x, p.y);
-    for (let i = 0; i < path.length; i += 2) ctx.lineTo(path[i], path[i + 1]);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // ghost landing spot
-    const gx = path.length ? path[path.length - 2] : p.x;
-    const gy = path.length ? path[path.length - 1] : p.y;
-    const offTable = gx > TL || gy < 0 || gy > TW;
-    const z = offTable ? 0 : zoneOf(gx);
-    ctx.strokeStyle = offTable ? 'rgba(255,150,130,.9)' : z >= 3 ? 'rgba(150,240,170,.95)' : 'rgba(255,246,227,.8)';
-    ctx.lineWidth = 3 * px;
-    ctx.setLineDash([6, 5]);
-    ctx.beginPath();
-    ctx.arc(clamp(gx, 0, TL), clamp(gy, 0, TW), PR, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    const label = offTable ? 'OFF!' : ZONE_NAME[z];
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = '900 13px "Trebuchet MS",sans-serif';
-    // a dark pill so the call-out reads over the big band numerals, kept fully
-    // on the table by its own measured width
-    const tw = ctx.measureText(label).width;
-    const lx = clamp(gx, tw / 2 + 10, TL - tw / 2 - 10);
-    const ly = clamp(gy, 6, TW) - PR - 14;
-    ctx.fillStyle = 'rgba(30,18,10,.72)';
-    rrect(ctx, lx - tw / 2 - 6, ly - 9, tw + 12, 18, 9);
-    ctx.fill();
-    ctx.fillStyle = ctx.strokeStyle;
-    ctx.fillText(label, lx, ly);
-
-    // the push: a wedge along the aim line as long as the power you loaded
-    const reach = this.aim.power * MAX_DRAG;
-    const bx = p.x + Math.cos(this.aim.angle) * reach;
-    const by = p.y + Math.sin(this.aim.angle) * reach;
-    const wedge = ctx.createLinearGradient(p.x, p.y, bx, by);
-    wedge.addColorStop(0, 'rgba(242,182,74,.15)');
-    wedge.addColorStop(1, 'rgba(242,182,74,.85)');
-    ctx.strokeStyle = wedge;
-    ctx.lineWidth = 7 * px;
-    ctx.beginPath();
-    ctx.moveTo(p.x, p.y); ctx.lineTo(bx, by);
-    ctx.stroke();
-    ctx.fillStyle = '#f2b64a';
-    ctx.beginPath(); ctx.arc(bx, by, 5.5, 0, Math.PI * 2); ctx.fill();
-    ctx.lineWidth = 2 * px; ctx.strokeStyle = 'rgba(58,42,28,.8)'; ctx.stroke();
+    drawAimArrow(ctx, p.x, p.y, this.aim.angle, px, this.charge.on ? 1 : 0.72 + pulse * 0.2);
+    drawChargeMeter(ctx, p.y, px, this.charge.on ? this.charge.value : null, this.clock * 0.42);
   }
 
   _drawPucks(ctx) {
@@ -2363,57 +2512,38 @@ export class ShuffleGame extends Minigame {
     }
   }
 
-  /** Power meter + zone key, drawn in the strip under the table. */
-  _drawMeter(ctx, cw, ch, sc) {
+  /**
+   * The strip under the table. It used to carry the power bar with the scoring
+   * bands solved onto it, which meant a player could simply read their landing
+   * spot off a ruler. Now it carries words: what to do, never how far it goes.
+   */
+  _drawStrip(ctx, cw, sc) {
     const y = this.view.oy + TW * sc + 22;
-    const w = Math.min(360, cw * 0.5);
-    const x = (cw - w) / 2;
     const showing = this.phase === 'aim' || this.phase === 'slide'
       || this.phase === 'think' || this.phase === 'wait';
     if (!showing) return;
-
+    const dots = '.'.repeat(1 + (Math.floor(this.clock * 2.2) % 3));
+    let label = 'SLIDING...';
+    let col = 'rgba(255,246,227,.6)';
+    if (this.phase === 'aim') {
+      if (this.charge.on) {
+        const hot = this.charge.value >= SWEET_LO && this.charge.value <= SWEET_HI;
+        label = hot ? 'LET GO NOW!' : 'LET GO TO SLIDE';
+        col = hot ? '#f2b64a' : 'rgba(255,246,227,.82)';
+      } else {
+        label = 'DRAG FROM YOUR PUCK TO AIM, THEN HOLD TO CHARGE THE METER';
+      }
+    } else if (this.phase === 'think') {
+      label = `WAXWELL IS LINING IT UP${dots}`;
+    } else if (this.phase === 'wait') {
+      label = `${this.pvp.foe.short.toUpperCase()} IS LINING IT UP${dots}`;
+    }
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.font = '900 11px "Trebuchet MS",sans-serif';
-
-    if (this.phase === 'aim') {
-      const h = 15;
-      ctx.fillStyle = 'rgba(0,0,0,.42)';
-      const r = h / 2;
-      rrect(ctx, x, y, w, h, r); ctx.fill();
-      const g = ctx.createLinearGradient(x, 0, x + w, 0);
-      g.addColorStop(0, '#7ac74f'); g.addColorStop(0.55, '#f2b64a'); g.addColorStop(1, '#e8657a');
-      ctx.save();
-      rrect(ctx, x, y, w, h, r); ctx.clip();
-      ctx.fillStyle = g;
-      ctx.fillRect(x, y, w * this.aim.power, h);
-      ctx.restore();
-      // marks solved from the real friction curve: where each band begins
-      ctx.strokeStyle = 'rgba(255,246,227,.55)';
-      ctx.lineWidth = 2;
-      for (const [frac, label] of [[0.228, '1'], [0.469, '2'], [0.648, '3'], [0.809, '4']]) {
-        const mx = x + w * frac;
-        ctx.beginPath(); ctx.moveTo(mx, y - 3); ctx.lineTo(mx, y + h + 3); ctx.stroke();
-        ctx.fillStyle = 'rgba(255,246,227,.75)';
-        ctx.fillText(label, mx, y + h + 12);
-      }
-      // past here the puck leaves the building
-      ctx.fillStyle = 'rgba(255,140,120,.75)';
-      ctx.fillRect(x + w * 0.849, y - 4, Math.max(2, w * 0.151), 3);
-      ctx.fillStyle = '#fff6e3';
-      ctx.textAlign = 'right';
-      ctx.fillText(`${Math.round(this.aim.power * 100)}%`, x - 10, y + h / 2);
-      ctx.textAlign = 'left';
-      ctx.fillText('POWER', x + w + 10, y + h / 2);
-    } else {
-      const dots = '.'.repeat(1 + (Math.floor(this.clock * 2.2) % 3));
-      const label = this.phase === 'think' ? `WAXWELL IS LINING IT UP${dots}`
-        : this.phase === 'wait' ? `${this.pvp.foe.short.toUpperCase()} IS LINING IT UP${dots}`
-          : 'SLIDING...';
-      ctx.fillStyle = 'rgba(255,246,227,.6)';
-      ctx.fillText(label, cw / 2, y + 8);
-    }
+    ctx.fillStyle = col;
+    ctx.fillText(label, cw / 2, y + 8);
     ctx.restore();
   }
 }
