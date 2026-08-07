@@ -176,8 +176,11 @@ export class Engine {
       this.scene.add(this.playerAvatar.group);
 
       const hint = this.room.cameraHint;
+      // clone: rooms may re-author camCfg.offset per frame (The Drift's swim
+      // cam does); a shared reference would corrupt camDefault for every
+      // later room
       this.camCfg = {
-        offset: hint?.offset || this.camDefault.offset,
+        offset: (hint?.offset || this.camDefault.offset).clone(),
         lookHeight: hint?.lookHeight ?? this.camDefault.lookHeight,
       };
       this.camera.position.copy(spawn).add(this.camCfg.offset);
@@ -379,6 +382,10 @@ export class Engine {
       }
       if (el) {
         v.copy(h.position); v.y += 1.6; v.project(this.camera);
+        // behind-the-camera projections mirror onto the screen: hide instead
+        // (same guard _updateOverlays has always had)
+        if (v.z > 1) { el.style.display = 'none'; continue; }
+        el.style.display = '';
         el.style.left = `${(v.x * 0.5 + 0.5) * innerWidth}px`;
         el.style.top = `${(-v.y * 0.5 + 0.5) * innerHeight}px`;
       }

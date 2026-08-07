@@ -55,8 +55,10 @@ const SURFACE_GLSL = SURFACE_Y.toFixed(1); // same number, spelled for GLSL
 const FLOOR_R = 50;              // seabed plate radius (fog eats the rim)
 const DAY_SECONDS = 40 * 60;     // one cove day, from LIVING-COVE.md A
 
-// Swimmable volume. Pushing the edge eases you back: "the current".
-const BOUND_MIN = [-30, 1.3, -30];
+// Swimmable volume. Pushing the edge eases you back: "the current". The floor
+// of it is the DUNES, not this y (see SwimController.floorAt): the box bottom
+// is only the backstop out past the rim where the plate runs out.
+const BOUND_MIN = [-30, 0.35, -30];
 const BOUND_MAX = [30, 16.5, 30];
 
 // The dive bell: arrival and exit. It sits BEHIND the arrival camera on
@@ -362,9 +364,46 @@ void main() {
 
 // ---------------------------------------------------------------- helpers ---
 
-// follow-camera vantages: tight while you swim, pulled back while you ride
-const CAM_SWIM = new THREE.Vector3(0, 3.4, 12.8);
-const CAM_RIDE = new THREE.Vector3(0, 7, 17.5);
+/* THE SWIM CAMERA (follow mode only; static mode is untouched).
+ *
+ * The engine's follow camera is built for walking: a fixed world offset behind
+ * and high above the player, aimed at a point `lookHeight` above the SMOOTHED
+ * player position. Down here that read as a low, near-level shot that lost the
+ * swimmer the moment she climbed or dived (the look point lags, so a fast
+ * ascent slid her off the top of the frame) and left every click ray skimming
+ * the seabed at a few degrees, where two pixels of cursor swing the hit point
+ * through tens of units of depth.
+ *
+ * The room fixes both WITHOUT touching engine.js, because `_tick` reads
+ * `camTarget`, `camCfg.offset` and `camCfg.lookHeight` fresh every frame and
+ * AFTER `room.update()`:
+ *  - we write camTarget = the avatar's ACTUAL position, so the engine's lerp
+ *    toward it is a no-op and the camera looks exactly at her, always;
+ *  - we write camCfg.offset every frame, so the vantage can orbit;
+ *  - the engine's own `camera.position.lerp(camTarget + offset)` stays the
+ *    only thing that moves the camera: that is the soft lag, on all 3 axes.
+ *
+ * The vantage sits behind whatever you are travelling on, but it does NOT
+ * chase every turn: it holds still (which is what makes the static camera
+ * comfortable) until your heading swings more than `reframe` away from it,
+ * then eases around behind you at no more than `slew` rad/s. So swimming into
+ * open water never moves it, and turning back toward the bell does.
+ */
+const CAM = {
+  swimH: 5.2, swimD: 15.4, swimLook: 0.9,  // back, and nearly level with her
+  rideH: 6.6, rideD: 16.0, rideLook: 1.1,  // riding: six capys have to fit
+  slew: 1.0,                               // rad/s the vantage may orbit
+  reframe: 1.55,                           // heading change that earns a swing
+  ease: 1.4,                               // 1/s swim <-> ride blend
+  step: 0.55,                              // rad per arrow-key look-around
+};
+
+// Click-to-swim. REACH is how far one click takes you; STEER_R is the radius of
+// the sphere the click ray is projected onto when there is nothing solid to aim
+// at, and so how sharply one click can turn you (smaller = sharper).
+const REACH = 20;
+const STEER_R = 10;
+const NUDGE = 2.6;               // wheel / arrow-key rise and sink, per press
 
 const _dummy = new THREE.Object3D();
 const _v = new THREE.Vector3();
@@ -373,6 +412,11 @@ const _seat = new THREE.Vector3();
 const _ndc = new THREE.Vector2();
 const _mat = new THREE.Matrix4();
 const _col = new THREE.Color();
+
+/** Shortest signed angle from a to b, in (-PI, PI]. */
+function angleDelta(a, b) {
+  return ((((b - a) % TAU) + Math.PI * 3) % TAU) - Math.PI;
+}
 
 /** Deterministic scatter: the room looks the same on every visit. */
 function mulberry32(a) {
@@ -617,6 +661,15 @@ export class DriftRoom extends Room {
     this._bubbleAt = 0;
     this._offs = [];
     this._scene = scene;
+    // swim camera: where the vantage sits around her, as an azimuth (0 = due
+    // +Z, which is the arrival shot), and where it is easing to
+    this._camAz = 0;
+    this._camGoal = 0;
+    this._camH = CAM.swimH;
+    this._camD = CAM.swimD;
+    this._rideSpin = 0;      // look-around while riding, relative to her nose
+    this._markT = 1;
+    this._nudgeAt = -99;
 
     const rng = mulberry32(20260806);
 
@@ -667,7 +720,11 @@ export class DriftRoom extends Room {
     // Nearly level, unlike every other room: the interest here is in the water
     // column (whale, rays, jellies, the surface), not on the floor, and a
     // downward-tilted 3/4 view cropped Big Blue clean out of the arrival shot.
-    this.cameraHint = { offset: CAM_SWIM.clone(), lookHeight: 2.3 };
+    // update() re-authors this every frame from CAM (see the swim camera note).
+    this.cameraHint = {
+      offset: new THREE.Vector3(0, CAM.swimH, CAM.swimD),
+      lookHeight: CAM.swimLook,
+    };
     this.staticCamera = {
       position: new THREE.Vector3(0, 15, 34),
       lookAt: new THREE.Vector3(0, 7.5, -4),
@@ -690,12 +747,51 @@ export class DriftRoom extends Room {
         bounds: new THREE.Box3(
           new THREE.Vector3(...BOUND_MIN), new THREE.Vector3(...BOUND_MAX),
         ),
+        floorAt: duneHeight,   // hug the sand instead of a flat box bottom
       });
     }
     this._ray = new THREE.Raycaster();
     this._onPointer = (e) => this._pointer(e);
     this._canvas = eng?.canvas || null;
     this._canvas?.addEventListener('pointerdown', this._onPointer);
+    // Explicit rise/sink. The click already steers in 3D, but a near-level
+    // camera makes "straight down" a fiddly click, and this is how you park at
+    // the bell's hatch or settle onto the sand. 'w' and 'd' are taken globally
+    // (wave, dance), so the keys are the arrows.
+    this._onWheel = (e) => {
+      if (!this._canNudge()) return;
+      e.preventDefault();
+      this._nudge(e.deltaY > 0 ? -NUDGE : NUDGE);
+    };
+    this._canvas?.addEventListener('wheel', this._onWheel, { passive: false });
+    this._onKey = (e) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (this._game?.activeMinigame || eng?.paused) return;
+      const k = e.key;
+      if (k === 'ArrowUp' || k === 'ArrowDown') {
+        if (!this._canNudge()) return;
+        e.preventDefault();
+        this._nudge(k === 'ArrowUp' ? NUDGE : -NUDGE);
+      } else if (k === 'ArrowLeft' || k === 'ArrowRight') {
+        // look around: the camera swings itself when you double back, but the
+        // dive bell starts the room BEHIND you, and nobody should have to swim
+        // a lap to find the way home
+        e.preventDefault();
+        this._spin(k === 'ArrowLeft' ? -CAM.step : CAM.step);
+      }
+    };
+    addEventListener('keydown', this._onKey);
+
+    // where the last click landed: the only readout of a swim target, since
+    // there is no floor for the engine's own click ring to lie on
+    const markG = new THREE.RingGeometry(0.55, 0.78, 22);
+    this._mark = new THREE.Mesh(markG, new THREE.MeshBasicMaterial({
+      color: 0xcdf3ff, transparent: true, opacity: 0,
+      depthWrite: false, side: THREE.DoubleSide,
+    }));
+    this._mark.renderOrder = 6;
+    this._mark.visible = false;
+    scene.add(this._mark);
 
     // The daily message in a bottle is server-spawned; if no frame arrives we
     // simply never show one.
@@ -1542,29 +1638,97 @@ export class DriftRoom extends Room {
     if (this._ray.intersectObjects(eng.remoteGroup.children, true).length) return;
 
     const hits = this._ray.intersectObjects(this._clickTargets(), false);
-    if (hits.length && hits[0].object === this._whaleBody) {
+    const hit = hits.length ? hits[0] : null;
+    if (hit && hit.object === this._whaleBody) {
       this._beginMount();
       return;
     }
     if (this._riding) this._dismount();
     this._mountPending = false;
+    if (hit && hit.object === this._bottleMesh) this._claimBottle();
 
-    if (hits.length) {
-      const h = hits[0];
-      _v.copy(h.point);
-      if (h.face) _v.addScaledVector(h.face.normal, 1.4);
-      _v.y = Math.max(_v.y, h.point.y + 0.9);
-      if (h.object === this._bottleMesh) this._claimBottle();
-    } else {
-      // no geometry under the cursor: project into the water volume
-      const o = this._ray.ray.origin;
-      const d = this._ray.ray.direction;
-      let t = 26;
-      if (d.y < -0.02) t = Math.min(t, (1.8 - o.y) / d.y);
-      _v.copy(o).addScaledVector(d, Math.max(4, t));
-    }
-    this._swim.setTarget(_v);
+    this._swim.setTarget(this._aim(hit, _v));
+    this._showMark(this._swim.target);
     this._game.audio?.play?.('bubble');
+  }
+
+  /**
+   * Turn a click into a swim target that behaves the same from ANY camera
+   * angle. THE OLD BUG: the target was whatever the ray hit, and from a
+   * near-level camera the seabed is nearly edge-on, so a two-pixel cursor move
+   * slid the hit point (and therefore the swim) through 20+ units of depth,
+   * with a hard discontinuity at the horizon where the ray stopped hitting the
+   * floor at all and fell back to a flat 26 units. THE RULE NOW:
+   *
+   *   swim to the thing you clicked if it is within REACH of you; otherwise
+   *   swim REACH units in the direction you clicked.
+   *
+   * The direction for that second case is the point where the ray leaves a
+   * sphere of radius STEER_R around the swimmer, which is continuous over the
+   * whole window, never grazes anything, and is bounded by construction: no
+   * depth in the scene can influence it. Off the tangent of that sphere (the
+   * far corners of a very wide window) it degrades into the ray's closest
+   * approach, which is exactly the hardest turn the scheme can give.
+   */
+  _aim(hit, out) {
+    const pos = this._swim.pos;
+    const ray = this._ray.ray;
+    if (hit) {
+      // stop in FRONT of what you clicked, not inside it: back off along the
+      // ray, which works for instanced/rotated props where a face normal is in
+      // some other frame entirely
+      out.copy(hit.point).addScaledVector(ray.direction, -1.15);
+      // The seabed is the ONE thing you see edge-on, and so the one thing whose
+      // distance cannot be trusted: past REACH it only gets to say which way.
+      // A landmark you picked out on purpose (the bell, the arch, a boulder,
+      // the bottle) is worth the whole swim, however far off it is.
+      if (hit.object !== this._seabed || out.distanceTo(pos) <= REACH) return this._settle(out);
+    }
+    _v2.copy(pos).sub(ray.origin);
+    const along = _v2.dot(ray.direction);          // how far along the ray she is
+    const off2 = Math.max(0, _v2.lengthSq() - along * along); // squared miss distance
+    const t = off2 < STEER_R * STEER_R
+      ? along + Math.sqrt(STEER_R * STEER_R - off2)  // the far side of the sphere
+      : along;                                       // grazing: closest approach
+    out.copy(ray.origin).addScaledVector(ray.direction, Math.max(t, 0.5)).sub(pos);
+    const len = out.length() || 1;
+    return this._settle(out.multiplyScalar(REACH / len).add(pos));
+  }
+
+  /** Keep a target out of the sand; setTarget() clamps it into the volume. */
+  _settle(v) {
+    v.y = Math.max(v.y, duneHeight(v.x, v.z) + 0.9);
+    return v;
+  }
+
+  /** Wheel / arrow keys are live whenever a click would be. */
+  _canNudge() {
+    const game = this._game;
+    return !!(this._swim && !this._riding && game && !game.activeMinigame
+      && !game.engine?.paused);
+  }
+
+  _nudge(dy) {
+    this._showMark(this._swim.nudgeVertical(dy));
+    // one flick of a real wheel is a dozen events: keep the blip, drop the spam
+    if (this._t - this._nudgeAt > 0.16) {
+      this._nudgeAt = this._t;
+      this._game.audio?.play?.('bubble');
+    }
+  }
+
+  /** Walk the vantage around her by `d` radians (arrow keys). */
+  _spin(d) {
+    if (this._riding) this._rideSpin += d;   // the ride owns its own azimuth
+    else this._camGoal += d;
+  }
+
+  /** Pop the target ring at `v`; update() faces it at the camera and fades it. */
+  _showMark(v) {
+    if (!this._mark || !v) return;
+    this._mark.position.copy(v);
+    this._mark.visible = true;
+    this._markT = 0;
   }
 
   _clickTargets() {
@@ -1770,6 +1934,11 @@ export class DriftRoom extends Room {
       // Reset our wire pose: a capy who arrives still flagged 'sit' from a
       // bench or a chairlift would otherwise read as a rider to everyone else.
       this._sendPose('idle');
+      this._game.toast?.(
+        'Click where you want to swim. Scroll (or up/down) to rise and sink, '
+        + 'left/right to look around.',
+        5600,
+      );
     }
 
     // ---- Big Blue -------------------------------------------------------
@@ -1802,17 +1971,10 @@ export class DriftRoom extends Room {
       }
     }
 
-    // riding pulls the camera back and up: her back is the group photo spot in
-    // this game and the swim framing is far too tight to fit six capybaras
-    const cam = this._game.engine?.camCfg;
-    if (cam?.offset) {
-      const k = Math.min(1, dt * 1.3);
-      cam.offset.lerp(this._riding ? CAM_RIDE : CAM_SWIM, k);
-      cam.lookHeight += ((this._riding ? 1.1 : 2.3) - cam.lookHeight) * k;
-    }
-
     const p = avatar ? avatar.group.position : this._fallbackPos;
     const speed = swim ? swim.speedNow : 0;
+    this._updateCamera(dt, p);
+    this._updateMark(dt);
 
     // ---- exit gate: the bell only offers the ride up when you are level ---
     // (hotspots measure distance in xz only, and 0 would fall back to 2.5)
@@ -1868,6 +2030,68 @@ export class DriftRoom extends Room {
 
     // ---- other capybaras --------------------------------------------------
     this._syncRemotes(game);
+  }
+
+  /**
+   * The swim camera (see the CAM note up top). Follow mode only: static mode
+   * has its own authored vantage and must not feel any of this.
+   */
+  _updateCamera(dt, p) {
+    const eng = this._game.engine;
+    const cfg = eng?.camCfg;
+    if (!cfg?.offset) return;
+
+    // Where the vantage WANTS to be: an azimuth, on the far side of wherever
+    // the swimmer is pointed. Only a real heading counts, so a dive, a climb
+    // or a drift to a stop never moves it.
+    const swim = this._swim;
+    let want = null;
+    if (this._riding && this._whale) want = this._whale.rotation.y + Math.PI + this._rideSpin;
+    else if (swim && swim.hSpeed > 1.2) want = swim.yaw + Math.PI;
+    // ...and it only earns a swing once you have turned most of the way round,
+    // which is what keeps the shot as still as the static camera the whole
+    // time you are exploring, and gets it out of your way when you double back
+    // toward the bell. Once a swing starts it finishes (the goal is sticky).
+    // (riding is the exception: she turns at a fortieth of a radian a second,
+    // so the vantage simply tracks her and the ride reads as one long shot)
+    const swinging = Math.abs(angleDelta(this._camAz, this._camGoal)) > 0.06;
+    if (want !== null && (this._riding || swinging
+      || Math.abs(angleDelta(this._camGoal, want)) > CAM.reframe)) {
+      this._camGoal = want;
+    }
+    const d = angleDelta(this._camAz, this._camGoal);
+    if (Math.abs(d) > 1e-4) {
+      // ease out of the swing, but never faster than CAM.slew: no snap, no flip
+      const rate = Math.min(Math.abs(d) * 2.2, CAM.slew);
+      this._camAz += Math.sign(d) * Math.min(Math.abs(d), rate * dt);
+    }
+
+    const k = Math.min(1, dt * CAM.ease);
+    this._camH += ((this._riding ? CAM.rideH : CAM.swimH) - this._camH) * k;
+    this._camD += ((this._riding ? CAM.rideD : CAM.swimD) - this._camD) * k;
+    if (eng.cameraMode === 'static') return;   // nothing below applies up there
+    cfg.offset.set(
+      Math.sin(this._camAz) * this._camD, this._camH, Math.cos(this._camAz) * this._camD,
+    );
+    cfg.lookHeight += ((this._riding ? CAM.rideLook : CAM.swimLook) - cfg.lookHeight) * k;
+    // Look at her ACTUAL position, not the engine's smoothed one: its lerp
+    // toward p is what used to slide a climbing swimmer out of frame. The lag
+    // that is left is the camera's own, on all three axes, which is the part
+    // that feels like water.
+    eng.camTarget.copy(p);
+  }
+
+  /** The click ring: always facing the camera, gone in half a second. */
+  _updateMark(dt) {
+    const m = this._mark;
+    if (!m?.visible) return;
+    this._markT += dt;
+    const k = this._markT / 0.55;
+    if (k >= 1) { m.visible = false; return; }
+    m.scale.setScalar(0.8 + k * 0.7);
+    m.material.opacity = 0.85 * (1 - k);
+    const cam = this._game.engine?.camera;
+    if (cam) m.quaternion.copy(cam.quaternion);
   }
 
   /** Her lap, evaluated into `out`. Shared phase = shared position. */
@@ -2112,8 +2336,12 @@ export class DriftRoom extends Room {
 
   dispose() {
     this._canvas?.removeEventListener('pointerdown', this._onPointer);
+    this._canvas?.removeEventListener('wheel', this._onWheel);
+    removeEventListener('keydown', this._onKey);
     for (const off of this._offs) { try { off?.(); } catch { /* already gone */ } }
     this._offs.length = 0;
+    // (camCfg.offset is this room's own cameraHint vector and camTarget is
+    // re-seeded from the next room's spawn, so neither needs restoring here.)
 
     // hand the walker back and put the avatar upright again: every other room
     // assumes an XYZ euler with no pitch or roll

@@ -18,6 +18,10 @@ import * as THREE from 'three';
  *    visual only. It is deliberately gentle: `net/client.js` gates move frames
  *    at 0.02 units of y, and a bigger bob would make a motionless swimmer
  *    stream position updates at the full tick rate forever.
+ *  - Yaw follows the HORIZONTAL velocity only. Steering straight up or down
+ *    leaves atan2(vx, vz) reading pure noise, which used to spin the capy (and
+ *    anything aimed at her heading, i.e. The Drift's follow camera) on the
+ *    spot. Below `YAW_MIN_H` the last heading is simply held.
  *
  * No DOM, no import-time side effects. The room owns the pointer handling and
  * hands us world-space targets.
@@ -35,7 +39,10 @@ const RESPONSE = 3.6;               // 1/s: how hard we chase the desired veloci
 const TURN_RATE = 4.6;              // 1/s yaw lerp
 const BANK = 0.85;                  // roll per radian of remaining turn
 const MAX_BANK = 0.72;
-const MAX_PITCH = 0.78;
+// Steep enough to read as "going straight down" from a near-level swim camera
+// without folding the capy in half.
+const MAX_PITCH = 1.02;
+const YAW_MIN_H = 0.5;              // horizontal speed below which yaw holds
 
 /** Shortest signed angle from a to b, in (-PI, PI]. */
 function angleDelta(a, b) {
@@ -58,8 +65,8 @@ export class SwimController {
    * @param {number} opts.current     inward acceleration at full penetration
    */
   constructor(avatar, {
-    bounds = null, speed = SWIM_SPEED, margin = 5, marginY = 1.6,
-    current = 11, drag = 2.1,
+    bounds = null, speed = SWIM_SPEED, margin = 5, marginY = 1.0,
+    current = 11, drag = 2.1, floorAt = null, clearance = 0.55,
   } = {}) {
     this.avatar = avatar;
     this.bounds = bounds || new THREE.Box3(
@@ -73,6 +80,13 @@ export class SwimController {
     this.marginY = marginY;
     this.current = current;
     this.drag = drag;
+    // The floor is not flat. With a single AABB bottom the box has to clear the
+    // tallest dune, which parks you two or three units over the sand
+    // everywhere else and makes "swim down and touch the bottom" impossible.
+    // `floorAt(x, z)` (the room's own ground function) lets the soft bottom
+    // follow the dunes instead, `clearance` above the sand.
+    this.floorAt = floorAt;
+    this.clearance = clearance;
 
     this.pos = avatar.group.position.clone(); // physics position (bob excluded)
     this.vel = new THREE.Vector3();
@@ -86,12 +100,26 @@ export class SwimController {
     this.bobT = Math.random() * 10;
     this.bobY = 0;
     this.speedNow = 0;
+    this.hSpeed = 0;        // horizontal speed: what a follow camera should read
   }
 
   /** Swim toward a world point (clamped into the volume). */
   setTarget(v3) {
     this.target = (this.target || new THREE.Vector3()).copy(v3);
     this.bounds.clampPoint(this.target, this.target);
+  }
+
+  /**
+   * Rise or sink by `dy` without touching the heading: the explicit up/down
+   * control (mouse wheel, arrow keys). Stacks, because it moves the CURRENT
+   * target rather than replacing it, so three flicks of the wheel is three
+   * times the climb and the horizontal part of the trip survives.
+   */
+  nudgeVertical(dy) {
+    _to.copy(this.target || this.pos);
+    _to.y += dy;
+    this.setTarget(_to);
+    return this.target;
   }
 
   /** Drop the target; drag brings us to a stop. */
@@ -131,6 +159,7 @@ export class SwimController {
     if (!this.enabled || this.mounted) {
       // riding: the room writes the transform, we just keep the pose upright
       this.speedNow = 0;
+      this.hSpeed = 0;
       return;
     }
     const g = this.avatar.group;
@@ -157,8 +186,11 @@ export class SwimController {
     const m = this.margin;
     const my = this.marginY;
     const c = this.current;
+    const floor = this.floorAt
+      ? Math.max(lo.y, this.floorAt(this.pos.x, this.pos.z) + this.clearance)
+      : lo.y;
     _acc.x += edgePush(this.pos.x, lo.x, hi.x, m, c);
-    _acc.y += edgePush(this.pos.y, lo.y, hi.y, my, c);
+    _acc.y += edgePush(this.pos.y, floor, hi.y, my, c);
     _acc.z += edgePush(this.pos.z, lo.z, hi.z, m, c);
 
     this.vel.addScaledVector(_acc, dt);
@@ -166,17 +198,23 @@ export class SwimController {
     if (sp > this.speed * 1.6) this.vel.multiplyScalar((this.speed * 1.6) / sp);
     this.pos.addScaledVector(this.vel, dt);
     this.speedNow = sp;
+    const hsp = Math.hypot(this.vel.x, this.vel.z);
+    this.hSpeed = hsp;
 
     // backstop only: the current above should always win before we get here
     this.pos.x = Math.max(lo.x - m, Math.min(hi.x + m, this.pos.x));
-    this.pos.y = Math.max(lo.y, Math.min(hi.y + my, this.pos.y));
+    this.pos.y = Math.max(floor, Math.min(hi.y + my, this.pos.y));
     this.pos.z = Math.max(lo.z - m, Math.min(hi.z + m, this.pos.z));
 
     // ---- orientation: yaw follows the swim, roll banks into the turn ------
     if (sp > 0.35) {
-      const wantYaw = Math.atan2(this.vel.x, this.vel.z);
-      const d = angleDelta(this.yaw, wantYaw);
-      this.yaw += d * Math.min(1, dt * TURN_RATE);
+      // yaw off the HORIZONTAL velocity only (see the header note): a dive or a
+      // climb keeps the heading it had instead of spinning on noise
+      let d = 0;
+      if (hsp > YAW_MIN_H) {
+        d = angleDelta(this.yaw, Math.atan2(this.vel.x, this.vel.z));
+        this.yaw += d * Math.min(1, dt * TURN_RATE);
+      }
       const lean = Math.max(-1, Math.min(1, sp / 3.2));
       const wantRoll = Math.max(-MAX_BANK, Math.min(MAX_BANK, -d * BANK)) * lean;
       const wantPitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH,
