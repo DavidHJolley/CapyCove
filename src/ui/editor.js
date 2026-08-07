@@ -139,6 +139,8 @@ function openEditor(game) {
   let dragging = false;
   let dragStart = null;
   let shiftDrag = false;
+  let lastClick = null;   // free mode: click the same spot to cycle deeper
+  let pickIndex = 0;
   const freeMoves = new Map(); // path -> { label, from:[x,y,z], to:[x,y,z], obj, instanceId }
 
   const pinGeo = new THREE.ConeGeometry(0.16, 0.5, 10);
@@ -146,7 +148,7 @@ function openEditor(game) {
 
   const KEYS = {
     handles: '<b>Drag a pin</b> to move that number - <b>Shift-drag</b> the gold prop pin moves a whole station<br><b>Arrows</b> nudge (Shift = 0.5), <b>[ ]</b> turn the prop - <b>Esc</b> closes. Walking still works.',
-    free: '<b>Click any object</b> to grab it - <b>drag</b> to move - <b>Tab</b> selects its parent<br><b>Arrows</b> nudge, <b>PgUp/Dn</b> height, <b>[ ]</b> rotate, <b>- =</b> resize, <b>H</b> hide<br>Hold <b>Shift</b> for bigger steps. Visual preview only.',
+    free: '<b>Click</b> grabs the whole prop - <b>click again</b> on the same spot for what is behind it - <b>Tab</b> drills into its parts<br><b>Drag</b> to move, <b>arrows</b> nudge, <b>PgUp/Dn</b> height, <b>[ ]</b> rotate, <b>- =</b> resize, <b>H</b> hide<br>Hold <b>Shift</b> for bigger steps. Visual preview only.',
   };
 
   // ---- shared helpers ------------------------------------------------------
@@ -188,6 +190,25 @@ function openEditor(game) {
     let o = obj;
     while (o) { if (ex.includes(o)) return true; o = o.parent; }
     return false;
+  }
+
+  /**
+   * Is this worth grabbing? Particle systems, lines and glow overlays have
+   * enormous bounding volumes and no surface anyone wants to move, and they
+   * were swallowing every click in rooms like the mine (its dust motes span
+   * the whole cavern). Backdrops (sky domes, cave shells) are pickable but
+   * sorted last, so they never hide the furniture in front of them.
+   */
+  function pickRank(obj) {
+    if (!obj.visible) return -1;
+    if (obj.isPoints || obj.isLine || obj.isLineSegments || obj.isSprite) return -1;
+    if (isExcluded(obj)) return -1;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    if (mats.some((m) => m && m.transparent && m.depthWrite === false)) return -1; // haze, glow, light pools
+    const g = obj.geometry;
+    if (g && !g.boundingSphere) g.computeBoundingSphere();
+    const r = (g?.boundingSphere?.radius || 0) * Math.max(obj.scale.x, obj.scale.y, obj.scale.z);
+    return r > 28 ? 1 : 0; // 1 = backdrop, tried only after real props
   }
 
   // ---- handles mode --------------------------------------------------------
@@ -307,9 +328,39 @@ function openEditor(game) {
     return { rot: free.obj.rotation.y, scale: free.obj.scale.x };
   }
 
-  function selectFree(obj, instanceId) {
+  /** scene-child ... hit object, so selection can start at the whole prop. */
+  function pickChain(obj) {
+    const chain = [];
+    let o = obj;
+    while (o && o !== engine.scene) { chain.unshift(o); o = o.parent; }
+    return chain;
+  }
+
+  /**
+   * Select at a depth along the pick chain. Depth 0 is the whole prop (the
+   * group the room added to the scene), deeper is one of its parts, and the
+   * last level of an InstancedMesh hit is the single instance. Clicking picks
+   * the PROP, because "move that bench" is the common intent and grabbing one
+   * plank of it is the rare one; Tab drills in.
+   */
+  function selectDepth(chain, depth, rawInstanceId) {
+    const levels = chain.length + (rawInstanceId != null ? 1 : 0);
+    const d = ((depth % levels) + levels) % levels;
+    const isInstance = rawInstanceId != null && d === chain.length;
+    const obj = chain[Math.min(d, chain.length - 1)];
+    selectFree(obj, isInstance ? rawInstanceId : null, { chain, depth: d, levels, rawInstanceId });
+  }
+
+  function selectFree(obj, instanceId, nav = null) {
     const path = pathOf(obj, engine.scene) + (instanceId != null ? `#${instanceId}` : '');
-    free = { obj, instanceId, path, label: labelOf(obj, instanceId), start: [0, 0, 0] };
+    const kids = obj.children?.length || 0;
+    const what = instanceId != null ? 'instance'
+      : (nav?.depth ?? 0) > 0 ? 'part'
+        : kids ? `whole prop, ${kids} part${kids === 1 ? '' : 's'}` : 'prop';
+    free = {
+      obj, instanceId, path, label: `${labelOf(obj, instanceId)} (${what})`,
+      start: [0, 0, 0], nav: nav || { chain: pickChain(obj), depth: 0, levels: 1, rawInstanceId: instanceId },
+    };
     const cur = freePos();
     const st = freeState();
     const known = freeMoves.get(path);
@@ -427,13 +478,23 @@ function openEditor(game) {
       return;
     }
 
-    // free mode: pick anything except the players and the editor's own gizmos
-    const hits = ray.intersectObjects(engine.scene.children, true)
-      .filter((h) => h.object.visible !== false && !isExcluded(h.object));
-    if (!hits.length) return;
+    // free mode: pick anything except players, gizmos, particles and glow
+    const ranked = ray.intersectObjects(engine.scene.children, true)
+      .map((h) => ({ h, rank: pickRank(h.object) }))
+      .filter((x) => x.rank >= 0)
+      .sort((a, b) => a.rank - b.rank);   // props first, backdrops last
+    if (!ranked.length) return;
     e.stopPropagation(); e.preventDefault();
-    const h = hits[0];
-    selectFree(h.object, h.instanceId ?? null);
+
+    // clicking the same spot again steps to whatever is behind the last pick,
+    // so a prop tucked under a table is still reachable
+    const same = lastClick && Math.hypot(e.clientX - lastClick.x, e.clientY - lastClick.y) < 6;
+    pickIndex = same ? (pickIndex + 1) % ranked.length : 0;
+    lastClick = { x: e.clientX, y: e.clientY };
+    const h = ranked[pickIndex].h;
+
+    // start at the whole prop; Tab drills down to its parts
+    selectDepth(pickChain(h.object), 0, h.instanceId ?? null);
     const cur = freePos();
     plane.constant = -cur.y;
     if (ray.ray.intersectPlane(plane, hit)) grab.copy(cur).sub(hit);
@@ -507,7 +568,7 @@ function openEditor(game) {
       _: () => freeApply((p, q, sc) => sc.multiplyScalar(0.8)),
       '=': () => freeApply((p, q, sc) => sc.multiplyScalar(e.shiftKey ? 1.25 : 1.0526)),
       '+': () => freeApply((p, q, sc) => sc.multiplyScalar(1.25)),
-      Tab: () => { if (free.obj.parent && free.obj.parent !== engine.scene) selectFree(free.obj.parent, null); },
+      Tab: () => selectDepth(free.nav.chain, free.nav.depth + (e.shiftKey ? -1 : 1), free.nav.rawInstanceId),
       h: () => { if (free.instanceId == null) { free.obj.visible = !free.obj.visible; paint(); } },
       H: () => { if (free.instanceId == null) { free.obj.visible = !free.obj.visible; paint(); } },
     };
