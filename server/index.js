@@ -10,6 +10,7 @@ import {
 } from './db.js';
 import { signup, login, verifyToken, publicProfile } from './auth.js';
 import { BotManager } from './bots.js';
+import * as progress from './progress.js';
 import {
   ROOM_IDS, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
   NAME_MAX_LEN, NAME_MIN_LEN, clampCoinsForGame, MINIGAMES,
@@ -269,6 +270,9 @@ function grantCoins(p, amount, reason) {
   sendTo(p, { t: 'coins', coins: p.coins, delta: payout, reason });
   return payout;
 }
+
+// progression module boot (quests/stamps/milestones live in server/progress.js)
+progress.install({ users, saveSoon, grantCoins, sendTo, broadcastToRoom, has });
 
 /**
  * Budget for the social messages (cards, friends, lobby): each one either fans
@@ -1229,6 +1233,9 @@ wss.on('connection', (ws) => {
 
     // One bad frame must never take the process down with it.
     try {
+      // progression module (server/progress.js) gets first refusal on frames
+      // it owns (quest-*, stamp-* etc.); everything else falls through
+      if (p && progress.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
           if (p) return;
