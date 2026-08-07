@@ -117,9 +117,17 @@ Waves 1-7 are SHIPPED (see the registry above for the full protocol). Wave 7
 (the Social Cove, docs/LIVING-COVE.md) landed last: world clock + weather +
 aurora, snowballs/beach ball/bonfire, parties, the plaza mural, daily quests +
 stamp album + milestone cosmetics, and The Drift (swimming, shaders, Big
-Blue). Wave 8 (Capy Clash Spectacle, docs/CARDGAME.md section 10) is PARKED
-pending an explicit user go-ahead. Remaining: PUBLIC DEPLOYMENT (configs in
-repo: Dockerfile, render.yaml, fly.toml; needs the user's hosting account).
+Blue). A wave-7.5 playtest-polish pass followed (doodle word sync, prop hunt
+arena rebuild + free prop movement + wall-clock timers, mine declutter,
+music beds for mine/jungle/drift, right-click snowballs, plaza tidy, Den
+floor decongestion, Drift swim-cam overhaul, click-to-move marker, loft
+stair routing via room.routeTo, background-tab movement, beach minWalkY
+shoreline clamp, citizens: no sleeping + hash-scattered spots). PENDING (see
+the session task list): EST real-time world clock (America/New_York), lobby
+"Start now" chips, lobby walk-away un-queue. Wave 8 (Capy Clash Spectacle,
+docs/CARDGAME.md section 10) is PARKED pending an explicit user go-ahead.
+Remaining after that: PUBLIC DEPLOYMENT (configs in repo: Dockerfile,
+render.yaml, fly.toml; needs the user's hosting account).
 
 ## Historical roadmap notes (2026-08-06)
 
