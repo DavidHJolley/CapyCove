@@ -141,6 +141,10 @@ class Game {
       const a = this.engine?.playerAvatar;
       if (a) a.setAnim(a.state.anim === 'dance' ? 'idle' : 'dance');
     }
+    if (kind === 'groove') {
+      this.engine?.playerAvatar?.playGroove?.();
+      this.audio?.play?.('combo'); // escalating mash pitch (falls back silent)
+    }
     this.net?.send({ t: 'emote', kind });
   }
 

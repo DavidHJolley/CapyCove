@@ -208,6 +208,7 @@ export class NetClient {
         if (!r) break;
         if (m.kind === 'wave') r.avatar.playWave();
         if (m.kind === 'dance') r.avatar.setAnim(r.avatar.state.anim === 'dance' ? 'idle' : 'dance');
+        if (m.kind === 'groove') r.avatar.playGroove?.();
         break;
       }
       case 'custom': {

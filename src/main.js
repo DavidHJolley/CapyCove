@@ -68,7 +68,9 @@ addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
   if (game.activeMinigame) return;
   if (e.repeat) return; // held keys must not spam emotes (and net sends)
-  if (e.key === 'd' || e.key === 'D') game.emote('dance');
+  // D = groove pop, built for mashing (the HUD button still toggles the
+  // dance loop); each press is one move, fast presses build combo
+  if (e.key === 'd' || e.key === 'D') game.emote('groove');
   if (e.key === 'w' || e.key === 'W') game.emote('wave');
   if (e.key === 'm' || e.key === 'M') document.getElementById('map-overlay')?.classList.toggle('hidden');
   if (e.key === 'Enter') document.getElementById('chat-input')?.focus();

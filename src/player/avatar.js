@@ -44,6 +44,7 @@ const EAR_Z = -0.03;
 const EAR_TILT = 0.2;
 const BLINK_DUR = 0.15;
 const WAVE_DUR = 1.6;
+const GROOVE_DUR = 0.38; // one groove pop (before combo speed-up)
 const PULSE_DUR = 0.34;  // squash-and-stretch on animation changes
 
 // Per-vertex tint multipliers (see note 3 above).
@@ -296,6 +297,7 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
 
   const state = {
     anim: 'idle', hat: 'none', color, t: Math.random() * 10, waveT: -1,
+    grooveT: -1, grooveMove: 0, grooveCombo: 0, grooveLast: -9,
     blinkIn: 1 + Math.random() * 4, blinkT: 0,
     twitchIn: 2 + Math.random() * 5, twitchT: 0, twitchEar: 0,
     stretchIn: 6 + Math.random() * 9, stretchT: 0,
@@ -554,6 +556,44 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
       if (w > WAVE_DUR) state.waveT = -1;
     }
 
+    // ---- groove pops: one-shot mash moves (the D key), stack-friendly ------
+    if (state.grooveT >= 0) {
+      const speed = 1 + Math.min(state.grooveCombo, 10) * 0.13; // mash = faster
+      state.grooveT += dt * speed;
+      const u = Math.min(1, state.grooveT / GROOVE_DUR);
+      const k = Math.sin(u * Math.PI);
+      const squash = u < 0.18 ? (1 - u / 0.18) * 0.12 : 0; // anticipation dip
+      body.scale.y += k * 0.06 - squash;
+      body.scale.x += squash * 0.6;
+      body.scale.z += squash * 0.6;
+      const m = state.grooveMove;
+      if (m === 0) { // full spin with a hop
+        body.rotation.y += u * Math.PI * 2;
+        body.position.y += k * 0.34;
+        arms[0].rotation.z -= k * 1.2;
+        arms[1].rotation.z += k * 1.2;
+      } else if (m === 1) { // star jump
+        body.position.y += k * 0.42;
+        arms[0].rotation.z -= k * 2.2;
+        arms[1].rotation.z += k * 2.2;
+        legs[0].rotation.z = -k * 0.7;
+        legs[1].rotation.z = k * 0.7;
+        ears[0].rotation.z += k * 0.5;
+        ears[1].rotation.z -= k * 0.5;
+      } else if (m === 2) { // hip shake, tail going wild
+        body.rotation.z += Math.sin(u * Math.PI * 4) * 0.22 * (1 - u * 0.4);
+        headG.rotation.z -= Math.sin(u * Math.PI * 4) * 0.14;
+        tail.rotation.z = Math.sin(u * Math.PI * 6) * 0.6;
+        body.position.y += Math.abs(Math.sin(u * Math.PI * 2)) * 0.1;
+      } else { // the backflip
+        body.rotation.x -= u * Math.PI * 2;
+        body.position.y += k * 0.55;
+        arms[0].rotation.x = -k * 2.4;
+        arms[1].rotation.x = -k * 2.4;
+      }
+      if (u >= 1) state.grooveT = -1;
+    }
+
     // ---- transition squash: a damped 0.94 -> 1 pulse on every state change --
     if (state.pulse > 0) {
       state.pulse = Math.max(0, state.pulse - dt);
@@ -572,5 +612,15 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
     group.traverse((o) => { if (o.geometry && !o.geometry.userData.shared) o.geometry.dispose(); });
   }
 
-  return { group, body, headG, hatAnchor, state, setHat, setColor, setAnim, playWave, update, dispose };
+  /** One-shot mash move (the D key): each call fires the next pop; presses
+   *  within 0.75s of each other build combo, which speeds the moves up. */
+  function playGroove() {
+    const now = state.t;
+    state.grooveCombo = now - state.grooveLast < 0.75 ? Math.min(state.grooveCombo + 1, 12) : 0;
+    state.grooveLast = now;
+    state.grooveMove = (state.grooveMove + 1 + (state.grooveCombo === 0 ? Math.floor(Math.random() * 2) : 0)) % 4;
+    state.grooveT = 0;
+  }
+
+  return { group, body, headG, hatAnchor, state, setHat, setColor, setAnim, playWave, playGroove, update, dispose };
 }

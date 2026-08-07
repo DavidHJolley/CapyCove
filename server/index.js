@@ -2261,7 +2261,7 @@ wss.on('connection', (ws) => {
           break;
         }
         case 'emote':
-          if (['wave', 'dance'].includes(m.kind)) {
+          if (['wave', 'dance', 'groove'].includes(m.kind)) {
             if (m.kind === 'dance') p.anim = p.anim === 'dance' ? 'idle' : 'dance';
             broadcastToRoom(p.room, { t: 'emote', id: p.id, kind: m.kind }, p.id);
             if (m.kind === 'wave') signal('wave', p, { room: p.room });
@@ -2617,7 +2617,19 @@ wss.on('connection', (ws) => {
         case 'dd-pick': {
           const g = p.dd;
           if (!g || g.ended || g.phase !== 'pick' || g.drawerId !== p.id) break;
-          beginDoodleDrawing(g, Math.floor(Number(m.i) || 0));
+          // The index is the contract, but a drawer's screen and this list
+          // disagreeing is the one failure this game cannot survive: they draw
+          // one word while every guess is scored against another. If the frame
+          // also NAMES a word and we offered it, the name wins over the index.
+          // (Belt and braces: the client no longer shows a word it invented,
+          // and it renders the word from the state frame this call produces.)
+          let i = Math.floor(Number(m.i) || 0);
+          const named = typeof m.word === 'string' ? normalizeWord(m.word.slice(0, 40)) : '';
+          if (named) {
+            const j = g.choices.findIndex((w) => normalizeWord(w) === named);
+            if (j >= 0) i = j;
+          }
+          beginDoodleDrawing(g, i);
           break;
         }
         case 'dd-stroke': {
