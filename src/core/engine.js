@@ -475,32 +475,65 @@ export class Engine {
     if (!this.room || !this.playerAvatar) return;
     const p = this.playerAvatar.group.position;
     const v = new THREE.Vector3();
+    // per-frame movement, for exit INTENT (see below)
+    const mx = p.x - (this._hpx ?? p.x);
+    const mz = p.z - (this._hpz ?? p.z);
+    this._hpx = p.x;
+    this._hpz = p.z;
+    const mlen = Math.hypot(mx, mz);
     for (const h of this.room.hotspots) {
       const d = Math.hypot(p.x - h.position.x, p.z - h.position.z);
       const radius = h.radius || 2.5;
       const near = d <= radius;
 
-      // exits fire by walking in, no click needed. Armed only once the player
-      // has been clearly outside the radius (prevents an instant bounce-back
-      // when arriving on a spawn near the return exit).
+      // Exits fire on INTENT: you are inside the band AND walking toward the
+      // archway. This replaced the old "arm only after stepping clear" rule,
+      // which blocked the one thing people actually do at an arrival spawn:
+      // turn straight around and go back (playtester call, 2026-08-07).
+      // Standing on the spawn does nothing; walking away does nothing; a few
+      // frames of walking at the arch fires it, wherever you started.
       if (h.id?.startsWith('exit-') && !h.noAuto) {
-        if (!h.__armed) {
-          if (this.roomAge > 0.4 && d > radius + 0.75) h.__armed = true;
-        } else if (!h.__fired && d <= radius * 0.8 && this.roomAge > 1.2 && !this.game.activeMinigame) {
-          h.__fired = true;
-          // no whoosh here: switchRoom plays it with the iris wipe
-          h.action(this.game);
-          continue;
+        if (!h.__fired && this.roomAge > 0.8 && !this.game.activeMinigame) {
+          let toward = false;
+          if (mlen > 0.005 && d > 1e-3) {
+            const dot = ((h.position.x - p.x) * mx + (h.position.z - p.z) * mz) / (d * mlen);
+            toward = dot > 0.6;
+          }
+          h.__intent = near && toward ? (h.__intent || 0) + 1 : 0;
+          if (h.__intent >= 6 || (near && toward && d <= radius * 0.45)) {
+            h.__fired = true;
+            // no whoosh here: switchRoom plays it with the iris wipe
+            h.action(this.game);
+            continue;
+          }
         }
       }
 
-      // Walk-through exits fire themselves: a "Go to X" button on top of an
-      // archway you can simply walk through is noise (playtester call,
-      // 2026-08-07). Auto-firing exits never get a DOM prompt; hotspots that
-      // opted out of auto-fire (noAuto) keep theirs.
+      // Walk-through exits fire themselves, so they get no clickable button
+      // (playtester call, 2026-08-07). Instead: a small non-interactive CUE
+      // fades in while you approach, naming where the archway leads, so the
+      // auto-travel never surprises anyone. Appears in an outer band before
+      // the fire line, disappears if you veer off.
       if (h.id?.startsWith('exit-') && !h.noAuto) {
-        const stale = this.hotspotEls.get(h);
-        if (stale) { stale.remove(); this.hotspotEls.delete(h); }
+        const inBand = d <= radius + 2.2 && !h.__fired;
+        let cue = this.hotspotEls.get(h);
+        if (inBand && !cue) {
+          cue = document.createElement('div');
+          cue.className = 'exit-cue';
+          cue.textContent = '→ ' + (h.label || '').replace(/^(go to|back to|back out to|down to|up to|take the)\s+/i, '');
+          this.overlayRoot.appendChild(cue);
+          this.hotspotEls.set(h, cue);
+        } else if (!inBand && cue) {
+          cue.remove();
+          this.hotspotEls.delete(h);
+        }
+        if (cue) {
+          v.copy(h.position); v.y += 2.1; v.project(this.camera);
+          if (v.z > 1) { cue.style.display = 'none'; continue; }
+          cue.style.display = '';
+          cue.style.left = `${(v.x * 0.5 + 0.5) * innerWidth}px`;
+          cue.style.top = `${(-v.y * 0.5 + 0.5) * innerHeight}px`;
+        }
         continue;
       }
 

@@ -107,6 +107,21 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
   100% { opacity: 1; scale: 1; translate: 0 0; }
 }
 
+/* approach cue over a walk-through exit: information, not a control */
+.exit-cue {
+  position: absolute; transform: translate(-50%, -100%); pointer-events: none;
+  background: rgba(255, 253, 246, 0.92); color: var(--ink);
+  font-weight: 800; font-size: 12.5px; letter-spacing: 0.02em;
+  padding: 5px 13px; border-radius: 999px; white-space: nowrap;
+  box-shadow: 0 3px 12px rgba(45, 36, 23, 0.22);
+  animation: cue-in 0.3s var(--spring), cue-float 2.2s 0.3s ease-in-out infinite;
+}
+@keyframes cue-in { from { opacity: 0; translate: 0 6px; scale: 0.85; } }
+@keyframes cue-float { 50% { translate: 0 -4px; } }
+@media (prefers-reduced-motion: reduce) {
+  .exit-cue { animation: cue-in 0.2s ease; }
+}
+
 .hotspot-prompt {
   position: absolute; transform: translate(-50%, -100%);
   background: linear-gradient(180deg, #ffd98a 0%, var(--gold) 100%);
@@ -709,6 +724,64 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
   box-shadow: 0 5px 0 rgba(0, 0, 0, 0.2);
 }
 .mg-btn.ghost:hover { background: rgba(255, 255, 255, 0.12); }
+
+/* ---------- loading screen handoff ----------
+   The loading screen itself (warm backdrop, the rising sun, the empty track,
+   the tip) is inlined in index.html so it paints before this file even exists,
+   with no JS involved at all. What lives
+   here is everything that is only needed AFTER the bundle has loaded: the
+   milestone shine on the bar, and the lift into the title screen.
+
+   The lift is a soft iris: a mask hole opens from the middle of the screen
+   while the whole panel fades and floats up, so the title sky is revealed
+   rather than cross-dissolved. --boot-iris is registered so the hole radius
+   can be transitioned; browsers without @property keep the plain fade, and
+   main.js removes the element on a timer either way. */
+@property --boot-iris {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+
+#boot {
+  --boot-iris: 0px;
+  transition: opacity 0.5s ease, translate 0.6s var(--spring), scale 0.6s var(--spring);
+}
+/* a travelling glint on the fill, so a stalled milestone still looks alive */
+#boot .boot-fill::after {
+  content: ''; position: absolute; inset: 0; border-radius: 999px;
+  background: linear-gradient(100deg,
+    rgba(255, 255, 255, 0) 30%, rgba(255, 255, 255, 0.55) 50%, rgba(255, 255, 255, 0) 70%);
+  background-size: 260% 100%;
+  animation: boot-shine 1.5s linear infinite;
+}
+@keyframes boot-shine { from { background-position: 130% 0; } to { background-position: -130% 0; } }
+
+#boot.is-out {
+  opacity: 0; scale: 1.06; translate: 0 -14px; pointer-events: none;
+  transition: opacity 0.5s ease, translate 0.6s var(--spring), scale 0.6s var(--spring),
+    --boot-iris 0.55s cubic-bezier(0.45, 0.05, 0.35, 1);
+  --boot-iris: 92vmax;
+  -webkit-mask-image: radial-gradient(circle at 50% 46%,
+    rgba(0, 0, 0, 0) var(--boot-iris), #000 calc(var(--boot-iris) + 16vmax));
+  mask-image: radial-gradient(circle at 50% 46%,
+    rgba(0, 0, 0, 0) var(--boot-iris), #000 calc(var(--boot-iris) + 16vmax));
+}
+/* the sun keeps rising as the iris opens, so the exit reads as a sunrise
+   rather than a panel being switched off */
+#boot.is-out .boot-sun { animation: boot-sun-out 0.55s var(--spring) forwards; }
+@keyframes boot-sun-out { to { translate: 0 -34px; scale: 1.14; opacity: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  /* no iris, no float, no shine: the panel simply fades out */
+  #boot .boot-fill::after { animation: none; opacity: 0; }
+  #boot, #boot.is-out {
+    transition: opacity 0.3s ease;
+    scale: 1; translate: 0 0;
+    -webkit-mask-image: none; mask-image: none;
+  }
+  #boot.is-out .boot-sun { animation: none; }
+}
 
 /* ---------- motion preferences ---------- */
 @media (prefers-reduced-motion: reduce) {

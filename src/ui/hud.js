@@ -267,6 +267,7 @@ export function initHud(game) {
       <button class="hud-btn" id="btn-shop" title="Wardrobe & Shop">&#127913;</button>
       <button class="hud-btn" id="btn-cam" title="Camera view">&#127909;</button>
       <button class="hud-btn" id="btn-mute" title="Sound">&#128266;</button>
+      <button class="hud-btn" id="btn-tour" title="Replay the welcome tour" aria-label="Replay the welcome tour">?</button>
     </div>
     <div class="hud-bottom">
       <div class="emotes">
@@ -307,8 +308,10 @@ export function initHud(game) {
   game.events.on('room', (id) => {
     const info = Object.prototype.hasOwnProperty.call(ROOM_INFO, id) ? ROOM_INFO[id] : null;
     if (info) {
+      // No arrival toast (playtester call, 2026-08-07): you walked through the
+      // archway or clicked the map, you know where you are, and the room chip
+      // top-left already says so.
       $('room-name').textContent = info.name;
-      game.toast(`${info.name} : ${info.desc || ''}`, 2200);
       return;
     }
     const owner = typeof id === 'string' && id.startsWith('house:')
@@ -501,6 +504,12 @@ export function initHud(game) {
   $('btn-shop').onclick = () => import('./shop.js')
     .then((m) => m.openShop(game))
     .catch((e) => { console.error('[hud] shop failed to load:', e); game.toast('The shop is not answering, try again'); });
+
+  // "?": replay the first-run tour (same on-demand load as the shop button;
+  // the module clears the 'capycove-toured' flag and runs it from beat 1)
+  $('btn-tour').onclick = () => import('./firstrun.js')
+    .then((m) => m.replayTour(game))
+    .catch((e) => { console.error('[hud] tour failed to load:', e); game.toast('The tour guide is having a nap, try again'); });
 
   // menu (same on-demand load: pause card, how to play, sound, log out)
   $('btn-menu').onclick = () => import('./menu.js')
