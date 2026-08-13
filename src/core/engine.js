@@ -494,6 +494,16 @@ export class Engine {
         }
       }
 
+      // Walk-through exits fire themselves: a "Go to X" button on top of an
+      // archway you can simply walk through is noise (playtester call,
+      // 2026-08-07). Auto-firing exits never get a DOM prompt; hotspots that
+      // opted out of auto-fire (noAuto) keep theirs.
+      if (h.id?.startsWith('exit-') && !h.noAuto) {
+        const stale = this.hotspotEls.get(h);
+        if (stale) { stale.remove(); this.hotspotEls.delete(h); }
+        continue;
+      }
+
       let el = this.hotspotEls.get(h);
       if (near && !el) {
         el = document.createElement('button');
