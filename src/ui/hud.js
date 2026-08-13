@@ -354,6 +354,9 @@ export function initHud(game) {
     const text = $('chat-input').value;
     $('chat-input').value = '';
     if (!text.trim()) return;
+    // /w Name message (or /msg): private whisper to one online player
+    const w = text.trim().match(/^\/(?:w|msg|whisper)\s+(\S+)\s+(.+)$/i);
+    if (w) { game.net?.send({ t: 'whisper', to: w[1], text: w[2].slice(0, 120) }); return; }
     game.say(text);
     game.engine?.showBubble(game.engine.playerAvatar.group, text.trim().slice(0, 120));
   });
@@ -395,17 +398,25 @@ export function initHud(game) {
     $('chat-log').classList.remove('is-tucked');
   }
 
-  game.events.on('chat', ({ name, text, self }) => {
+  game.events.on('chat', ({ name, text, self, whisper, replyTo }) => {
     const log = $('chat-log');
     const line = makeLine(name, text, self);
+    if (whisper) {
+      line.classList.add('whisper');
+      // click a whisper to prefill the reply
+      line.style.pointerEvents = 'auto';
+      line.style.cursor = 'pointer';
+      line.onclick = () => { const i = $('chat-input'); i.value = `/w ${replyTo} `; i.focus(); };
+    }
     log.appendChild(line);
     while (log.children.length > 6) log.firstChild.remove();
-    setTimeout(() => { line.classList.add('fade-out'); setTimeout(() => line.remove(), 900); }, 9000);
+    setTimeout(() => { line.classList.add('fade-out'); setTimeout(() => line.remove(), 900); }, whisper ? 14000 : 9000);
 
     // stay pinned to the newest line unless the player scrolled up to read
     const atBottom = historyScroll.scrollHeight - historyScroll.scrollTop
       - historyScroll.clientHeight < 56;
     const kept = makeLine(name, text, self);
+    if (whisper) kept.classList.add('whisper');
     kept.classList.add('chat-history-line');
     historyScroll.appendChild(kept);
     while (historyScroll.children.length > HISTORY_MAX) historyScroll.firstChild.remove();

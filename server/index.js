@@ -2260,6 +2260,21 @@ wss.on('connection', (ws) => {
           signal('chat', p, { room: p.room });
           break;
         }
+        case 'whisper': {
+          // private line to one online player, any room. Same throttle as chat.
+          const now = Date.now();
+          if (now - p.lastChat < 400) return;
+          p.lastChat = now;
+          const text = String(m.text || '').slice(0, CHAT_MAX_LEN).trim();
+          const toName = String(m.to || '').trim().toLowerCase();
+          if (!text || !toName) return;
+          const target = [...world.players.values()].find((q) => !q.bot && q.name.toLowerCase() === toName);
+          if (!target) return sendTo(p, { t: 'toast', msg: 'Nobody by that name is in the cove right now' });
+          if (target.id === p.id) return sendTo(p, { t: 'toast', msg: 'Whispering to yourself is free, out loud' });
+          sendTo(target, { t: 'whisper', from: p.name, text });
+          sendTo(p, { t: 'whisper', to: target.name, text }); // sender echo
+          break;
+        }
         case 'emote':
           if (['wave', 'dance', 'groove'].includes(m.kind)) {
             if (m.kind === 'dance') p.anim = p.anim === 'dance' ? 'idle' : 'dance';

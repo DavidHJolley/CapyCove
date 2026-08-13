@@ -281,6 +281,8 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
 }
 .chat-line.self b { color: var(--accent); }
 .chat-line b { color: var(--accent2); margin-right: 2px; }
+.chat-line.whisper { background: rgba(155, 107, 212, 0.16); font-style: italic; }
+.chat-line.whisper b { color: #9b6bd4; }
 .chat-line.fade-out { opacity: 0; }
 .chat-log.is-tucked { opacity: 0; }
 @keyframes chat-in {

@@ -234,6 +234,18 @@ export class NetClient {
       case 'toast':
         game.toast(m.msg);
         break;
+      case 'whisper':
+        // private line: m.from = someone whispering to us, m.to = our own echo
+        game.events.emit('chat', {
+          from: 'whisper',
+          name: m.from ? `${m.from} whispers` : `to ${m.to}`,
+          text: m.text,
+          self: !m.from,
+          whisper: true,
+          replyTo: m.from || m.to,
+        });
+        if (m.from) game.audio?.play?.('pop');
+        break;
       // ---- player cards / friends ------------------------------------------
       // Re-emitted raw: the UI owns the shape (see server/index.js). Named
       // '*-data' so they never collide with the local 'profile' state event.

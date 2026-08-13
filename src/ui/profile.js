@@ -882,6 +882,10 @@ const CSS = `
 .pf-fbtn:hover:not(:disabled) { scale: 1.06; filter: brightness(1.05); }
 .pf-fbtn:active:not(:disabled) { scale: 0.95; }
 .pf-fbtn:focus-visible { outline: 3px solid var(--accent2); outline-offset: 3px; }
+.pf-fbtn.is-msg {
+  background: linear-gradient(180deg, #b48ae0 0%, #9b6bd4 100%);
+  box-shadow: 0 4px 0 rgba(90, 55, 140, 0.32), 0 8px 18px rgba(45, 36, 23, 0.18);
+}
 .pf-fbtn.is-remove {
   background: linear-gradient(180deg, #fffefa 0%, #f2e6cd 100%); color: var(--ink);
   box-shadow: 0 4px 0 rgba(45, 36, 23, 0.14), 0 8px 18px rgba(45, 36, 23, 0.14);
@@ -1463,6 +1467,19 @@ export function openProfile(game, playerId) {
       return;
     }
     if (who.bot) return; // bots keep no address book, and that is fine
+    // Whispers need no account on either side: any online capy can be
+    // messaged. Prefills "/w Name " in the chat box and closes the card.
+    if (who.name && game.net?.connected) {
+      const msg = elm('button', 'pf-fbtn is-msg', 'Message');
+      msg.type = 'button';
+      msg.title = `Whisper ${who.name} privately (/w in chat)`;
+      msg.addEventListener('click', () => {
+        close();
+        const input = document.getElementById('chat-input');
+        if (input) { input.value = `/w ${who.name} `; input.focus(); }
+      });
+      actionsEl.appendChild(msg);
+    }
     if (!who.loaded) {
       if (!game.net?.connected) {
         actionsEl.appendChild(note('Friends need a connection to the cove. Yours will come back on its own.'));
