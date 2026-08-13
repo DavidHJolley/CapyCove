@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import * as postfx from './postfx.js';
 import { disposeObject } from './materials.js';
 import { createAvatar } from '../player/avatar.js';
 import { WalkController } from '../player/controller.js';
@@ -53,6 +54,9 @@ export class Engine {
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 300);
+    // Post chain (bloom + grade). If it can't build (old GPU), _tick keeps the
+    // plain renderer.render path: postfx.render() returns false forever.
+    postfx.init(this.renderer, null, this.camera);
     this.camDefault = { offset: new THREE.Vector3(0, 14, 19), lookHeight: 1 };
     this.camCfg = { offset: this.camDefault.offset, lookHeight: this.camDefault.lookHeight };
     this.camTarget = new THREE.Vector3();
@@ -109,6 +113,7 @@ export class Engine {
   _resize() {
     const w = innerWidth, h = innerHeight;
     this.renderer.setSize(w, h);
+    postfx.resize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     // whole-room framing depends on the aspect: a tall phone window has to pull
@@ -146,7 +151,8 @@ export class Engine {
     pending.catch(() => {}); // handled in the timer; this only silences an orphaned reject
 
     const fade = document.getElementById('fade');
-    fade.classList.add('on');
+    this._irisClose(fade); // soft iris wipe closing on the player (adds .on)
+    this.game.audio?.play?.('whoosh');
 
     this._switchTimer = setTimeout(async () => {
       this._switchTimer = null;
@@ -155,7 +161,7 @@ export class Engine {
         RoomClass = await pending;
       } catch (e) {
         console.error(`[engine] failed to load room '${id}':`, e);
-        if (seq === this._switchSeq) { this._pendingRoom = null; fade.classList.remove('on'); }
+        if (seq === this._switchSeq) { this._pendingRoom = null; this._irisReset(fade); }
         return;
       }
       if (seq !== this._switchSeq) return; // superseded while loading
@@ -167,6 +173,7 @@ export class Engine {
       this.room.build(this.scene, this.game);
       if (!this.room.groundMeshes?.length) console.warn(`[engine] room '${id}' has no groundMeshes`);
       this.scene.add(this.remoteGroup);
+      postfx.setScene(this.scene, this.camera);
 
       const spawn = this.room.getSpawn(fromId);
       this.playerAvatar.group.position.copy(spawn);
@@ -198,8 +205,83 @@ export class Engine {
         try { this.room.onClock(c.dayT, c.weather, c.aurora, c); }
         catch (e) { console.error('[engine] onClock:', e); }
       }
-      fade.classList.remove('on');
+      this._irisOpen(fade); // iris opens from the arrival spawn, then clears .on
     }, 220);
+  }
+
+  // ---- iris wipe -----------------------------------------------------------
+  /** Room switches wipe with a soft iris: a radial mask on the #fade div
+   *  closes on the player's screen position, then opens from the arrival
+   *  spawn (~0.45s total). Browsers without @property support (no registered
+   *  --iris-r to transition) keep the old plain opacity fade: the CSS
+   *  degrades to it under prefers-reduced-motion too. */
+  _irisOk() {
+    if (this._irisOkCache === undefined) {
+      this._irisOkCache = typeof CSS !== 'undefined' && typeof CSS.registerProperty === 'function';
+    }
+    return this._irisOkCache;
+  }
+
+  /** World position -> CSS pixels, or null when it projects off-screen. */
+  _screenXY(pos, yOff = 0) {
+    const v = new THREE.Vector3(pos.x, pos.y + yOff, pos.z).project(this.camera);
+    if (!(v.z > -1 && v.z < 1)) return null;
+    return { x: (v.x * 0.5 + 0.5) * innerWidth, y: (-v.y * 0.5 + 0.5) * innerHeight };
+  }
+
+  /** Radius that covers the whole viewport from (x, y). */
+  _coverR(x, y) {
+    return Math.ceil(Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y))) + 2;
+  }
+
+  _irisClose(fade) {
+    if (this._irisTimer) { clearTimeout(this._irisTimer); this._irisTimer = null; }
+    fade.classList.add('on');
+    if (!this._irisOk()) return; // plain opacity fade
+    const p = this.playerAvatar?.group?.position;
+    const at = (p && this.scene) ? this._screenXY(p, 1) : null;
+    const x = at ? at.x : innerWidth / 2;
+    const y = at ? at.y : innerHeight / 2;
+    fade.classList.add('iris');
+    // plant the start state (fully open at the player) without transitioning
+    fade.style.transition = 'none';
+    fade.style.setProperty('--iris-x', `${x}px`);
+    fade.style.setProperty('--iris-y', `${y}px`);
+    fade.style.setProperty('--iris-r', `${this._coverR(x, y)}px`);
+    void fade.offsetWidth; // commit it
+    fade.style.transition = '';
+    fade.style.setProperty('--iris-r', '0px'); // ...then close on them
+  }
+
+  _irisOpen(fade) {
+    if (!fade.classList.contains('iris')) { fade.classList.remove('on'); return; }
+    // aim the camera the way the first visible frame will, so the spawn
+    // projects where it will actually appear (both camera modes start here)
+    this.camera.lookAt(this._lookNow);
+    this.camera.updateMatrixWorld(true);
+    const p = this.playerAvatar?.group?.position;
+    const at = p ? this._screenXY(p, 1) : null;
+    const x = at ? at.x : innerWidth / 2;
+    const y = at ? at.y : innerHeight / 2;
+    fade.style.setProperty('--iris-x', `${x}px`);
+    fade.style.setProperty('--iris-y', `${y}px`);
+    void fade.offsetWidth;
+    fade.style.setProperty('--iris-r', `${this._coverR(x, y)}px`);
+    this._irisTimer = setTimeout(() => { this._irisTimer = null; this._irisReset(fade); }, 260);
+  }
+
+  /** Back to the resting state with no flash: opacity snaps to 0 while .iris
+   *  still zeroes the opacity transition, THEN the gradient class goes. */
+  _irisReset(fade) {
+    if (this._irisTimer) { clearTimeout(this._irisTimer); this._irisTimer = null; }
+    fade.classList.remove('on');
+    if (!fade.classList.contains('iris')) return;
+    void fade.offsetWidth; // recalc at opacity 0 before restoring the 0.22s fade
+    fade.classList.remove('iris');
+    fade.style.removeProperty('--iris-x');
+    fade.style.removeProperty('--iris-y');
+    fade.style.removeProperty('--iris-r');
+    fade.style.transition = '';
   }
 
   /** Called by the net client on every 'clock' frame. The full frame rides as
@@ -230,6 +312,7 @@ export class Engine {
     this.scene = new THREE.Scene();
     this.room.build(this.scene, this.game);
     this.scene.add(this.remoteGroup);
+    postfx.setScene(this.scene, this.camera);
 
     this.playerAvatar.group.position.copy(pos);
     this.playerAvatar.group.rotation.y = rot;
@@ -397,7 +480,7 @@ export class Engine {
           if (this.roomAge > 0.4 && d > radius + 0.75) h.__armed = true;
         } else if (!h.__fired && d <= radius * 0.8 && this.roomAge > 1.2 && !this.game.activeMinigame) {
           h.__fired = true;
-          this.game.audio?.play?.('whoosh');
+          // no whoosh here: switchRoom plays it with the iris wipe
           h.action(this.game);
           continue;
         }
@@ -577,7 +660,9 @@ export class Engine {
         this.camera.lookAt(this._lookNow);
       }
 
-      this.renderer.render(this.scene, this.camera);
+      // post chain (bloom + grade); falls back to the plain render if the
+      // chain could not build or a pass throws (postfx.render returns false)
+      if (!postfx.render(dt)) this.renderer.render(this.scene, this.camera);
       this._updateOverlays();
       this._updateHotspots();
     }

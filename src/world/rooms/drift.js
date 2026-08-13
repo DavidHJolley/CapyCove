@@ -726,8 +726,11 @@ export class DriftRoom extends Room {
       lookHeight: CAM.swimLook,
     };
     this.staticCamera = {
-      position: new THREE.Vector3(0, 15, 34),
-      lookAt: new THREE.Vector3(0, 7.5, -4),
+      // In FRONT of the dive bell (z = 21): from the old vantage at z = 34 the
+      // bell's cable ran top-to-bottom through dead centre of the whole-room
+      // frame. Any z behind the bell puts the cable back across the lens.
+      position: new THREE.Vector3(0, 15, 20),
+      lookAt: new THREE.Vector3(0, 7.5, -6),
     };
     this._exit = {
       id: 'exit-beach',

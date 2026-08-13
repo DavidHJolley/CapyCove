@@ -1,4 +1,5 @@
 import './styles.css';
+import * as THREE from 'three';
 import { game } from './core/game.js';
 import { Engine } from './core/engine.js';
 import { NetClient } from './net/client.js';
@@ -100,6 +101,98 @@ addEventListener('keydown', (e) => {
   if (e.key === 'Enter') document.getElementById('chat-input')?.focus();
 });
 
+/**
+ * Cinematic arrival: a ~2.5s establishing swoop from high above the room's
+ * static vantage down into the normal follow camera behind the spawn. Driven
+ * entirely from outside the engine: we flip `engine.cameraMode` to 'static',
+ * zero `_camEase`, and rewrite `engine._staticCam` every frame along our own
+ * path (the engine's static branch copies from it before each render), then
+ * hand back the player's saved camera mode. Skippable with any click/keypress;
+ * `onLanded` fires exactly once (land or bail) so held UI can be released.
+ */
+function startArrivalSwoop(onLanded) {
+  const SWOOP_MS = 2500;
+  const savedMode = engine.cameraMode; // restore after the swoop
+  let phase = 'wait'; // wait (room still building) -> fly -> done
+  let rafId = 0;
+  let t0 = 0;
+  const waitStart = performance.now();
+  const startPos = new THREE.Vector3();
+  const startLook = new THREE.Vector3();
+  const endPos = new THREE.Vector3();
+  const endLook = new THREE.Vector3();
+  // the engine reads these two by reference every frame; we mutate in place
+  const pos = new THREE.Vector3();
+  const look = new THREE.Vector3();
+
+  const onSkip = () => land();
+
+  function land() {
+    if (phase === 'done') return;
+    phase = 'done';
+    cancelAnimationFrame(rafId);
+    removeEventListener('pointerdown', onSkip, true);
+    removeEventListener('keydown', onSkip, true);
+    engine.cameraMode = savedMode === 'static' ? 'static' : 'follow';
+    const p = engine.playerAvatar?.group?.position;
+    if (engine.cameraMode === 'static') {
+      // recompute the room's real vantage and glide there from wherever we are
+      if (engine.room) engine._resolveStaticCam(true);
+    } else if (p) {
+      // park exactly on the follow vantage so the takeover has no snap
+      engine.camTarget.copy(p);
+      engine.camera.position.copy(p).add(engine.camCfg.offset);
+    }
+    onLanded?.();
+  }
+
+  addEventListener('pointerdown', onSkip, true);
+  addEventListener('keydown', onSkip, true);
+
+  function frame() {
+    if (phase === 'done') return;
+    rafId = requestAnimationFrame(frame);
+    const now = performance.now();
+    if (phase === 'wait') {
+      // switchRoom builds the scene behind a 220ms fade; poll until it lands
+      if (engine.scene && engine.room && engine.playerAvatar && engine._staticCam) {
+        // start: the room's static vantage pulled back 1.5x and lifted 15deg
+        const base = engine._staticCam;
+        startLook.copy(base.lookAt);
+        const off = base.position.clone().sub(base.lookAt);
+        const sph = new THREE.Spherical().setFromVector3(off);
+        sph.radius *= 1.5;
+        sph.phi = Math.max(0.12, sph.phi - THREE.MathUtils.degToRad(15));
+        startPos.copy(startLook).add(off.setFromSpherical(sph));
+        pos.copy(startPos);
+        look.copy(startLook);
+        engine.cameraMode = 'static';
+        engine._camEase = 0; // the engine copies _staticCam verbatim at ease 0
+        engine._staticCam = { position: pos, lookAt: look };
+        t0 = now;
+        phase = 'fly';
+      } else if (now - waitStart > 6000) {
+        land(); // the room never built (load error): give the camera back
+      }
+      return;
+    }
+    // a mid-swoop room change replaces _staticCam (switchRoom re-resolves it);
+    // if ours is gone, stop driving and hand the camera back cleanly
+    if (engine._staticCam?.position !== pos) { land(); return; }
+    const u = Math.min(1, (now - t0) / SWOOP_MS);
+    const k = u * u * (3 - 2 * u); // smoothstep
+    // the destination tracks the LIVE player: walking during the swoop still
+    // lands the camera exactly behind them, so control feels instant at touchdown
+    const p = engine.playerAvatar.group.position;
+    endPos.copy(p).add(engine.camCfg.offset);
+    endLook.set(p.x, p.y + engine.camCfg.lookHeight, p.z);
+    pos.lerpVectors(startPos, endPos, k);
+    look.lerpVectors(startLook, endLook, k);
+    if (u >= 1) land();
+  }
+  rafId = requestAnimationFrame(frame);
+}
+
 function enterWorld(auth) {
   audio.init();
   engine.createPlayer();
@@ -110,7 +203,18 @@ function enterWorld(auth) {
   initFriendsButton(game);
   net.connect(auth);
   engine.start();
+  // Hold every toast (the room-name banner rides the 'room' event via
+  // game.toast) until the arrival swoop lands, so the UI beat syncs with the
+  // camera touchdown instead of firing over the establishing shot.
+  const held = [];
+  const wrappedToast = (msg, ms) => { held.push([msg, ms]); };
+  game.toast = wrappedToast;
+  const releaseToasts = () => {
+    if (game.toast === wrappedToast) delete game.toast; // back to the prototype method
+    for (const [msg, ms] of held.splice(0)) game.toast(msg, ms);
+  };
   game.goToRoom(DEFAULT_ROOM, null);
+  startArrivalSwoop(releaseToasts);
   audio.play('success');
 }
 

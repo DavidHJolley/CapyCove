@@ -111,8 +111,23 @@ export function showTitle(game, onEnter) {
     if (entered) return;
     entered = true;
     goBtn.disabled = true;
-    el.classList.add('fade-out');
-    setTimeout(() => el.remove(), 450);
-    onEnter(auth);
+    // 0.3s press-confirm (squash -> pop + gold glow) before the fade, so the
+    // handoff into the arrival swoop reads as an authored beat, not a cut.
+    // WAAPI keeps this self-contained; if it is unavailable, fall through now.
+    let delay = 0;
+    try {
+      goBtn.animate([
+        { transform: 'scale(1)', boxShadow: '0 0 0 0 rgba(242, 182, 74, 0)' },
+        { transform: 'scale(0.9)', boxShadow: '0 0 18px 4px rgba(242, 182, 74, 0.9)', offset: 0.35 },
+        { transform: 'scale(1.12)', boxShadow: '0 0 30px 8px rgba(242, 182, 74, 0.95)', offset: 0.7 },
+        { transform: 'scale(1.04)', boxShadow: '0 0 22px 6px rgba(242, 182, 74, 0.55)' },
+      ], { duration: 300, easing: 'cubic-bezier(0.2, 1.35, 0.4, 1)', fill: 'forwards' });
+      delay = 300;
+    } catch { /* no WAAPI: skip straight to the fade */ }
+    setTimeout(() => {
+      el.classList.add('fade-out');
+      setTimeout(() => el.remove(), 450);
+      onEnter(auth);
+    }, delay);
   }
 }

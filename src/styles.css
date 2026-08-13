@@ -53,12 +53,33 @@ body { font-family: var(--font); color: var(--ink); background: #1c2733; }
 ::-webkit-scrollbar-thumb:hover { background: #c4a97a; background-clip: padding-box; }
 ::-webkit-scrollbar-corner { background: transparent; }
 
-/* fade between rooms */
+/* fade between rooms. Base is the plain opacity fade; the engine upgrades a
+   room switch to a soft iris wipe by adding .iris and driving --iris-x/y/r
+   (close on the leaving player, open from the arrival spawn). --iris-r is
+   registered so the radius itself transitions. Browsers without @property
+   simply never get .iris and keep this fade. */
+@property --iris-r {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 4000px;
+}
 .fade {
   position: absolute; inset: 0; background: #14202c; opacity: 0;
   pointer-events: none; transition: opacity 0.22s ease; z-index: 60;
 }
 .fade.on { opacity: 1; }
+.fade.iris {
+  transition: --iris-r 0.22s cubic-bezier(0.45, 0.05, 0.35, 1), opacity 0s;
+  background: radial-gradient(
+    circle at var(--iris-x, 50%) var(--iris-y, 50%),
+    rgba(20, 32, 44, 0) calc(var(--iris-r) * 0.8),
+    #14202c var(--iris-r)
+  );
+}
+@media (prefers-reduced-motion: reduce) {
+  /* the iris is spatial motion: collapse it back to the plain opacity fade */
+  .fade.iris { background: #14202c; transition: opacity 0.22s ease; }
+}
 
 /* ---------- world-anchored overlays ---------- */
 #overlay-root { position: absolute; inset: 0; pointer-events: none; z-index: 20; }

@@ -4,6 +4,10 @@
 //   audio.init()          - call once after a user gesture
 //   audio.play(name)      - one-shot sfx: click, coin, step, splash, whoosh,
 //                           success, fail, pop, ding (+ extras, see SFX below)
+//                           play('step', surface?) picks a footstep voice for
+//                           wood/sand/snow/stone/grass; with no surface given
+//                           it is inferred from the current room id, so the
+//                           existing play('step') call sites need no change.
 //   audio.setRoom(roomId) - crossfade the generative music bed to that room
 //                           (one bed per room id in TRACKS: plaza, beach, peak,
 //                           cafe, club, lounge, mine, jungle, drift; any other
@@ -26,7 +30,7 @@ const VERB_LEVEL = 0.42;
 
 const TICK_MS = 90;        // scheduler wake-up
 const LOOKAHEAD = 0.28;    // seconds of notes queued ahead of the clock
-const CROSSFADE = 1.0;     // room-to-room music fade, seconds
+const CROSSFADE = 1.5;     // room-to-room music fade, seconds
 
 // ------------------------------------------------------------ graph state ---
 
@@ -44,6 +48,7 @@ let muted = false;
 let currentRoom = null;
 let tracks = [];        // live music tracks (usually 1, briefly 2 while fading)
 let schedTimer = null;
+let stepPans = null;    // [left, right] persistent footstep panners
 
 // ------------------------------------------------------------- utilities ----
 
@@ -136,6 +141,10 @@ function ensure() {
   sfxWet = ctx.createGain(); sfxWet.connect(sfxBus);
   const wetSend = ctx.createGain(); wetSend.gain.value = 0.34;
   sfxWet.connect(wetSend); wetSend.connect(convolver);
+
+  // Persistent left/right footstep destinations: steps alternate between them
+  // so a walk cycle sways gently instead of stacking dead centre.
+  stepPans = [panNode(sfxDry, -0.16), panNode(sfxDry, 0.16)];
 
   if (ctx.state === 'suspended') ctx.resume().catch(() => {});
 
@@ -486,6 +495,7 @@ function destroyTrack(tr) {
   tr.sources.length = 0;
   try { tr.out.disconnect(); } catch { /* noop */ }
   try { tr.send.disconnect(); } catch { /* noop */ }
+  try { tr.pan?.disconnect(); } catch { /* noop */ }
 }
 
 function startTrack(id) {
@@ -495,16 +505,37 @@ function startTrack(id) {
 
   const out = ctx.createGain();
   out.gain.setValueAtTime(0.0001, t0);
-  out.connect(musicBus);
+
+  const tr = {
+    id, out, send: null, pan: null, sources: [], step: 0, nextTime: t0 + 0.14,
+    dying: false, deadAt: null, stepDur: 0.125, onStep: () => {},
+  };
+
+  // Slow stereo drift so the bed breathes: an LFO wobbles the whole track
+  // +-0.15 across ~30-50s. One panner + one oscillator per track, reaped with
+  // the track in destroyTrack.
+  if (ctx.createStereoPanner) {
+    const pan = ctx.createStereoPanner();
+    pan.pan.value = 0;
+    pan.connect(musicBus);
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = rnd(0.02, 0.034);
+    const amt = ctx.createGain();
+    amt.gain.value = 0.15;
+    lfo.connect(amt); amt.connect(pan.pan);
+    lfo.start(t0);
+    out.connect(pan);
+    tr.pan = pan;
+    tr.sources.push(lfo);
+  } else {
+    out.connect(musicBus);
+  }
 
   const send = ctx.createGain();
   send.gain.value = 0.4;
   send.connect(convolver);
-
-  const tr = {
-    id, out, send, sources: [], step: 0, nextTime: t0 + 0.14,
-    dying: false, deadAt: null, stepDur: 0.125, onStep: () => {},
-  };
+  tr.send = send;
 
   let spec;
   try {
@@ -1479,11 +1510,66 @@ TRACKS.drift = (tr) => {
 
 let comboN = 0;
 let comboAt = -99;
+let coinStreak = 0;
+let coinAt = -99;
+// Semitone offsets up the major scale for coin streaks (3rd coin onward).
+const COIN_LADDER = [2, 4, 5, 7, 9, 11, 12, 14, 16, 17];
 const lastPlayed = Object.create(null);
 const MIN_GAP = { step: 0.075, click: 0.022, tick: 0.018, hover: 0.05, coin: 0.028, pop: 0.028 };
 
 // Sounds that want to ring out in the room rather than sit in the player's face.
 const WET_SFX = new Set(['ding', 'chime', 'success', 'levelup', 'unlock', 'sparkle', 'buy']);
+
+// Chat-adjacent notifications duck the music bed -6dB for a beat so the ping
+// reads clearly over whatever the room is playing.
+const DUCK_SFX = new Set(['pop', 'ding', 'chime']);
+
+// ------------------------------------------------------------- footsteps ----
+
+// Which ground a room puts underfoot. Dynamic 'house:<owner>' rooms are wood
+// (handled in roomSurfaceKey); anything unknown falls back to stone.
+const STEP_SURFACE = {
+  cafe: 'wood', lounge: 'wood', house: 'wood',
+  beach: 'sand',
+  peak: 'snow',
+  mine: 'stone', club: 'stone', drift: 'stone',
+  plaza: 'grass', jungle: 'grass',
+};
+
+function roomSurfaceKey() {
+  if (!currentRoom) return 'plaza';
+  return currentRoom.startsWith('house:') ? 'house' : currentRoom;
+}
+
+let stepSide = 0; // alternates L/R per step
+
+// One short voice per surface: a body tone plus a filtered noise burst,
+// everything scaled by the per-step pitch factor `p`.
+const STEP_VOICES = {
+  wood(d, t, p) {
+    tone(d, t, { type: 'sine', f0: 155 * p, f1: 82 * p, dur: 0.07, vol: 0.13, a: 0.003 });
+    noise(d, t, { dur: 0.045, vol: 0.055, type: 'bandpass', freq: 1150 * p, q: 1.3, sweep: 0.55, rate: 0.85 });
+  },
+  sand(d, t, p) {
+    tone(d, t, { type: 'sine', f0: 108 * p, f1: 66 * p, dur: 0.06, vol: 0.075, a: 0.004 });
+    noise(d, t, { dur: 0.095, vol: 0.07, type: 'lowpass', freq: 1600 * p, q: 0.7, sweep: 0.4, rate: 0.72 });
+    noise(d, t + 0.035, { dur: 0.045, vol: 0.03, type: 'bandpass', freq: 2400 * p, q: 1, sweep: 0.6, rate: 0.8 });
+  },
+  snow(d, t, p) {
+    tone(d, t, { type: 'sine', f0: 125 * p, f1: 72 * p, dur: 0.06, vol: 0.085, a: 0.004 });
+    noise(d, t, { dur: 0.08, vol: 0.08, type: 'bandpass', freq: 2300 * p, q: 0.8, sweep: 0.5, rate: 1.05 });
+    noise(d, t + 0.022, { dur: 0.035, vol: 0.045, type: 'bandpass', freq: 3100 * p, q: 1.2, sweep: 0.55, rate: 1.2 });
+  },
+  stone(d, t, p) {
+    tone(d, t, { type: 'sine', f0: 165 * p, f1: 84 * p, dur: 0.055, vol: 0.11, a: 0.002 });
+    noise(d, t, { dur: 0.032, vol: 0.06, type: 'bandpass', freq: 2500 * p, q: 1.4, sweep: 0.6 });
+    noise(d, t, { dur: 0.012, vol: 0.025, type: 'highpass', freq: 5200 });
+  },
+  grass(d, t, p) {
+    tone(d, t, { type: 'sine', f0: 118 * p, f1: 70 * p, dur: 0.06, vol: 0.095, a: 0.004 });
+    noise(d, t, { dur: 0.065, vol: 0.05, type: 'bandpass', freq: 1900 * p, q: 0.9, sweep: 0.6, rate: 1.15 });
+  },
+};
 
 const SFX = {
   click(d, t) {
@@ -1498,10 +1584,14 @@ const SFX = {
     noise(d, t, { dur: 0.012, vol: 0.09, type: 'highpass', freq: 5200 });
     tone(d, t, { type: 'square', f0: 2400, dur: 0.015, vol: 0.04, a: 0.001 });
   },
-  step(d, t) {
-    const p = rnd(0.9, 1.12);
-    tone(d, t, { type: 'sine', f0: 128 * p, f1: 74 * p, dur: 0.075, vol: 0.14, a: 0.003 });
-    noise(d, t, { dur: 0.045, vol: 0.05, type: 'lowpass', freq: 900 * p, q: 0.8, sweep: 0.5, rate: 0.8 });
+  step(d, t, surface) {
+    // Alternate the persistent L/R panners so a walk cycle sways; fall back to
+    // the plain dry bus if StereoPannerNode is unavailable.
+    stepSide ^= 1;
+    const out = stepPans ? stepPans[stepSide] : d;
+    const p = rnd(0.92, 1.1); // subtle per-step pitch variance
+    const fn = STEP_VOICES[surface] || STEP_VOICES[STEP_SURFACE[roomSurfaceKey()] || 'stone'];
+    fn(out, t, p);
   },
   jump(d, t) {
     tone(d, t, { type: 'triangle', f0: 320, f1: 780, dur: 0.13, vol: 0.16, a: 0.004 });
@@ -1516,11 +1606,18 @@ const SFX = {
     noise(d, t, { dur: 0.1, vol: 0.08, type: 'lowpass', freq: 700, sweep: 0.4 });
   },
   coin(d, t) {
-    const base = 1046.5;
+    // Streak stinger: 3+ coins within 2s of each other walk the pickup up the
+    // major scale, so a run of coins turns into a little ascending melody.
+    if (t - coinAt > 2) coinStreak = 0;
+    coinAt = t;
+    coinStreak++;
+    const up = coinStreak >= 3 ? COIN_LADDER[Math.min(coinStreak - 3, COIN_LADDER.length - 1)] : 0;
+    const base = 1046.5 * Math.pow(2, up / 12);
     tone(d, t, { type: 'square', f0: base, dur: 0.06, vol: 0.09, a: 0.002 });
     tone(d, t + 0.058, { type: 'square', f0: base * 1.5, dur: 0.16, vol: 0.085, a: 0.002 });
     tone(d, t + 0.058, { type: 'sine', f0: base * 3, dur: 0.2, vol: 0.045, a: 0.002 });
     noise(d, t, { dur: 0.03, vol: 0.045, type: 'highpass', freq: 6000 });
+    if (up >= 12) bell(sfxWet, t + 0.06, 96 + (up - 12), { vol: 0.07, dur: 1.2 }); // topped out: a glint
   },
   buy(d, t) {
     SFX.coin(d, t);
@@ -1618,6 +1715,47 @@ SFX.select = SFX.click;
 SFX.chime = SFX.ding;
 SFX.catch = SFX.pop;
 
+/** Pull the music bed down ~6dB for a beat, then ease it back. Reuses the one
+ *  musicBus gain param: no nodes are created. */
+function duckMusic(t) {
+  if (!musicBus) return;
+  const g = musicBus.gain;
+  g.cancelScheduledValues(t);
+  g.setValueAtTime(Math.max(0.0001, g.value), t);
+  g.linearRampToValueAtTime(MUSIC_LEVEL * 0.5, t + 0.05);
+  g.setValueAtTime(MUSIC_LEVEL * 0.5, t + 0.35);
+  g.linearRampToValueAtTime(MUSIC_LEVEL, t + 0.9);
+}
+
+// -------------------------------------------------------- room-enter chord --
+
+// A gentle ~0.8s arrival chord per room, voiced in that bed's own key so it
+// resolves straight into the music that is fading up underneath it.
+const ROOM_CHORDS = {
+  plaza: [60, 64, 67, 72],  // C
+  beach: [53, 60, 65, 69],  // F
+  peak: [57, 64, 71, 76],   // Am9
+  cafe: [53, 60, 64, 69],   // Fmaj7
+  club: [57, 60, 64, 67],   // Am7
+  lounge: [55, 62, 66, 71], // Gmaj7
+  mine: [50, 57, 62, 65],   // Dm
+  jungle: [52, 59, 64, 67], // Em7
+  drift: [50, 57, 62, 66],  // Dmadd9-ish, watery
+};
+
+function roomChord(id) {
+  if (muted || !ctx) return;
+  const chord = ROOM_CHORDS[id];
+  if (!chord) return;
+  const t = ctx.currentTime + 0.06;
+  try {
+    chord.forEach((n, i) => {
+      rhodes(sfxWet, t + i * 0.035, n, { vol: 0.085 - i * 0.012, dur: 0.8 });
+    });
+    bell(sfxWet, t + 0.12, chord[chord.length - 1] + 12, { vol: 0.045, dur: 1.1 });
+  } catch { /* an arrival flourish must never block the room switch */ }
+}
+
 // ================================================================= PUBLIC ====
 
 export const audio = {
@@ -1628,8 +1766,9 @@ export const audio = {
     ensure();
   },
 
-  /** Fire a one-shot sound effect. Unknown names are ignored. */
-  play(name) {
+  /** Fire a one-shot sound effect. Unknown names are ignored. The optional
+   *  second argument is sfx-specific ('step' takes a surface name). */
+  play(name, arg) {
     if (muted) return;
     if (!ensure()) return;
     const fn = SFX[name];
@@ -1639,7 +1778,8 @@ export const audio = {
     if (t - (lastPlayed[name] ?? -99) < gap) return;
     lastPlayed[name] = t;
     try {
-      fn(WET_SFX.has(name) ? sfxWet : sfxDry, t + 0.001);
+      fn(WET_SFX.has(name) ? sfxWet : sfxDry, t + 0.001, arg);
+      if (DUCK_SFX.has(name)) duckMusic(t);
     } catch { /* a dropped sfx must never break gameplay */ }
   },
 
@@ -1649,10 +1789,12 @@ export const audio = {
   setRoom(roomId) {
     const id = roomId || null;
     if (id === currentRoom && tracks.some((t) => !t.dying && t.id === id)) return;
+    const changed = id !== currentRoom;
     currentRoom = id;
     if (!ctx) return; // init() will start it
     fadeOutAll();
     if (id && TRACKS[id]) startTrack(id);
+    if (changed) roomChord(id);
   },
 
   /** Instant kill / restore of all output. Returns the new muted state. */

@@ -1570,7 +1570,10 @@ export class MineRoom extends Room {
     const nx = -6.4;
     const nz = 9.4;
     for (const s of [-1, 1]) {
-      part(p, new THREE.CylinderGeometry(0.09, 0.11, 2.3, 7), C.woodDark, { x: nx + s * 0.85, y: 1.15, z: nz });
+      // posts sit a step NORTH of the face: at z = nz their 0.11 radius poked
+      // 0.09 through the sign plane (nz + 0.02) and guillotined the title's
+      // edge letters from the play camera (seen: "HE GLIMMER MIN")
+      part(p, new THREE.CylinderGeometry(0.09, 0.11, 2.3, 7), C.woodDark, { x: nx + s * 0.85, y: 1.15, z: nz - 0.18 });
     }
     part(p, new THREE.BoxGeometry(2.15, 1.15, 0.1), C.woodDark, { x: nx, y: 1.85, z: nz - 0.06 });
     this.obstacles.push({ x: nx, z: nz, r: 0.9 });

@@ -2723,13 +2723,16 @@ export class PeakRoom extends Room {
     }
 
     // ---- the board over the lintel -----------------------------------------
-    part(solid, new THREE.BoxGeometry(2.5, 1.14, 0.12), C.woodDark, { y: H + 1.42, z: -0.16 });
+    // z was -0.16, i.e. BEHIND the doorway plane and buried in the mountain:
+    // the whole board rendered as a dark slab inside the rock. The frame lives
+    // at z 0.02-0.34, so the sign mounts proud of it at 0.24.
+    part(solid, new THREE.BoxGeometry(2.5, 1.14, 0.12), C.woodDark, { y: H + 1.42, z: 0.24 });
     part(solid, new THREE.BoxGeometry(2.6, 0.12, 0.26), C.snowLit, { y: H + 2.04, z: -0.14 });
     for (const s of [-1, 1]) {
-      part(solid, new THREE.SphereGeometry(0.09, 8, 6), C.gold, { x: s * 1.08, y: H + 1.42, z: -0.09 });
+      part(solid, new THREE.SphereGeometry(0.09, 8, 6), C.gold, { x: s * 1.08, y: H + 1.42, z: 0.31 });
     }
     const board = new THREE.Mesh(new THREE.PlaneGeometry(2.38, 1.08), texMat(mineSignTexture()));
-    board.position.set(0, H + 1.42, -0.09);
+    board.position.set(0, H + 1.42, 0.31);
     g.add(board);
 
     // ---- rails running out of the mouth, ending in the drift ---------------

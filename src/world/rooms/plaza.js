@@ -1299,6 +1299,10 @@ export class PlazaRoom extends Room {
     put(g, new THREE.BoxGeometry(0.1, 0.1, 1.6), iron, fw - 0.6, 3.5, 3.05, { cast: false });
     put(g, new THREE.CylinderGeometry(0.04, 0.04, 0.55, 5), iron, fw - 0.6, 3.24, 3.75, { cast: false });
     put(g, new THREE.CircleGeometry(0.62, 20), glowMap(hatSignTex()), fw - 0.6, 2.68, 3.78, { cast: false });
+    // decorated back: from the fountain walk the single-faced sign showed a bare
+    // edge floating off the bracket (DESIGN.md: backs are slabs, never voids)
+    put(g, new THREE.CircleGeometry(0.64, 20), makeToon(C.coral), fw - 0.6, 2.68, 3.765,
+      { rot: [0, Math.PI, 0], cast: false });
 
     // outdoor stall against the shop front, hats on display
     const sx = -3.6, sz = -2.6;

@@ -385,7 +385,9 @@ function texChalk() {
     g.textAlign = 'left';
     g.font = `30px ${CHALK_FONT}`;
     MENU.forEach(([name, price], i) => {
-      const y = 138 + i * 34;
+      // 130 + 30/row (was 138 + 34): the fifth row used to land on top of the
+      // 'free refill' footer line at h-34
+      const y = 130 + i * 30;
       g.fillStyle = i % 2 ? '#ffe8b8' : '#f4f8ec';
       g.fillText(name, 74, y + (i % 2 ? 1 : -1));
       g.fillText('.'.repeat(Math.max(2, 26 - name.length)), 74 + 250, y);
@@ -1174,7 +1176,10 @@ export class CafeRoom extends Room {
 
     // --- menu chalkboard ----------------------------------------------------
     const board = new THREE.Mesh(new THREE.PlaneGeometry(6.4, 2.2), toonMap(texChalk()));
-    board.position.set(0, 2.75, ZN + 0.06);
+    // 0.09, not 0.06: the frame box behind it is 0.1 deep centred at ZN+0.02,
+    // so its front face lands at ZN+0.07 and used to swallow the chalk face
+    // entirely (the menu shipped as a blank brown slab)
+    board.position.set(0, 2.75, ZN + 0.09);
     scene.add(board);
     boxFlat.add(PAL.wood, 0, 2.75, ZN + 0.02, 6.9, 2.7, 0.1);
     boxFlat.add(PAL.woodLight, 0, 1.55, ZN + 0.14, 6.9, 0.14, 0.24); // chalk ledge
