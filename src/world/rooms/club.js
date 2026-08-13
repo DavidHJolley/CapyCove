@@ -227,11 +227,13 @@ export class ClubRoom extends Room {
     scene.fog = new THREE.FogExp2(0x110a20, 0.017);
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11, 15), lookHeight: 1 };
-    // Static camera: steeper than the other rooms on purpose. Anything at the
-    // usual 3/4 elevation looks straight through the stalactite curtain, which
-    // slashes the neon sign, the DJ and the LED floor into ribbons; from up here
-    // the drips foreshorten to their own footprints and the grotto reads whole.
-    this.staticCamera = { position: new THREE.Vector3(-4, 31, 12), lookAt: new THREE.Vector3(-0.5, 0.8, -3) };
+    // Static camera: a 3/4 vantage like every other room. The old near-vertical
+    // one (y=31 over z=12) kept the stalactites off the sign but shrank a dancer
+    // to 12px: from the floor you were looking at a floorplan, not a club. The
+    // fix is the x offset, not the elevation: 2 east threads the gap in the
+    // drip curtain, so the neon sign, the DJ booth and the LED floor all read
+    // whole and a capy on the floor is ~45px. Worst hotspot/spawn NDC 0.56.
+    this.staticCamera = { position: new THREE.Vector3(2, 15, 21), lookAt: new THREE.Vector3(0, 1.4, 0.5) };
 
     this._buildCave(scene);
     this._buildDanceFloor(scene);
@@ -298,25 +300,14 @@ export class ClubRoom extends Room {
 
     const r = rng(20260806);
 
-    // stalactites hanging from the dome (flipped so the point aims down)
-    const dripGeo = faceted(new THREE.ConeGeometry(0.42, 2.4, 6));
-    dripGeo.rotateX(Math.PI);
-    dripGeo.translate(0, -1.2, 0);
-    const drips = new THREE.InstancedMesh(dripGeo, makeToon(PAL.rockDeep), 34);
+    // Stalactites removed (playtester call, 2026-08-07): from every play
+    // camera they crossed the frame as dark blades over the dance floor and
+    // hid dancers. The dome, crystals and floor spikes carry the cave read;
+    // burn the rng draws they consumed so everything placed after them keeps
+    // its seeded spot.
+    // (8 draws each: angle, radius, 3 rotation, 3 scale)
+    for (let i = 0; i < 34 * 8; i++) r();
     const d = this._dummy;
-    for (let i = 0; i < 34; i++) {
-      const a = r() * Math.PI * 2;
-      const rad = 3.5 + r() * 11;
-      const x = Math.cos(a) * rad;
-      const z = Math.sin(a) * rad;
-      const ceil = this._ceilingY(x, z);
-      d.position.set(x, ceil + 0.35, z);
-      d.rotation.set((r() - 0.5) * 0.28, r() * 6.28, (r() - 0.5) * 0.28);
-      d.scale.set(0.5 + r() * 0.9, 0.7 + r() * 2.1, 0.5 + r() * 0.9);
-      d.updateMatrix();
-      drips.setMatrixAt(i, d.matrix);
-    }
-    scene.add(drips);
 
     // stalagmites + boulders around the rim
     const spikeGeo = faceted(new THREE.ConeGeometry(0.55, 2.2, 6));
