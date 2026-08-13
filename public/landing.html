@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Capy Cove — a cozy multiplayer capybara island</title>
+<meta name="description" content="Capy Cove is a free browser game: a cozy multiplayer island where chibi capybaras play ten minigames, furnish their own dens, paint a shared mural and watch the aurora come out. No download." />
+<meta name="theme-color" content="#fff6e3" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Capy Cove — waddle in, stay a while" />
+<meta property="og:description" content="A cozy multiplayer island where capybaras chat, race, fish, decorate and get absolutely nothing done. Free, in your browser." />
+<meta property="og:image" content="/img/hero-plaza.jpg" />
+<meta name="twitter:card" content="summary_large_image" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23e8657a'/%3E%3Cellipse cx='16' cy='19' rx='9' ry='7.5' fill='%23b08a5a'/%3E%3Cellipse cx='16' cy='11' rx='7.5' ry='6.5' fill='%23c9a06b'/%3E%3Ccircle cx='9.5' cy='6.5' r='2.4' fill='%23b08a5a'/%3E%3Ccircle cx='22.5' cy='6.5' r='2.4' fill='%23b08a5a'/%3E%3Ccircle cx='12.8' cy='10.5' r='1.5' fill='%232d2417'/%3E%3Ccircle cx='19.2' cy='10.5' r='1.5' fill='%232d2417'/%3E%3Cellipse cx='16' cy='14.6' rx='3.6' ry='2.6' fill='%23e8b98a'/%3E%3Cellipse cx='16' cy='13.9' rx='1.7' ry='1.1' fill='%232d2417'/%3E%3C/svg%3E" />
+
+<style>
+/* ------------------------------------------------------------------
+   Capy Cove landing page. Self-contained: no external requests, no
+   web fonts, no CDNs. Palette and type stack follow DESIGN.md.
+   ------------------------------------------------------------------ */
+:root{
+  --cream:#fff6e3;
+  --cream-deep:#f7e8c9;
+  --sand:#f0dca0;
+  --ink:#2d2417;
+  --ink-soft:#5c4d38;
+  --coral:#e8657a;
+  --coral-deep:#c94a60;
+  --gold:#f2b64a;
+  --sky:#4fb3e8;
+  --sky-deep:#1f7fb8; /* the sky blue is too light to carry white text (2.2:1) */
+  --leaf:#7ac74f;
+  --night:#2a2038;
+  --shadow:0 14px 34px rgba(45,36,23,.16);
+  --shadow-lift:0 22px 48px rgba(45,36,23,.24);
+  --spring:cubic-bezier(0.2, 1.35, 0.4, 1);
+  --font:"Trebuchet MS","Lucida Grande","Lucida Sans Unicode","Lucida Sans",Tahoma,Verdana,sans-serif;
+  --pad:clamp(20px,5vw,64px);
+  --maxw:1180px;
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+
+body{
+  margin:0;
+  font-family:var(--font);
+  color:var(--ink);
+  background:var(--cream);
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
+}
+
+img{max-width:100%;display:block}
+a{color:var(--coral-deep)}
+
+:focus-visible{
+  outline:3px solid var(--sky);
+  outline-offset:3px;
+  border-radius:12px;
+}
+
+.wrap{width:100%;max-width:var(--maxw);margin:0 auto;padding-inline:var(--pad)}
+/* the gallery gets a decisively wider band so the screenshots read large;
+   anything between this and --maxw just looks like a mistake */
+.wrap-wide{max-width:1440px}
+
+.skip{
+  position:absolute;left:-9999px;top:0;z-index:100;
+  background:var(--cream);color:var(--ink);padding:12px 20px;
+  border-radius:0 0 16px 0;font-weight:700;
+}
+.skip:focus{left:0}
+
+/* ---------- buttons ---------- */
+.btn{
+  display:inline-flex;align-items:center;gap:.55em;
+  font-family:inherit;font-weight:800;text-decoration:none;
+  border-radius:999px;border:3px solid #fff;
+  padding:.72em 1.5em;
+  box-shadow:var(--shadow);
+  transition:transform .28s var(--spring), box-shadow .28s var(--spring), background-color .2s ease;
+  cursor:pointer;
+}
+.btn:hover{transform:translateY(-3px) scale(1.03);box-shadow:var(--shadow-lift)}
+.btn:active{transform:translateY(0) scale(.99)}
+.btn-play{
+  background:var(--coral);color:#fff;
+  font-size:clamp(1.05rem,2.4vw,1.35rem);
+  letter-spacing:.01em;
+  padding:.8em 1.9em;
+}
+.btn-play:hover{background:#f0728a}
+.btn-ghost{
+  background:var(--gold);color:var(--ink);
+  font-size:1rem;
+}
+.btn-ghost:hover{background:#f7c465}
+/* small button text needs the 4.5:1 ratio the lighter brand coral misses */
+.btn-small{padding:.55em 1.2em;font-size:.95rem;background:var(--coral-deep)}
+.btn-small:hover{background:var(--coral)}
+
+/* ---------- top bar ---------- */
+.topbar{
+  position:sticky;top:0;z-index:40;
+  background:rgba(255,246,227,.92);
+  backdrop-filter:blur(8px);
+  border-bottom:2px solid rgba(45,36,23,.08);
+}
+.topbar .wrap{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-block:10px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:1.15rem;letter-spacing:.01em;text-decoration:none;color:var(--ink)}
+.brand svg{flex:none}
+
+/* ---------- hero ---------- */
+.hero{position:relative;isolation:isolate;overflow:hidden;background:var(--night)}
+.hero-img{
+  position:absolute;inset:0;width:100%;height:100%;
+  object-fit:cover;object-position:50% 42%;
+  z-index:-2;
+}
+.hero::after{
+  content:"";position:absolute;inset:0;z-index:-1;
+  background:
+    linear-gradient(180deg, rgba(45,36,23,.40) 0%, rgba(45,36,23,.08) 30%, rgba(45,36,23,.36) 70%, rgba(45,36,23,.80) 100%),
+    linear-gradient(100deg, rgba(45,36,23,.70) 0%, rgba(45,36,23,.40) 34%, rgba(45,36,23,0) 64%),
+    radial-gradient(120% 95% at 20% 62%, rgba(45,36,23,.55) 0%, rgba(45,36,23,0) 60%);
+}
+.hero-inner{
+  position:relative;
+  max-width:var(--maxw);margin:0 auto;padding:clamp(72px,13vw,150px) var(--pad) clamp(56px,10vw,116px);
+  min-height:min(84vh,760px);
+  display:flex;flex-direction:column;justify-content:flex-end;
+  gap:clamp(14px,2.4vw,22px);
+}
+.logotype{
+  margin:0;
+  font-size:clamp(3.1rem,11vw,7.2rem);
+  line-height:.92;
+  font-weight:900;
+  letter-spacing:-.015em;
+  color:var(--cream);
+  text-shadow:
+    0 3px 0 rgba(45,36,23,.55),
+    0 10px 30px rgba(45,36,23,.55);
+  max-width:15ch;
+}
+.logotype .co{color:var(--gold)}
+.tagline{
+  margin:0;
+  font-size:clamp(1.35rem,3.6vw,2.3rem);
+  font-weight:800;
+  color:#fff;
+  text-shadow:0 2px 14px rgba(45,36,23,.8);
+  max-width:28ch;
+  text-wrap:balance;
+}
+.hero-sub{
+  margin:0;
+  font-size:clamp(1rem,1.9vw,1.2rem);
+  color:rgba(255,246,227,.94);
+  text-shadow:0 2px 12px rgba(45,36,23,.8);
+  max-width:52ch;
+}
+.hero-cta{display:flex;flex-wrap:wrap;align-items:center;gap:14px 18px;margin-top:6px}
+.hero-note{
+  font-size:.95rem;font-weight:700;
+  color:rgba(255,246,227,.92);
+  text-shadow:0 2px 10px rgba(45,36,23,.8);
+}
+
+/* ---------- stat strip ---------- */
+.stats{background:var(--gold);border-block:3px solid rgba(45,36,23,.10)}
+.stats ul{
+  list-style:none;margin:0;padding-block:18px;
+  display:flex;flex-wrap:wrap;justify-content:center;gap:8px clamp(18px,5vw,54px);
+}
+.stats li{display:flex;align-items:baseline;gap:.5em;font-weight:800;color:var(--ink);font-size:clamp(.95rem,2vw,1.1rem)}
+.stats b{font-size:clamp(1.3rem,3vw,1.7rem);line-height:1}
+
+/* ---------- sections ---------- */
+section{padding-block:clamp(56px,9vw,104px)}
+.section-head{max-width:62ch;margin:0 auto clamp(32px,5vw,56px);text-align:center}
+h2{
+  margin:0 0 .4em;
+  font-size:clamp(1.9rem,5vw,3rem);
+  line-height:1.1;font-weight:900;letter-spacing:-.01em;
+  text-wrap:balance;
+}
+h3{text-wrap:balance}
+code{
+  font-family:ui-monospace,"Consolas","Courier New",monospace;
+  font-size:.92em;font-weight:700;
+  background:var(--cream-deep);color:var(--ink);
+  padding:.08em .42em;border-radius:7px;
+}
+.section-head p{margin:0;font-size:clamp(1rem,2vw,1.2rem);color:var(--ink-soft)}
+.eyebrow{
+  display:inline-block;margin-bottom:14px;
+  background:var(--coral-deep);color:#fff; /* deep coral: small caps need 4.5:1 */
+  font-weight:800;font-size:.82rem;letter-spacing:.12em;text-transform:uppercase;
+  padding:.42em 1.1em;border-radius:999px;border:3px solid #fff;
+  box-shadow:0 6px 16px rgba(45,36,23,.14);
+}
+
+/* ---------- feature grid ---------- */
+.features{background:var(--cream-deep)}
+.grid{display:grid;gap:clamp(16px,2.4vw,26px);grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
+.card{
+  background:var(--cream);
+  border-radius:26px;
+  padding:clamp(22px,3vw,30px);
+  box-shadow:var(--shadow);
+  border:2px solid rgba(45,36,23,.06);
+  transition:transform .3s var(--spring), box-shadow .3s var(--spring);
+}
+.card:hover{transform:translateY(-6px);box-shadow:var(--shadow-lift)}
+.card h3{margin:0 0 .5em;font-size:1.25rem;font-weight:900;line-height:1.25}
+.card p{margin:0;color:var(--ink-soft);font-size:1rem}
+.icon{
+  width:60px;height:60px;border-radius:20px;
+  display:grid;place-items:center;margin-bottom:16px;
+  border:3px solid #fff;box-shadow:0 8px 18px rgba(45,36,23,.14);
+}
+.i-coral{background:var(--coral)}
+.i-gold{background:var(--gold)}
+.i-sky{background:var(--sky)}
+.i-leaf{background:var(--leaf)}
+.i-night{background:var(--night)}
+.i-brown{background:#b08a5a}
+
+/* ---------- gallery ---------- */
+.gallery-grid{display:grid;gap:clamp(16px,2.4vw,26px);grid-template-columns:repeat(auto-fit,minmax(310px,1fr))}
+figure{
+  margin:0;background:var(--cream);
+  border-radius:26px;overflow:hidden;
+  box-shadow:var(--shadow);
+  border:2px solid rgba(45,36,23,.06);
+  transition:transform .3s var(--spring), box-shadow .3s var(--spring);
+}
+figure:hover{transform:translateY(-6px);box-shadow:var(--shadow-lift)}
+figure:hover img{transform:scale(1.045)}
+/* height:auto is load-bearing: the width/height attributes on the <img> are
+   presentational hints that would otherwise pin the box to 619px tall and
+   stop aspect-ratio from ever applying. */
+figure img{width:100%;height:auto;aspect-ratio:16/9;object-fit:cover;background:var(--cream-deep);transition:transform .45s var(--spring)}
+figcaption{padding:16px 20px 20px}
+figcaption b{display:block;font-size:1.08rem;font-weight:900}
+figcaption span{display:block;color:var(--ink-soft);font-size:.95rem;margin-top:2px}
+
+/* ---------- how it works ---------- */
+.how{background:var(--sky-deep);color:var(--ink);position:relative;overflow:hidden}
+.how::before{
+  content:"";position:absolute;inset:auto 0 -40px 0;height:120px;
+  background:radial-gradient(60% 100% at 50% 100%, rgba(255,246,227,.34), transparent 70%);
+  pointer-events:none;
+}
+.how h2,.how .section-head p{color:#fff}
+.how .section-head p{opacity:.95}
+.steps{
+  list-style:none;margin:0;padding:0;
+  display:grid;gap:clamp(16px,2.4vw,26px);
+  grid-template-columns:repeat(auto-fit,minmax(270px,1fr));
+  counter-reset:step;
+}
+.steps li{
+  background:var(--cream);border-radius:26px;
+  padding:clamp(24px,3vw,32px);
+  box-shadow:var(--shadow);position:relative;
+}
+.step-num{
+  width:52px;height:52px;border-radius:999px;
+  background:var(--coral);color:#fff;border:3px solid #fff;
+  display:grid;place-items:center;
+  font-weight:900;font-size:1.4rem;line-height:1;
+  box-shadow:0 8px 18px rgba(45,36,23,.18);
+  margin-bottom:16px;
+}
+.steps h3{margin:0 0 .45em;font-size:1.2rem;font-weight:900}
+.steps p{margin:0;color:var(--ink-soft)}
+
+/* ---------- final call ---------- */
+.finale{background:var(--cream-deep);text-align:center}
+.finale .wrap{max-width:760px}
+.finale h2{margin-bottom:.35em}
+.finale p{margin:0 auto 28px;color:var(--ink-soft);font-size:clamp(1rem,2vw,1.18rem);max-width:46ch}
+.finale .hero-note{color:var(--ink-soft);text-shadow:none;display:block;margin-top:16px}
+
+/* ---------- footer ---------- */
+footer{background:var(--ink);color:#e9dfcb;padding-block:clamp(38px,6vw,58px);font-size:.92rem}
+footer .wrap{display:grid;gap:22px}
+footer .foot-brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:1.1rem;color:var(--cream)}
+footer p{margin:0;max-width:70ch;color:#c9bda6;line-height:1.65}
+footer a{color:var(--gold);font-weight:700}
+.smallprint{font-size:.85rem;color:#a1957f}
+
+/* ---------- reveal on scroll ---------- */
+.js-reveal .reveal{opacity:0;transform:translateY(26px)}
+.js-reveal .reveal.in{
+  opacity:1;transform:none;
+  transition:opacity .7s ease, transform .7s var(--spring);
+}
+@media (prefers-reduced-motion: reduce){
+  .js-reveal .reveal{opacity:1;transform:none}
+  .btn:hover,.card:hover,figure:hover,figure:hover img{transform:none}
+  .btn,.card,figure,figure img{transition:none}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <ellipse cx="16" cy="20" rx="9.5" ry="8" fill="#b08a5a"/>
+        <circle cx="9.2" cy="7" r="2.7" fill="#8a6642"/><circle cx="22.8" cy="7" r="2.7" fill="#8a6642"/>
+        <ellipse cx="16" cy="11.5" rx="8" ry="7" fill="#c9a06b"/>
+        <circle cx="12.6" cy="11" r="1.6" fill="#2d2417"/><circle cx="19.4" cy="11" r="1.6" fill="#2d2417"/>
+        <ellipse cx="16" cy="15.4" rx="3.8" ry="2.7" fill="#e8b98a"/>
+        <ellipse cx="16" cy="14.6" rx="1.8" ry="1.15" fill="#2d2417"/>
+      </svg>
+      Capy Cove
+    </a>
+    <a class="btn btn-play btn-small" href="/">Play now</a>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ================= HERO ================= -->
+<div class="hero" id="top">
+  <img class="hero-img" src="/img/hero-plaza.jpg" alt="Sunny Plaza in Capy Cove: a round cobbled square on a green island with a fountain, a quest board, the Wardrobe and Hat Shop, a big blank mural wall and a capybara standing in the middle." fetchpriority="high" width="1600" height="900" />
+  <div class="hero-inner">
+    <h1 class="logotype">Capy <span class="co">Cove</span></h1>
+    <p class="tagline">Waddle in. Stay a while.</p>
+    <p class="hero-sub">A cozy multiplayer island where chibi capybaras play ten minigames, furnish their own dens, paint one shared mural and stop whatever they are doing when the aurora comes out.</p>
+    <div class="hero-cta">
+      <a class="btn btn-play" href="/">Play now — free</a>
+      <span class="hero-note">No download. Runs in your browser.</span>
+    </div>
+  </div>
+</div>
+
+<!-- ================= STATS ================= -->
+<div class="stats">
+  <div class="wrap">
+    <ul>
+      <li><b>9</b> places to be</li>
+      <li><b>10</b> minigames</li>
+      <li><b>50</b> stamps to earn</li>
+      <li><b>1</b> very large whale</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ================= FEATURES ================= -->
+<section class="features" aria-labelledby="feat-h">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">What you get</span>
+      <h2 id="feat-h">A whole island, and nothing urgent to do on it</h2>
+      <p>Capy Cove is built entirely from scratch: every model, texture and sound is generated in the browser, so there is nothing to install and nothing to wait for.</p>
+    </div>
+
+    <div class="grid">
+      <article class="card reveal">
+        <div class="icon i-coral" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="5"/><path d="M7 10.5v3M5.5 12h3"/><circle cx="16" cy="11" r="1.1" fill="#fff" stroke="none"/><circle cx="18.5" cy="13.5" r="1.1" fill="#fff" stroke="none"/></svg>
+        </div>
+        <h3>Ten minigames, and most of them want company</h3>
+        <p>Race two rivals down Summit Sprint, hide as a barrel in the Glimmer Mine's Prop Hunt, guess doodles in the jungle, then take a seat in the Game Den for pong, shuffleboard, chess, four-in-a-row or the Capy Clash card duel. Reel Rush and Smoothie Scramble are yours alone, but everyone can watch.</p>
+      </article>
+
+      <article class="card reveal">
+        <div class="icon i-brown" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11 12 3l9 8"/><path d="M5.5 10v10h13V10"/><rect x="9.5" y="14" width="5" height="6" rx="1.4"/></svg>
+        </div>
+        <h3>A den of your own, furnished your way</h3>
+        <p>Every capy gets a den. Twenty pieces of furniture in the shop, up to sixty of them placed wherever you like with a drag-and-drop editor, and a front door you can set to open, friends-only or invite-only.</p>
+      </article>
+
+      <article class="card reveal">
+        <div class="icon i-night" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7Z"/><path d="M17 3.5v3M15.5 5h3" stroke="#f2b64a"/></svg>
+        </div>
+        <h3>An island that keeps living while you are away</h3>
+        <p>One cove day is forty real minutes, and it runs from dawn to midnight for everybody at the same time. The sky drifts between clear, breezy and rain, snow falls on Frosty Peak, and once a day the aurora comes out over the mountain. If you miss it, you miss it.</p>
+      </article>
+
+      <article class="card reveal">
+        <div class="icon i-gold" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#2d2417" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.8 14.6 8l5.9.9-4.3 4.1 1 5.8L12 16.1 6.8 18.8l1-5.8L3.5 8.9 9.4 8Z"/></svg>
+        </div>
+        <h3>Stamps and dailies you cannot buy your way past</h3>
+        <p>Three daily quests, drawn from a pool of twenty-eight, plus a fifty-stamp album for the things worth doing once: riding the whale, winning a photo finish, striking a gem. Hit five, twelve, twenty, thirty and forty stamps and the cove hands over a snorkel, an aurora dye, a whale-song gramophone, a golden pickaxe and the title Legend of the Cove. None of the five is for sale at any price.</p>
+      </article>
+
+      <article class="card reveal">
+        <div class="icon i-leaf" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.6"/><path d="M3 9.5h18M9 4.5v15M15 9.5v10"/></svg>
+        </div>
+        <h3>One mural, everybody's paws on it</h3>
+        <p>A ninety-six by fifty-four wall stands in the plaza with fourteen colours and a twenty-second cooldown, so you get one pixel at a time. It never resets. Whatever the cove paints there stays painted.</p>
+      </article>
+
+      <article class="card reveal">
+        <div class="icon i-sky" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12.4c0 3.9-3.6 7-8 7a9.4 9.4 0 0 1-2.6-.36L4.6 20.6l1.2-3.5A6.6 6.6 0 0 1 4 12.4c0-3.9 3.6-7 8-7s8 3.1 8 7Z"/><path d="M9 12h.01M12 12h.01M15 12h.01"/></svg>
+        </div>
+        <h3>Chat, friends and quiet words</h3>
+        <p>Speech bubbles pop over your head, <code>/w</code> sends a private whisper, and clicking any capy opens their card and their personal bests. Add them as a friend and the list will take you straight to their den, or throw a party and see who turns up.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ================= GALLERY ================= -->
+<section aria-labelledby="gal-h">
+  <div class="wrap wrap-wide">
+    <div class="section-head reveal">
+      <span class="eyebrow">The cove</span>
+      <h2 id="gal-h">Nine places worth walking to</h2>
+      <p>All captured in-game, at whatever hour the island happened to be having.</p>
+    </div>
+
+    <div class="gallery-grid">
+      <figure class="reveal">
+        <img src="/img/peak-aurora.jpg" width="1100" height="619" loading="lazy" decoding="async"
+             alt="Frosty Peak at night: a snowy slope lit by the warm windows of the Game Den lodge, with a Summit Sprint start gate, pine trees, falling snow and a green aurora across the sky." />
+        <figcaption><b>Frosty Peak</b><span>Sledding, snowball fights, and the aurora rolled once a day.</span></figcaption>
+      </figure>
+
+      <figure class="reveal">
+        <img src="/img/groove-grotto.jpg" width="1100" height="619" loading="lazy" decoding="async"
+             alt="The Groove Grotto: a purple cave with a glowing rainbow dance floor, a mirror ball, neon crystals and a dozen capybaras dancing in front of a DJ booth." />
+        <figcaption><b>Groove Grotto</b><span>An underground dance cave with a resident DJ capy.</span></figcaption>
+      </figure>
+
+      <figure class="reveal">
+        <img src="/img/game-den.jpg" width="1100" height="619" loading="lazy" decoding="async"
+             alt="The Game Den: a warm wooden ski lodge interior with a giant four-in-a-row board, an arcade cabinet, a shuffleboard table, a chess set, a cocoa bar and a fireplace on the mezzanine." />
+        <figcaption><b>The Game Den</b><span>Five table games, two seats each, and a cocoa bar.</span></figcaption>
+      </figure>
+
+      <figure class="reveal">
+        <img src="/img/the-drift.jpg" width="1100" height="619" loading="lazy" decoding="async"
+             alt="The Drift: an underwater scene of pale sand, teal kelp, coral arches and drifting jellyfish, with a swimming capybara trailing bubbles and a huge blue whale passing overhead." />
+        <figcaption><b>The Drift</b><span>Take the dive bell down and meet Big Blue.</span></figcaption>
+      </figure>
+
+      <figure class="reveal">
+        <img src="/img/beach-bonfire.jpg" width="1100" height="619" loading="lazy" decoding="async"
+             alt="Driftwood Beach after dark: a sandy island with palm trees and a wooden pier, where two capybaras sit beside a glowing bonfire ringed with stones." />
+        <figcaption><b>Driftwood Beach</b><span>Fishing off the pier by day, bonfire after dusk.</span></figcaption>
+      </figure>
+
+      <figure class="reveal">
+        <img src="/img/smoothie-shack.jpg" width="1100" height="619" loading="lazy" decoding="async"
+             alt="The Smoothie Shack: a bright wooden cafe with a striped counter, a Today's Blends chalkboard menu, parasol tables, potted palms and bunting." />
+        <figcaption><b>The Smoothie Shack</b><span>Order one, or get behind the counter and blend.</span></figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ================= HOW IT WORKS ================= -->
+<section class="how" aria-labelledby="how-h">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">Three steps</span>
+      <h2 id="how-h">You are about ninety seconds from the plaza</h2>
+      <p>No installer, no launcher, no email address.</p>
+    </div>
+
+    <ol class="steps">
+      <li class="reveal">
+        <div class="step-num" aria-hidden="true">1</div>
+        <h3>Pick a capybara</h3>
+        <p>Ten body colours on the title screen, from honest capy brown to a slightly unlikely mint. You can change it later at the Wardrobe, and everybody else sees it.</p>
+      </li>
+      <li class="reveal">
+        <div class="step-num" aria-hidden="true">2</div>
+        <h3>Waddle in as a guest</h3>
+        <p>Type a nickname, press the button, and the camera swoops down into Sunny Plaza. No account needed. Guest progress is kept on the device you played on.</p>
+      </li>
+      <li class="reveal">
+        <div class="step-num" aria-hidden="true">3</div>
+        <h3>Make an account when you like it</h3>
+        <p>Sign up and your coins, hats, furniture, stamps and friends follow you to any browser on any machine. Everything you earned as a guest is still yours.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- ================= FINALE ================= -->
+<section class="finale" aria-labelledby="fin-h">
+  <div class="wrap">
+    <h2 id="fin-h" class="reveal">The fountain is running. Come and sit by it.</h2>
+    <p class="reveal">The cove is free, the capybaras are friendly, and the aurora is due at some point tonight.</p>
+    <div class="reveal">
+      <a class="btn btn-play" href="/">Play now — free</a>
+      <span class="hero-note">No download. Runs in your browser.</span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-brand">
+      <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <ellipse cx="16" cy="20" rx="9.5" ry="8" fill="#b08a5a"/>
+        <circle cx="9.2" cy="7" r="2.7" fill="#8a6642"/><circle cx="22.8" cy="7" r="2.7" fill="#8a6642"/>
+        <ellipse cx="16" cy="11.5" rx="8" ry="7" fill="#c9a06b"/>
+        <circle cx="12.6" cy="11" r="1.6" fill="#2d2417"/><circle cx="19.4" cy="11" r="1.6" fill="#2d2417"/>
+        <ellipse cx="16" cy="15.4" rx="3.8" ry="2.7" fill="#e8b98a"/>
+        <ellipse cx="16" cy="14.6" rx="1.8" ry="1.15" fill="#2d2417"/>
+      </svg>
+      Capy Cove
+    </div>
+    <p>An original indie game, built from nothing but code: every capybara, cobblestone, jellyfish and jingle is generated in your browser at runtime. There are no downloaded assets in it anywhere.</p>
+    <p class="smallprint">Capy Cove is not affiliated with, endorsed by, sponsored by or connected to any other company, game, studio or franchise, and no resemblance to any of them is intended. Any real capybaras depicted are unpaid volunteers. <a href="/">Play now</a></p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var bail = function () { root.classList.remove('js-reveal'); };
+  try {
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce || !('IntersectionObserver' in window)) return;
+    // Only hide things once we know we can animate them back in, so the page
+    // still reads fine with JS off or in an observer-less browser.
+    root.classList.add('js-reveal');
+    var delivered = false;
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e, i) {
+        if (!e.isIntersecting) return;
+        delivered = true;
+        var el = e.target;
+        el.style.transitionDelay = Math.min(i * 70, 280) + 'ms';
+        el.classList.add('in');
+        io.unobserve(el);
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+    document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
+    // FAILSAFE, and not a theoretical one: intersections are delivered from
+    // the rendering pipeline, so a renderer that never composites (a
+    // backgrounded or embedded view) never fires the callback at all and
+    // would leave every section of this page sitting at opacity 0 forever.
+    // If nothing has been delivered shortly after load, throw the animation
+    // away rather than the content.
+    setTimeout(function () { if (!delivered) bail(); }, 1600);
+  } catch (err) {
+    bail();
+  }
+})();
+</script>
+</body>
+</html>
