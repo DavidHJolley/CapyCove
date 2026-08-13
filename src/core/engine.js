@@ -371,11 +371,19 @@ export class Engine {
     const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
     this.ray.setFromCamera(ndc, this.camera);
 
-    // clicking another capybara opens their profile instead of walking
-    const avatarHits = this.ray.intersectObjects(this.remoteGroup.children, true);
+    // clicking a capybara (anyone else's OR your own) opens their profile
+    // instead of walking: profile.js renders the self view when the id is ours
+    const clickable = [...this.remoteGroup.children];
+    if (this.playerAvatar && this.game.net?.selfId != null) clickable.push(this.playerAvatar.group);
+    const avatarHits = this.ray.intersectObjects(clickable, true);
     if (avatarHits.length) {
       let root = avatarHits[0].object;
-      while (root.parent && root.parent !== this.remoteGroup) root = root.parent;
+      while (root.parent && root.parent !== this.remoteGroup && root.parent !== this.scene) root = root.parent;
+      if (root === this.playerAvatar?.group) {
+        this.game.audio?.play?.('pop');
+        this.game.events.emit('avatar-click', String(this.game.net.selfId));
+        return;
+      }
       const remotes = this.game.net?.remotes;
       if (remotes) {
         for (const [id, r] of remotes) {
