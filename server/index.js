@@ -275,7 +275,13 @@ function broadcastAll(msg) {
 
 // The bonfire spot travels with the citizens so section B's fire-keepers and
 // section A2's coin validation cannot drift apart: one constant, two readers.
-const bots = new BotManager({ broadcastToRoom, snapshotFor }, { perRoom: 2, bonfire: BONFIRE });
+// COVE_BOTS is the release kill-switch: the citizens exist to keep a small
+// world from feeling dead, and the user's launch plan is no AI at all once
+// real players fill the rooms. COVE_BOTS=0 disables every bot (spawning,
+// schedules, chatter: the manager just holds an empty map); unset keeps the
+// dev default of 2 per room.
+const BOTS_PER_ROOM = Math.max(0, Number(process.env.COVE_BOTS ?? 2) || 0);
+const bots = new BotManager({ broadcastToRoom, snapshotFor }, { perRoom: BOTS_PER_ROOM, bonfire: BONFIRE });
 
 function roomSnapshot(roomId) {
   const players = [...(world.rooms.get(roomId) || [])]
