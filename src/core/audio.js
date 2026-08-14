@@ -14,6 +14,15 @@
 //                           id fades to silence and is otherwise ignored)
 //   audio.toggleMute()    - returns new muted state
 //   audio.muted
+//   audio.setVolume(bus, v) / audio.getVolume(bus)
+//                         - per-bus trim, bus is 'music' or 'sfx', v is 0..1.
+//                           A scalar ON TOP of the authored MUSIC_LEVEL /
+//                           SFX_LEVEL mix, so 1 is exactly the mix this game
+//                           has always shipped. Persisted in localStorage
+//                           ('capycove-vol') and re-applied by init(), so the
+//                           settings panel does not have to re-push them after
+//                           a reload. Mute is separate and still wins: it zeros
+//                           the master gain no matter what the trims say.
 //
 // Everything is synthesized. Music uses lookahead scheduling: a single interval
 // wakes up every ~90ms and schedules notes ~280ms ahead on the AudioContext
@@ -27,6 +36,13 @@ const MASTER_LEVEL = 0.75; // pre-limiter trim
 const MUSIC_LEVEL = 0.21;  // music bus sits around -18dBFS
 const SFX_LEVEL = 0.6;     // sfx ride above the music
 const VERB_LEVEL = 0.42;
+
+// Player-facing per-bus trims (0..1) multiply the levels above. They live in
+// one localStorage key so a reload gets the mix the player chose without the
+// settings UI (src/ui/settings.js) having to be loaded first.
+const VOL_KEY = 'capycove-vol';
+const BUS_LEVEL = { music: MUSIC_LEVEL, sfx: SFX_LEVEL };
+let vol = null; // { music, sfx }, lazily loaded: no localStorage at import time
 
 const TICK_MS = 90;        // scheduler wake-up
 const LOOKAHEAD = 0.28;    // seconds of notes queued ahead of the clock
@@ -56,6 +72,29 @@ const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const rnd = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[(Math.random() * arr.length) | 0];
 const chance = (p) => Math.random() < p;
+
+/** The saved per-bus trims, read from localStorage exactly once (and never at
+ *  import time: this module must stay side-effect free until it is used).
+ *  Missing or broken storage simply means 1, the authored mix. */
+function volumes() {
+  if (vol) return vol;
+  vol = { music: 1, sfx: 1 };
+  try {
+    const raw = JSON.parse(localStorage.getItem(VOL_KEY) || 'null');
+    if (raw && typeof raw === 'object') {
+      for (const b of ['music', 'sfx']) {
+        const n = Number(raw[b]);
+        if (Number.isFinite(n)) vol[b] = clamp(n, 0, 1);
+      }
+    }
+  } catch { /* private mode, or somebody typed into the key: keep the defaults */ }
+  return vol;
+}
+
+/** Authored bus level scaled by the player's trim. */
+function busLevel(bus) {
+  return BUS_LEVEL[bus] * volumes()[bus];
+}
 
 /** MIDI note number -> Hz. 60 = middle C. */
 const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
@@ -117,11 +156,11 @@ function ensure() {
   master.connect(limiter);
 
   musicBus = ctx.createGain();
-  musicBus.gain.value = MUSIC_LEVEL;
+  musicBus.gain.value = busLevel('music'); // authored level x the saved trim
   musicBus.connect(master);
 
   sfxBus = ctx.createGain();
-  sfxBus.gain.value = SFX_LEVEL;
+  sfxBus.gain.value = busLevel('sfx');
   sfxBus.connect(master);
 
   noiseBuf = makeNoiseBuffer(2);
@@ -1720,11 +1759,12 @@ SFX.catch = SFX.pop;
 function duckMusic(t) {
   if (!musicBus) return;
   const g = musicBus.gain;
+  const lvl = busLevel('music'); // the duck is relative to the player's trim
   g.cancelScheduledValues(t);
   g.setValueAtTime(Math.max(0.0001, g.value), t);
-  g.linearRampToValueAtTime(MUSIC_LEVEL * 0.5, t + 0.05);
-  g.setValueAtTime(MUSIC_LEVEL * 0.5, t + 0.35);
-  g.linearRampToValueAtTime(MUSIC_LEVEL, t + 0.9);
+  g.linearRampToValueAtTime(lvl * 0.5, t + 0.05);
+  g.setValueAtTime(lvl * 0.5, t + 0.35);
+  g.linearRampToValueAtTime(lvl, t + 0.9);
 }
 
 // -------------------------------------------------------- room-enter chord --
@@ -1795,6 +1835,37 @@ export const audio = {
     fadeOutAll();
     if (id && TRACKS[id]) startTrack(id);
     if (changed) roomChord(id);
+  },
+
+  /**
+   * Per-bus trim, 0..1, on top of the authored mix. `bus` is 'music' or 'sfx';
+   * anything else is ignored and returns null. Applies live with a 60ms ramp
+   * (a step on a running pad clicks), persists, and returns the clamped value.
+   * Mute is untouched: while muted the master gain is 0 and nothing is audible
+   * regardless of the trims, and unmuting restores whatever they are then.
+   */
+  setVolume(bus, v) {
+    if (bus !== 'music' && bus !== 'sfx') return null;
+    const n = Number(v);
+    const next = Number.isFinite(n) ? clamp(n, 0, 1) : 1;
+    volumes()[bus] = next;
+    try { localStorage.setItem(VOL_KEY, JSON.stringify(volumes())); } catch { /* private mode */ }
+    const node = bus === 'music' ? musicBus : sfxBus;
+    if (node && ctx) {
+      const t = ctx.currentTime;
+      const g = node.gain;
+      // cancel first: a music duck may have ramps queued past this moment
+      g.cancelScheduledValues(t);
+      g.setValueAtTime(g.value, t);
+      g.linearRampToValueAtTime(busLevel(bus), t + 0.06);
+    }
+    return next;
+  },
+
+  /** The current trim for 'music' or 'sfx' (0..1). Unknown buses read as 1. */
+  getVolume(bus) {
+    if (bus !== 'music' && bus !== 'sfx') return 1;
+    return volumes()[bus];
   },
 
   /** Instant kill / restore of all output. Returns the new muted state. */

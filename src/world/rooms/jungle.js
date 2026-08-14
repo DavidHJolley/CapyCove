@@ -883,16 +883,18 @@ export class JungleRoom extends Room {
     );
 
     this.cameraHint = { offset: new THREE.Vector3(0, 12.5, 18.5), lookHeight: 1.4 };
-    // Static camera: steeper than the other rooms on purpose. Anything shallower
-    // looks THROUGH the south tree line, and this room's whole gimmick is that
-    // the tree line is thick. From up here you look down the hole in the canopy
-    // at the clearing, the ruin terrace north and the falls west.
-    // steeper than the first pass: at (0,32,26) the upper third of the frame
-    // was near-camera canopy lobes; a higher, more top-down vantage keeps the
-    // canopy as a thin frame and spends the pixels on the clearing/ruin/falls
+    // Static camera: down the hole in the canopy at the clearing, the ruin
+    // terrace north and the falls west. The near-top-down pass (0,36,17) paid
+    // for that with the room: a capy came out 10px tall and the beach exit
+    // prompt projected clean off the bottom of the frame (NDC -1.09), so from
+    // the whole-room view you could neither see yourself nor find the way out.
+    // Standing further off and much flatter (30 degrees, near the world default
+    // 36) keeps the canopy as a frame instead of a lid, and does it without
+    // looking through the south tree line: 34px capy, every prompt inside NDC
+    // 0.56, the doodle easel clear of the top HUD band at 96px.
     this.staticCamera = {
-      position: new THREE.Vector3(0, 36, 17),
-      lookAt: new THREE.Vector3(-0.5, 0.5, -3.5),
+      position: new THREE.Vector3(0, 18, 31),
+      lookAt: new THREE.Vector3(0, 1.5, 2),
     };
 
     // Live only while this room is: both handles are dropped in dispose().

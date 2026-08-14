@@ -628,16 +628,28 @@ export class PlazaRoom extends Room {
 
     // just inside each gate, a step beyond its hotspot radius so arriving from
     // a room does not immediately re-prompt the way back
+    // The two on the fountain's axis stand a step OFF it (1.4 and 0.9). The
+    // fountain, the arrival spot and the peak gate used to be collinear, and a
+    // walker aiming dead at the centre of a circle gets no tangent to slide
+    // along: it pressed into the basin and gave up. A step to the side also
+    // buys the arrival a three-quarter read of the fountain instead of a flat
+    // symmetrical one.
     this.spawnPoints = {
-      default: new THREE.Vector3(0, 0, 4),
+      default: new THREE.Vector3(1.4, 0, 4.4),
       from_beach: new THREE.Vector3(-9.5, 0, 0),
-      from_peak: new THREE.Vector3(0, 0, -9.5),
+      from_peak: new THREE.Vector3(0.9, 0, -9.4),
       from_cafe: new THREE.Vector3(9.44, 0, 1.45),
       from_club: new THREE.Vector3(6.72, 0, 8.21),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 15, 20), lookHeight: 1.2 };
-    // static camera: the whole cobbled circle, all three gate arches and the club mouth
-    this.staticCamera = { position: new THREE.Vector3(0, 23.5, 32), lookAt: new THREE.Vector3(0, 1.2, 0.6) };
+    // Static camera: the whole cobbled circle, all three gate arches and the
+    // club mouth. Pulled IN 20% from (0, 23.5, 32) in the play-view framing
+    // pass: from there the furthest hotspot sat at NDC 0.52 and a fifth of the
+    // frame was empty sea. On the same view line (so the composition is
+    // unchanged, only the crop) every hotspot now lands inside +-0.65, the gate
+    // name boards inside +-0.75 and the grotto sign at 0.67: full frame, and
+    // still clear of the HUD's top and bottom bars.
+    this.staticCamera = { position: new THREE.Vector3(0, 19.0, 25.7), lookAt: new THREE.Vector3(0, 1.2, 0.6) };
   }
 
   // -------------------------------------------------------------- ground --
@@ -812,10 +824,21 @@ export class PlazaRoom extends Room {
 
   // --------------------------------------------------------------- lamps --
   _buildLamps(scene) {
-    // The east lamp sits at z 5.1, not 4.2: the walk line from spawn (0,4) to the
-    // cafe gate (13,2) passes under it, and 4.2 left only 0.8 of clearance.
+    // Desire-line pass (playtester's annotated routes, 2026-08-13). The six
+    // lamps are the bunting anchors, so they may only slide ALONG their runs;
+    // what moved and why, in chain order (NE, NW, SW, SE, E, W):
+    //  - the north pair came in from (+-4.2, -7.27) to (+-3.4, -6.75): they used
+    //    to stand 0.08 from the benches that flanked the fountain and 1.57 from
+    //    the peak-gate flower beds. From here they clear the fountain by 1.71
+    //    and the beds by 2.00, and they still flank the walk to the peak gate.
+    //  - the NW lamp came in to (-7.0, 3.4): at (-7.27, 4.2) it stood 0.53 from
+    //    the topiary planter, and the mural -> plaza line is exactly that gap.
+    //  - the SE lamp dropped to (7.27, 4.2) so the east flower bed's corner is
+    //    no longer a 1.28 slot (the bed itself has moved to the south lawn).
+    //  - E and W keep their shipped spots: with the benches that used to sit
+    //    0.07 away gone, a lone post on the walk line is just a post to round.
     const pts = [
-      [7.27, 5.1], [-7.27, 4.2], [-4.2, -7.27], [4.2, -7.27], [5.99, -2.2], [-5.99, -2.2],
+      [7.27, 4.2], [-7.0, 3.4], [-3.4, -6.75], [3.4, -6.75], [5.99, -2.2], [-5.99, -2.2],
     ];
     const base = [], post = [], cap = [], globe = [], halo = [];
     for (const [x, z] of pts) {
@@ -867,20 +890,26 @@ export class PlazaRoom extends Room {
       const a = pts[ia], b = pts[ib];
       // Tied to the very top of each lamp (cap tip is 3.82), not to its middle:
       // at 3.25 the cord ran straight through the glowing globe at 3.28 and the
-      // three spans meeting at a lamp made a bright tangle there. Low point is
-      // now 3.2, still well clear of avatars and name tags.
-      const top = 3.9, sag = 0.7;
+      // three spans meeting at a lamp made a bright tangle there.
+      // Sag and flag count are now DERIVED from the span, not fixed at 0.7/14:
+      // moving the anchors changed every run length, and a constant sag makes a
+      // short run look tight and a long one slack. 0.105 * span keeps the low
+      // point at 3.2-3.3 (clear of avatars and name tags) whatever the spacing,
+      // and one flag per ~0.8 units keeps the bunting evenly patterned.
+      const span = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const top = 3.9, sag = 0.105 * span;
+      const N = Math.max(10, 2 * Math.round(span / 0.8));
       let prev = null;
-      for (let s = 0; s <= 14; s++) {
-        const u = s / 14;
+      for (let s = 0; s <= N; s++) {
+        const u = s / N;
         const p = [a[0] + (b[0] - a[0]) * u, top - sag * 4 * u * (1 - u), a[1] + (b[1] - a[1]) * u];
         if (prev) cordPts.push(prev[0], prev[1], prev[2], p[0], p[1], p[2]);
         prev = p;
-        if (s > 0 && s < 14 && s % 2 === 0) {
+        if (s > 0 && s < N && s % 2 === 0) {
           const k = flagData.length % 2;
           flagData.push({ p, k, i: flags[k].length, phase: flagData.length * 0.7 });
           flags[k].push(T([p[0], p[1] - 0.2, p[2]], [Math.PI, 0, 0]));
-        } else if (s > 0 && s < 14) {
+        } else if (s > 0 && s < N) {
           // a bulb between every pair of flags: dark beads by day, the string
           // lights that come on at dusk (LIVING-COVE.md A)
           beadPts.push(p);
@@ -901,20 +930,47 @@ export class PlazaRoom extends Room {
 
   // ------------------------------------------------------------- benches --
   _buildBenches(scene) {
-    // Four flank the fountain; the fifth is a lawn seat on the south-west grass,
-    // well outside every gate route (it used to sit at (7.0, 1.4) and squeezed
-    // the walk to the cafe gate down to a 1.26-wide gap against the east lamp).
-    const spots = [[4.9, -3.4], [-4.9, -3.4], [-2.6, -7.6], [2.6, -7.6], [-4.6, 12.4]];
+    // THE DESIRE-LINE PASS (playtester's annotated screenshots, 2026-08-13).
+    // Four of these used to ring the fountain at radius ~4.9, which put them on
+    // every arc that has to get round the landmark: the walk from spawn to the
+    // hat shop threaded a 0.07 gap between the east bench and the east lamp,
+    // the mirror gap on the west was 0.07, the bench-to-flower-bed gap was 0.10,
+    // and the corridor between the fountain and a bench was 1.02. Walkers do
+    // not read that as furniture, they read it as the plaza fighting them, and
+    // the WalkController genuinely gave up in some of those slots.
+    // Nothing is deleted: the seats move OUT to the plaza's rim, one per pocket
+    // that carries no route, each still turned to look at the fountain, so the
+    // square keeps its five benches and the traffic circle stays empty:
+    //   (-7.0, -8.8)   west lawn, beside the west flower bed
+    //   (9.4, -2.4)    the shop forecourt, facing back across the plaza
+    //   (4.2, 12.6)    south lawn, east of the arrival
+    //   (-4.6, 12.4)   south lawn, west of the arrival (the one seat that stays)
+    //   (-10.4, 10.4)  in front of the mural: the only one that faces something
+    //                  else, because the artwork is the thing to sit and watch.
+    // Verified by driving the real WalkController over all 96 gate x gate,
+    // gate x hotspot, hotspot x hotspot and spawn x everything routes: nothing
+    // stalls, the tightest corridor any of them threads is 1.63 and the worst
+    // detour over the straight line is 8.0%.
+    const spots = [
+      [-7.0, -8.8], [9.4, -2.4], [4.2, 12.6], [-4.6, 12.4],
+      [-10.4, 10.4, -11.87, 6.63],   // [x, z, faceX, faceZ]
+    ];
     const seat = [], back = [], legs = [], arms = [];
-    for (const [x, z] of spots) {
-      const bm = T([x, 0, z], [0, Math.atan2(FX - x, FZ - z), 0]); // face the fountain
+    for (const [x, z, fx = FX, fz = FZ] of spots) {
+      const bm = T([x, 0, z], [0, Math.atan2(fx - x, fz - z), 0]); // face the fountain
       seat.push(_m1.multiplyMatrices(bm, T([0, 0.56, 0], null, [1.95, 0.14, 0.68])).clone());
       back.push(_m1.multiplyMatrices(bm, T([0, 0.95, -0.3], [0.22, 0, 0], [1.95, 0.62, 0.12])).clone());
       for (const sx of [-0.8, 0.8]) {
         legs.push(_m1.multiplyMatrices(bm, T([sx, 0.26, 0], null, [0.16, 0.52, 0.6])).clone());
         arms.push(_m1.multiplyMatrices(bm, T([sx, 0.78, 0.06], null, [0.12, 0.34, 0.7])).clone());
       }
-      this.obstacles.push({ x, z, r: 1.05 });
+      // 1.0, not 1.05: the seat's own half-diagonal is 1.03, and every tenth
+      // of collider is a tenth off every corridor that passes it. (A two-circle
+      // collider models the 1.95 x 0.9 box far better, but two overlapping
+      // circles make a concave cusp, and the controller resolves circles one at
+      // a time: a walker that wanders into the cusp gets pushed A->B->A and
+      // stops. One disc per bench stays honest AND stays walkable.)
+      this.obstacles.push({ x, z, r: 1.0 });
     }
     const box = new THREE.BoxGeometry(1, 1, 1);
     const wood = makeToon(C.wood);
@@ -926,12 +982,20 @@ export class PlazaRoom extends Room {
 
   // --------------------------------------------------------- flower beds --
   _buildFlowerBeds(scene, rand) {
-    // The east bed sits in the grass wedge between the cafe path and the club
-    // path. At (9.6, 5.6) it hugged the cafe side, leaving a thin ragged sliver
-    // of grass along the club path and reaching into the east lamp's light
-    // pool; (10.3, 5.9) centres it with an even ~1.15 margin off both path
-    // edges and clears the lamp, so the ring reads as planted, not dropped.
-    const beds = [[-7.27, -4.2], [-3.4, -10.6], [3.4, -10.6], [10.3, 5.9]];
+    // The peak-gate pair (+-3.4, -10.6) is untouched: it flanks the paved walk
+    // north without narrowing it (4.1 clear between the two rims) and no route
+    // threads the pocket behind them.
+    // The west bed moved out to (-8.6, -5.2). At (-7.27, -4.2) it sat 0.52 from
+    // the west lamp and 0.10 from the bench that used to be there: the walk
+    // from the shop to the beach gate ran straight into that slot. From here
+    // the lamp is 2.13 clear and the relocated west bench 1.70.
+    // The east bed has left the wedge between the cafe path and the club path
+    // altogether. That wedge is 42 degrees wide and both its walls are walking
+    // routes, so a 2.7-wide bed could not clear 1.6 on both sides (it was 0.68
+    // from the cafe gate planter and 1.28 from the lamp). It is now the
+    // welcome bed on the south lawn at (2.6, 11.9), where it greets arrivals
+    // instead of pinching the club path; the wedge keeps its lamp.
+    const beds = [[-8.6, -5.2], [-3.4, -10.6], [3.4, -10.6], [2.6, 11.9]];
     const rim = [], soil = [], stems = [];
     const blooms = [[], []];
     for (const [x, z] of beds) {
@@ -957,7 +1021,14 @@ export class PlazaRoom extends Room {
 
   // ------------------------------------------------------------- topiary --
   _buildTopiary(scene) {
-    const x = -6.9, z = 6.9;
+    // Nudged south off (-6.9, 6.9): the planter's rim was 0.53 from the
+    // north-west lamp and 0.32 from the mural wall's near post, and the
+    // playtester's line (c) - mural across to the fountain - runs through
+    // exactly that gap, so everyone walking to the artwork was funnelled into
+    // it. From (-6.0, 8.3) the wall is 1.73 clear and the lamp 2.80, the
+    // topiary still holds the same south-west corner, and it stays outside the
+    // citizens' wander disc.
+    const x = -6.0, z = 8.3;
     const g = new THREE.Group();
     g.position.set(x, 0, z);
     g.rotation.y = Math.atan2(-x, -2 - z); // look at the plaza
@@ -989,24 +1060,31 @@ export class PlazaRoom extends Room {
 
   // --------------------------------------------------------- quest board --
   _buildQuestBoard(scene) {
-    // Set back on the west lawn: at (-8.6, 3.0) its collider reached to within
-    // 0.47 of the spawn -> beach-gate walk line. Its hotspot still overlaps the
-    // route, so passers-by are offered the read without being herded into it.
     // Wave 7 (LIVING-COVE.md D): the cove notice board IS the Quest Board now.
     // Playtester layout pass (dev editor, 2026-08-07): brought in off the west
     // lawn to the middle of the plaza, square to the arrival camera, so the
     // day's jobs are the first thing you read when you walk in.
-    const x = 0.04, z = 1.0;
+    // Desire-line pass (2026-08-13): (0.04, 1.0) was the single worst collider
+    // in the room. It sat 4.0 from the fountain centre, so board rim to basin
+    // rim was 0.05: the east-west traverse (cafe gate to beach gate) and the
+    // whole spawn/quest -> peak-gate arc had to squeeze through that slot, and
+    // the real controller wedged and gave up there in five of the 124 routes.
+    // It also stood inside the bot wander disc (BOT_ZONES.plaza is (0,5) r5, and
+    // citizens walk straight lines inside 0.9 of it), so the regulars strolled
+    // through the noticeboard all day.
+    // It moves west, off the fountain axis, keeping its facing: the fountain is
+    // now 2.00 clear, the wander disc 0.35 clear, and - the bonus - the arrival
+    // view no longer has a plank wall standing between the player and the
+    // room's star attraction. Its hotspot rides along (derived below), 5.3 from
+    // the spawn, so the prompt greets you as you walk up rather than at birth.
+    const x = -4.4, z = 1.0;
     const g = new THREE.Group();
     g.position.set(x, 0, z);
     // Facing the plaza centre (the original yaw 1.90) put its BACK to the play
-    // camera; the later 0.95 fixed that but left the board sitting at a
-    // different angle from the mural wall 6.6 away, so this whole civic corner
-    // read as furniture dropped at random. It now shares the mural wall's yaw
-    // exactly: the two faces are parallel, square-on to the static camera and
-    // 9 degrees off square from the follow camera at spawn. The hotspot is
-    // pinned below rather than derived from the yaw, so the walk line from
-    // spawn to the beach gate still passes through it.
+    // camera; the later 0.95 fixed that but left it at a random angle. It now
+    // faces due south, square-on to both the static camera and the follow
+    // camera at spawn, and the move west did not change that: a reading face
+    // that is square to the arrival is the whole point of the board.
     g.rotation.y = -0.045;
     scene.add(g);
 
@@ -1496,9 +1574,12 @@ export class PlazaRoom extends Room {
       { x: 0, z: 0, r: 10.6 },
       { x: -13, z: 0, r: 4.2 }, { x: 0, z: -13, r: 4.2 }, { x: 13, z: 2, r: 4.2 },
       { x: 10.6, z: -4.8, r: 6.6 }, { x: 10.9, z: 13.2, r: 7.0 },
-      { x: -6.9, z: 6.9, r: 3.0 }, { x: -9.9, z: 4.4, r: 3.0 },
-      { x: -9.4, z: 6.6, r: 2.4 }, { x: 10.3, z: 5.9, r: 2.4 },
-      { x: -4.6, z: 12.4, r: 2.2 }, // clearing around the lawn bench
+      { x: -6.0, z: 8.3, r: 3.0 }, { x: -9.9, z: 4.4, r: 3.0 },
+      { x: -9.4, z: 6.6, r: 2.4 }, { x: 2.6, z: 11.9, r: 2.4 },
+      // clearings around the relocated seats: a bench with a tree in its lap is
+      // no more sittable than a bench in a walk line
+      { x: -4.6, z: 12.4, r: 2.2 }, { x: 4.2, z: 12.6, r: 2.2 },
+      { x: -7.0, z: -8.8, r: 2.2 }, { x: -10.4, z: 10.4, r: 2.4 },
       { x: -9.9, z: 11.0, r: 5.6 }, // mural wall: nothing grows in front of it
     ];
     const segs = [

@@ -4,7 +4,103 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Capy Cove</title>
+  <meta name="theme-color" content="#ffd9a6" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#129423;</text></svg>" />
+  <!--
+    CRITICAL BOOT CSS. Inline on purpose: this paints the loading screen on the
+    very first frame, long before /src/main.js (and the ~700KB of three.js under
+    it) has been fetched and parsed, and before styles.css exists at all. It
+    only styles #boot; everything else keeps waiting for the real stylesheet.
+    main.js removes this <style> together with the #boot element at handoff, so
+    nothing of the loading screen survives into the game.
+    The exit animation and the polish that is NOT needed on frame one live in
+    the "loading screen" section of src/styles.css.
+  -->
+  <style id="boot-css">
+    html, body { height: 100%; }
+    body { margin: 0; background: #ffdda8; }
+    #boot {
+      position: fixed; inset: 0; z-index: 200;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 0; overflow: hidden; text-align: center;
+      font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif; color: #2d2417;
+      -webkit-user-select: none; user-select: none;
+      /* warm cove sunrise sky: the ONE sun is the centrepiece element below */
+      background: linear-gradient(180deg, #fff1cf 0%, #ffdda8 38%, #f8c795 72%, #efab8c 100%);
+    }
+    /* a soft cream dune the capybara stands on, so the frame is not an empty wash */
+    #boot::after {
+      content: ''; position: absolute; left: -12%; right: -12%; bottom: -30vh; height: 56vh;
+      border-radius: 50% 50% 0 0 / 34% 34% 0 0; pointer-events: none;
+      background: linear-gradient(180deg, #fff6e3 0%, #f4e2b4 100%);
+      box-shadow: 0 -6px 0 rgba(255, 255, 255, 0.55);
+    }
+    #boot > * { position: relative; z-index: 1; }
+
+    /* ---- the rising sun: the loading screen's whole composition ----
+       Playtester direction 2026-08-07: no wordmark, no mascot here: a big sun
+       over the dune. The title screen right after carries the game's name. */
+    .boot-sun {
+      position: relative; width: min(46vh, 340px); height: min(46vh, 340px);
+      margin-bottom: 34px; flex: none;
+    }
+    .boot-sun > * { position: absolute; inset: 0; border-radius: 50%; }
+    .boot-rays {
+      background: repeating-conic-gradient(from 8deg,
+        rgba(255, 214, 140, 0.55) 0deg 9deg,
+        rgba(255, 214, 140, 0.0) 9deg 30deg);
+      -webkit-mask: radial-gradient(circle, transparent 44%, #000 52%, #000 66%, transparent 76%);
+      mask: radial-gradient(circle, transparent 44%, #000 52%, #000 66%, transparent 76%);
+      animation: sun-turn 46s linear infinite;
+    }
+    .boot-core {
+      inset: 17%;
+      background: radial-gradient(circle at 38% 32%, #fffbe9 0%, #ffe9a8 42%, #ffcf78 74%, #f7ad6a 100%);
+      box-shadow:
+        0 0 0 10px rgba(255, 249, 224, 0.35),
+        0 0 60px 24px rgba(255, 214, 140, 0.55),
+        0 14px 44px rgba(214, 138, 78, 0.35);
+      animation: sun-swell 5.2s ease-in-out infinite;
+    }
+    @keyframes sun-turn { to { rotate: 360deg; } }
+    @keyframes sun-swell { 50% { scale: 1.03; } }
+
+    /* ---- progress track: empty on first paint, main.js fills it ---- */
+    .boot-track {
+      position: relative; width: min(300px, 68vw); height: 16px; border-radius: 999px;
+      background: rgba(255, 253, 246, 0.85); border: 3px solid #fff;
+      box-shadow: inset 0 2px 5px rgba(107, 79, 53, 0.22), 0 5px 14px rgba(45, 36, 23, 0.14);
+      overflow: hidden;
+    }
+    .boot-fill {
+      position: absolute; inset: 0 auto 0 0; width: 0; border-radius: 999px;
+      background: linear-gradient(90deg, #f2b64a 0%, #f7a35f 58%, #e8657a 100%);
+      box-shadow: inset 0 -3px 0 rgba(150, 55, 72, 0.18);
+      transition: width 0.45s cubic-bezier(0.3, 0.9, 0.35, 1);
+    }
+    .boot-note {
+      margin-top: 12px; min-height: 15px; font-size: 12px; font-weight: 800;
+      letter-spacing: 0.1em; text-transform: uppercase; color: #a8794f;
+    }
+
+    .boot-tip {
+      margin-top: 28px; width: min(460px, 88vw);
+      display: flex; align-items: center; gap: 10px; text-align: left;
+      font-size: 13.5px; font-weight: 700; line-height: 1.4; color: #6b4f35;
+    }
+    .boot-tip > span:last-child { flex: 1 1 auto; }
+    .boot-tip-key {
+      flex: none; padding: 4px 11px; border-radius: 999px; background: #fffdf6; border: 2px solid #fff;
+      font-size: 10.5px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: #e8657a;
+      box-shadow: 0 3px 0 rgba(45, 36, 23, 0.1);
+    }
+
+    /* reduced motion: a still sunrise, nothing turning, no swell */
+    @media (prefers-reduced-motion: reduce) {
+      .boot-rays, .boot-core { animation: none; }
+      .boot-fill { transition-duration: 0.01ms; }
+    }
+  </style>
 </head>
 <body>
   <div id="app">
@@ -14,6 +110,47 @@
     <div id="overlay-root"></div>
     <div id="fade" class="fade"></div>
   </div>
+
+  <!-- First paint. No JS needed to see this: markup + the inline CSS above. -->
+  <div id="boot" role="status" aria-label="Loading Capy Cove">
+    <!-- Playtester direction 2026-08-07: no wordmark, no mascot: a big rising
+         sun over the dune is the whole composition. The title screen right
+         after this carries the game's name. -->
+    <div class="boot-sun" aria-hidden="true">
+      <div class="boot-rays"></div>
+      <div class="boot-core"></div>
+    </div>
+    <div class="boot-track" id="boot-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="boot-fill" id="boot-fill"></div>
+    </div>
+    <div class="boot-note" id="boot-note">warming up the cove</div>
+    <p class="boot-tip">
+      <span class="boot-tip-key">tip</span>
+      <span id="boot-tip">Press C to swap between following your capy and seeing the whole room.</span>
+    </p>
+  </div>
+  <script>
+    /* One tip per boot. Every line here was read out of the game code before it
+       was written down (hotkeys in main.js/hud.js, right-click snowballs in
+       rooms/peak.js, passive payouts in rooms/mine.js, the 20s mural cooldown
+       in ui/mural.js, avatar clicks in core/engine.js). The markup above ships
+       with a real tip already in it, so this only shuffles: JS off still reads. */
+    (function () {
+      var tips = [
+        'Press C to swap between following your capy and seeing the whole room.',
+        'Up on Frosty Peak, hold the RIGHT mouse button to pack a snowball, let go to throw it.',
+        'Type /w Name hello to whisper. Click a whisper in the log to fire one straight back.',
+        'The Glimmer Mine pays you for standing around in it. Honest, cozy work.',
+        'Click your own capybara to open your player card.',
+        'W waves, D grooves, M opens the map, Enter jumps to the chat box.',
+        'The plaza mural takes one pixel every twenty seconds, and it stays on the wall for good.',
+        'Click anywhere on the ground and your capy waddles over to the marker.'
+      ];
+      var el = document.getElementById('boot-tip');
+      if (el) el.textContent = tips[Math.floor(Math.random() * tips.length)];
+    })();
+  </script>
+
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

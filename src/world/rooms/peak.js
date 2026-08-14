@@ -1300,8 +1300,12 @@ export class PeakRoom extends Room {
     );
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11.5, 20), lookHeight: 1.8 };
-    // static camera: the sled gate up top, the lodge door east, the frozen pond west
-    this.staticCamera = { position: new THREE.Vector3(0, 24, 31), lookAt: new THREE.Vector3(0, 1.5, -2) };
+    // Static camera: the sled gate up top, the lodge door east, the frozen pond
+    // west. Framed by eye at 960x540: the look point moved south to z=4.5 so the
+    // plaza gate prompt (z=12) and the mine spawn lift out of the bottom HUD
+    // band, and pulled in from z=31 so a capy reads at ~35px instead of 28.
+    // Worst hotspot/spawn NDC 0.58.
+    this.staticCamera = { position: new THREE.Vector3(0, 19, 26), lookAt: new THREE.Vector3(0, 1.7, 4.5) };
 
     // Live only while this room is: every handle is dropped in dispose().
     if (game?.events?.on) {

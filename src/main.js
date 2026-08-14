@@ -9,7 +9,69 @@ import { GAMES } from './minigames/index.js';
 import { initHud } from './ui/hud.js';
 import { initFriendsButton } from './ui/friends.js';
 import { showTitle } from './ui/title.js';
+import { maybeStartTour } from './ui/firstrun.js';
 import { DEFAULT_ROOM } from '../shared/constants.js';
+
+/**
+ * BOOT LOADING SCREEN (the #boot panel + its critical CSS are inlined in
+ * index.html; the exit animation is the "loading screen handoff" section of
+ * styles.css).
+ *
+ * Reaching this line already means the whole entry bundle (three.js, the
+ * engine, the UI) has been fetched, parsed and evaluated, which is the long
+ * pole of a cold start: that is milestone one. The rest are real events, not a
+ * timed fake:
+ *   30%  this file started running (bundle parsed)
+ *   55%  the spawn room's code-split chunk resolved (warmed below)
+ *   85%  the first room is built and the player avatar is standing in it,
+ *        OR the title screen is up (guest path: nothing else is loading)
+ *   100% the server said welcome ('net' -> online), or 3s after the room
+ *        built, whichever lands first
+ * Then the panel lifts, minimum 0.8s after navigation so a warm reload never
+ * flashes it, and both the element and its <style> are deleted: no leftover
+ * DOM, no leftover listeners, no leftover timers.
+ */
+const bootCleanups = [];
+const boot = (() => {
+  const el = document.getElementById('boot');
+  if (!el) return { set() {}, finish() {} }; // nothing to drive (embedded/test host)
+  const fill = document.getElementById('boot-fill');
+  const track = document.getElementById('boot-track');
+  const note = document.getElementById('boot-note');
+  const MIN_MS = 800;    // no flash
+  const HARD_MS = 12000; // ...but never hold the screen hostage either
+  let pct = 0;
+  let done = false;
+  const release = () => {
+    for (const fn of bootCleanups.splice(0)) { try { fn(); } catch (e) { console.error('[boot] cleanup:', e); } }
+  };
+  const set = (p, label) => {
+    if (done) return;
+    if (label && note) note.textContent = label;
+    if (p <= pct) return;
+    pct = p;
+    if (fill) fill.style.width = `${p}%`;
+    track?.setAttribute('aria-valuenow', String(Math.round(p)));
+  };
+  const finish = () => {
+    if (done) return;
+    set(100, 'here we go');
+    done = true;
+    release();
+    // hold the full bar for a beat, and honour the 0.8s floor measured from
+    // navigation start (performance.now() is exactly that clock)
+    const wait = Math.max(140, MIN_MS - performance.now());
+    setTimeout(() => {
+      el.classList.add('is-out');
+      // outlast the 0.6s lift, then take the panel AND its inline styles out
+      setTimeout(() => { el.remove(); document.getElementById('boot-css')?.remove(); }, 700);
+    }, wait);
+  };
+  const hardStop = setTimeout(finish, HARD_MS);
+  bootCleanups.push(() => clearTimeout(hardStop));
+  return { set, finish };
+})();
+boot.set(30, 'unpacking the cove');
 
 game.loadLocal();
 game.audio = audio;
@@ -22,6 +84,49 @@ game.engine = engine;
 
 const net = new NetClient(game, engine);
 game.net = net;
+
+/* Boot milestones 55 -> 100. All of these are observations of work that is
+   really happening; none of them make the boot any slower. */
+
+// 55%: pull the spawn room's chunk now instead of waiting for switchRoom to ask
+// for it behind the 220ms fade. Room modules have no import-time side effects
+// (CLAUDE.md), so this only warms the module cache: the build below reuses it.
+{
+  const warm = Object.prototype.hasOwnProperty.call(ROOMS, DEFAULT_ROOM) ? ROOMS[DEFAULT_ROOM] : null;
+  const at55 = () => boot.set(55, 'unrolling the plaza');
+  if (warm) Promise.resolve().then(warm).then(at55, at55);
+  else at55();
+}
+
+// 85% + 100%: one timer watches for whichever destination this boot is headed
+// to. Registered before the entry paths below run, and torn down by boot.finish.
+{
+  let roomBuilt = false;
+  let greeted = false; // ws welcome landed, or we gave up waiting for it
+  let welcomeWait = 0;
+  // BOTH have to be true on the world path: the welcome frame can beat the
+  // room build on a warm reload, and lifting then would show an empty canvas
+  const tryFinish = () => { if (roomBuilt && greeted) boot.finish(); };
+  const poll = setInterval(() => {
+    // guest path: the title screen IS the destination, so it is fully loaded
+    if (document.querySelector('.title-screen')) {
+      boot.set(85, 'opening the gate');
+      boot.finish();
+      return;
+    }
+    // returning-player path: wait for the first room to actually stand up
+    if (!roomBuilt && engine.room && engine.playerAvatar) {
+      roomBuilt = true;
+      boot.set(85, 'waking the neighbours');
+      // the ws welcome normally beats this; if the server is slow or down, the
+      // world is playable anyway, so hand it over
+      if (!welcomeWait) welcomeWait = setTimeout(() => { greeted = true; tryFinish(); }, 3000);
+      tryFinish();
+    }
+  }, 80);
+  bootCleanups.push(() => { clearInterval(poll); if (welcomeWait) clearTimeout(welcomeWait); });
+  bootCleanups.push(game.events.on('net', (s) => { if (s === 'online') { greeted = true; tryFinish(); } }));
+}
 
 // minigame lifecycle
 let activeGame = null;
@@ -216,6 +321,7 @@ function enterWorld(auth) {
   game.goToRoom(DEFAULT_ROOM, null);
   startArrivalSwoop(releaseToasts);
   audio.play('success');
+  maybeStartTour(game); // first visit only; it waits for the swoop to land
 }
 
 // returning registered player: skip the title screen only if the token works

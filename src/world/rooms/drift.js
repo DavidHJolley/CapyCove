@@ -726,11 +726,16 @@ export class DriftRoom extends Room {
       lookHeight: CAM.swimLook,
     };
     this.staticCamera = {
-      // In FRONT of the dive bell (z = 21): from the old vantage at z = 34 the
-      // bell's cable ran top-to-bottom through dead centre of the whole-room
-      // frame. Any z behind the bell puts the cable back across the lens.
-      position: new THREE.Vector3(0, 15, 20),
-      lookAt: new THREE.Vector3(0, 7.5, -6),
+      // Behind the bell after all, but off its shoulder. Standing in FRONT of it
+      // (z = 20) did keep the cable off the lens, at the price of putting the
+      // only exit in the room BEHIND the camera: the prompt projected to NDC
+      // -14, so from the whole-room view the way home did not exist. The cable
+      // is only a problem when it is centred, and the fix for that is x, not z:
+      // 9 east drops the bell and its cable into the left third and leaves the
+      // sunken arch centre and Big Blue's lap (cx -4, cz -17, rx 18, rz 15)
+      // across the upper frame. Exit prompt 410px, capy ~36px, worst NDC 0.52.
+      position: new THREE.Vector3(9, 12.5, 38),
+      lookAt: new THREE.Vector3(-2, 4, -6),
     };
     this._exit = {
       id: 'exit-beach',

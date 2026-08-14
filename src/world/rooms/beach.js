@@ -586,8 +586,12 @@ export class BeachRoom extends Room {
     // gentle east bias: keeps the cove and dock in frame even at the eastern
     // from_plaza spawn (a stronger offset framed mostly open sea there)
     this.cameraHint = { offset: new THREE.Vector3(3.5, 13, 16), lookHeight: 1.1 };
-    // static camera: the whole cove, the dock out to the fishing spot, the plaza gate
-    this.staticCamera = { position: new THREE.Vector3(0, 20, 29), lookAt: new THREE.Vector3(0, 1, -1.5) };
+    // Static camera: the whole cove, the dock out to the fishing spot, the plaza
+    // gate. Framed by eye at 960x540: biased 3 west so the dock and the dive
+    // bell balance the plaza gate (the old centred vantage pushed the bell to
+    // the left rim), and pulled in from z=29 so a capy at the spawns reads at
+    // ~40px instead of 32. Worst hotspot/spawn NDC 0.83.
+    this.staticCamera = { position: new THREE.Vector3(-3, 16, 25.5), lookAt: new THREE.Vector3(-3, 1.35, -2.5) };
 
     // Live only while this room is: every handle is dropped in dispose().
     if (game?.events?.on) {

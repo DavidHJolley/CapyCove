@@ -748,8 +748,12 @@ export class CafeRoom extends Room {
       from_plaza: new THREE.Vector3(0, 0, 4.3),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 10, 13), lookHeight: 1 };
-    // static camera: the full interior, counter to doormat, under the rafters
-    this.staticCamera = { position: new THREE.Vector3(0, 14.5, 16.8), lookAt: new THREE.Vector3(0, 1.1, -0.5) };
+    // Static camera: the full interior, counter to doormat, under the rafters.
+    // Framed by eye at 960x540: the look point slid south to z=0.3 and the
+    // vantage back to z=17.6, which lifts the plaza-door prompt off the bottom
+    // HUD band (was 459px, now 431px) while the blend board stays readable.
+    // Worst hotspot/spawn NDC 0.60, a capy at the spawn reads at ~46px.
+    this.staticCamera = { position: new THREE.Vector3(0, 15, 17.6), lookAt: new THREE.Vector3(0, 1.1, 0.3) };
     this.hotspots.push(
       {
         id: 'play-smoothie',

@@ -493,6 +493,13 @@ export class Engine {
       // Standing on the spawn does nothing; walking away does nothing; a few
       // frames of walking at the arch fires it, wherever you started.
       if (h.id?.startsWith('exit-') && !h.noAuto) {
+        // proximity is 2D; a zone tagged with floorY only exists for players
+        // at that height (the Den's floor-hop treads sit above/below lanes)
+        if (h.floorY !== undefined && Math.abs(p.y - h.floorY) > 1.5) {
+          const stale = this.hotspotEls.get(h);
+          if (stale) { stale.remove(); this.hotspotEls.delete(h); }
+          continue;
+        }
         if (!h.__fired && this.roomAge > 0.8 && !this.game.activeMinigame) {
           let toward = false;
           if (mlen > 0.005 && d > 1e-3) {

@@ -1318,9 +1318,14 @@ export class LoungeRoom extends Room {
     // and the rail does not eat the chess table, close enough that the arcade
     // downstairs still reads. Everything from the gable top (8.8) to the porch
     // (z 9) sits inside the 16:9 frustum with ~14% margin.
+    // Re-framed by eye at 960x540: the dollhouse angle was right, it was just
+    // standing too far off. The look point moved south to z=1.5 (the peak-door
+    // prompt was sitting at the 429px HUD line) and the vantage in to
+    // 18.5/24, which trades a strip of dead snow at the top for ~2px of capy
+    // (34.6 -> 36.7). Worst hotspot/spawn NDC 0.55; both floors still read.
     this.staticCamera = {
-      position: new THREE.Vector3(0, 19.5, 25.5),
-      lookAt: new THREE.Vector3(0, 3.0, 0),
+      position: new THREE.Vector3(0, 18.5, 24),
+      lookAt: new THREE.Vector3(0, 3.0, 1.5),
     };
 
     // Two prompts per station: sit down at the real table, or play the house.
@@ -1356,6 +1361,51 @@ export class LoungeRoom extends Room {
       label: 'Back out to Frosty Peak',
       action: (g) => g.goToRoom('peak', 'lounge'),
     });
+
+    // Instant floor hops (playtester call, 2026-08-07: walking the stairs
+    // every time was a chore). Step onto the BOTTOM tread and you pop up to
+    // the loft; step onto the TOP tread and you pop down. They ride the same
+    // walk-through intent logic as room exits ('exit-' prefix), the treads are
+    // out of every normal walking lane, and the stairs stay for the look.
+    {
+      const cx = (ST_X0 + HW) / 2;
+      const upSpot = new THREE.Vector3(cx, 0.25, ST_Z0 + 0.1);
+      const downSpot = new THREE.Vector3(cx, MZ_Y - 0.3, MZ_S + 0.55);
+      const hop = (g, to, other) => {
+        const eng = g.engine;
+        const a = eng.playerAvatar;
+        a.group.position.copy(to);
+        eng.snapY(a.group.position, this);
+        eng.controller.stop();
+        eng.camTarget.copy(a.group.position);
+        g.audio?.play?.('pop');
+        // both zones re-arm: unlike room exits, we are still in the room
+        for (const h of this.hotspots) {
+          if (h.id === 'exit-loft-up' || h.id === 'exit-loft-down') {
+            h.__fired = false;
+            h.__intent = 0;
+          }
+        }
+      };
+      this.hotspots.push(
+        {
+          id: 'exit-loft-up',
+          position: upSpot,
+          radius: 1.25,
+          floorY: 0,
+          label: 'Up to the loft',
+          action: (g) => hop(g, new THREE.Vector3(cx, MZ_Y, MZ_S - 1.2)),
+        },
+        {
+          id: 'exit-loft-down',
+          position: downSpot,
+          radius: 1.25,
+          floorY: MZ_Y,
+          label: 'Down to the floor',
+          action: (g) => hop(g, new THREE.Vector3(cx, 0, ST_Z0 + 1.8)),
+        },
+      );
+    }
 
     // Live only while this room is: both handles are dropped in dispose().
     if (game?.events?.on) {

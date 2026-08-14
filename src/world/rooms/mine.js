@@ -729,9 +729,14 @@ export class MineRoom extends Room {
     // the six pads and the HUNTERS board - with the mess and the adit in shot.
     // Above the shell's apex (8.7), which is fine: the ceiling is BackSide, so
     // from up here it simply is not drawn.
+    // Re-framed by eye at 960x540: the adit (z 11) used to sit at 534px, all
+    // but off the bottom of the frame, so the way out of the room was invisible
+    // from the whole-room view. Swinging the look point 6.5 south brings it to
+    // 424px, and the shorter throw takes a capy from 35px to 36px.
+    // Worst hotspot/spawn NDC 0.57.
     this.staticCamera = {
-      position: new THREE.Vector3(0, 19.5, 23.5),
-      lookAt: new THREE.Vector3(0, 1.3, -3.0),
+      position: new THREE.Vector3(0, 18.5, 24.5),
+      lookAt: new THREE.Vector3(0, 1.5, 3.5),
     };
 
     // Live only while this room is: every handle is dropped in dispose().

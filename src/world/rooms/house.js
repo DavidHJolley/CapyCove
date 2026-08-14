@@ -590,8 +590,11 @@ export class HouseRoom extends Room {
       from_plaza: new THREE.Vector3(0, 0, 3.0),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 11.5, 15), lookHeight: 1.1 };
-    // static camera: the whole den floor, both shelf walls and the doormat
-    this.staticCamera = { position: new THREE.Vector3(0, 13.5, 16.5), lookAt: new THREE.Vector3(0, 1.15, -1) };
+    // Static camera: the whole den floor, both shelf walls and the doormat.
+    // Framed by eye at 960x540: the look point moved south to z=0.5 so the
+    // welcome sign stops being sliced by the bottom edge and the door prompt
+    // clears the HUD band (451px -> 406px). Worst NDC 0.50, capy ~49px.
+    this.staticCamera = { position: new THREE.Vector3(0, 13.8, 17.6), lookAt: new THREE.Vector3(0, 1.15, 0.5) };
 
     this._buildHotspots();
 

@@ -70,6 +70,7 @@ export function openMenu(game) {
         <ul></ul>
       </div>
       <div class="menu-list">
+        <button class="menu-item" type="button" data-act="settings"></button>
         <button class="menu-item" type="button" data-act="sound"></button>
         <button class="menu-item" type="button" data-act="logout"></button>
         <button class="menu-item is-quiet" type="button" data-act="exit">Exit to title</button>
@@ -85,6 +86,7 @@ export function openMenu(game) {
   const questBtn = root.querySelector('[data-act="quests"]');
   const partyBtn = root.querySelector('[data-act="party"]');
   const partyPanel = root.querySelector('.menu-party');
+  const settingsBtn = root.querySelector('[data-act="settings"]');
   const soundBtn = root.querySelector('[data-act="sound"]');
   const logoutBtn = root.querySelector('[data-act="logout"]');
   const exitBtn = root.querySelector('[data-act="exit"]');
@@ -264,6 +266,28 @@ export function openMenu(game) {
     }
     game.audio?.play?.('click');
     venuePicker();
+  });
+
+  // ---- settings ------------------------------------------------------------
+  // The panel is loaded on demand (it is nobody's business until asked for),
+  // and opening the MENU is also the earliest hook this module has for putting
+  // the saved graphics/motion preferences back on a freshly reloaded page:
+  // applySavedSettings() is idempotent, so calling it here costs nothing.
+  // A boot hook in main.js would be better; that file is not ours to edit.
+  const settingsReady = import('./settings.js')
+    .then((m) => { try { m.applySavedSettings(game); } catch (e) { console.error('[menu] settings restore:', e); } return m; })
+    .catch((e) => { console.error('[menu] settings failed to load:', e); return null; });
+
+  settingsBtn.innerHTML = '<span class="menu-ico">&#9881;</span>';
+  settingsBtn.appendChild(document.createTextNode('Settings'));
+  settingsBtn.title = 'Graphics, volume, camera and motion.';
+  settingsBtn.addEventListener('click', () => {
+    disarm();
+    close();
+    settingsReady.then((m) => {
+      if (m) m.openSettings(game);
+      else game.toast('The settings drawer is stuck, try again');
+    });
   });
 
   // ---- sound ---------------------------------------------------------------
