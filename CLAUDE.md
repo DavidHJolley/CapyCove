@@ -117,6 +117,20 @@ rebuilds if standing in that room). All layout-* writes require the 'editor'
 capability. Read side: `GET /api/layout/:room` with ETag; published ops applied
 at room build by src/world/overlay.js `attachOverlay` (called from engine
 switchRoom/rebuildRoom; do not call room.build without it).
+Shipped wave 11 (economy integrity): 'mgstart' is consumed by server/econ.js
+(econ.handleMessage runs after progress, before the main switch). A run token
+is bound to MINIGAMES[game].room, is spent by the 'score' that pays it, and
+carries the pending 'best' (the client sends best BEFORE score), so a personal
+best is only written against a run the coin road accepted, and never above the
+score that run claimed. Duels: econ.matchStarted/matchMove/duelPayout refuse
+IMPOSSIBLE wins (too fast, winner never moved); a hot pair (many wins/hour,
+same two accounts) is LOG-ONLY - the owner's law is NO caps on honest play,
+ever. Refusals ride the existing 'toast' frame; anomalies go to server/audit.js
+LOG-ONLY. No new wire frames. Telemetry: server/log.js JSON lines (install
+first, COVE_LOG_LEVEL/COVE_LOG_PRETTY), /api/health carries econ + log + frame
+counters. Tests: npm test runs test/**/*.test.js + tests/**/*.test.mjs; CI in
+.github/workflows/ci.yml builds with COVE_STRICT_BUILD=1 (a surviving
+window.__x debug handle fails the build; clearing `= null` writes are fine).
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

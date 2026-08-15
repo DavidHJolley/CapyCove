@@ -3788,7 +3788,9 @@ export class CardsGame extends Minigame {
       this._loop();
       // debug handle, like window.__game: lets a playtest harness step and
       // photograph the diorama without reaching through the module graph
-      if (typeof window !== 'undefined') window.__cards = this;
+      // dev-only debug handle; the import.meta.env.DEV form is load-bearing -
+      // esbuild folds it out of the prod bundle (see foot of src/core/game.js)
+      if (import.meta.env && import.meta.env.DEV) window.__cards = this;
     } else {
       // no WebGL: keep the v1 flat board readable rather than showing nothing
       wrap.classList.add('mg-cards-flat');
@@ -3836,7 +3838,7 @@ export class CardsGame extends Minigame {
     this._onKey = null;
     if (this.stage) { try { this.stage.dispose(); } catch (e) { console.warn('[cards] stage dispose', e); } }
     this.stage = null;
-    if (typeof window !== 'undefined' && window.__cards === this) window.__cards = null;
+    if (import.meta.env && import.meta.env.DEV && window.__cards === this) window.__cards = null;
     if (this._stinger) { this._stinger.dispose(); this._stinger = null; }
     this._nodes.clear();
     this.el = {};

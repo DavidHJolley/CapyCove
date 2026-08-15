@@ -20,19 +20,25 @@ export const ROOM_INFO = {
 // NOTE: 'drift' deliberately has NO BOT_ZONES entry: citizens do not dive.
 
 // Minigames: id -> reward formula. Server clamps client-reported scores with these.
+// minRunMs / minMatchMs / minMoves are FLOORS, not typical play: the shortest a
+// run or duel can possibly be, with margin under it (wave 11; a typical run is
+// 5-15x longer). server/econ.js falls back to its own copy for any row that
+// lacks them. They reject IMPOSSIBLE claims only - never cap honest play.
 export const MINIGAMES = {
-  fishing: { name: 'Reel Rush', room: 'beach', maxCoinsPerRun: 120 },
-  sled: { name: 'Summit Sprint', room: 'peak', maxCoinsPerRun: 150 },
-  smoothie: { name: 'Smoothie Scramble', room: 'cafe', maxCoinsPerRun: 130 },
-  pong: { name: 'Paddle Panic', room: 'lounge', maxCoinsPerRun: 60 },
-  shuffle: { name: 'Shuffle Showdown', room: 'lounge', maxCoinsPerRun: 70 },
+  fishing: { name: 'Reel Rush', room: 'beach', maxCoinsPerRun: 120, minRunMs: 6_000 },
+  sled: { name: 'Summit Sprint', room: 'peak', maxCoinsPerRun: 150, minRunMs: 5_000 },
+  smoothie: { name: 'Smoothie Scramble', room: 'cafe', maxCoinsPerRun: 130, minRunMs: 6_000 },
+  pong: { name: 'Paddle Panic', room: 'lounge', maxCoinsPerRun: 60, minRunMs: 8_000, minMatchMs: 6_000, minMoves: 8 },
+  shuffle: { name: 'Shuffle Showdown', room: 'lounge', maxCoinsPerRun: 70, minRunMs: 10_000, minMatchMs: 10_000, minMoves: 3 },
   // chess and cards are upstairs in the Trophy Loft; the server reads `room`
-  // to decide which room a table may be joined from (see TABLE_GAMES)
-  chess: { name: 'Grand Capy Chess', room: 'loft', maxCoinsPerRun: 100 },
-  connect4: { name: 'Four in a Row', room: 'lounge', maxCoinsPerRun: 60 },
-  cards: { name: 'Capy Clash', room: 'loft', maxCoinsPerRun: 100 },
-  prophunt: { name: 'Prop Hunt', room: 'mine', maxCoinsPerRun: 90 },
-  doodle: { name: 'Capy Doodles', room: 'jungle', maxCoinsPerRun: 90 },
+  // to decide which room a table may be joined from (see TABLE_GAMES), and
+  // server/econ.js reads the same field to bind a run token to a room.
+  // chess minMoves is 2: fool's mate is a real two-move win.
+  chess: { name: 'Grand Capy Chess', room: 'loft', maxCoinsPerRun: 100, minRunMs: 6_000, minMatchMs: 6_000, minMoves: 2 },
+  connect4: { name: 'Four in a Row', room: 'lounge', maxCoinsPerRun: 60, minRunMs: 5_000, minMatchMs: 5_000, minMoves: 3 },
+  cards: { name: 'Capy Clash', room: 'loft', maxCoinsPerRun: 100, minRunMs: 12_000, minMatchMs: 12_000, minMoves: 4 },
+  prophunt: { name: 'Prop Hunt', room: 'mine', maxCoinsPerRun: 90, minRunMs: 9_000 },
+  doodle: { name: 'Capy Doodles', room: 'jungle', maxCoinsPerRun: 90, minRunMs: 10_000 },
 };
 
 // Hat catalog. Client renders these procedurally (src/player/hats.js must have a

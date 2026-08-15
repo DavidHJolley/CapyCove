@@ -17,6 +17,8 @@ import * as layouts from './layouts.js';
 import * as filter from './filter.js';
 import * as chatlog from './chatlog.js';
 import * as reports from './reports.js';
+import * as econ from './econ.js';
+import * as log from './log.js';
 import { flush, markSeen, adminSeed, renameAccount, banActive } from './db.js';
 import { writeJsonAtomic } from './store.js';
 import {
@@ -29,7 +31,7 @@ import {
 // chain: HATS['constructor'] is truthy and HATS['__proto__'] is an object.
 const has = (obj, key) => typeof key === 'string' && Object.prototype.hasOwnProperty.call(obj, key);
 
-const MIN_RUN_MS = 5_000; // a minigame run shorter than this pays nothing
+// (the one-size MIN_RUN_MS is gone: server/econ.js holds per-game floors)
 const MAX_COINS_PER_HOUR = 12_000; // rolling backstop, far above honest play
 const JOIN_COOLDOWN_MS = 400;
 const MSG_BURST_LIMIT = 80; // messages per second before we drop the socket
@@ -237,7 +239,7 @@ app.get('/api/me', (req, res) => {
 // `rooms` counts the live room sets: the fixed ROOM_IDS plus however many dens
 // currently have someone standing in them. Handy for spotting a den that failed
 // to get reaped when its last visitor left.
-app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, audit: audit.stats() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, sockets: wss.clients.size, audit: audit.stats(), econ: econ.stats(), ...log.health() }));
 app.get('/api/layout/:room', (req, res) => layouts.httpGet(req, res));
 
 // dev-only: lets automated playtests save canvas captures to disk
@@ -291,7 +293,7 @@ function snapshotFor(p) {
 }
 
 function sendTo(p, msg) {
-  if (p.ws?.readyState === 1) p.ws.send(JSON.stringify(msg));
+  if (p.ws?.readyState === 1) { log.frameOut(); p.ws.send(JSON.stringify(msg)); }
 }
 
 function broadcastToRoom(roomId, msg, exceptId = null) {
@@ -401,6 +403,7 @@ function leaveWorld(p) {
   exitDoodle(p);
   if (p.room) leaveRoomSet(p);
   chatlog.drop(p); // covers every disconnect path, not just ws 'close'
+  econ.dropPlayer(p);
   world.players.delete(p.id);
 }
 
@@ -439,7 +442,12 @@ function grantCoins(p, amount, reason) {
   const payout = Math.max(0, Math.floor(Number(amount) || 0));
   if (payout <= 0) return 0;
   p.earned = p.earned.filter((e) => now - e.t < 3_600_000);
-  if (p.earned.reduce((a, e) => a + e.n, 0) + payout > MAX_COINS_PER_HOUR) return 0;
+  if (p.earned.reduce((a, e) => a + e.n, 0) + payout > MAX_COINS_PER_HOUR) {
+    // under the owner's law this should almost never fire for an honest
+    // player, so every occurrence is worth a look in the log
+    log.warn('econ.backstop', { name: p.name, delta: payout, reason, limit: MAX_COINS_PER_HOUR });
+    return 0;
+  }
   p.earned.push({ t: now, n: payout });
   const rec = recordFor(p);
   const bal = rec ? rec.coins : p.coins;
@@ -455,6 +463,9 @@ function grantCoins(p, amount, reason) {
 progress.install({ users, saveSoon, grantCoins, sendTo, broadcastToRoom, has });
 // wave 9, the spine: audit first (so admin ops log from the start), then the
 // operator module: it takes first refusal on every frame (see :2178 area)
+// telemetry first (wave 11D): JSON lines to stdout, COVE_LOG_LEVEL tunes it,
+// COVE_LOG_PRETTY=1 gives the human-readable form for a dev terminal
+log.install({ base: { pid: process.pid, svc: 'cove' } });
 audit.install({ meta: { pid: process.pid } });
 if (adminSeed.name) {
   audit.log({ actor: null, via: 'system', op: audit.OPS.ROLE_SEED, target: { uid: adminSeed.uid, name: adminSeed.name }, args: { role: 'admin', applied: adminSeed.applied, missing: adminSeed.missing } });
@@ -467,6 +478,7 @@ admin.install({
 chatlog.install({ audit: audit.log, recordFor });
 reports.install({ audit: audit.log, sendTo, recordFor, findEntity, chatlog });
 layouts.install({ sendTo, broadcastAll, recordFor, audit: audit.log });
+econ.install({ sendTo, audit: audit.log, recordFor });
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -914,6 +926,8 @@ function startMatch(table) {
     reports: new Map(), // playerId -> { winner, score }
   };
   for (const p of members) p.match = match;
+  // wave 11: econ times the duel and counts the moves (N-18)
+  econ.matchStarted(match, members);
   // youAre is the index into the roster both sides received: player 0 is the
   // authority wherever a den game needs one (ball physics, who moves first)
   members.forEach((p, i) => sendTo(p, { t: 'match-start', game: match.game, players: roster, youAre: i, seed }));
@@ -947,13 +961,19 @@ function endMatch(match, reason, forfeitWinner = null) {
   if (winner && winner !== 'draw') {
     const champ = world.players.get(winner);
     if (champ) {
-      grantCoins(champ, MATCH_WIN_COINS, 'match win');
+      // N-18: an impossible duel (shorter than the game takes to play, or a
+      // winner who never moved) pays nothing and signals nothing. A pair
+      // trading many wins an hour is LOG-ONLY (owner's law: two friends
+      // playing all evening look exactly like that): the win pays in full and
+      // the pattern goes to the audit trail for a person to judge.
+      const verdict = econ.duelPayout(match, winner, reason);
+      if (verdict.pay) grantCoins(champ, MATCH_WIN_COINS, 'match win');
       // an agreed win (or a forfeit): the only den result the server ever sees.
       // `sweep` is the loser's own reported score being zero, which is the
       // closest thing to "without dropping a point" that both sides signed off.
       const beaten = match.reports.get(otherSeat(match, winner));
       const sweep = reason === 'done' && !!beaten && beaten.score === 0;
-      signal('match-win', champ, { game: match.game, reason, sweep });
+      if (verdict.signal) signal('match-win', champ, { game: match.game, reason, sweep });
     }
   }
 }
@@ -2213,8 +2233,9 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     // flood guard: an honest client sends ~10-15 messages a second
     const t0 = Date.now();
+    log.frameIn();
     if (t0 - msgWindow > 1000) { msgWindow = t0; msgCount = 0; }
-    if (++msgCount > MSG_BURST_LIMIT) { try { ws.close(1008, 'Slow down'); } catch {} return; }
+    if (++msgCount > MSG_BURST_LIMIT) { log.frameDrop(); try { ws.close(1008, 'Slow down'); } catch {} return; }
 
     let m;
     try { m = JSON.parse(raw); } catch { return; }
@@ -2236,6 +2257,8 @@ wss.on('connection', (ws) => {
       if (p && reports.handleMessage(p, m)) return;
       if (p && layouts.handleMessage(p, m)) return;
       if (p && progress.handleMessage(p, m)) return;
+      // wave 11: econ owns the run token. It consumes 'mgstart' and nothing else.
+      if (p && econ.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
           if (p) return;
@@ -2277,7 +2300,10 @@ wss.on('connection', (ws) => {
               }
             }
             profile = {
-              name, coins: Math.max(0, Math.min(99999, Number(m.coins) || 0)),
+              // absurdity bound on the client's remembered purse, NOT an
+              // earning cap: a guest who really ground past the old 99,999
+              // was losing honest coins on every reconnect (owner's law)
+              name, coins: Math.max(0, Math.min(9_999_999, Number(m.coins) || 0)),
               color: Number(m.color) || 0xb08a5a,
               hat: has(HATS, m.hat) && ownedHats.includes(m.hat) ? m.hat : 'none',
               ownedHats, bests,
@@ -2308,7 +2334,7 @@ wss.on('connection', (ws) => {
           // that joins mid-evening must not open at noon and snap
           sendTo(p, clockFrame());
           sendTo(p, partiesFrame());
-          console.log(`[ws] ${p.name} connected (${p.registered ? 'account' : 'guest'}), online: ${world.players.size}`);
+          log.info('ws.connect', { id: p.id, name: p.name, account: p.registered, online: world.players.size });
           break;
         }
         case 'join': {
@@ -2396,24 +2422,34 @@ wss.on('connection', (ws) => {
         }
         // A run must be announced before it can be paid out, so 'score' can no
         // longer be replayed: one payout per started run, and never instantly.
-        case 'mgstart':
-          if (has(MINIGAMES, m.game)) p.run = { game: m.game, startedAt: t0 };
-          break;
+        // wave 11: 'mgstart' never reaches this switch (econ.handleMessage
+        // consumed it above; the run token now lives in server/econ.js).
         case 'score': {
-          const run = p.run;
-          p.run = null; // single use
-          if (!run || run.game !== m.game) break;
-          if (t0 - run.startedAt < MIN_RUN_MS) break;
+          // econ owns the run token: it toasts and audits its own refusals, so
+          // there is exactly one thing to check here.
+          const claim = econ.claimRun(p, m);
+          if (!claim.ok) break;
           const paid = grantCoins(p, clampCoinsForGame(m.game, Number(m.coins) || 0), m.game);
+          // N-19: the personal best rode the token and is written only now,
+          // against a run the coin road actually accepted - and never above
+          // the score that run itself claimed (a best IS a score this run hit)
+          const runScore = Math.floor(Number(m.score) || 0);
+          if (claim.best > (p.bests[m.game] || 0) && claim.best < 10_000_000
+            && (runScore <= 0 || claim.best <= runScore)) {
+            p.bests[m.game] = claim.best;
+            persist(p);
+          }
           // the quest board only ever sees a run the coin road already accepted
-          signal('score', p, { game: m.game, coins: paid, score: Math.floor(Number(m.score) || 0) });
+          signal('score', p, { game: m.game, coins: paid, score: runScore });
           break;
         }
         case 'best': {
-          if (!has(MINIGAMES, m.game)) break; // arbitrary keys would bloat users.json forever
-          const s = Math.max(0, Math.floor(Number(m.score) || 0));
-          if (s > (p.bests[m.game] || 0) && s < 10_000_000) {
-            p.bests[m.game] = s;
+          // econ validates the game, the range and the run behind it; a best
+          // sent mid-run is PARKED and written by 'score' once the run is paid.
+          const noted = econ.noteBest(p, m);
+          if (!noted.ok) break;
+          if (noted.score > (p.bests[m.game] || 0)) {
+            p.bests[m.game] = noted.score;
             persist(p);
           }
           break;
@@ -2667,6 +2703,7 @@ wss.on('connection', (ws) => {
           let size = 0;
           try { size = JSON.stringify(m.data).length; } catch { break; }
           if (!size || size > MATCH_MOVE_MAX) break;
+          econ.matchMove(p); // a winner who never touched the board is not one
           const other = world.players.get(otherSeat(match, p.id));
           if (other && other.match === match) sendTo(other, { t: 'match-move', from: p.id, data: m.data });
           break;
@@ -2888,7 +2925,7 @@ wss.on('connection', (ws) => {
     if (p) {
       persist(p);
       leaveWorld(p);
-      console.log(`[ws] ${p.name} left, online: ${world.players.size}`);
+      log.info('ws.disconnect', { id: p.id, name: p.name, room: p.room, online: world.players.size });
     }
   });
   ws.on('error', () => {});
@@ -2906,7 +2943,7 @@ setInterval(() => {
 
 // last resort: the game should never die from one unexpected throw
 process.on('uncaughtException', (e) => {
-  console.error('[fatal]', e);
+  log.error('fatal.uncaught', e);
   try {
     audit.log({ actor: null, via: 'system', op: audit.OPS.SERVER_UNCAUGHT, args: { name: e?.name || 'Error', at: String(e?.stack || e).slice(0, 800) }, ok: false });
     audit.flush();
@@ -2914,7 +2951,7 @@ process.on('uncaughtException', (e) => {
     flush();
   } catch {}
 });
-process.on('unhandledRejection', (e) => console.error('[fatal] unhandled rejection:', e));
+process.on('unhandledRejection', (e) => log.error('fatal.rejection', e));
 
 // ---------- tick: broadcast positions + run bots ----------
 let last = Date.now();

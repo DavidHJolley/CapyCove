@@ -242,6 +242,16 @@ const WORDS_NAME = [
 ];
 
 /**
+ * The reserved terms that block a name ANYWHERE inside it, not only as the
+ * whole name. Only impersonation cores belong here: every other WORDS_NAME
+ * entry is a common English fragment (root, support, owner, official...) that
+ * honest names contain all the time.
+ */
+const NAME_AGGRESSIVE = new Set([
+  'admin', 'administrator', 'moderator', 'capycove', 'covestaff', 'sysop',
+]);
+
+/**
  * Terms that ALSO get the boundary-free "squeezed" pass in check(): the ones
  * whose whole evasion strategy is to hide inside another token. Keep this set
  * SHORT and unambiguous — it is the pass that manufactures false positives,
@@ -867,15 +877,15 @@ export function checkName(name, opts = {}) {
 
   const tiers = [TIER.BLOCK, TIER.MASK, TIER.NAME, TIER.MILD];
   const all = scan(src, tiers, true).spans;
-  // A reserved word shorter than the loose floor has to be the WHOLE name,
-  // spelled exactly. `mod` is three letters with a repeated one, so the
-  // repeat-and-affix tolerance that catches `MOOOD`-style evasion elsewhere
-  // rejects `Mood` (m+o+o+d) and `Modes` (mod + the -es affix) here.
-  // Impersonation is "Mod"; a cozy game is full of Moods.
+  // A reserved word blocks a name in exactly two shapes. Either it IS the name
+  // (fold+strip equality, so `Mod`, `M0D`, `Cove_Staff` are caught while a
+  // cozy game keeps its Moods, Rootbeers, Supporters and Servernames), or it
+  // is one of the few terms nobody embeds innocently: `AdminGuy` is an
+  // impersonation attempt, `Staffy` and `Officially` are just names.
   const key = fold(src).replace(/[^a-z0-9]/g, '');
   const hits = all.filter((h) => (
     h.tier !== TIER.NAME
-    || h.term.replace(/ /g, '').length >= NAME_LOOSE_MIN
+    || NAME_AGGRESSIVE.has(h.term.replace(/ /g, ''))
     || key === h.term.replace(/ /g, '')
   ));
   if (!hits.length) {

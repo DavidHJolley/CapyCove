@@ -1,5 +1,7 @@
 import { Emitter } from './events.js';
-import { clampCoinsForGame, DEFAULT_ROOM, HATS } from '../../shared/constants.js';
+import {
+  BODY_COLORS, clampCoinsForGame, DEFAULT_ROOM, FURNITURE, HATS, MINIGAMES, NAME_MAX_LEN,
+} from '../../shared/constants.js';
 
 /**
  * Global game singleton: profile state, coins, room/minigame flow control.
@@ -53,6 +55,105 @@ function cleanMuteUntil(v) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+/**
+ * GUEST PROFILE SCHEMA (wave 11B).
+ *
+ * `capycove-guest` is a text file the player owns, so it is read exactly like a
+ * frame from an untrusted peer: allowlist the keys, clamp the numbers, cap the
+ * arrays, drop the rest on the floor. Before this, `loadLocal` did
+ * `Object.assign(this.state, saved)` with whatever JSON.parse handed back, so a
+ * hand-edited file could seed the hello frame with any coin total it liked — and
+ * could set `__proto__` on the way through, since Object.assign uses [[Set]] and
+ * the setter is real.
+ *
+ * The bounds are deliberately the SAME NUMBERS the server uses on the guest
+ * hello (server/index.js: coins 0..99999, hats filtered against HATS, bests
+ * 1..9,999,999 for known games). Two walls, one story, so the client never ships
+ * a claim the server is only going to reject.
+ *
+ * This is anti-tamper, NOT an earning cap. Nothing here touches grantCoins or
+ * syncCoins: a guest who plays for six hours keeps every coin he earned, online
+ * or off. The ceiling only exists at the boundary where a number arrives from a
+ * file instead of from play, and it is the ceiling the server already had.
+ */
+// An ABSURDITY bound, not an earning cap (owner's law: never cap honest play).
+// It exists only to stop a hand-edited localStorage file smuggling a silly
+// number in; it mirrors the server's guest-hello clamp, and both sit far above
+// anything reachable by playing. A guest anywhere near it should make an
+// account anyway - that is what accounts are for.
+const GUEST_COINS_MAX = 9_999_999;
+const GUEST_BEST_MAX = 9_999_999; // server keeps scores 0 < s < 10_000_000
+const GUEST_HATS_MAX = 64; // mirrors the server's ownedHats .slice(0, 64)
+const GUEST_FURN_MAX = 999; // per id; guests have no house, so this is pure paranoia
+const DEFAULT_COLOR = BODY_COLORS[0];
+
+/** Own-property lookup: `saved.bests.constructor` must not read as a score. */
+const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
+
+/** Floor to an integer inside [lo, hi]; anything unparseable becomes `fallback`. */
+function intIn(v, lo, hi, fallback = lo) {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
+}
+
+/**
+ * Catalog entries a guest can legitimately hold. Milestone cosmetics are earned
+ * through server/progress.js, which only writes to account records, so a guest
+ * claiming one is a guest who edited the file.
+ */
+const ownableHat = (id) => typeof id === 'string' && has(HATS, id) && !HATS[id].milestone;
+const ownableFurn = (id) => has(FURNITURE, id) && !FURNITURE[id].milestone;
+
+/**
+ * The whole guest profile, rebuilt field by field from an untrusted object.
+ * Returns a fresh plain object containing only the keys below, so anything the
+ * schema does not name (a stale field, a server-only field like `title`, a
+ * smuggled `role`, `__proto__`) simply does not exist on the way out.
+ */
+function cleanGuestProfile(src) {
+  const out = {
+    registered: false, // a guest cache can only ever describe a guest
+    coins: intIn(src.coins, 0, GUEST_COINS_MAX, 0),
+    // A guest owns exactly the starting palette: the bonus dyes ride
+    // `unlockedColors` on an account profile and are never his to claim.
+    color: BODY_COLORS.includes(Number(src.color)) ? Number(src.color) : DEFAULT_COLOR,
+  };
+  if (typeof src.name === 'string') {
+    const name = src.name.trim().slice(0, NAME_MAX_LEN);
+    if (name) out.name = name; // else leave the constructor's 'Guest' standing
+  }
+  const hats = ['none'];
+  if (Array.isArray(src.ownedHats)) {
+    for (const id of src.ownedHats) {
+      if (hats.length >= GUEST_HATS_MAX) break;
+      if (ownableHat(id) && !hats.includes(id)) hats.push(id);
+    }
+  }
+  out.ownedHats = hats;
+  out.hat = typeof src.hat === 'string' && hats.includes(src.hat) ? src.hat : 'none';
+
+  const bests = {};
+  if (src.bests && typeof src.bests === 'object') {
+    for (const g of Object.keys(src.bests)) {
+      if (!has(MINIGAMES, g)) continue;
+      const s = intIn(src.bests[g], 0, GUEST_BEST_MAX, 0);
+      if (s > 0) bests[g] = s;
+    }
+  }
+  out.bests = bests;
+
+  const furn = {};
+  if (src.ownedFurniture && typeof src.ownedFurniture === 'object') {
+    for (const id of Object.keys(src.ownedFurniture)) {
+      if (!ownableFurn(id)) continue;
+      const n = intIn(src.ownedFurniture[id], 0, GUEST_FURN_MAX, 0);
+      if (n > 0) furn[id] = n;
+    }
+  }
+  out.ownedFurniture = furn;
+  return out;
+}
+
 /** "3 minutes", "2 hours" — the same voice the server uses in its own notice. */
 function humanLeft(ms) {
   if (ms >= 3600_000) {
@@ -88,20 +189,20 @@ class Game {
   }
 
   // ---- profile -------------------------------------------------------------
+  /**
+   * The server profile WINS, guest or not (wave 11B).
+   *
+   * This used to Math.max the client's remembered coins/bests over the server's
+   * answer, on the reasoning that "a server profile may only ever grow" guest
+   * progress. It made the server's correction unenforceable: claim 90,000 coins
+   * in localStorage, let the server clamp the hello and send back the real
+   * total, and the max put the claim straight back — where saveLocal wrote it
+   * out again. The merge was never doing any work either, because the hello
+   * frame ships our coins/hats/bests up and the welcome IS that claim, already
+   * clamped. Taking the server's word loses a guest nothing he earned honestly
+   * and costs a hand-edited file everything it invented.
+   */
   applyProfile(p) {
-    if (p && p.registered === false) {
-      // Guest progress is client-owned and saveLocal() writes whatever lands
-      // here, so a server profile may only ever grow it. Belt and braces: the
-      // hello frame already ships our coins/hats/bests up.
-      const bests = { ...(this.state.bests || {}) };
-      for (const [g, v] of Object.entries(p.bests || {})) if (v > (bests[g] || 0)) bests[g] = v;
-      p = {
-        ...p,
-        coins: Math.max(this.state.coins || 0, Number(p.coins) || 0),
-        ownedHats: [...new Set([...(this.state.ownedHats || ['none']), ...(p.ownedHats || [])])],
-        bests,
-      };
-    }
     Object.assign(this.state, p);
     // AFTER the assign, and unconditionally: role/caps/muteUntil are re-derived
     // from this profile every time, so a frame that has lost them takes the
@@ -147,9 +248,10 @@ class Game {
   saveLocal() {
     if (this.state.registered) return; // server is source of truth
     try {
-      const safe = { ...this.state };
-      for (const k of MOD_FIELDS) delete safe[k]; // a cached role is a granted role
-      localStorage.setItem('capycove-guest', JSON.stringify(safe));
+      // written through the same schema it will be read back through, so the
+      // file only ever holds keys the reader will accept. MOD_FIELDS are not in
+      // the schema, which is the whole point: a cached role is a granted role.
+      localStorage.setItem('capycove-guest', JSON.stringify(cleanGuestProfile(this.state)));
     } catch {}
   }
 
@@ -158,11 +260,15 @@ class Game {
       const raw = localStorage.getItem('capycove-guest');
       if (!raw) return;
       const saved = JSON.parse(raw);
-      if (!saved || typeof saved !== 'object') return;
+      if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
       // belt to saveLocal's braces: a cache written by an older build, or by
-      // hand, does not get to hand anyone a capability
+      // hand, does not get to hand anyone a capability. cleanGuestProfile drops
+      // them too (they are not in the schema); this is the line the file's
+      // header promises, and it stays even so.
       for (const k of MOD_FIELDS) delete saved[k];
-      Object.assign(this.state, saved, { registered: false, role: 'player', caps: [], muteUntil: 0 });
+      Object.assign(this.state, cleanGuestProfile(saved), {
+        registered: false, role: 'player', caps: [], muteUntil: 0,
+      });
     } catch {}
   }
 
@@ -327,5 +433,11 @@ export const game = new Game();
  *    esbuild against Vite's real define set.
  *
  * The orchestrator's post-build check:   grep -rn "__game" dist/    -> no hits.
+ *
+ * Re-audited in wave 11B against a real `npm run build`: this statement is gone
+ * from the bundle, the claim holds. What it did NOT hold for was every other
+ * debug handle in the tree, so the check no longer relies on anyone remembering
+ * to grep — vite.config.js's `debugGlobalGuard` reads the emitted chunks and
+ * names any `window.__x = ` that survived.
  */
 if (import.meta.env && import.meta.env.DEV) window.__game = game;

@@ -1,0 +1,44 @@
+# Capy Cove CI: build the client and run the suite on both Node lines we ship on.
+# No third-party actions: marketplace code here has the blast radius of a deploy key.
+name: CI
+
+on:
+  push:
+    branches: [master, main] # the repo's branch is master today
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build + test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      # strict: a surviving window.__x debug handle FAILS the build (wave 11B)
+      - run: npm run build
+        env:
+          COVE_STRICT_BUILD: '1'
+      - run: npm test
+      # every wave's hard rule, enforced once: a fresh data dir still boots.
+      - name: server boots clean
+        env:
+          COVE_DATA_DIR: ${{ runner.temp }}/cove-ci
+          PORT: '3999'
+        run: |
+          node server/index.js > "$RUNNER_TEMP/boot.log" 2>&1 &
+          for i in $(seq 30); do sleep 1; curl -sf localhost:3999/api/health && exit 0; done
+          echo '--- server output (boot failed) ---'
+          cat "$RUNNER_TEMP/boot.log"
+          exit 1
