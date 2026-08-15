@@ -551,6 +551,11 @@ export class BeachRoom extends Room {
 
     scene.background = new THREE.Color(0xf3d9ac);
     scene.fog = new THREE.Fog(0xf6dcae, 42, 150);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). The golden-hour room
+    // and the one place in the cove where leaning warm IS the point - but the
+    // clock already swings this sky from peach to midnight blue on its own, so
+    // the grade only has to agree with it, not do its job.
+    this.grade = { warmth: 0.45, lift: 0.12 };
 
     this._buildLight(scene);
     this._buildSky(scene);
@@ -943,6 +948,13 @@ export class BeachRoom extends Room {
     const vCount = (SEG + 1) * (RINGS + 1);
     const pos = new Float32Array(vCount * 3);
     const uv = new Float32Array(vCount * 2);
+    // Vertex tint. texSand() gives grain but one tone: 23 metres of it in the
+    // wide shot read as a flat sheet with props stickered on. Two cheap terms,
+    // both build-time: the sand bleaches with height (the back dunes catch the
+    // sun, the hollows hold damp) and a slow sine wash breaks the rings up so
+    // the gradient never reads as a bullseye. Multiplied over the map, so the
+    // clock's relight still owns the actual colour.
+    const col = new Float32Array(vCount * 3);
     const idx = new Uint16Array(SEG * RINGS * 6);
     let ii = 0;
     for (let j = 0; j <= RINGS; j++) {
@@ -953,8 +965,15 @@ export class BeachRoom extends Room {
         const x = CX + Math.cos(th) * r;
         const z = CZ + Math.sin(th) * r;
         const k = j * (SEG + 1) + i;
-        pos[k * 3] = x; pos[k * 3 + 1] = sandY(x, z); pos[k * 3 + 2] = z;
+        const y = sandY(x, z);
+        pos[k * 3] = x; pos[k * 3 + 1] = y; pos[k * 3 + 2] = z;
         uv[k * 2] = x / 6; uv[k * 2 + 1] = z / 6;
+        const wash = Math.sin(x * 0.23 + 1.1) * Math.sin(z * 0.19 - 0.4);
+        const dry = clamp01((y + 0.35) / 1.3);
+        const t = 1 + wash * 0.045 + (dry - 0.5) * 0.075;
+        col[k * 3] = t;
+        col[k * 3 + 1] = t - wash * 0.008 - (dry - 0.5) * 0.006;
+        col[k * 3 + 2] = t - wash * 0.02 - (dry - 0.5) * 0.05;
       }
     }
     for (let j = 0; j < RINGS; j++) {
@@ -968,10 +987,11 @@ export class BeachRoom extends Room {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
     g.setIndex(new THREE.BufferAttribute(idx, 1));
     g.computeVertexNormals();
 
-    const sand = new THREE.Mesh(g, toonTex(0xffffff, texSand()));
+    const sand = new THREE.Mesh(g, toonTex(0xffffff, texSand(), { vertexColors: true }));
     sand.receiveShadow = true;
     scene.add(sand);
     this.groundMeshes = [sand];
@@ -1100,9 +1120,20 @@ export class BeachRoom extends Room {
     }
     this.anim.glintMesh = glints;
 
-    // horizon islands (single merged silhouette)
+    // Horizon islands (single merged silhouette). Every island the room shipped
+    // with sits WEST, because that is where the sunset is - but the wide camera
+    // is 16:9 and pitched shallow enough to hold the real horizon, so the whole
+    // right third of the frame was open water with nothing in it at all. One
+    // more to the north-east, sized and placed so it is cut by the top edge
+    // exactly like its western siblings and answers them across the shot.
+    // (A low sandy cay was tried nearer in, at 22,-44: the big palm on the
+    // island's east side covers that whole wedge of the frame. Verify against
+    // the wide camera before adding anything out here.)
     const isl = [];
-    for (const [x, z, r, h] of [[-78, -46, 22, 11], [-104, 8, 15, 7], [-62, 52, 26, 13], [-40, -74, 12, 6]]) {
+    for (const [x, z, r, h] of [
+      [-78, -46, 22, 11], [-104, 8, 15, 7], [-62, 52, 26, 13], [-40, -74, 12, 6],
+      [36, -72, 20, 10],
+    ]) {
       isl.push({ g: xf(new THREE.ConeGeometry(r, h, 7, 1), x, h * 0.42 - 0.6, z), c: 0x6f97a6 });
       isl.push({ g: xf(new THREE.ConeGeometry(r * 0.55, h * 0.7, 6, 1), x + r * 0.5, h * 0.3 - 0.6, z + r * 0.3), c: 0x7ea5b0 });
     }

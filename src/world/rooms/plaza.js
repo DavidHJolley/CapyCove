@@ -161,6 +161,44 @@ function rng(seed) {
   };
 }
 
+/**
+ * Low-frequency vertex tint for the big flat ground discs. A 36-metre circle in
+ * one flat toon colour is the single cheapest-reading thing in a wide shot: the
+ * eye has nothing to hold on to and the silhouette of every prop sits on paper.
+ * Two sine octaves over the surface break it up without ever becoming a pattern
+ * you can name. The numbers hover around 1 because vertex colours MULTIPLY the
+ * material colour, and the blue channel is pulled slightly harder in the dark
+ * lobes so the dips read as cool shade rather than as grey. Build-time only:
+ * one Float32Array per ground mesh, nothing per frame.
+ */
+function mottle(geo, amt = 0.07, freq = 0.09, seed = 0) {
+  const p = geo.attributes.position;
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox;
+  // works before OR after a rotateX: pick the two widest axes of the plane
+  const second = bb.max.z - bb.min.z >= bb.max.y - bb.min.y ? 2 : 1;
+  const arr = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i);
+    const y = second === 2 ? p.getZ(i) : p.getY(i);
+    const n = Math.sin(x * freq + seed) * Math.sin(y * freq * 1.37 + seed * 1.7)
+      + 0.5 * Math.sin((x + y) * freq * 2.3 + seed * 2.9);
+    const k = 1 + n * amt * 0.62;
+    arr[i * 3] = k;
+    arr[i * 3 + 1] = k - n * amt * 0.06;
+    arr[i * 3 + 2] = k - n * amt * 0.2;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  return geo;
+}
+
+/** A flat disc with radial rings, so `mottle` has vertices to work with.
+ *  RingGeometry at inner radius 0 is a circle; the inner fan is degenerate and
+ *  costs nothing. */
+function disc(r, seg, rings) {
+  return new THREE.RingGeometry(0, r, seg, rings);
+}
+
 /** Matrix from position / euler / scale. `r` may be null, `s` a number or [x,y,z]. */
 function T(p, r, s) {
   _o.position.set(p[0], p[1], p[2]);
@@ -583,6 +621,11 @@ export class PlazaRoom extends Room {
 
     scene.background = new THREE.Color(SKY);
     scene.fog = new THREE.Fog(FOG, 42, 118);
+    // Per-room colour grade (src/core/postfx.js; -1..+1 mood nudges, not
+    // absolute offsets). The plaza IS the reference look every other room is
+    // judged against, so it asks for almost nothing: a hair of afternoon on
+    // the cream, shadows exactly where the global default puts them.
+    this.grade = { warmth: 0.12, lift: 0 };
 
     const hemi = new THREE.HemisphereLight(0xfff6e2, 0x8fae6a, 1.0);
     scene.add(hemi);
@@ -657,8 +700,11 @@ export class PlazaRoom extends Room {
 
   // -------------------------------------------------------------- ground --
   _buildGround(scene, rand) {
-    // sea + island skirt (decor, not walkable)
-    const sea = put(scene, new THREE.CircleGeometry(130, 44), makeToon(C.seaFar),
+    // sea + island skirt (decor, not walkable). Both discs carry a vertex tint:
+    // the near sea is the widest single colour in the wide shot, and the flat
+    // fill made the foam ring look pasted on rather than lying in water.
+    const sea = put(scene, mottle(disc(130, 44, 7), 0.09, 0.055, 3.1),
+      makeToon(C.seaFar, { vertexColors: true }),
       0, -1.35, 0, { rot: [-Math.PI / 2, 0, 0], cast: false });
     const foam = put(scene, new THREE.TorusGeometry(18.8, 0.34, 5, 56), glowFade(0xffffff, 0.5),
       0, -0.95, 0, { rot: [-Math.PI / 2, 0, 0], cast: false });
@@ -666,7 +712,8 @@ export class PlazaRoom extends Room {
       0, -2.32, 0, { cast: false, recv: true });
 
     // walkable grass
-    const grass = put(scene, new THREE.CircleGeometry(ISLAND_R, 56), makeToon(C.grass),
+    const grass = put(scene, mottle(disc(ISLAND_R, 56, 5), 0.075, 0.13, 1.7),
+      makeToon(C.grass, { vertexColors: true }),
       0, 0, 0, { rot: [-Math.PI / 2, 0, 0], cast: false, recv: true });
 
     // cobbled plaza
@@ -726,6 +773,16 @@ export class PlazaRoom extends Room {
     inst(scene, hillGeo, makeToon(C.hillA), bands[0], false, false);
     inst(scene, hillGeo, makeToon(C.hillB), bands[1], false, false);
     inst(scene, hillGeo, makeToon(C.hillC), bands[2], false, false);
+
+    // NOTE for the next person tempted to hang a mountain on this skyline:
+    // measure first. The FOLLOW camera (the default) sits at only ~26 degrees
+    // below horizontal, so at 60 units out things up to roughly y = +4.7 CAN
+    // reach the frame; the earlier claim that nothing above y = 19 - 0.26*d is
+    // ever visible was wrong (it described the wide vantage only). What
+    // actually protects this skyline is OCCLUSION: the near hill bands cover
+    // the horizon line from every walkable spot (1200/1200 sampled). So a
+    // distant peak is possible, but project the apex from the FOLLOW camera at
+    // the room's edges before you build it, not from the wide one.
 
     // clouds: one instanced puff field, slowly orbiting the cove
     const clouds = new THREE.Group();

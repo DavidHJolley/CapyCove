@@ -647,6 +647,12 @@ export class MineRoom extends Room {
 
     scene.background = new THREE.Color(0x120c08);
     scene.fog = new THREE.FogExp2(0x1a120b, 0.0145);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). Every light down
+    // here is a lantern, so this is the warmest grade in the cove. Unlike the
+    // club it takes a small POSITIVE lift: the mine is a play space (the prop
+    // hunt runs in it) and a seeker has to be able to read a barrel from a
+    // capybara in the rim shadow.
+    this.grade = { warmth: 0.55, lift: 0.2 };
 
     this._lights(scene);
     this._cave(scene);
@@ -801,7 +807,13 @@ export class MineRoom extends Room {
 
     // Walkable floor: one disc, vertex-shaded from a warm lantern-lit middle to
     // a dark rim. Detail (lanes, spills, puddles) is dressed on top of it.
-    const geo = new THREE.CircleGeometry(FLOOR_R, 56);
+    // RingGeometry at inner radius 0 is a circle with RINGS of vertices in it,
+    // where CircleGeometry is a bare fan: the radial ramp below was landing on
+    // a centre vertex and a rim, so it interpolated as one clean cone of light
+    // and the floor read as painted. Rings give the ramp somewhere to breathe
+    // and give the dust blotches somewhere to live. Same disc, same raycast,
+    // ~330 verts instead of 58, still one draw call.
+    const geo = new THREE.RingGeometry(0, FLOOR_R, 56, 5);
     geo.rotateX(-Math.PI / 2);
     const pos = geo.attributes.position;
     const col = new Float32Array(pos.count * 3);
@@ -809,11 +821,16 @@ export class MineRoom extends Room {
     const dark = new THREE.Color(C.floorDark);
     const tmp = new THREE.Color();
     for (let i = 0; i < pos.count; i++) {
-      const r = Math.hypot(pos.getX(i), pos.getZ(i)) / FLOOR_R;
+      const x = pos.getX(i), z = pos.getZ(i);
+      const r = Math.hypot(x, z) / FLOOR_R;
       tmp.copy(lit).lerp(dark, Math.min(1, r * r * 1.15));
-      col[i * 3] = tmp.r;
-      col[i * 3 + 1] = tmp.g;
-      col[i * 3 + 2] = tmp.b;
+      // trodden dust and damp: broad patches, warm where the lanterns pool
+      const blot = Math.sin(x * 0.37 + 1.4) * Math.sin(z * 0.33 - 0.7)
+        + 0.5 * Math.sin((x + z) * 0.71 + 2.6);
+      const k = 1 + blot * 0.06;
+      col[i * 3] = tmp.r * k;
+      col[i * 3 + 1] = tmp.g * (k - blot * 0.012);
+      col[i * 3 + 2] = tmp.b * (k - blot * 0.03);
     }
     geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
     const floor = new THREE.Mesh(geo, makeToon(0xffffff, { vertexColors: true, steps: 4 }));

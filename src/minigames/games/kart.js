@@ -3,22 +3,40 @@ import { Minigame } from '../minigame.js';
 import { makeToon, makeGlow, canvasTexture, disposeObject } from '../../core/materials.js';
 import { createAvatar } from '../../player/avatar.js';
 import { BODY_COLORS } from '../../../shared/constants.js';
+import {
+  TRACK_ORDER, DEFAULT_TRACK, getTrack, isTrackId, buildTrack, buildTrackWorld,
+  mergeParts, hazardPose, hazardHits, frac1,
+  G_SLOPE, DOWNHILL_CEIL_MUL, GRAVITY_AIR, AIR_STEER, AIR_MIN_MS,
+  LAND_BOOST_MS, LAND_BOOST_TARGET, LAND_HARD_YAW,
+  HAZ_HIT_MS, HAZ_IMMUNE_MS, HAZ_SPEED_MUL,
+} from './kart-tracks.js';
+import { KartHud } from './kart-hud.js';
 
 /**
- * Capy Karts: six capybaras, three laps, one beachside circuit.
+ * Capy Karts: six capybaras, three laps, four cozy circuits.
  *
- * Built to docs/KARTS.md (FROZEN). Read that first; this file is the racer
- * client and follows it number for number.
+ * Built to docs/KARTS.md (FROZEN) plus its GRAND PRIX AMENDMENT. Read those
+ * first; this file is the racer client and follows them number for number.
  *
- * TRACK SPACE. The circuit is a closed centripetal Catmull-Rom loop scale-locked
- * to LAP_UNITS = 545, and every kart is stored as (q, lat, yaw):
+ * TRACK SPACE. Each circuit is a closed centripetal Catmull-Rom loop scale-locked
+ * to its own `LAP_UNITS`, and every kart is stored as (q, lat, yaw):
  *   q    normalised lap progress, 0 at the finish line, wraps 1 -> 0
  *   lat  lateral offset as a fraction of the local half-width (0 centre,
  *        +-1 the white line, +-1.85 the barrier)
  *   yaw  heading MINUS the track tangent, wrapped to -pi..pi
- * x/z never touch the wire: they are `posAt(s)` plus `lat * halfWidth`, which is
- * why server/kart.js needs no track data at all. Driving integrates in world
- * space and is projected back into track space every frame (§2).
+ * x/y/z never touch the wire: they are `posAt(s)` plus `lat * halfWidth`, which
+ * is why server/kart.js needs no track geometry at all. **Elevation is CLIENT
+ * geometry** (§A1): the y column rides the control points, shapes the road mesh
+ * and drives the slope physics of §A3, and never travels.
+ *
+ * THREE MODULES, ONE RACE.
+ *   `kart-tracks.js` (GP1) owns the registry: four rows of numbers plus the
+ *     theme bundles. We read `TRACKS` through the frozen row shape only and
+ *     never reach into its internals.
+ *   `kart-hud.js` (GP3) owns every DOM node of the race UI behind the ten-method
+ *     interface of §A7. This file keeps the 3D scene, the camera, the audio and
+ *     the Minigame lifecycle, and hands the HUD one reused view object a frame.
+ *   this file owns the driving.
  *
  * TWO MODES, ONE SIMULATION.
  *   practice (`game.__kartCtx == null`): we own the boxes, the hazards, the hit
@@ -29,12 +47,10 @@ import { BODY_COLORS } from '../../../shared/constants.js';
  *     `kart-in`, and render everyone else from `kart-state` with a 120ms
  *     interpolation buffer. A hit is NEVER applied on prediction: we may splash
  *     cosmetically the instant we drive through something, but no speed or
- *     control penalty lands until `kart-hit` says so (§4 decision 1).
+ *     control penalty lands until `kart-hit` says so (§4 decision 1, §A2).
  */
 
 // ============================================================== contract ====
-const LAP_UNITS = 545;         // §2 scale lock
-const S_FIN = 30.0;            // finish line, units along the spline from CTRL[0]
 const LAPS = 3;
 const KART_LIGHTS_MS = 3200;   // §3.4
 const RACE_MAX_MS = 360000;
@@ -42,14 +58,41 @@ const LOCAL_GRACE_MS = 15000;  // practice only; a race ends on the server's wor
 const SEND_HZ = 10;            // kart-in
 const INTERP_MS = 120;         // remote kart render delay
 
-/** [x, z, fullWidth] — §2. Scaled uniformly at build so the lap is 545 units. */
-const CTRL = [
-  [-60, -80, 15], [-20, -84, 15], [20, -84, 15], [56, -76, 14],
-  [84, -58, 13], [95, -30, 13], [92, 2, 12], [82, 30, 11],
-  [62, 48, 10], [36, 50, 10], [18, 36, 9], [-4, 44, 9],
-  [-30, 50, 11], [-56, 40, 12], [-74, 14, 13], [-80, -16, 13],
-  [-76, -48, 14], [-70, -68, 15],
-];
+/**
+ * The ACTIVE track's numbers. The engine mounts exactly one minigame at a time,
+ * so the circuit lives here rather than threading `this.` through the three
+ * hundred call sites that read it; `_selectTrack` is the only writer.
+ */
+let LAP_UNITS = 545;           // §A1 scale lock, per track
+let S_FIN = 30.0;              // finish line, units along the spline from points[0]
+let CHECKPOINTS = 6;           // §A1.3 bits; crossing q = k/CHECKPOINTS sets k
+let CP_MASK = 0b111111;        // all checkpoint bits set
+
+// ---- §A3 elevation, grip and airtime. Client physics only; never on the wire.
+// The constants themselves are GP1's (one source for the two files that have to
+// agree); only the two numbers §A3 states in terms of V_MAX are resolved here.
+const DOWNHILL_CEIL = 22.0 * DOWNHILL_CEIL_MUL;  // 25.3 — gravity's own ceiling
+const LAND_CLEAN = 0.35;             // |yaw| under this lands you a boost
+const LAND_HARD = LAND_HARD_YAW;     // |yaw| over this costs you 30% of your speed
+
+// ---- §A6 wrong way
+const WRONGWAY_MS = 1200;
+const WRONGWAY_MIN_V = 5.0;
+const WRONGWAY_CLEAR_MS = 400;
+const WRONGWAY_LP_HZ = 400;
+
+// ---- §A4 the roster: five sidegrades, four stats, every kart summing to 12.
+const KARTS = {
+  coco: { id: 'coco', name: 'Coconut Cruiser', blurb: 'round tub, husk fenders', acc: 3, vmax: 3, han: 3, wgt: 3, runs: 0 },
+  reef: { id: 'reef', name: 'Reef Racer', blurb: 'low wedge, coral fin', acc: 4, vmax: 4, han: 3, wgt: 1, runs: 0 },
+  biscuit: { id: 'biscuit', name: 'Biscuit Barrel', blurb: 'stout barrel, crumb trim', acc: 2, vmax: 2, han: 3, wgt: 5, runs: 0 },
+  dart: { id: 'dart', name: 'Dune Dart', blurb: 'needle nose, sand skis', acc: 3, vmax: 5, han: 3, wgt: 1, runs: 10 },
+  fern: { id: 'fern', name: 'Fernback', blurb: 'leafy buggy, frond spoiler', acc: 4, vmax: 2, han: 5, wgt: 1, runs: 25 },
+};
+const KART_ORDER = ['coco', 'reef', 'biscuit', 'dart', 'fern'];
+const LS_RUNS = 'cove.kart.runs';
+const LS_KART = 'cove.kart.pick';
+const LS_TRACK = 'cove.kart.track';
 
 // ---- §3.1 driving
 const V_MAX = 22.0;
@@ -105,12 +148,7 @@ const SOAK_MUL = 0.5;
 const BERRY_MS = 1300;
 const BERRY_TARGET = 30;
 
-/** §2 — frozen in (q, lat) so both sides agree without the spline. */
-const BOXES = [
-  [0.220, -0.62], [0.220, -0.21], [0.220, 0.21], [0.220, 0.62],
-  [0.550, -0.45], [0.550, 0.00], [0.550, 0.45],
-  [0.790, -0.62], [0.790, -0.21], [0.790, 0.21], [0.790, 0.62],
-];
+// §A1.2 — the eleven boxes are frozen per track in (q, lat), in the registry.
 const BOX_DQ = 0.006;
 const BOX_DLAT = 0.22;
 
@@ -140,10 +178,6 @@ const KERB_A = 0xe8657a;
 const KERB_B = 0xfff6e2;
 const GOLD = 0xf2b64a;
 const CREAM = 0xfff6e2;
-const SKY_TOP = 0x3f9fdd;
-const SKY_LOW = 0xffeecb;
-const FOG_COL = 0xcfe6f2;
-
 // ================================================================ helpers ====
 const _m4 = new THREE.Matrix4();
 const _q4 = new THREE.Quaternion();
@@ -182,7 +216,6 @@ function dq(a, b) {
   if (d < -0.5) d += 1;
   return d;
 }
-const frac1 = (v) => v - Math.floor(v);
 
 const ORD = ['th', 'st', 'nd', 'rd'];
 function ordinal(n) {
@@ -215,378 +248,19 @@ function mulberry32(seed) {
 }
 
 /**
- * Merge primitive parts into one vertex-coloured BufferGeometry so a multi-colour
- * prop still costs a single draw call through InstancedMesh. Inputs are consumed.
+ * §A4 — the kart pick, the track pick and the races-run count live in
+ * localStorage: an unlock here is a CEREMONY, never a gate, and five
+ * equal-total sidegrades are not worth a server round trip. A locked-down
+ * browser (private mode, storage disabled) simply always races the default.
  */
-function mergeParts(parts) {
-  const pos = [];
-  const nor = [];
-  const cols = [];
-  for (const p of parts) {
-    const src = p.geo;
-    const g = src.index ? src.toNonIndexed() : src;
-    const gp = g.attributes.position;
-    const gn = g.attributes.normal;
-    _eu.set(p.rx || 0, p.ry || 0, p.rz || 0);
-    _q4.setFromEuler(_eu);
-    _v3b.set(p.x || 0, p.y || 0, p.z || 0);
-    _sc.set(p.sx ?? p.s ?? 1, p.sy ?? p.s ?? 1, p.sz ?? p.s ?? 1);
-    _m4.compose(_v3b, _q4, _sc);
-    _nm.getNormalMatrix(_m4);
-    _col.setHex(p.color ?? 0xffffff);
-    for (let i = 0; i < gp.count; i++) {
-      _v3.fromBufferAttribute(gp, i).applyMatrix4(_m4);
-      pos.push(_v3.x, _v3.y, _v3.z);
-      _v3.fromBufferAttribute(gn, i).applyNormalMatrix(_nm).normalize();
-      nor.push(_v3.x, _v3.y, _v3.z);
-      cols.push(_col.r, _col.g, _col.b);
-    }
-    if (g !== src) g.dispose();
-    src.dispose();
-  }
-  const out = new THREE.BufferGeometry();
-  out.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  out.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
-  out.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
-  return out;
+function readLS(key, dflt) {
+  try {
+    const v = globalThis.localStorage?.getItem(key);
+    return v === null || v === undefined ? dflt : v;
+  } catch { return dflt; }
 }
-
-// ================================================================== track ====
-/**
- * Centripetal Catmull-Rom through (x, z, width). The knots come from the 2D
- * distance only, so the width rides exactly the same parameterisation as the
- * centreline and a wide corner never gets a narrow apex.
- */
-function crEval(P0, P1, P2, P3, t, out) {
-  const d2 = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
-  const t0 = 0;
-  const t1 = t0 + (Math.sqrt(d2(P0, P1)) || 1e-4);
-  const t2 = t1 + (Math.sqrt(d2(P1, P2)) || 1e-4);
-  const t3 = t2 + (Math.sqrt(d2(P2, P3)) || 1e-4);
-  const tt = t1 + (t2 - t1) * t;
-  for (let k = 0; k < 3; k++) {
-    const a1 = ((t1 - tt) * P0[k] + (tt - t0) * P1[k]) / (t1 - t0);
-    const a2 = ((t2 - tt) * P1[k] + (tt - t1) * P2[k]) / (t2 - t1);
-    const a3 = ((t3 - tt) * P2[k] + (tt - t2) * P3[k]) / (t3 - t2);
-    const b1 = ((t2 - tt) * a1 + (tt - t0) * a2) / (t2 - t0);
-    const b2 = ((t3 - tt) * a2 + (tt - t1) * a3) / (t3 - t1);
-    out[k] = ((t2 - tt) * b1 + (tt - t1) * b2) / (t2 - t1);
-  }
-  return out;
-}
-
-/**
- * Build the arc-length LUT. Everything downstream (road ribbon, item boxes,
- * grid, minimap, physics) reads the circuit through this one object, so the
- * scale lock lives in exactly one place.
- *
- * @returns {{ step:number, n:number, x:Float32Array, z:Float32Array,
- *   ang:Float32Array, hw:Float32Array, curv:Float32Array,
- *   at(s, out):object, worldOf(q, lat, out):object, angleAt(s):number }}
- */
-function buildTrack() {
-  const n = CTRL.length;
-  const SUB = 48;
-  const raw = [];
-  const tmp = [0, 0, 0];
-  let len = 0;
-  let prev = null;
-  for (let i = 0; i < n; i++) {
-    const P0 = CTRL[(i - 1 + n) % n];
-    const P1 = CTRL[i];
-    const P2 = CTRL[(i + 1) % n];
-    const P3 = CTRL[(i + 2) % n];
-    for (let j = 0; j < SUB; j++) {
-      const p = crEval(P0, P1, P2, P3, j / SUB, tmp).slice();
-      if (prev) len += Math.hypot(p[0] - prev[0], p[1] - prev[1]);
-      raw.push(p);
-      prev = p;
-    }
-  }
-  len += Math.hypot(raw[0][0] - prev[0], raw[0][1] - prev[1]);
-
-  // SCALE LOCK: one uniform factor on x, z and width, so the lap measures
-  // exactly LAP_UNITS and the road keeps its authored proportion to the corners.
-  const k = LAP_UNITS / len;
-  for (const p of raw) { p[0] *= k; p[1] *= k; p[2] *= k; }
-
-  // Resample to a fixed 2u step, walking the fine samples and interpolating.
-  const step = 2;
-  const N = Math.round(LAP_UNITS / step); // 272.5 -> 273 slots + wrap
-  const stepR = LAP_UNITS / N;
-  const xs = new Float32Array(N + 1);
-  const zs = new Float32Array(N + 1);
-  const hws = new Float32Array(N + 1);
-  const angs = new Float32Array(N + 1);
-  const curv = new Float32Array(N + 1);
-
-  let acc = 0;
-  let ri = 0;
-  for (let i = 0; i <= N; i++) {
-    const want = Math.min(i * stepR, LAP_UNITS - 1e-4);
-    while (ri < raw.length) {
-      const a = raw[ri];
-      const b = raw[(ri + 1) % raw.length];
-      const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
-      if (acc + d >= want || ri === raw.length - 1) {
-        const f = d > 1e-9 ? clamp((want - acc) / d, 0, 1) : 0;
-        xs[i] = lerp(a[0], b[0], f);
-        zs[i] = lerp(a[1], b[1], f);
-        hws[i] = lerp(a[2], b[2], f) * 0.5; // table is FULL width
-        break;
-      }
-      acc += d;
-      ri++;
-    }
-  }
-  xs[N] = xs[0]; zs[N] = zs[0]; hws[N] = hws[0];
-
-  for (let i = 0; i <= N; i++) {
-    const a = (i - 1 + N) % N;
-    const b = (i + 1) % N;
-    angs[i] = Math.atan2(zs[b] - zs[a], xs[b] - xs[a]);
-  }
-  for (let i = 0; i <= N; i++) {
-    const a = (i - 1 + N) % N;
-    const b = (i + 1) % N;
-    curv[i] = wrapPi(angs[b] - angs[a]) / (2 * stepR);
-  }
-
-  /**
-   * An offset path folds through its own centre of curvature once
-   * |lat*hw| > 1/|curv|. The hairpin at q~0.55 is tight enough for the barrier
-   * line to reach that far, so every world offset is squeezed to stay on the
-   * outside of it. `lat` on the wire is untouched: this only shapes geometry.
-   */
-  function safeOffset(d, c) {
-    if (d * c > 0.72) return 0.72 / c;
-    return d;
-  }
-
-  const at = (s, out = {}) => {
-    let u = s % LAP_UNITS;
-    if (u < 0) u += LAP_UNITS;
-    const f = u / stepR;
-    const i = Math.floor(f);
-    const t = f - i;
-    const j = i + 1;
-    out.x = lerp(xs[i], xs[j], t);
-    out.z = lerp(zs[i], zs[j], t);
-    out.hw = lerp(hws[i], hws[j], t);
-    out.ang = angLerp(angs[i], angs[j], t);
-    out.curv = lerp(curv[i], curv[j], t);
-    return out;
-  };
-
-  const _t = {};
-  const worldOf = (q, lat, out = {}) => {
-    at(frac1(q) * LAP_UNITS + S_FIN, _t);
-    const d = safeOffset(lat * _t.hw, _t.curv);
-    const sa = Math.sin(_t.ang);
-    const ca = Math.cos(_t.ang);
-    out.x = _t.x - sa * d;
-    out.z = _t.z + ca * d;
-    out.ang = _t.ang;
-    out.hw = _t.hw;
-    return out;
-  };
-
-  return {
-    step: stepR, n: N, x: xs, z: zs, hw: hws, ang: angs, curv,
-    at, worldOf, safeOffset,
-    angleAt(s) { return at(s, _t).ang; },
-    /** Centreline point for index i, offset laterally by d world units. */
-    edge(i, d, out) {
-      const c = curv[i];
-      const dd = d * c > 0.72 ? 0.72 / c : d;
-      out[0] = xs[i] - Math.sin(angs[i]) * dd;
-      out[1] = zs[i] + Math.cos(angs[i]) * dd;
-      return out;
-    },
-  };
-}
-
-// ========================================================= circuit meshes ====
-/**
- * Road, kerbs and run-off are THREE merged ribbons (§6), never per-segment
- * meshes. Each is a closed triangle strip walked once around the LUT with a
- * baked vertex colour, so the whole circuit surface is 3 draw calls.
- */
-function buildRibbon(track, bands) {
-  const N = track.n;
-  const pos = [];
-  const nor = [];
-  const cols = [];
-  const a = [0, 0];
-  const b = [0, 0];
-  const c = [0, 0];
-  const d = [0, 0];
-  for (const band of bands) {
-    for (let i = 0; i < N; i++) {
-      const j = (i + 1) % N;
-      const hwI = track.hw[i];
-      const hwJ = track.hw[j];
-      const inner = band.inner;
-      const outer = band.outer;
-      track.edge(i, inner * hwI, a);
-      track.edge(i, outer * hwI, b);
-      track.edge(j, outer * hwJ, c);
-      track.edge(j, inner * hwJ, d);
-      const y = band.y ?? 0;
-      const col = band.color(i, N);
-      _col.setHex(col);
-      // two triangles, flat up-normal (everything is y = const per band)
-      const quad = [a, b, c, a, c, d];
-      for (const p of quad) {
-        pos.push(p[0], y, p[1]);
-        nor.push(0, 1, 0);
-        cols.push(_col.r, _col.g, _col.b);
-      }
-    }
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
-  g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
-  g.computeBoundingSphere();
-  return g;
-}
-
-/** Asphalt with lane shading, white edge lines and a checkered start band. */
-function roadBands(track) {
-  const finI = Math.round((S_FIN / LAP_UNITS) * track.n) % track.n;
-  const dark = 0x4b4658;
-  const mid = ASPHALT;
-  const light = 0x6a6377;
-  const road = (i, N) => {
-    // start/finish: 5 rows of checker just before the line
-    const back = (finI - i + N) % N;
-    if (back < 4) return (i + Math.floor(back)) % 2 === 0 ? 0xf7f2e6 : 0x38343f;
-    // gentle blotching so a 545-unit ribbon is not one flat grey
-    const t = (Math.sin(i * 0.7) + Math.sin(i * 0.19 + 1.3)) * 0.25 + 0.5;
-    return t > 0.62 ? light : t < 0.36 ? dark : mid;
-  };
-  return [
-    { inner: -1.0, outer: -0.955, y: 0.012, color: () => 0xf7f2e6 },
-    { inner: -0.955, outer: 0, y: 0.01, color: road },
-    { inner: 0, outer: 0.955, y: 0.01, color: road },
-    { inner: 0.955, outer: 1.0, y: 0.012, color: () => 0xf7f2e6 },
-  ];
-}
-
-/** Coral/cream kerbs. The stripe period is in LUT steps, so it stays even. */
-function kerbBands() {
-  const stripe = (i) => (Math.floor(i / 2) % 2 === 0 ? KERB_A : KERB_B);
-  return [
-    { inner: -1.24, outer: -1.0, y: 0.055, color: stripe },
-    { inner: 1.0, outer: 1.24, y: 0.055, color: stripe },
-  ];
-}
-
-/** Sandy run-off aprons outside the kerbs. */
-function apronBands() {
-  const grit = (i) => (Math.sin(i * 1.1) > 0.35 ? 0xe4cd90 : SAND);
-  return [
-    { inner: -1.78, outer: -1.24, y: -0.02, color: grit },
-    { inner: 1.24, outer: 1.78, y: -0.02, color: grit },
-  ];
-}
-
-// ---------------------------------------------------------------- props ----
-function palmGeo() {
-  const parts = [];
-  for (let i = 0; i < 5; i++) {
-    const t = i / 4;
-    parts.push({
-      geo: new THREE.CylinderGeometry(0.16 - t * 0.05, 0.2 - t * 0.05, 1.1, 6),
-      x: Math.sin(t * 1.5) * 0.5, y: 0.55 + i * 1.02, rz: -0.16,
-      color: i % 2 ? 0x9a7a52 : 0x8a6c46,
-    });
-  }
-  for (let i = 0; i < 7; i++) {
-    const a = (i / 7) * Math.PI * 2;
-    parts.push({
-      geo: new THREE.ConeGeometry(0.42, 2.5, 4),
-      x: Math.sin(1.5) * 0.5 + Math.cos(a) * 1.1, y: 5.5, z: Math.sin(a) * 1.1,
-      rx: Math.sin(a) * 0.95, rz: -Math.cos(a) * 0.95, sy: 1,
-      color: i % 2 ? 0x5aa83c : 0x7ac74f,
-    });
-  }
-  parts.push({ geo: new THREE.SphereGeometry(0.34, 7, 5), x: 0.6, y: 5.1, color: 0xd8a43c });
-  return mergeParts(parts);
-}
-
-function tyreGeo() {
-  const parts = [];
-  for (let i = 0; i < 3; i++) {
-    parts.push({
-      geo: new THREE.CylinderGeometry(0.55, 0.55, 0.32, 10),
-      y: 0.17 + i * 0.31, ry: i * 0.5,
-      color: i % 2 ? 0x3a3540 : 0x2c2833,
-    });
-    parts.push({
-      geo: new THREE.CylinderGeometry(0.26, 0.26, 0.34, 8),
-      y: 0.17 + i * 0.31, color: i === 1 ? KERB_A : CREAM,
-    });
-  }
-  return mergeParts(parts);
-}
-
-function baleGeo() {
-  const parts = [
-    { geo: new THREE.CylinderGeometry(0.62, 0.62, 1.5, 9), rz: Math.PI / 2, y: 0.62, color: 0xe0c274 },
-    { geo: new THREE.TorusGeometry(0.63, 0.06, 4, 10), ry: Math.PI / 2, x: -0.4, y: 0.62, color: 0xb99a52 },
-    { geo: new THREE.TorusGeometry(0.63, 0.06, 4, 10), ry: Math.PI / 2, x: 0.4, y: 0.62, color: 0xb99a52 },
-  ];
-  return mergeParts(parts);
-}
-
-/** A bunting arch: two posts and a swagged rope of little pennants. */
-function archGeo() {
-  const parts = [];
-  for (const side of [-1, 1]) {
-    parts.push({ geo: new THREE.CylinderGeometry(0.16, 0.2, 5.2, 6), x: side * 5.6, y: 2.6, color: 0xe6d9bd });
-    parts.push({ geo: new THREE.SphereGeometry(0.26, 7, 5), x: side * 5.6, y: 5.3, color: GOLD });
-  }
-  const flagCols = [KERB_A, GOLD, SEA, 0x7ac74f, CREAM];
-  for (let i = 0; i <= 14; i++) {
-    const t = i / 14;
-    const x = -5.6 + t * 11.2;
-    const y = 5.1 - Math.sin(t * Math.PI) * 0.85;
-    parts.push({ geo: new THREE.BoxGeometry(0.78, 0.09, 0.09), x, y, rz: Math.cos(t * Math.PI) * 0.28, color: 0xd9cbaa });
-    if (i < 14) {
-      parts.push({
-        geo: new THREE.ConeGeometry(0.26, 0.5, 3), x: x + 0.38, y: y - 0.3,
-        rx: Math.PI, color: flagCols[i % flagCols.length],
-      });
-    }
-  }
-  return mergeParts(parts);
-}
-
-/** A cheering capybara in the stands: one merged blob, not a full avatar. */
-function crowdGeo(color) {
-  return mergeParts([
-    { geo: new THREE.SphereGeometry(0.42, 8, 6), y: 0.44, sy: 1.05, color },
-    { geo: new THREE.SphereGeometry(0.33, 8, 6), y: 1.0, color },
-    { geo: new THREE.BoxGeometry(0.3, 0.2, 0.2), y: 0.94, z: 0.28, color },
-    { geo: new THREE.SphereGeometry(0.09, 6, 5), x: -0.24, y: 1.24, sz: 0.6, color },
-    { geo: new THREE.SphereGeometry(0.09, 6, 5), x: 0.24, y: 1.24, sz: 0.6, color },
-    { geo: new THREE.SphereGeometry(0.05, 5, 4), x: -0.12, y: 1.04, z: 0.3, color: 0x241a12 },
-    { geo: new THREE.SphereGeometry(0.05, 5, 4), x: 0.12, y: 1.04, z: 0.3, color: 0x241a12 },
-    { geo: new THREE.CapsuleGeometry(0.08, 0.3, 3, 6), x: -0.44, y: 0.86, rz: 0.9, color },
-    { geo: new THREE.CapsuleGeometry(0.08, 0.3, 3, 6), x: 0.44, y: 0.86, rz: -0.9, color },
-  ]);
-}
-
-function gullGeo() {
-  return mergeParts([
-    { geo: new THREE.SphereGeometry(0.16, 7, 5), sz: 1.5, color: 0xfdfbf4 },
-    { geo: new THREE.SphereGeometry(0.1, 6, 5), z: 0.24, y: 0.06, color: 0xfdfbf4 },
-    { geo: new THREE.ConeGeometry(0.04, 0.14, 4), z: 0.34, y: 0.05, rx: Math.PI / 2, color: GOLD },
-    { geo: new THREE.BoxGeometry(0.62, 0.03, 0.16), x: -0.34, y: 0.06, rz: 0.3, color: 0xe9e4d6 },
-    { geo: new THREE.BoxGeometry(0.62, 0.03, 0.16), x: 0.34, y: 0.06, rz: -0.3, color: 0xe9e4d6 },
-  ]);
+function writeLS(key, value) {
+  try { globalThis.localStorage?.setItem(key, String(value)); } catch { /* no storage, no ceremony */ }
 }
 
 /** Item box: a floating cube with a glowing capy-paw sigil on every face. */
@@ -635,84 +309,71 @@ function bubbleGeo() {
   ]);
 }
 
-/** Start gantry straddling the main straight, with a checkered banner. */
-function gantryGeo(span) {
-  const parts = [];
-  for (const side of [-1, 1]) {
-    parts.push({ geo: new THREE.BoxGeometry(0.7, 7.2, 0.7), x: side * span, y: 3.6, color: GOLD });
-    parts.push({ geo: new THREE.BoxGeometry(1.4, 0.4, 1.4), x: side * span, y: 0.2, color: 0xd39a2f });
-    parts.push({ geo: new THREE.SphereGeometry(0.45, 8, 6), x: side * span, y: 7.4, color: KERB_A });
-  }
-  parts.push({ geo: new THREE.BoxGeometry(span * 2 + 0.7, 0.55, 0.9), y: 7.0, color: GOLD });
-  parts.push({ geo: new THREE.BoxGeometry(span * 2 - 0.6, 1.5, 0.3), y: 6.1, color: CREAM });
-  const cols = Math.floor(span * 2 / 0.85);
-  for (let i = 0; i < cols; i++) {
-    for (let r = 0; r < 2; r++) {
-      parts.push({
-        geo: new THREE.BoxGeometry(0.85, 0.4, 0.12),
-        x: -span + 0.6 + i * 0.85, y: 5.7 + r * 0.4, z: -0.2,
-        color: (i + r) % 2 ? 0x2f2b36 : 0xf7f2e6,
-      });
-    }
-  }
-  // five start lights on the crossbeam
-  for (let i = 0; i < 5; i++) {
-    parts.push({
-      geo: new THREE.SphereGeometry(0.28, 8, 6),
-      x: (i - 2) * 1.1, y: 7.0, z: 0.5, color: 0x4a3b3b,
-    });
-  }
-  return mergeParts(parts);
-}
-
-function lighthouseGeo() {
-  const parts = [
-    { geo: new THREE.CylinderGeometry(2.4, 3.4, 2.0, 12), y: 1.0, color: 0xcfc6b4 },
-  ];
-  for (let i = 0; i < 6; i++) {
-    parts.push({
-      geo: new THREE.CylinderGeometry(1.5 - i * 0.13, 1.7 - i * 0.13, 2.2, 12),
-      y: 3.1 + i * 2.2, color: i % 2 ? KERB_A : CREAM,
-    });
-  }
-  parts.push({ geo: new THREE.CylinderGeometry(1.35, 1.35, 1.5, 12), y: 17.2, color: 0x6a6377 });
-  parts.push({ geo: new THREE.SphereGeometry(1.0, 10, 7), y: 17.4, color: 0xfff0b0 });
-  parts.push({ geo: new THREE.ConeGeometry(1.6, 1.6, 12), y: 18.7, color: 0x4a4356 });
-  parts.push({ geo: new THREE.SphereGeometry(0.24, 6, 5), y: 19.7, color: GOLD });
-  return mergeParts(parts);
-}
-
-/** Grandstand: merged steps plus a bunting roofline, one draw call. */
-function standGeo(len) {
-  const parts = [];
-  for (let i = 0; i < 5; i++) {
-    parts.push({
-      geo: new THREE.BoxGeometry(len, 0.55, 1.5),
-      y: 0.28 + i * 0.55, z: -i * 1.5, color: i % 2 ? 0xe6d9bd : 0xd8c8a6,
-    });
-  }
-  parts.push({ geo: new THREE.BoxGeometry(len, 0.3, 0.4), y: 3.1, z: -6.4, color: KERB_A });
-  return mergeParts(parts);
-}
-
 // ------------------------------------------------------------- the kart ----
-/** Racer-coloured shell. White vertex colour: the tint rides instanceColor. */
-function kartBodyGeo() {
-  return mergeParts([
-    { geo: new THREE.BoxGeometry(1.1, 0.3, 1.5), y: 0.34 },
-    { geo: new THREE.BoxGeometry(0.78, 0.26, 0.5), y: 0.55, z: 0.52 },
-    { geo: new THREE.ConeGeometry(0.46, 0.6, 4), y: 0.42, z: 0.92, rx: Math.PI / 2, ry: Math.PI / 4 },
-    { geo: new THREE.BoxGeometry(1.34, 0.18, 0.62), y: 0.3, z: 0.12 },
-    { geo: new THREE.BoxGeometry(0.9, 0.5, 0.42), y: 0.62, z: -0.6 },
-    { geo: new THREE.BoxGeometry(1.02, 0.1, 0.36), y: 1.02, z: -0.78 },
-    { geo: new THREE.BoxGeometry(0.1, 0.3, 0.14), x: -0.4, y: 0.87, z: -0.74 },
-    { geo: new THREE.BoxGeometry(0.1, 0.3, 0.14), x: 0.4, y: 0.87, z: -0.74 },
-  ]);
+/**
+ * §A4 — five shells, one footprint. The chassis box, the wheel mounts and the
+ * seat all stay where they were, so a kart choice changes the SILHOUETTE and the
+ * four stat multipliers and nothing else about how the thing drives. White
+ * vertex colour throughout: the racer's tint rides instanceColor.
+ */
+function kartBodyGeo(style) {
+  switch (style) {
+    case 'reef': // low wedge with a coral dorsal fin
+      return mergeParts([
+        { geo: new THREE.BoxGeometry(1.16, 0.24, 1.62), y: 0.3 },
+        { geo: new THREE.ConeGeometry(0.5, 1.0, 4), y: 0.34, z: 1.0, rx: Math.PI / 2, ry: Math.PI / 4 },
+        { geo: new THREE.BoxGeometry(1.36, 0.14, 0.7), y: 0.26, z: 0.1 },
+        { geo: new THREE.BoxGeometry(0.86, 0.36, 0.5), y: 0.5, z: -0.62 },
+        { geo: new THREE.ConeGeometry(0.34, 0.9, 3), y: 0.86, z: -0.5, rx: -0.25 },
+        { geo: new THREE.BoxGeometry(1.16, 0.08, 0.34), y: 0.92, z: -0.86 },
+      ]);
+    case 'biscuit': // a stout barrel with crumb trim
+      return mergeParts([
+        { geo: new THREE.CylinderGeometry(0.56, 0.56, 1.5, 12), y: 0.5, rx: Math.PI / 2 },
+        { geo: new THREE.CylinderGeometry(0.6, 0.6, 0.16, 12), y: 0.5, z: 0.6, rx: Math.PI / 2 },
+        { geo: new THREE.CylinderGeometry(0.6, 0.6, 0.16, 12), y: 0.5, z: -0.6, rx: Math.PI / 2 },
+        { geo: new THREE.BoxGeometry(1.34, 0.2, 0.66), y: 0.3, z: 0.1 },
+        { geo: new THREE.SphereGeometry(0.3, 8, 6), y: 0.98, z: -0.62 },
+        { geo: new THREE.BoxGeometry(0.96, 0.12, 0.3), y: 1.06, z: -0.8 },
+      ]);
+    case 'dart': // needle nose on sand skis
+      return mergeParts([
+        { geo: new THREE.BoxGeometry(0.86, 0.24, 1.5), y: 0.32 },
+        { geo: new THREE.ConeGeometry(0.34, 1.5, 6), y: 0.36, z: 1.24, rx: Math.PI / 2 },
+        { geo: new THREE.BoxGeometry(1.4, 0.1, 0.5), y: 0.22, z: 0.2 },
+        { geo: new THREE.BoxGeometry(0.2, 0.1, 1.5), x: -0.66, y: 0.14, z: 0.3, rz: 0.06 },
+        { geo: new THREE.BoxGeometry(0.2, 0.1, 1.5), x: 0.66, y: 0.14, z: 0.3, rz: -0.06 },
+        { geo: new THREE.BoxGeometry(0.82, 0.42, 0.44), y: 0.56, z: -0.6 },
+        { geo: new THREE.BoxGeometry(1.0, 0.08, 0.26), y: 1.0, z: -0.84 },
+      ]);
+    case 'fern': // an open leafy buggy with a frond spoiler
+      return mergeParts([
+        { geo: new THREE.BoxGeometry(1.0, 0.22, 1.44), y: 0.32 },
+        { geo: new THREE.BoxGeometry(1.36, 0.14, 0.2), y: 0.36, z: 0.74 },
+        { geo: new THREE.BoxGeometry(0.12, 0.12, 1.5), x: -0.56, y: 0.5, z: 0.05 },
+        { geo: new THREE.BoxGeometry(0.12, 0.12, 1.5), x: 0.56, y: 0.5, z: 0.05 },
+        { geo: new THREE.ConeGeometry(0.44, 0.7, 4), y: 0.42, z: 0.94, rx: Math.PI / 2, ry: Math.PI / 4 },
+        { geo: new THREE.BoxGeometry(0.86, 0.44, 0.44), y: 0.58, z: -0.58 },
+        { geo: new THREE.ConeGeometry(0.5, 1.1, 4), y: 1.02, z: -0.9, rx: 1.35, sz: 0.3 },
+      ]);
+    default: // 'coco' — the round tub with husk fenders
+      return mergeParts([
+        { geo: new THREE.BoxGeometry(1.1, 0.3, 1.5), y: 0.34 },
+        { geo: new THREE.SphereGeometry(0.62, 12, 8), y: 0.42, sz: 1.15, sy: 0.72 },
+        { geo: new THREE.BoxGeometry(0.78, 0.26, 0.5), y: 0.55, z: 0.52 },
+        { geo: new THREE.ConeGeometry(0.46, 0.6, 4), y: 0.42, z: 0.92, rx: Math.PI / 2, ry: Math.PI / 4 },
+        { geo: new THREE.BoxGeometry(1.34, 0.18, 0.62), y: 0.3, z: 0.12 },
+        { geo: new THREE.BoxGeometry(0.9, 0.5, 0.42), y: 0.62, z: -0.6 },
+        { geo: new THREE.BoxGeometry(1.02, 0.1, 0.36), y: 1.02, z: -0.78 },
+        { geo: new THREE.BoxGeometry(0.1, 0.3, 0.14), x: -0.4, y: 0.87, z: -0.74 },
+        { geo: new THREE.BoxGeometry(0.1, 0.3, 0.14), x: 0.4, y: 0.87, z: -0.74 },
+      ]);
+  }
 }
 
 /** Everything that is NOT the racer's colour, so the tint never touches it. */
-function kartTrimGeo() {
-  return mergeParts([
+function kartTrimGeo(style) {
+  const parts = [
     { geo: new THREE.BoxGeometry(0.66, 0.12, 0.44), y: 0.5, z: -0.18, color: 0x8a6642 },
     { geo: new THREE.BoxGeometry(0.62, 0.34, 0.1), y: 0.68, z: -0.36, color: 0x8a6642 },
     { geo: new THREE.TorusGeometry(0.2, 0.045, 5, 10), y: 0.78, z: 0.42, rx: 1.15, color: 0x3a3540 },
@@ -721,8 +382,41 @@ function kartTrimGeo() {
     { geo: new THREE.BoxGeometry(0.86, 0.12, 0.12), y: 0.24, z: -0.86, color: CREAM },
     { geo: new THREE.CylinderGeometry(0.08, 0.1, 0.5, 6), x: -0.3, y: 0.9, z: -0.86, rx: 1.2, color: 0x9aa2ad },
     { geo: new THREE.CylinderGeometry(0.08, 0.1, 0.5, 6), x: 0.3, y: 0.9, z: -0.86, rx: 1.2, color: 0x9aa2ad },
-  ]);
+  ];
+  // one signature flourish each, in its own colour so it survives the tint
+  if (style === 'reef') parts.push({ geo: new THREE.TorusGeometry(0.22, 0.06, 4, 8, Math.PI), y: 0.4, z: -0.95, rx: 1.2, color: 0xe8657a });
+  if (style === 'biscuit') {
+    for (let i = 0; i < 5; i++) {
+      parts.push({ geo: new THREE.SphereGeometry(0.09, 5, 4), x: -0.4 + i * 0.2, y: 1.02, z: 0.1 + (i % 2) * 0.2, color: 0xd39a2f });
+    }
+  }
+  if (style === 'dart') parts.push({ geo: new THREE.ConeGeometry(0.12, 0.3, 4), y: 0.42, z: 1.9, rx: Math.PI / 2, color: GOLD });
+  if (style === 'fern') {
+    for (const s of [-1, 1]) {
+      parts.push({ geo: new THREE.ConeGeometry(0.2, 0.7, 4), x: s * 0.62, y: 0.8, z: 0.1, rz: -s * 0.5, color: 0x7ac74f });
+    }
+  }
+  if (style === 'coco') parts.push({ geo: new THREE.SphereGeometry(0.16, 7, 5), y: 0.82, z: 0.86, color: 0x6b4f35 });
+  return mergeParts(parts);
 }
+
+/** §A4 — the four stats resolved into the numbers §3.1 drives with. */
+function kartStats(id) {
+  const k = KARTS[id] || KARTS.coco;
+  return {
+    id: k.id,
+    name: k.name,
+    vmax: V_MAX * (0.98 + 0.02 * k.vmax),
+    accel: ACCEL * (0.90 + 0.05 * k.acc),
+    han: 0.92 + 0.04 * k.han,
+    offMul: OFF_MUL + 0.03 * (k.wgt - 3),
+    hitMul: 1 - 0.04 * (k.wgt - 3),
+    landHard: LAND_HARD + 0.05 * (k.wgt - 3),
+  };
+}
+
+/** The chosen kart, coerced to something real. Unknown ids become 'coco'. */
+function kartIdOf(v) { return KARTS[v] ? v : 'coco'; }
 
 function wheelGeo() {
   return mergeParts([
@@ -787,187 +481,121 @@ function roundelTex(n, color) {
   });
 }
 
-/** Vertical gradient sky dome. Follows the camera, ignores fog. */
-function buildSky() {
-  const geo = new THREE.SphereGeometry(600, 20, 14);
-  const p = geo.attributes.position;
-  const cols = new Float32Array(p.count * 3);
-  const top = new THREE.Color(SKY_TOP);
-  const mid = new THREE.Color(0xa9dcf2);
-  const low = new THREE.Color(SKY_LOW);
-  const c = new THREE.Color();
-  for (let i = 0; i < p.count; i++) {
-    const t = clamp(p.getY(i) / 600, -1, 1);
-    if (t > 0.1) c.copy(mid).lerp(top, clamp((t - 0.1) / 0.7, 0, 1));
-    else c.copy(low).lerp(mid, clamp((t + 0.3) / 0.4, 0, 1));
-    cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
-  }
-  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
-    vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false,
-  }));
-  mesh.frustumCulled = false;
-  mesh.renderOrder = -1;
-  return mesh;
-}
-
 // ==================================================================== css ====
+/**
+ * Only what kart.js still owns: the canvas shell, the vignette/flash overlays,
+ * the world-anchored name tags, the big centre-screen callouts and the two cards
+ * (the splash and its pickers). Every HUD element of A7 lives in kart-hud.js
+ * with its own <style>, which is why nothing here is called `mg-kart-*` any
+ * more: two modules must never race to define the same class.
+ */
 const CSS = `
-.mg-kart-wrap{position:absolute;inset:0;overflow:hidden;font-family:var(--font);color:var(--ink);
+.mg-kk-wrap{position:absolute;inset:0;overflow:hidden;font-family:var(--font);color:var(--ink);
   user-select:none;-webkit-user-select:none;background:#bfe3f2;cursor:default;}
-.mg-kart-wrap canvas.mg-kart-gl{position:absolute;inset:0;width:100%;height:100%;display:block;}
-.mg-kart-vig{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .25s ease;
+.mg-kk-wrap canvas.mg-kk-gl{position:absolute;inset:0;width:100%;height:100%;display:block;}
+.mg-kk-vig{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .25s ease;
   background:radial-gradient(ellipse 64% 60% at 50% 52%,rgba(0,0,0,0) 42%,rgba(24,38,58,.5) 100%);}
-.mg-kart-flash{position:absolute;inset:0;pointer-events:none;opacity:0;}
-.mg-kart-flash.hit{animation:mg-kart-fx .45s ease-out;
+.mg-kk-vig.wrong{background:radial-gradient(ellipse 64% 60% at 50% 52%,rgba(0,0,0,0) 34%,rgba(232,101,122,.6) 100%);
+  animation:mg-kk-wrong 1.1s ease-in-out infinite;}
+@keyframes mg-kk-wrong{50%{opacity:.42}}
+.mg-kk-flash{position:absolute;inset:0;pointer-events:none;opacity:0;}
+.mg-kk-flash.hit{animation:mg-kk-fx .45s ease-out;
   background:radial-gradient(ellipse at 50% 55%,rgba(232,101,122,0) 32%,rgba(232,101,122,.85) 100%);}
-.mg-kart-flash.soak{animation:mg-kart-fx .55s ease-out;
+.mg-kk-flash.soak{animation:mg-kk-fx .55s ease-out;
   background:radial-gradient(ellipse at 50% 55%,rgba(79,179,232,0) 25%,rgba(120,205,245,.9) 100%);}
-.mg-kart-flash.boost{animation:mg-kart-fx .5s ease-out;
+.mg-kk-flash.boost{animation:mg-kk-fx .5s ease-out;
   background:radial-gradient(ellipse at 50% 62%,rgba(255,235,170,0) 28%,rgba(255,226,140,.7) 100%);}
-@keyframes mg-kart-fx{from{opacity:1}to{opacity:0}}
+.mg-kk-flash.bonk{animation:mg-kk-fx .5s ease-out;
+  background:radial-gradient(ellipse at 50% 58%,rgba(122,199,79,0) 30%,rgba(150,214,110,.8) 100%);}
+.mg-kk-flash.land{animation:mg-kk-fx .35s ease-out;
+  background:radial-gradient(ellipse at 50% 80%,rgba(255,255,255,0) 42%,rgba(255,255,255,.55) 100%);}
+@keyframes mg-kk-fx{from{opacity:1}to{opacity:0}}
 
-.mg-kart-hud{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s ease;}
-.mg-kart-hud.on{opacity:1;}
-.mg-kart-panel{position:absolute;background:rgba(255,253,246,.92);border-radius:16px;padding:9px 14px;
-  box-shadow:var(--shadow);font-weight:800;}
-.mg-kart-pos{top:16px;left:16px;min-width:168px;}
-.mg-kart-place{font-size:44px;line-height:.95;color:var(--accent);letter-spacing:-.01em;}
-.mg-kart-place span{font-size:15px;color:#9b8a6c;margin-left:5px;letter-spacing:0;}
-.mg-kart-lbl{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:#9b8a6c;}
-.mg-kart-order{margin-top:7px;display:flex;flex-direction:column;gap:2px;}
-.mg-kart-orow{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:800;color:#5c5140;
-  padding:1px 3px;border-radius:6px;}
-.mg-kart-orow.me{background:rgba(232,101,122,.16);}
-.mg-kart-orow.ghost{opacity:.45;}
-.mg-kart-orow i{width:9px;height:9px;border-radius:99px;flex:none;box-shadow:inset 0 -2px 0 rgba(0,0,0,.2);}
-.mg-kart-orow u{text-decoration:none;color:#9b8a6c;font-size:10px;width:16px;}
-.mg-kart-orow b{margin-left:auto;font-size:10px;color:#a2937a;font-weight:900;}
+.mg-kk-hud{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s ease;}
+.mg-kk-hud.on{opacity:1;}
 
-.mg-kart-lap{top:16px;right:16px;text-align:right;min-width:132px;}
-.mg-kart-lapn{font-size:32px;line-height:1;}
-.mg-kart-lapn span{font-size:15px;color:#9b8a6c;}
-.mg-kart-time{font-size:15px;color:#5c5140;margin-top:3px;font-variant-numeric:tabular-nums;}
-.mg-kart-best{font-size:11px;color:#9b8a6c;margin-top:2px;font-variant-numeric:tabular-nums;}
-
-.mg-kart-item{position:absolute;top:16px;left:50%;translate:-50% 0;width:96px;height:96px;
-  border-radius:22px;background:rgba(255,253,246,.9);box-shadow:var(--shadow);display:flex;
-  align-items:center;justify-content:center;transition:scale .16s ease;}
-.mg-kart-item.spin{animation:mg-kart-spin .6s linear;}
-.mg-kart-item.pop{scale:1.14;}
-@keyframes mg-kart-spin{50%{rotate:8deg}}
-.mg-kart-icon{width:62px;height:62px;opacity:0;transition:opacity .12s ease;}
-.mg-kart-icon.on{opacity:1;}
-.mg-kart-use{position:absolute;bottom:-9px;left:50%;translate:-50% 0;background:var(--accent);color:#fff;
-  font-size:10px;font-weight:900;padding:3px 10px;border-radius:99px;letter-spacing:.06em;opacity:0;
-  transition:opacity .15s ease;white-space:nowrap;}
-.mg-kart-use.on{opacity:1;}
-
-.mg-kart-map{position:absolute;right:16px;bottom:16px;width:160px;height:160px;border-radius:20px;
-  background:rgba(255,253,246,.88);box-shadow:var(--shadow);padding:6px;}
-.mg-kart-map canvas{width:148px;height:148px;display:block;}
-
-.mg-kart-lights{position:absolute;top:14%;left:50%;translate:-50% 0;display:none;gap:12px;
-  padding:14px 20px;border-radius:99px;background:rgba(35,28,42,.6);}
-.mg-kart-lights.on{display:flex;}
-.mg-kart-bulb{width:26px;height:26px;border-radius:99px;background:#4a3b3b;
-  box-shadow:inset 0 -4px 0 rgba(0,0,0,.3);transition:background .12s ease;}
-.mg-kart-bulb.lit{background:#e8657a;box-shadow:0 0 16px rgba(232,101,122,.9),inset 0 -4px 0 rgba(0,0,0,.2);}
-.mg-kart-bulb.go{background:#7ac74f;box-shadow:0 0 18px rgba(122,199,79,.95),inset 0 -4px 0 rgba(0,0,0,.2);}
-
-.mg-kart-big{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+.mg-kk-big{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   pointer-events:none;}
-.mg-kart-num{font-size:132px;font-weight:900;color:#fff;text-shadow:0 7px 0 rgba(45,36,23,.32);
-  animation:mg-kart-num .8s ease-out forwards;}
-.mg-kart-num.go{color:var(--gold);font-size:108px;}
-@keyframes mg-kart-num{from{opacity:0;scale:2.2}18%{opacity:1;scale:1}to{opacity:0;scale:.7}}
-.mg-kart-banner{position:absolute;top:34%;left:0;right:0;text-align:center;font-size:52px;
+.mg-kk-banner{position:absolute;top:34%;left:0;right:0;text-align:center;font-size:52px;
   font-weight:900;color:#fff;text-shadow:0 6px 0 rgba(45,36,23,.32);letter-spacing:.04em;
-  animation:mg-kart-ban 1.9s ease-out forwards;pointer-events:none;}
-@keyframes mg-kart-ban{0%{opacity:0;translate:-40px 0}
+  animation:mg-kk-ban 1.9s ease-out forwards;pointer-events:none;}
+@keyframes mg-kk-ban{0%{opacity:0;translate:-40px 0}
   14%{opacity:1;translate:0 0}72%{opacity:1;translate:0 0}to{opacity:0;translate:40px 0}}
 
-.mg-kart-pops{position:absolute;left:50%;top:56%;translate:-50% 0;width:0;pointer-events:none;}
-.mg-kart-pop{position:absolute;left:0;top:0;translate:-50% 0;white-space:nowrap;font-weight:900;
-  font-size:26px;color:#fff;text-shadow:0 3px 0 rgba(45,36,23,.35);animation:mg-kart-pop 1s ease-out forwards;}
-.mg-kart-pop.gold{color:var(--gold);}.mg-kart-pop.sky{color:#8fdcff;}.mg-kart-pop.bad{color:#ff9bab;}
-@keyframes mg-kart-pop{from{opacity:0;translate:-50% 16px;scale:.6}
+.mg-kk-pops{position:absolute;left:50%;top:56%;translate:-50% 0;width:0;pointer-events:none;}
+.mg-kk-pop{position:absolute;left:0;top:0;translate:-50% 0;white-space:nowrap;font-weight:900;
+  font-size:26px;color:#fff;text-shadow:0 3px 0 rgba(45,36,23,.35);animation:mg-kk-pop 1s ease-out forwards;}
+.mg-kk-pop.gold{color:var(--gold);}.mg-kk-pop.sky{color:#8fdcff;}.mg-kk-pop.bad{color:#ff9bab;}
+@keyframes mg-kk-pop{from{opacity:0;translate:-50% 16px;scale:.6}
   25%{opacity:1;translate:-50% -6px;scale:1.14}to{opacity:0;translate:-50% -66px;scale:1}}
 
-.mg-kart-tags{position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden;}
-.mg-kart-tag{position:absolute;left:0;top:0;translate:-50% -100%;display:none;align-items:center;gap:6px;
+.mg-kk-tags{position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden;}
+.mg-kk-tag{position:absolute;left:0;top:0;translate:-50% -100%;display:none;align-items:center;gap:6px;
   background:rgba(255,253,246,.9);border-radius:999px;padding:2px 9px 2px 4px;font-size:11.5px;
   font-weight:800;white-space:nowrap;box-shadow:0 3px 10px rgba(26,52,78,.28);}
-.mg-kart-tag.on{display:flex;}
-.mg-kart-tag i{width:12px;height:12px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.2);}
-.mg-kart-tag u{text-decoration:none;font-size:10px;color:#8a7a5a;font-weight:900;}
+.mg-kk-tag.on{display:flex;}
+.mg-kk-tag i{width:12px;height:12px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.2);}
+.mg-kk-tag u{text-decoration:none;font-size:10px;color:#8a7a5a;font-weight:900;}
 
-.mg-kart-cards{position:absolute;inset:0;z-index:4;pointer-events:none;}
-.mg-kart-card{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;gap:13px;
+.mg-kk-cards{position:absolute;inset:0;z-index:5;pointer-events:none;}
+.mg-kk-card{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;gap:13px;
   padding:22px;text-align:center;pointer-events:auto;overflow-y:auto;
   background:linear-gradient(180deg,rgba(20,32,44,.3),rgba(20,32,44,.72));}
-.mg-kart-card>*{margin:auto 0;}
-.mg-kart-card.out{animation:mg-kart-out .28s ease forwards;pointer-events:none;}
-@keyframes mg-kart-out{to{opacity:0;scale:1.05}}
-.mg-kart-box{background:var(--cream);border-radius:28px;padding:24px 30px;width:min(500px,93vw);
-  box-shadow:var(--shadow);animation:mg-kart-in .3s ease;}
-@keyframes mg-kart-in{from{opacity:0;translate:0 20px;scale:.94}}
-.mg-kart-title{font-size:40px;font-weight:900;color:var(--accent);line-height:1;}
-.mg-kart-sub{font-weight:700;color:#8a7a5a;font-size:13px;margin-top:6px;}
-.mg-kart-keys{display:flex;gap:7px;justify-content:center;margin:14px 0 10px;flex-wrap:wrap;}
-.mg-kart-key{background:#fff;border:2px solid #e3d9c4;border-radius:9px;padding:4px 10px;
+.mg-kk-card>*{margin:auto 0;}
+.mg-kk-card.out{animation:mg-kk-out .28s ease forwards;pointer-events:none;}
+@keyframes mg-kk-out{to{opacity:0;scale:1.05}}
+.mg-kk-box{background:var(--cream);border-radius:28px;padding:24px 30px;width:min(560px,94vw);
+  box-shadow:var(--shadow);animation:mg-kk-in .3s ease;}
+@keyframes mg-kk-in{from{opacity:0;translate:0 20px;scale:.94}}
+.mg-kk-title{font-size:40px;font-weight:900;color:var(--accent);line-height:1;}
+.mg-kk-sub{font-weight:700;color:#8a7a5a;font-size:13px;margin-top:6px;}
+.mg-kk-keys{display:flex;gap:7px;justify-content:center;margin:14px 0 10px;flex-wrap:wrap;}
+.mg-kk-key{background:#fff;border:2px solid #e3d9c4;border-radius:9px;padding:4px 10px;
   font-weight:900;font-size:13px;box-shadow:0 2px 0 #e3d9c4;}
-.mg-kart-key u{text-decoration:none;color:#a2937a;font-weight:800;margin-left:5px;font-size:11px;}
-.mg-kart-rules{display:flex;flex-direction:column;gap:7px;text-align:left;margin:6px 0;}
-.mg-kart-rule{display:flex;gap:10px;align-items:center;font-size:13px;font-weight:700;color:#5c5140;}
-.mg-kart-swatch{width:26px;height:26px;border-radius:8px;flex:none;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
-.mg-kart-btns{display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;}
-.mg-kart-btn{background:var(--accent);color:#fff;border:3px solid #fff;font-family:var(--font);
+.mg-kk-key u{text-decoration:none;color:#a2937a;font-weight:800;margin-left:5px;font-size:11px;}
+.mg-kk-rules{display:flex;flex-direction:column;gap:7px;text-align:left;margin:6px 0;}
+.mg-kk-rule{display:flex;gap:10px;align-items:center;font-size:13px;font-weight:700;color:#5c5140;}
+.mg-kk-swatch{width:26px;height:26px;border-radius:8px;flex:none;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
+.mg-kk-btns{display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap;}
+.mg-kk-btn{background:var(--accent);color:#fff;border:3px solid #fff;font-family:var(--font);
   font-weight:900;font-size:16px;padding:11px 24px;border-radius:999px;cursor:pointer;
   box-shadow:var(--shadow);transition:scale .12s ease;}
-.mg-kart-btn:hover{scale:1.06;}.mg-kart-btn:active{scale:.96;}
-.mg-kart-btn.alt{background:var(--accent2);}
-.mg-kart-btn.ghost{background:transparent;color:var(--ink);border-color:#d8ccb4;box-shadow:none;}
-.mg-kart-blink{margin-top:12px;font-size:12.5px;font-weight:800;color:#a99a80;
-  animation:mg-kart-blink 1.5s ease-in-out infinite;}
-@keyframes mg-kart-blink{50%{opacity:.35}}
-.mg-kart-grid{display:flex;flex-direction:column;gap:5px;margin:12px 0 4px;}
-.mg-kart-grow{display:flex;align-items:center;gap:9px;background:var(--card);border-radius:11px;
+.mg-kk-btn:hover{scale:1.06;}.mg-kk-btn:active{scale:.96;}
+.mg-kk-btn.alt{background:var(--accent2);}
+.mg-kk-btn.ghost{background:transparent;color:var(--ink);border-color:#d8ccb4;box-shadow:none;}
+.mg-kk-blink{margin-top:12px;font-size:12.5px;font-weight:800;color:#a99a80;
+  animation:mg-kk-blink 1.5s ease-in-out infinite;}
+@keyframes mg-kk-blink{50%{opacity:.35}}
+.mg-kk-grid{display:flex;flex-direction:column;gap:5px;margin:12px 0 4px;}
+.mg-kk-grow{display:flex;align-items:center;gap:9px;background:var(--card);border-radius:11px;
   padding:6px 12px;font-weight:800;font-size:13px;}
-.mg-kart-grow i{width:14px;height:14px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.2);}
-.mg-kart-grow .n{width:26px;color:#9b8a6c;font-size:11px;}
-.mg-kart-grow b{margin-left:auto;font-size:11px;color:#a2937a;}
-.mg-kart-grow.me{outline:3px solid var(--accent);outline-offset:-3px;}
-.mg-kart-rows{margin:14px 0 4px;display:flex;flex-direction:column;gap:6px;}
-.mg-kart-row{display:flex;justify-content:space-between;align-items:center;background:var(--card);
-  border-radius:12px;padding:8px 14px;font-weight:800;font-size:14px;}
-.mg-kart-row.total{background:#2d2417;color:#fff;}
-.mg-kart-row.pay{background:var(--gold);font-size:16px;}
-.mg-kart-tag2{display:inline-block;background:var(--accent);color:#fff;font-size:11px;font-weight:900;
-  padding:3px 9px;border-radius:99px;margin-left:7px;letter-spacing:.06em;vertical-align:middle;
-  animation:mg-kart-tag 0.8s ease-in-out infinite;}
-@keyframes mg-kart-tag{50%{scale:1.12}}
-.mg-kart-wait{margin:14px 0 2px;font-size:13px;font-weight:800;color:#8a7a5a;
-  animation:mg-kart-blink 1.5s ease-in-out infinite;}
+.mg-kk-grow i{width:14px;height:14px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.2);}
+.mg-kk-grow .n{width:26px;color:#9b8a6c;font-size:11px;}
+.mg-kk-grow b{margin-left:auto;font-size:11px;color:#a2937a;}
+.mg-kk-grow.me{outline:3px solid var(--accent);outline-offset:-3px;}
 
-.mg-kart-quit{position:absolute;right:16px;top:16px;z-index:6;background:rgba(255,253,246,.9);border:0;
+.mg-kk-picks{display:flex;gap:7px;justify-content:center;flex-wrap:wrap;margin:10px 0 2px;}
+.mg-kk-pick{background:var(--card);border:3px solid transparent;border-radius:15px;padding:7px 11px;
+  font-family:var(--font);font-weight:900;font-size:12.5px;color:#5c5140;cursor:pointer;
+  transition:scale .12s ease,border-color .12s ease;min-width:100px;}
+.mg-kk-pick:hover{scale:1.05;}
+.mg-kk-pick.on{border-color:var(--accent);background:#fff;}
+.mg-kk-pick.locked{opacity:.5;cursor:not-allowed;}
+.mg-kk-pick u{display:block;text-decoration:none;font-weight:700;font-size:10.5px;color:#a2937a;margin-top:2px;}
+.mg-kk-bars{display:flex;gap:3px;justify-content:center;margin-top:5px;}
+.mg-kk-bar{width:5px;height:14px;border-radius:3px;background:#e3d9c4;}
+.mg-kk-bar.on{background:var(--gold);}
+.mg-kk-note{font-size:11.5px;font-weight:800;color:#a99a80;margin-top:8px;}
+
+.mg-kk-quit{position:absolute;right:16px;top:16px;z-index:6;background:rgba(255,253,246,.9);border:0;
   font-family:var(--font);font-weight:800;font-size:13px;padding:9px 16px;border-radius:999px;
   cursor:pointer;box-shadow:var(--shadow);transition:scale .12s ease;}
-.mg-kart-quit:hover{scale:1.07;}
-.mg-kart-quit b{font-weight:900;opacity:.5;margin-left:6px;font-size:11px;}
-.mg-kart-tip{position:absolute;left:50%;bottom:18px;translate:-50% 0;background:rgba(45,36,23,.7);
+.mg-kk-quit:hover{scale:1.07;}
+.mg-kk-quit b{font-weight:900;opacity:.5;margin-left:6px;font-size:11px;}
+.mg-kk-tip{position:absolute;left:50%;bottom:18px;translate:-50% 0;background:rgba(45,36,23,.7);
   color:#fff;font-size:12.5px;font-weight:700;padding:7px 16px;border-radius:999px;
-  transition:opacity .6s ease;pointer-events:none;}
+  transition:opacity .6s ease;pointer-events:none;z-index:2;}
 `;
-
-const COIN_ICO = '<svg viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="12" r="10" fill="#e0952f"/><circle cx="12" cy="12" r="7.4" fill="#f2b64a"/><circle cx="12" cy="12" r="3.6" fill="#ffd77a"/></svg>';
-
-/** Item card art, drawn as inline SVG so the HUD needs no textures. */
-const ITEM_SVG = {
-  peel: '<svg class="mg-kart-icon" viewBox="0 0 64 64"><path d="M8 44a26 26 0 0 0 48 0z" fill="#4f8f3a"/><path d="M13 44a21 21 0 0 0 38 0z" fill="#f58a9c"/><circle cx="26" cy="38" r="2.2" fill="#3b2a1c"/><circle cx="38" cy="38" r="2.2" fill="#3b2a1c"/><circle cx="32" cy="30" r="2.2" fill="#3b2a1c"/></svg>',
-  bubble: '<svg class="mg-kart-icon" viewBox="0 0 64 64"><circle cx="32" cy="34" r="22" fill="#bfe9ff"/><circle cx="32" cy="34" r="22" fill="none" stroke="#4fb3e8" stroke-width="3"/><circle cx="24" cy="26" r="6" fill="#fff"/><circle cx="41" cy="42" r="3" fill="#fff"/></svg>',
-  berry: '<svg class="mg-kart-icon" viewBox="0 0 64 64"><circle cx="32" cy="38" r="18" fill="#e8657a"/><circle cx="25" cy="32" r="5" fill="#ff9bab"/><path d="M32 20c0-6 5-9 9-9-1 6-4 9-9 9z" fill="#7ac74f"/><rect x="30.5" y="12" width="3" height="10" rx="1.5" fill="#7a5a3a"/></svg>',
-};
 
 // =================================================================== game ====
 export class KartGame extends Minigame {
@@ -1009,13 +637,36 @@ export class KartGame extends Minigame {
     this.rng = mulberry32((Date.now() ^ 0x5f3a) >>> 0);
     this._tmp = {};
     this._tmp2 = {};
+    this._tmp3 = {};
+    this.hud = null;
+    this.row = null;           // the active registry row
+    this.theme = null;         // the active track's palette, from GP1's THEMES
+    this.laps = LAPS;
+    this.myKart = kartIdOf(readLS(LS_KART, 'coco'));
+    this.runs = Math.max(0, Math.round(Number(readLS(LS_RUNS, 0))) || 0);
+    this.stats = kartStats(this.myKart);
+    this.wrongT = 0;           // §A6 hysteresis, both directions
+    this.wrongOn = false;
+    this.wrongDir = 0;
+    this.hazImmune = 0;        // §A2 HAZ_IMMUNE_MS, seconds remaining
+    this.hazSeen = new Map();  // hazard index -> raceMs of our last claim
+    /** The one view object handed to the HUD every frame. Never reallocated. */
+    this.view = {
+      place: 1, of: 6, raceMs: 0, lapMs: 0, bestMs: 0, v: 0, vmax: V_MAX,
+      boost: 0, drift: 0, order: [], karts: [], boxes: [], hazards: [],
+      wrong: false, wrongDir: 0,
+    };
   }
 
   // ------------------------------------------------------------- lifecycle -
   mount(root) {
     super.mount(root);
-    this.track = buildTrack();
     this.net = this._readCtx();
+    // §A4: races run is the only unlock currency, and it counts every mount --
+    // finished, DNF or quit, practice included. Placement never matters.
+    this.runs += 1;
+    writeLS(LS_RUNS, this.runs);
+    this._selectTrack(this.net?.track || readLS(LS_TRACK, DEFAULT_TRACK));
     this._buildDom(root);
     this._buildScene();
     this._buildKarts();
@@ -1047,6 +698,25 @@ export class KartGame extends Minigame {
   }
 
   /**
+   * §A1 — resolve the registry row and stamp the module-level track numbers.
+   * Everything downstream (the LUT, the grid, the boxes, the checkpoint mask,
+   * the minimap, the wire clamp the server mirrors) reads them from here.
+   */
+  _selectTrack(id) {
+    const want = isTrackId(id) ? id : DEFAULT_TRACK;
+    this.track = buildTrack(want);       // GP1's LUT: position, pitch, bank, zones
+    this.row = this.track.row;
+    LAP_UNITS = this.track.LAP_UNITS;
+    S_FIN = this.track.sFin;
+    CHECKPOINTS = this.track.checkpoints;
+    CP_MASK = (1 << CHECKPOINTS) - 1;
+    this.theme = this.track.palette;
+    this.boxDefs = this.track.boxes;     // the eleven, ids 0..10, in (q, lat)
+    this.hazDefs = this.track.hazards;
+    if (!this.net) writeLS(LS_TRACK, want);
+  }
+
+  /**
    * §5 — read the handshake speedway.js parked on the game object. Anything
    * malformed degrades to a practice run rather than breaking the minigame.
    */
@@ -1058,10 +728,16 @@ export class KartGame extends Minigame {
     const you = Number(ctx.you?.slot ?? ctx.grid?.you?.slot ?? ctx.slot);
     if (!Number.isFinite(you)) return null;
     const startAt = Number(ctx.startAt ?? ctx.grid?.startAt);
+    // §A5: kart-grid carries the track the lobby voted for, and its `laps`.
+    const track = String(ctx.grid?.track ?? ctx.track ?? '');
+    const laps = Math.round(Number(ctx.grid?.laps ?? ctx.laps));
+    this.laps = Number.isFinite(laps) && laps >= 1 && laps <= 9 ? laps : LAPS;
     return {
       race: String(ctx.race ?? ctx.grid?.race ?? ''),
       slots: grid.slice(0, 6),
       you: clamp(Math.round(you), 0, 5),
+      track: isTrackId(track) ? track : DEFAULT_TRACK,
+      trackName: String(ctx.grid?.trackName || '').slice(0, 32),
       startAt: Number.isFinite(startAt) ? startAt : 0,
       // skew is refined the moment our own kart-go lands
       skew: Number.isFinite(ctx.skew) ? ctx.skew : 0,
@@ -1072,18 +748,29 @@ export class KartGame extends Minigame {
     };
   }
 
-  /** Roster rows, from the server grid in a race or rolled locally otherwise. */
+  /**
+   * Roster rows, from the server grid in a race or rolled locally otherwise.
+   * §A4: everyone's chosen kart rides the grid echo, so the whole field is
+   * rendered in the shells their drivers picked, never five identical shells.
+   */
   _roster() {
     if (this.net) {
-      return this.net.slots.map((s, i) => ({
-        slot: Number.isFinite(s?.slot) ? s.slot : i,
-        id: s?.id ?? null,
-        ai: !!s?.ai,
-        name: String(s?.name || AI_NAMES[i % AI_NAMES.length]).slice(0, 16),
-        color: Number.isFinite(s?.color) ? s.color : BODY_COLORS[i % BODY_COLORS.length],
-        hat: typeof s?.hat === 'string' ? s.hat : 'none',
-        skill: clamp(Math.round(Number(s?.skill) || 0), 0, 4),
-      }));
+      return this.net.slots.map((s, i) => {
+        const slot = Number.isFinite(s?.slot) ? s.slot : i;
+        return {
+          slot,
+          id: s?.id ?? null,
+          ai: !!s?.ai,
+          name: String(s?.name || AI_NAMES[i % AI_NAMES.length]).slice(0, 16),
+          color: Number.isFinite(s?.color) ? s.color : BODY_COLORS[i % BODY_COLORS.length],
+          hat: typeof s?.hat === 'string' ? s.hat : 'none',
+          // an unknown id coerces to 'coco' exactly as the server coerces it;
+          // a row with no kart at all (an older server) is dealt one by slot so
+          // the field still reads as six different karts
+          kart: s?.kart ? kartIdOf(s.kart) : KART_ORDER[slot % KART_ORDER.length],
+          skill: clamp(Math.round(Number(s?.skill) || 0), 0, 4),
+        };
+      });
     }
     // practice: pole is ours, the rest are five cozy locals on descending skill
     const me = {
@@ -1091,6 +778,7 @@ export class KartGame extends Minigame {
       name: String(this.game.state.name || 'You').slice(0, 16),
       color: this.game.state.color ?? BODY_COLORS[0],
       hat: this.game.state.hat ?? 'none',
+      kart: this.myKart,
       skill: 0,
     };
     const pool = AI_NAMES.filter((n) => n.toLowerCase() !== me.name.toLowerCase());
@@ -1104,6 +792,7 @@ export class KartGame extends Minigame {
         name: pool.splice(pick, 1)[0] || AI_NAMES[i],
         color: BODY_COLORS[(2 + i * 3) % BODY_COLORS.length],
         hat: AI_HATS[(i + 1) % AI_HATS.length],
+        kart: KART_ORDER[(i + 1) % KART_ORDER.length],
         skill: 4 - i,
       });
     }
@@ -1116,6 +805,12 @@ export class KartGame extends Minigame {
     this.listeners.push([target, type, fn, opts]);
   }
 
+  /**
+   * The shell, and then GP3's HUD on top of it. Every element of §A7 lives in
+   * kart-hud.js behind the ten-method interface; kart.js keeps only the canvas,
+   * the two full-screen overlays, the world-anchored name tags, the centre-screen
+   * callouts and the splash card, and never reaches into the HUD's DOM.
+   */
   _buildDom(root) {
     const style = document.createElement('style');
     style.textContent = CSS;
@@ -1123,74 +818,52 @@ export class KartGame extends Minigame {
     this.styleEl = style;
 
     const wrap = document.createElement('div');
-    wrap.className = 'mg-kart-wrap';
+    wrap.className = 'mg-kk-wrap';
     root.appendChild(wrap);
     this.wrap = wrap;
 
     const vig = document.createElement('div');
-    vig.className = 'mg-kart-vig';
+    vig.className = 'mg-kk-vig';
     wrap.appendChild(vig);
     this.vig = vig;
 
     const flash = document.createElement('div');
-    flash.className = 'mg-kart-flash';
+    flash.className = 'mg-kk-flash';
     wrap.appendChild(flash);
     this.flash = flash;
-    this._on(flash, 'animationend', () => { flash.className = 'mg-kart-flash'; });
+    this._on(flash, 'animationend', () => { flash.className = 'mg-kk-flash'; });
 
-    const hud = document.createElement('div');
-    hud.className = 'mg-kart-hud';
-    hud.innerHTML = `
-      <div class="mg-kart-panel mg-kart-pos">
-        <div class="mg-kart-lbl">Position</div>
-        <div class="mg-kart-place"><b data-f="place">1st</b><span>of 6</span></div>
-        <div class="mg-kart-order" data-f="order"></div>
-      </div>
-      <div class="mg-kart-panel mg-kart-lap">
-        <div class="mg-kart-lbl">Lap</div>
-        <div class="mg-kart-lapn"><b data-f="lap">1</b><span>/${LAPS}</span></div>
-        <div class="mg-kart-time" data-f="time">0:00.00</div>
-        <div class="mg-kart-best" data-f="bestlap">best --:--</div>
-      </div>
-      <div class="mg-kart-item" data-f="item">
-        <div data-f="icon"></div>
-        <div class="mg-kart-use" data-f="use">E to use</div>
-      </div>
-      <div class="mg-kart-map"><canvas data-f="map" width="148" height="148"></canvas></div>
-      <div class="mg-kart-lights" data-f="lights"></div>
-      <div class="mg-kart-pops" data-f="pops"></div>`;
-    wrap.appendChild(hud);
-    this.hud = hud;
-    this.f = {};
-    hud.querySelectorAll('[data-f]').forEach((el) => { this.f[el.dataset.f] = el; });
-    this.bulbs = [];
-    for (let i = 0; i < 5; i++) {
-      const b = document.createElement('div');
-      b.className = 'mg-kart-bulb';
-      this.f.lights.appendChild(b);
-      this.bulbs.push(b);
-    }
-    this.mapCtx = this.f.map.getContext('2d');
+    // GP3 owns everything inside this node and must leave it clean on dispose()
+    const hudRoot = document.createElement('div');
+    hudRoot.className = 'mg-kk-hud on';
+    wrap.appendChild(hudRoot);
+    this.hudRoot = hudRoot;
+    this._mountHud();
 
     const tags = document.createElement('div');
-    tags.className = 'mg-kart-tags';
+    tags.className = 'mg-kk-tags';
     wrap.appendChild(tags);
     this.tagHost = tags;
 
     const big = document.createElement('div');
-    big.className = 'mg-kart-big';
+    big.className = 'mg-kk-big';
     wrap.appendChild(big);
     this.bigEl = big;
 
+    const pops = document.createElement('div');
+    pops.className = 'mg-kk-pops';
+    wrap.appendChild(pops);
+    this.popHost = pops;
+
     const tip = document.createElement('div');
-    tip.className = 'mg-kart-tip';
+    tip.className = 'mg-kk-tip';
     tip.textContent = 'W to go  .  A/D to steer  .  hold Shift into a corner to drift  .  E throws your item';
     tip.style.opacity = '0';
     wrap.appendChild(tip);
     this.tip = tip;
 
     const quit = document.createElement('button');
-    quit.className = 'mg-kart-quit';
+    quit.className = 'mg-kk-quit';
     quit.type = 'button';
     quit.innerHTML = 'Quit race<b>ESC</b>';
     // pointerdown, not click: the one control that must never miss a press
@@ -1203,14 +876,63 @@ export class KartGame extends Minigame {
     this.quitBtn = quit;
 
     this.cardHost = document.createElement('div');
-    this.cardHost.className = 'mg-kart-cards';
+    this.cardHost.className = 'mg-kk-cards';
     wrap.appendChild(this.cardHost);
+  }
+
+  /**
+   * §A7 — build the HUD for the CURRENT roster and track. Rebuilt (never
+   * mutated) when a Play Again lands on a different circuit, which is the only
+   * time either of those changes.
+   */
+  _mountHud() {
+    try { this.hud?.dispose?.(); } catch { /* a half-built HUD must not trap us */ }
+    this.hud = null;
+    const t = this.track;
+    // §A7's track payload comes straight from GP1 (decimated polyline, yMin/yMax
+    // for the elevation shading); `posOf` and the finish-line origin let the HUD
+    // put its dots exactly where we put our karts.
+    const hudTrack = t.hudTrack();
+    hudTrack.posOf = (q, lat, out) => t.worldOf(q, lat, out);
+    hudTrack.sFin = t.sFin;
+    hudTrack.LAP_UNITS = t.LAP_UNITS;
+    const roster = (this.karts.length ? this.karts : this._roster()).map((k) => ({
+      slot: k.slot, name: k.name, color: k.color, kart: k.kart, ai: !!k.ai, ghost: !!k.ghost,
+    }));
+    try {
+      this.hud = new KartHud(this.hudRoot, {
+        laps: this.laps,
+        you: this.me ? this.me.slot : (this.net ? this.net.you : 0),
+        track: hudTrack,
+        roster,
+        // kart.js owns the Minigame lifecycle, so the results furniture hands
+        // both decisions back here; onPlay lets the HUD ask for a sound rather
+        // than reaching into the audio graph itself.
+        onAgain: () => this._playAgain(),
+        onQuit: () => this.exitToRoom(),
+        onPlay: (name) => this.game.audio?.play?.(name),
+      });
+      this.hud.mount();
+      this.hud.setPhase(this.phase);
+    } catch (err) {
+      // A broken HUD must never cost the player the race: the world, the
+      // controls and the payout all still work without it.
+      this.hud = null;
+      console.warn('[kart] HUD unavailable', err);
+    }
+  }
+
+  /** Every HUD call goes through here, so one bad frame cannot stop the race. */
+  _hud(fn, ...args) {
+    const h = this.hud;
+    if (!h || typeof h[fn] !== 'function') return;
+    try { h[fn](...args); } catch { /* the HUD is decoration, the race is not */ }
   }
 
   /**
    * Remove on animationend OR after `ms`, whichever lands first. `animationend`
    * alone is not enough: a backgrounded tab, a compositor stall or a
-   * reduced-motion setting can swallow it, and a leftover `.mg-kart-card` spans
+   * reduced-motion setting can swallow it, and a leftover `.mg-kk-card` spans
    * the whole screen with pointer-events on — it would eat every click,
    * including Quit. The timer is the guarantee; the event is the polish.
    */
@@ -1238,80 +960,81 @@ export class KartGame extends Minigame {
   }
 
   _popup(text, cls = '') {
-    if (!this.f?.pops) return;
+    if (!this.popHost) return;
     const el = document.createElement('div');
-    el.className = `mg-kart-pop ${cls}`;
+    el.className = `mg-kk-pop ${cls}`;
     el.textContent = text;
     el.style.left = `${(Math.random() - 0.5) * 130}px`;
     el.style.top = `${(Math.random() - 0.5) * 40}px`;
-    this.f.pops.appendChild(el);
+    this.popHost.appendChild(el);
     this._autoRemove(el, 1400);
   }
 
-  _big(text, go) {
-    const el = document.createElement('div');
-    el.className = `mg-kart-num${go ? ' go' : ''}`;
-    el.textContent = text;
-    this.bigEl.appendChild(el);
-    this._autoRemove(el, 1200);
-  }
-
+  /**
+   * A centred banner. §A7 hands the countdown numerals, GO! and FINAL LAP to
+   * GP3's HUD (kart-hud.js `countdown()` / `lap()`), so this is only ever the
+   * finish shout the HUD has no method for; anything the HUD draws must NOT be
+   * drawn here as well, or the player reads it twice.
+   */
   _banner(text) {
     const el = document.createElement('div');
-    el.className = 'mg-kart-banner';
+    el.className = 'mg-kk-banner';
     el.textContent = text;
     this.bigEl.appendChild(el);
     this._autoRemove(el, 2300);
   }
 
   _flashFx(kind) {
-    this.flash.className = 'mg-kart-flash';
+    this.flash.className = 'mg-kk-flash';
     void this.flash.offsetWidth;
-    this.flash.className = `mg-kart-flash ${kind}`;
+    this.flash.className = `mg-kk-flash ${kind}`;
   }
 
-  /** §6 — instructions splash with a visual legend. */
+  /** §6 — instructions splash with a visual legend, plus the two pickers. */
   _showSplash() {
     const racing = !!this.net;
     const best = this.game.state.bests?.kart || 0;
     const rows = this.karts.map((k) => `
-      <div class="mg-kart-grow${k === this.me ? ' me' : ''}">
+      <div class="mg-kk-grow${k === this.me ? ' me' : ''}">
         <span class="n">P${k.slot + 1}</span><i style="background:${hex6(k.color)}"></i>
-        <span>${esc(k.name)}</span><b>${k === this.me ? 'you' : k.ai ? 'local racer' : ''}</b>
+        <span>${esc(k.name)}</span><b>${k === this.me ? 'you' : k.ai ? 'local racer' : ''} . ${
+  esc((KARTS[k.kart] || KARTS.coco).name)}</b>
       </div>`).join('');
+    const th = this.theme;
     const card = document.createElement('div');
-    card.className = 'mg-kart-card';
+    card.className = 'mg-kk-card';
     card.innerHTML = `
-      <div class="mg-kart-box">
-        <div class="mg-kart-title">${racing ? 'Grid is set' : 'Capy Karts'}</div>
-        <div class="mg-kart-sub">Three laps of Capy Speedway. Mind the melon.</div>
-        <div class="mg-kart-keys">
-          <span class="mg-kart-key">W<u>go</u></span>
-          <span class="mg-kart-key">S<u>brake</u></span>
-          <span class="mg-kart-key">A D<u>steer</u></span>
-          <span class="mg-kart-key">SHIFT<u>drift</u></span>
-          <span class="mg-kart-key">E<u>item</u></span>
-          <span class="mg-kart-key">Q<u>look back</u></span>
+      <div class="mg-kk-box">
+        <div class="mg-kk-title">${racing ? 'Grid is set' : 'Capy Karts'}</div>
+        <div class="mg-kk-sub">${this.laps} laps of ${esc(this.row.name)}. ${esc(this._trackPitch())}</div>
+        <div class="mg-kk-keys">
+          <span class="mg-kk-key">W<u>go</u></span>
+          <span class="mg-kk-key">S<u>brake</u></span>
+          <span class="mg-kk-key">A D<u>steer</u></span>
+          <span class="mg-kk-key">SHIFT<u>drift</u></span>
+          <span class="mg-kk-key">E<u>item</u></span>
+          <span class="mg-kk-key">Q<u>look back</u></span>
         </div>
-        <div class="mg-kart-rules">
-          <div class="mg-kart-rule"><span class="mg-kart-swatch" style="background:#4fb3e8"></span>
+        <div class="mg-kk-rules">
+          <div class="mg-kk-rule"><span class="mg-kk-swatch" style="background:#4fb3e8"></span>
             Hold drift through a corner. Sparks go sky blue, then gold, then coral:
             let go on coral for the longest boost.</div>
-          <div class="mg-kart-rule"><span class="mg-kart-swatch" style="background:#7ac74f"></span>
+          <div class="mg-kk-rule"><span class="mg-kk-swatch" style="background:#7ac74f"></span>
             Drive through a paw box for a melon peel, a splash bubble or a zoom berry.</div>
-          <div class="mg-kart-rule"><span class="mg-kart-swatch" style="background:#f0dca0"></span>
-            The sand slows you down. The tyres are softer than they look.</div>
+          <div class="mg-kk-rule"><span class="mg-kk-swatch" style="background:${hex6(th.apron)}"></span>
+            ${esc(this._trackHint())}</div>
         </div>
-        ${racing ? `<div class="mg-kart-grid">${rows}</div>` : ''}
-        <div class="mg-kart-sub">Best race score: <b>${best.toLocaleString()}</b></div>
-        <div class="mg-kart-btns">
-          ${racing ? '' : '<button class="mg-kart-btn" data-a="go">Roll out</button>'}
-          <button class="mg-kart-btn ghost" data-a="back">${racing ? 'Withdraw' : 'Back to the paddock'}</button>
+        ${racing ? `<div class="mg-kk-grid">${rows}</div>` : this._pickersHtml()}
+        <div class="mg-kk-sub">Best race score: <b>${best.toLocaleString()}</b></div>
+        <div class="mg-kk-btns">
+          ${racing ? '' : '<button class="mg-kk-btn" data-a="go">Roll out</button>'}
+          <button class="mg-kk-btn ghost" data-a="back">${racing ? 'Withdraw' : 'Back to the paddock'}</button>
         </div>
-        <div class="mg-kart-blink">${racing ? 'the lights are coming on' : 'or press any key'}</div>
+        <div class="mg-kk-blink">${racing ? 'the lights are coming on' : 'or press any key'}</div>
       </div>`;
     this.cardHost.appendChild(card);
     this.card = card;
+    if (!racing) this._bindPickers(card);
     const go = card.querySelector('[data-a="go"]');
     if (go) go.onclick = () => this._beginCountdown();
     card.querySelector('[data-a="back"]').onclick = () => {
@@ -1320,214 +1043,178 @@ export class KartGame extends Minigame {
     };
   }
 
+  /** One warm line per circuit, in the cove's own voice. */
+  _trackPitch() {
+    return {
+      sunny: 'Mind the melon.',
+      summit: 'Mind the ice on the way down.',
+      tangle: 'Mind the vines. And the boulders.',
+      glimmer: 'Mind the carts, and land the big one.',
+    }[this.row.id] || 'Mind the melon.';
+  }
+
+  _trackHint() {
+    return {
+      sunny: 'The sand slows you down. The tyres are softer than they look.',
+      summit: 'Pale patches are ice: less grip, less steering, same top speed. Climbs cost you, descents pay you back.',
+      tangle: 'Vines swing and boulders roll on a rhythm. Learn the beat and you can drive straight through.',
+      glimmer: 'Carts cross the road on a timer, and the ramp at half distance is worth landing straight.',
+    }[this.row.id] || 'The sand slows you down.';
+  }
+
+  /** §A4/§A5 — kart and circuit pickers. Practice only; a race is already set. */
+  _pickersHtml() {
+    const karts = KART_ORDER.map((id) => {
+      const k = KARTS[id];
+      const locked = this.runs < k.runs;
+      const bars = (n) => `<div class="mg-kk-bars">${
+        [1, 2, 3, 4, 5].map((i) => `<div class="mg-kk-bar${i <= n ? ' on' : ''}"></div>`).join('')}</div>`;
+      return `<button class="mg-kk-pick${id === this.myKart ? ' on' : ''}${locked ? ' locked' : ''}"
+        type="button" data-kart="${id}" ${locked ? 'disabled' : ''}>
+        ${esc(k.name)}<u>${locked ? `unlocks at ${k.runs} races (${this.runs})` : esc(k.blurb)}</u>
+        ${bars(k.acc)}${bars(k.vmax)}${bars(k.han)}${bars(k.wgt)}</button>`;
+    }).join('');
+    const FOCUS = {
+      sunny: 'the classic', summit: 'grip + gradient',
+      tangle: 'dodging + nerve', glimmer: 'banking + airtime',
+    };
+    const tracks = TRACK_ORDER.map((id) => {
+      const r = getTrack(id);
+      return `<button class="mg-kk-pick${id === this.row.id ? ' on' : ''}" type="button" data-track="${id}">
+        ${esc(r.name)}<u>${esc(FOCUS[id] || r.theme)}</u></button>`;
+    }).join('');
+    return `<div class="mg-kk-sub">Your kart</div><div class="mg-kk-picks">${karts}</div>
+      <div class="mg-kk-note">Every kart adds up to the same twelve. Unlocks by playing, never by paying.</div>
+      <div class="mg-kk-sub">Circuit</div><div class="mg-kk-picks">${tracks}</div>`;
+  }
+
+  _bindPickers(card) {
+    for (const el of card.querySelectorAll('[data-kart]')) {
+      el.onclick = () => {
+        this.myKart = kartIdOf(el.dataset.kart);
+        writeLS(LS_KART, this.myKart);
+        this.stats = kartStats(this.myKart);
+        this.game.audio?.play?.('click');
+        this._restartSplash();
+      };
+    }
+    for (const el of card.querySelectorAll('[data-track]')) {
+      el.onclick = () => {
+        const id = el.dataset.track;
+        if (id === this.row.id) return;
+        this.game.audio?.play?.('click');
+        this._switchTrack(id);
+      };
+    }
+  }
+
+  /** A new shell for the same circuit: the pick has to be visible on the grid. */
+  _restartSplash() {
+    if (this.phase !== 'splash') return;
+    this._rebuildWorld(this.row.id);
+  }
+
+  /**
+   * A different circuit is a different world. Practice only -- a race's track
+   * arrives on kart-grid and never changes under the racer.
+   */
+  _switchTrack(id) {
+    if (this.net || this.phase !== 'splash' || id === this.row.id) return;
+    this._rebuildWorld(id);
+  }
+
+  /**
+   * Tear the world down and build it again on `id`. The renderer, the camera,
+   * the DOM shell and the audio graph survive; everything the scene owns does
+   * not. Only ever called from the splash, where nothing is in flight.
+   */
+  _rebuildWorld(id) {
+    this._clearCard();
+    if (this.podium) {
+      for (const h of this.podium.hops) h.seat.remove(h.driver.group);
+      this.scene?.remove(this.podium.root);
+      disposeObject(this.podium.root);
+      this.podium = null;
+      this._podiumCam = false;
+    }
+    for (const k of this.karts) {
+      k.tag?.remove();
+      k.tag = null;
+      k.driver?.dispose?.();
+      k.driver = null;
+    }
+    this.karts.length = 0;
+    this.me = null;
+    if (this.camera && this.lines) this.camera.remove(this.lines);
+    if (this.scene && this.camera) this.scene.remove(this.camera);
+    // the circuit owns its own geometry, materials and textures (GP1)
+    try { this.world?.dispose?.(); } catch { /* half-built worlds die quietly */ }
+    this.world = null;
+    if (this.scene) {
+      disposeObject(this.scene);
+      this.scene.background = null;
+      this.scene.clear();
+      this.scene = null;
+    }
+    for (const g of this.geos) g.dispose?.();
+    this.geos.length = 0;
+    for (const m of this.mats) m.dispose?.();
+    this.mats.length = 0;
+    for (const t of this.texs) t.dispose?.();
+    this.texs.length = 0;
+    this.hazards.clear();
+    this.projectiles.clear();
+    this.parts.length = 0;
+    this.sparks.length = 0;
+    this.confetti.length = 0;
+    this.lines = null;
+    this._camInit = false;
+    this._selectTrack(id);
+    this._buildScene();
+    this._buildKarts();
+    this._mountHud();
+    this._resetRace();
+  }
+
   // ------------------------------------------------------------------ scene -
+  /**
+   * The renderer and the camera outlive a track change; everything the circuit
+   * owns does not. kart-tracks.js builds the whole world -- ribbons, skirt,
+   * ground, sky, lights, themed decor, the gantry and the moving hazards -- into
+   * one Group behind `buildTrackWorld`, so this file only has to hold the
+   * handle, feed it a frame, and dispose it.
+   */
   _buildScene() {
     const w = this.wrap.clientWidth || innerWidth;
     const h = this.wrap.clientHeight || innerHeight;
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    this.renderer.setSize(w, h);
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.renderer.domElement.className = 'mg-kart-gl';
-    this.wrap.insertBefore(this.renderer.domElement, this.vig);
+    if (!this.renderer) {
+      this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      this.renderer.setSize(w, h);
+      this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      this.renderer.shadowMap.enabled = true;
+      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      this.renderer.domElement.className = 'mg-kk-gl';
+      this.wrap.insertBefore(this.renderer.domElement, this.vig);
+    }
 
     const scene = new THREE.Scene();
     this.scene = scene;
-    scene.background = new THREE.Color(FOG_COL);
-    scene.fog = new THREE.Fog(FOG_COL, 120, 460);
-
-    this.camera = new THREE.PerspectiveCamera(62, w / h, 0.4, 1200);
+    if (!this.camera) this.camera = new THREE.PerspectiveCamera(62, w / h, 0.4, 1200);
     this.fov = 62;
-
-    scene.add(new THREE.HemisphereLight(0xfff3d8, 0x9ec8b0, 1.15));
-    const sun = new THREE.DirectionalLight(0xfff2d4, 1.55);
-    sun.position.set(60, 90, 30);
-    sun.castShadow = true;                    // §6: exactly one shadow caster
-    sun.shadow.mapSize.set(1024, 1024);
-    sun.shadow.camera.near = 20;
-    sun.shadow.camera.far = 260;
-    sun.shadow.camera.left = -70;
-    sun.shadow.camera.right = 70;
-    sun.shadow.camera.top = 70;
-    sun.shadow.camera.bottom = -70;
-    sun.shadow.bias = -0.0012;
-    scene.add(sun);
-    scene.add(sun.target);
-    this.sun = sun;
-    const rim = new THREE.DirectionalLight(0xa8dcff, 0.4);
-    rim.position.set(-40, 30, -60);
-    scene.add(rim);
-
-    this.sky = buildSky();
-    scene.add(this.sky);
 
     const vc = makeToon(0xffffff, { vertexColors: true });
     this.vcMat = vc;
 
-    // ---- ground: sand plate + a sea ring beyond it -------------------------
-    const sand = new THREE.Mesh(new THREE.CircleGeometry(300, 40), makeToon(SAND));
-    sand.rotation.x = -Math.PI / 2;
-    sand.position.set(7, -0.06, -17);
-    sand.receiveShadow = true;
-    scene.add(sand);
-    this.geos.push(sand.geometry);
+    this.world = buildTrackWorld(scene, this.track, { vcMat: vc });
+    scene.background = new THREE.Color(this.world.fog.color);
+    scene.fog = new THREE.Fog(this.world.fog.color, this.world.fog.near, this.world.fog.far);
+    this.sun = this.world.sun;
+    this.floorY = this.track.yMin - 6;
 
-    const sea = new THREE.Mesh(new THREE.RingGeometry(298, 900, 48), makeToon(SEA));
-    sea.rotation.x = -Math.PI / 2;
-    sea.position.set(7, -0.6, -17);
-    scene.add(sea);
-    this.geos.push(sea.geometry);
-    this.sea = sea;
-
-    // ---- the circuit: three merged ribbons (§6) ----------------------------
-    const t = this.track;
-    for (const bands of [apronBands(), kerbBands(), roadBands(t)]) {
-      const g = buildRibbon(t, bands);
-      const m = new THREE.Mesh(g, vc);
-      m.receiveShadow = true;
-      m.frustumCulled = false;
-      scene.add(m);
-      this.geos.push(g);
-    }
-
-    this._buildDecor();
     this._buildPools();
-  }
-
-  /** Everything trackside, one InstancedMesh per family (§2). */
-  _buildDecor() {
-    const t = this.track;
-    const scene = this.scene;
-    const vc = this.vcMat;
-    const rng = mulberry32(0xca9b0a);
-    const p = [0, 0];
-
-    const family = (geo, cap, mat = vc) => {
-      const im = new THREE.InstancedMesh(geo, mat, cap);
-      im.count = 0;
-      im.frustumCulled = false;
-      scene.add(im);
-      this.geos.push(geo);
-      return im;
-    };
-    const put = (im, x, y, z, ry, s) => {
-      if (im.count >= im.instanceMatrix.count) return;
-      _eu.set(0, ry, 0);
-      _q4.setFromEuler(_eu);
-      _v3b.set(x, y, z);
-      _sc.set(s, s, s);
-      _m4.compose(_v3b, _q4, _sc);
-      im.setMatrixAt(im.count++, _m4);
-    };
-
-    // barrier tyre stacks along both edges, every 7 units
-    const tyres = family(tyreGeo(), 220);
-    const stepI = Math.max(2, Math.round(7 / t.step));
-    for (let i = 0; i < t.n; i += stepI) {
-      for (const side of [-1, 1]) {
-        t.edge(i, side * WALL_LAT * t.hw[i], p);
-        put(tyres, p[0], 0, p[1], t.ang[i], 1);
-      }
-    }
-    tyres.castShadow = true;
-    tyres.instanceMatrix.needsUpdate = true;
-
-    // palms and hay bales scattered outside the barrier
-    const palms = family(palmGeo(), 90);
-    const bales = family(baleGeo(), 60);
-    for (let i = 0; i < t.n; i += 5) {
-      const side = rng() < 0.5 ? -1 : 1;
-      if (rng() < 0.55) {
-        t.edge(i, side * (WALL_LAT * t.hw[i] + 4 + rng() * 9), p);
-        put(palms, p[0], 0, p[1], rng() * 6.28, 0.8 + rng() * 0.5);
-      }
-      if (rng() < 0.22) {
-        t.edge(i, side * (WALL_LAT * t.hw[i] + 2.2), p);
-        put(bales, p[0], 0, p[1], t.ang[i] + Math.PI / 2, 1);
-      }
-    }
-    palms.castShadow = true;
-    palms.instanceMatrix.needsUpdate = true;
-    bales.castShadow = true;
-    bales.instanceMatrix.needsUpdate = true;
-
-    // bunting arches over the road at a handful of landmarks
-    const arches = family(archGeo(), 10);
-    for (const q of [0.08, 0.3, 0.47, 0.63, 0.86]) {
-      const s = t.at(q * LAP_UNITS + S_FIN, this._tmp);
-      const scale = s.hw / 5.6;
-      put(arches, s.x, 0, s.z, Math.PI / 2 - s.ang, clamp(scale, 0.8, 1.4));
-    }
-    arches.instanceMatrix.needsUpdate = true;
-
-    // Crowd rows. A spectator must FACE the road, so local +z is aimed along
-    // -side*N: ry = pi - ang on the +N side, -ang on the -N side.
-    const crowd = family(crowdGeo(0xb08a5a), 130);
-    const crowdSpots = [[0.90, 0.06, 30, -1], [0.50, 0.60, 22, 1], [0.27, 0.34, 16, -1]];
-    for (const [qa, qb, n, side] of crowdSpots) {
-      for (let i = 0; i < n; i++) {
-        const q = qa + (qb - qa) * (i / n);
-        const s = t.at(frac1(q) * LAP_UNITS + S_FIN, this._tmp);
-        const row = i % 4;
-        const dd = t.safeOffset(side * (s.hw * WALL_LAT + 3.6 + row * 1.5), s.curv);
-        put(crowd, s.x - Math.sin(s.ang) * dd + rng() - 0.5,
-          0.28 + row * 0.55, s.z + Math.cos(s.ang) * dd + rng() - 0.5,
-          side > 0 ? Math.PI - s.ang : -s.ang, 0.9 + rng() * 0.3);
-      }
-    }
-    crowd.instanceMatrix.needsUpdate = true;
-    this.crowd = crowd;
-
-    // Grandstand steps under the main-straight crowd. standGeo runs along local
-    // +x and steps back in -z, so it is aimed along the tangent: ry = -ang.
-    const stand = new THREE.Mesh(standGeo(64), vc);
-    const sMain = t.at(0.96 * LAP_UNITS + S_FIN, this._tmp);
-    const standOff = t.safeOffset(-(sMain.hw * WALL_LAT + 3.4), sMain.curv);
-    stand.position.set(
-      sMain.x - Math.sin(sMain.ang) * standOff, 0,
-      sMain.z + Math.cos(sMain.ang) * standOff,
-    );
-    stand.rotation.y = -sMain.ang;
-    stand.receiveShadow = true;
-    scene.add(stand);
-    this.geos.push(stand.geometry);
-
-    // gulls, animated in _updateDecor
-    const gulls = family(gullGeo(), 16, makeToon(0xffffff, { vertexColors: true }));
-    gulls.count = 14;
-    this.gulls = gulls;
-    this.gullSeeds = [];
-    for (let i = 0; i < 14; i++) {
-      this.gullSeeds.push({
-        x: rng() * 260 - 120, z: rng() * 220 - 110, y: 14 + rng() * 16,
-        r: 12 + rng() * 26, a: rng() * 6.28, sp: 0.25 + rng() * 0.4, flap: rng() * 6.28,
-        scare: 0,
-      });
-    }
-
-    // start gantry over the line, and the lighthouse out on the coastal run
-    const fin = t.at(S_FIN, this._tmp);
-    const gantry = new THREE.Mesh(gantryGeo(fin.hw * 1.6), vc);
-    gantry.position.set(fin.x, 0, fin.z);
-    gantry.rotation.y = Math.PI / 2 - fin.ang;
-    scene.add(gantry);
-    this.geos.push(gantry.geometry);
-
-    const coast = t.at(0.15 * LAP_UNITS + S_FIN, this._tmp);
-    const lhOff = t.safeOffset(-34, coast.curv);
-    const lh = new THREE.Mesh(lighthouseGeo(), vc);
-    lh.position.set(
-      coast.x - Math.sin(coast.ang) * lhOff, 0,
-      coast.z + Math.cos(coast.ang) * lhOff,
-    );
-    lh.castShadow = true;
-    scene.add(lh);
-    this.geos.push(lh.geometry);
-    this.lighthouse = lh;
   }
 
   /** Item boxes, hazards, projectiles and every particle pool. */
@@ -1553,7 +1240,7 @@ export class KartGame extends Minigame {
       return im;
     };
 
-    this.boxIM = new THREE.InstancedMesh(boxGeo(), vc, BOXES.length);
+    this.boxIM = new THREE.InstancedMesh(boxGeo(), vc, this.boxDefs.length);
     this.boxIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.boxIM.count = 0;
     this.boxIM.frustumCulled = false;
@@ -1580,8 +1267,8 @@ export class KartGame extends Minigame {
     this.sparkIM = glow(60, new THREE.TetrahedronGeometry(0.4, 0));
     this.confIM = glow(120, new THREE.BoxGeometry(0.3, 0.3, 0.06));
 
-    // speed lines live in camera space so they always streak past the lens
-    const lineGeo = new THREE.PlaneGeometry(0.03, 1.6);
+    // §A8 speed lines: camera-space planes laid ALONG the screen-space velocity
+    const lineGeo = new THREE.PlaneGeometry(0.03, 1.0);
     const lineMat = makeGlow(0xffffff, { unique: true });
     lineMat.transparent = true;
     lineMat.opacity = 0;
@@ -1598,9 +1285,22 @@ export class KartGame extends Minigame {
     this.scene.add(this.camera);
     this.geos.push(lineGeo);
     this.lineSeeds = [];
-    for (let i = 0; i < 24; i++) {
-      this.lineSeeds.push({ a: Math.random() * 6.28, r: 0.5 + Math.random() * 1.5, z: Math.random() });
-    }
+    for (let i = 0; i < 24; i++) this.lineSeeds.push(this._reseedLine({}, Math.random()));
+  }
+
+  /**
+   * §A8 — a streak's own numbers. `off` is where it sits ACROSS the velocity
+   * band, `j` is its slice of the +-0.18 rad of spread, and `t` is how far it
+   * has travelled down that band. The direction itself is shared by all 24 and
+   * recomputed every frame from the camera, which is the whole fix.
+   */
+  _reseedLine(s, t = 0) {
+    s.t = t;
+    s.off = rand(-1.7, 1.7);
+    s.j = rand(-0.18, 0.18);
+    s.len = 0.7 + Math.random() * 1.5;
+    s.d = 1.6 + Math.random() * 3.4;
+    return s;
   }
 
   // ------------------------------------------------------------------ karts -
@@ -1615,20 +1315,36 @@ export class KartGame extends Minigame {
     const roster = this._roster();
     const N = roster.length;
 
+    // §A4 — one geometry set per SHELL in this field (at most five), not one for
+    // the whole grid, so six racers still cost at most eleven kart draw calls.
     const shellMat = makeToon(0xffffff, { unique: true });
     this.mats.push(shellMat);
-    this.bodyIM = new THREE.InstancedMesh(kartBodyGeo(), shellMat, N);
-    this.bodyIM.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(N * 3).fill(1), 3);
-    this.trimIM = new THREE.InstancedMesh(kartTrimGeo(), this.vcMat, N);
-    this.wheelIM = new THREE.InstancedMesh(wheelGeo(), this.vcMat, N * 4);
-    for (const im of [this.bodyIM, this.trimIM, this.wheelIM]) {
-      im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      im.frustumCulled = false;
-      im.castShadow = true;
-      im.count = 0;
-      scene.add(im);
-      this.geos.push(im.geometry);
+    this.shells = new Map();
+    for (const r of roster) {
+      const id = kartIdOf(r.kart);
+      if (this.shells.has(id)) { this.shells.get(id).cap++; continue; }
+      this.shells.set(id, { cap: 1 });
     }
+    for (const [id, sh] of this.shells) {
+      sh.body = new THREE.InstancedMesh(kartBodyGeo(id), shellMat, sh.cap);
+      sh.body.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(sh.cap * 3).fill(1), 3);
+      sh.trim = new THREE.InstancedMesh(kartTrimGeo(id), this.vcMat, sh.cap);
+      for (const im of [sh.body, sh.trim]) {
+        im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        im.frustumCulled = false;
+        im.castShadow = true;
+        im.count = 0;
+        scene.add(im);
+        this.geos.push(im.geometry);
+      }
+    }
+    this.wheelIM = new THREE.InstancedMesh(wheelGeo(), this.vcMat, N * 4);
+    this.wheelIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.wheelIM.frustumCulled = false;
+    this.wheelIM.castShadow = true;
+    this.wheelIM.count = 0;
+    scene.add(this.wheelIM);
+    this.geos.push(this.wheelIM.geometry);
 
     const roundG = roundelGeo();
     this.geos.push(roundG);
@@ -1665,15 +1381,21 @@ export class KartGame extends Minigame {
       this.mats.push(shadow.material);
 
       const tag = document.createElement('div');
-      tag.className = 'mg-kart-tag';
+      tag.className = 'mg-kk-tag';
       tag.innerHTML = `<i style="background:${hex6(r.color)}"></i><span>${esc(r.name)}</span><u data-f="g"></u>`;
       this.tagHost.appendChild(tag);
 
       this.karts.push({
         ...r,
+        kart: kartIdOf(r.kart),
+        st: kartStats(r.kart),
         anchor, tilt, driver, roundel, shadow, tag, tagGap: tag.querySelector('[data-f="g"]'),
         // track-space state
         q: 0, lat: 0, yaw: 0, v: 0, laps: 0, heading: 0, velAng: 0,
+        // §A3 vertical state: world y, vertical speed, airtime
+        wy: 0, vy: 0, air: false, airMs: 0, roadVy: 0, airCool: 0,
+        // §A2 hazard state: the speed penalty, the wobble and the immunity
+        hazT: 0, wobT: 0, hazImmune: 0,
         // control + feel
         steer: 0, drift: 0, driftDir: 0, charge: 0, tier: 0, lowT: 0, offT: 0,
         boostT: 0, boostTarget: 0, spinT: 0, soakT: 0, wallT: 0, wheelSpin: 0,
@@ -1689,22 +1411,31 @@ export class KartGame extends Minigame {
     this.me = this.karts[this.net ? this.net.you : 0] || this.karts[0];
     this.me.tag.remove();
     this.me.tag = null;
-    // our own kart never needs a shadow blob drawn under the camera-facing hood
-    this._buildMinimapBase();
+    // our own kart drives on OUR chosen stats; everyone else is rendered, not
+    // simulated, so their numbers only matter in practice
+    this.stats = this.me.st;
   }
 
-  /** §2 grid: three staggered rows just behind the line. */
+  /** §A1.3 grid: three staggered rows just behind the line, off this lap. */
   _resetRace() {
-    const rows = [LAP_UNITS - 6, LAP_UNITS - 13, LAP_UNITS - 20];
     for (const k of this.karts) {
-      const u = rows[Math.floor(k.slot / 2)] ?? rows[2];
-      k.q = u / LAP_UNITS;
-      k.lat = k.slot % 2 === 0 ? -0.47 : 0.47;
+      const slot = this.track.gridSlot(k.slot, this._tmp);
+      k.q = slot.q;
+      k.lat = slot.lat;
       k.yaw = 0;
       k.v = 0;
       k.laps = 0;
       k.heading = this.track.angleAt(k.q * LAP_UNITS + S_FIN);
       k.velAng = k.heading;
+      k.wy = this.track.worldOf(k.q, k.lat, this._tmp3).y;
+      k.vy = 0;
+      k.air = false;
+      k.airMs = 0;
+      k.roadVy = 0;
+      k.airCool = 0;
+      k.hazT = 0;
+      k.wobT = 0;
+      k.hazImmune = 0;
       k.steer = 0; k.drift = 0; k.driftDir = 0; k.charge = 0; k.tier = 0;
       k.lowT = 0; k.offT = 0; k.boostT = 0; k.boostTarget = 0;
       k.spinT = 0; k.soakT = 0; k.wallT = 0; k.wheelSpin = 0;
@@ -1719,7 +1450,7 @@ export class KartGame extends Minigame {
       k.onPodium = false;
       k.anchor.visible = true;
     }
-    this.boxes = BOXES.map((b, i) => ({ i, q: b[0], lat: b[1], live: true, respawnAt: 0, cool: 0 }));
+    this.boxes = this.boxDefs.map((b, i) => ({ i, q: b.q, lat: b.lat, live: true, respawnAt: 0, cool: 0 }));
     this.hazards.clear();
     this.projectiles.clear();
     this.parts.length = 0;
@@ -1738,7 +1469,15 @@ export class KartGame extends Minigame {
     this.hudCache = {};
     this.spinLock = 0;
     this._camInit = false;
+    this.wrongT = 0;
+    this.wrongOn = false;
+    this.wrongDir = 0;
+    this.hazImmune = 0;
+    this.hazSeen.clear();
     this._placeOf = new Map();
+    this._hud('setPhase', 'splash');
+    this._hud('wrongWay', false);
+    this.vig.classList.remove('wrong');
     this._layoutKarts(0);
     this._showSplash();
   }
@@ -1758,6 +1497,12 @@ export class KartGame extends Minigame {
         return;
       }
       if (OWNED.has(e.key)) { e.preventDefault(); e.stopPropagation(); }
+      // the results board belongs to kart-hud.js, so keep a keyboard road back
+      // into a new race here: a player must never be stuck looking at a podium
+      if (this.phase === 'results' && !e.repeat && (e.key === 'Enter' || e.key === ' ')) {
+        this._playAgain();
+        return;
+      }
       if (this.phase === 'splash' && !e.repeat && !this.net) { this._beginCountdown(); return; }
       const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       this.keys.add(k);
@@ -1956,6 +1701,14 @@ export class KartGame extends Minigame {
     if (!this._mine(m)) return;
     const k = this._bySlot(m.s);
     if (!k) return;
+    // §A2: a static hazard rides the same frame with kind 'haz' and by: null.
+    // Nobody threw it, so nobody is credited, and it is never one-shot.
+    if (m.kind === 'haz') {
+      const claim = k === this.me ? this.hazSeen.get(m.i) : undefined;
+      const claimed = Number.isFinite(claim) && this.raceMs - claim < 600;
+      this._applyHaz(k, Number(m.ms) || HAZ_HIT_MS, !claimed);
+      return;
+    }
     this.hazards.delete(m.i);
     this.projectiles.delete(m.i);
     this._applyHit(k, m.kind === 'bubble' ? 'bubble' : 'peel', Number(m.ms) || 0);
@@ -1975,7 +1728,7 @@ export class KartGame extends Minigame {
     if (!this._mine(m)) return;
     const k = this._bySlot(m.s);
     if (!k) return;
-    const lap = clamp(Math.round(Number(m.lap) || 0), 1, LAPS);
+    const lap = clamp(Math.round(Number(m.lap) || 0), 1, this.laps);
     k.laps = Math.max(k.laps, lap);
     const ms = Number(m.ms) || 0;
     const split = ms - (k.lapMs.length ? k.lapMs[k.lapMs.length - 1] : 0);
@@ -2003,7 +1756,7 @@ export class KartGame extends Minigame {
       .map((r) => ({
         slot: r.s, name: String(r.name || 'Capy').slice(0, 16), ai: !!r.ai,
         place: clamp(Math.round(Number(r.place) || 6), 1, 6),
-        ms: Number(r.ms) || 0, laps: clamp(Math.round(Number(r.laps) || 0), 0, LAPS),
+        ms: Number(r.ms) || 0, laps: clamp(Math.round(Number(r.laps) || 0), 0, this.laps),
         best: Number(r.best) || 0,
       }))
       .sort((a, b) => a.place - b.place);
@@ -2021,7 +1774,7 @@ export class KartGame extends Minigame {
     if (Number.isFinite(m.q)) this.me.q = frac1(m.q);
     // Contract §4.2: `lap` is laps COMPLETED, `laps` is the race total (3).
     // Reading m.laps here would teleport a resumer to the chequered flag.
-    if (Number.isFinite(m.lap)) this.me.laps = clamp(Math.round(m.lap), 0, LAPS);
+    if (Number.isFinite(m.lap)) this.me.laps = clamp(Math.round(m.lap), 0, this.laps);
     this.me.ghost = false;
     this.me.v = 0;
     this.me.heading = this.track.angleAt(this.me.q * LAP_UNITS + S_FIN);
@@ -2031,13 +1784,17 @@ export class KartGame extends Minigame {
     }
     this._clearCard();
     this.phase = 'race';
-    this.hud.classList.add('on');
-    this.f.lights.classList.remove('on');
+    this._hud('setPhase', 'race');
     this.game.toast?.('Back in the seat. Go go go!');
   }
 
-  /** §4.4 — our own kart, 10Hz, on its own budget. */
-  _sendIn(force) {
+  /**
+   * §4.4 — our own kart, 10Hz, on its own budget, plus one extra frame right
+   * after a box, an item use or (§A2) a hazard clip. `hz` is the optional
+   * hazard CLAIM and nothing more: the server recomputes the phase formula at
+   * its own T and decides for itself.
+   */
+  _sendIn(force, hz) {
     const n = this.net;
     if (!n || this.phase !== 'race' || this.me.ghost) return;
     if (!force) {
@@ -2046,15 +1803,17 @@ export class KartGame extends Minigame {
     }
     n.sendAcc = 0;
     const k = this.me;
-    this.game.net?.send?.({
+    const msg = {
       t: 'kart-in',
       q: +k.q.toFixed(5),
       lat: +k.lat.toFixed(3),
       yaw: +k.yaw.toFixed(3),
       v: +k.v.toFixed(2),
       d: k.drift ? k.tier || 1 : 0,
-      air: false,
-    });
+      air: !!k.air,
+    };
+    if (Number.isFinite(hz)) msg.hz = hz;
+    this.game.net?.send?.(msg);
   }
 
   // ------------------------------------------------------------- lifecycle --
@@ -2063,8 +1822,7 @@ export class KartGame extends Minigame {
     this.game.audio?.play?.('click');
     this._clearCard();
     this.phase = 'count';
-    this.hud.classList.add('on');
-    this.f.lights.classList.add('on');
+    this._hud('setPhase', 'count');
     this.tip.style.opacity = '1';
     this._done = false;                       // each run reports itself
     this.lightStep = -1;
@@ -2076,8 +1834,8 @@ export class KartGame extends Minigame {
     this.phase = 'race';
     this.raceMs = 0;
     for (const k of this.karts) k.lapStart = 0;
-    this.f.lights.classList.remove('on');
-    this._big('GO!', true);
+    this._hud('setPhase', 'race');
+    // the GO! callout itself belongs to the HUD's countdown(4 - step, go) beat
     this.game.audio?.play?.('success');
     if (this.preHold > BOG_HOLD_MS / 1000) {
       // §3.4 bog: silly, not punishing
@@ -2090,12 +1848,22 @@ export class KartGame extends Minigame {
   }
 
   _onMyLap(lap, split, personalBest) {
-    if (lap >= LAPS) return;
-    this.game.audio?.play?.('ding');
+    const final = lap === this.laps - 1;
+    // §A7 element 2 owns the splits stack, the NEW BEST sweep and the FINAL LAP
+    // banner. `lap` here is laps COMPLETED, which is exactly what kart-hud.js
+    // (and `kart-lap` on the wire, §4.6) means by it: pass it through unchanged
+    // or the split stack labels the first completed lap "lap 2".
+    this._hud('lap', {
+      lap, laps: this.laps, splitMs: split,
+      bestMs: this.me.bestLap, best: !!personalBest, final,
+    });
+    if (lap >= this.laps) return;
+    // a personal best already chimes from the HUD's NEW BEST LAP; only the
+    // ordinary laps need their own ding, or the flag rings twice
+    if (!personalBest) this.game.audio?.play?.('ding');
     this._popup(`Lap ${lap} . ${lapTime(split)}`, personalBest ? 'gold' : '');
-    if (lap === LAPS - 1 && !this.finalLapShown) {
+    if (final && !this.finalLapShown) {
       this.finalLapShown = true;
-      this._banner('FINAL LAP');
       this.game.audio?.play?.('whoosh');
       this._scareGulls();
     }
@@ -2104,6 +1872,7 @@ export class KartGame extends Minigame {
   _onMyFinish() {
     if (this.phase !== 'race') return;
     this.phase = 'done';
+    this._hud('setPhase', 'done');
     this.tip.style.opacity = '0';
     this._banner(`${ordinal(this.me.place)} PLACE`);
     this.game.audio?.play?.('success');
@@ -2178,6 +1947,10 @@ export class KartGame extends Minigame {
   _stepMe(dt) {
     const k = this.me;
     const inp = this._readInput();
+    const st = this.stats;
+    const s0 = this.track.at(k.q * LAP_UNITS + S_FIN, this._tmp3);
+    const grip = this.track.gripAt(k.q);   // §A3 ice, from the registry's zones
+    if (k.air) { this._stepAir(k, dt, inp); return; }
 
     // ---- rocket start: only the first press inside the window counts --------
     if (this.rocketArmed && inp.gas) {
@@ -2195,8 +1968,9 @@ export class KartGame extends Minigame {
     const spun = k.spinT > 0;
     const want = spun ? 0 : inp.steer;
     k.steer = lerp(k.steer, want, ease(dt, STEER_EASE));
-    const frac = Math.min(1, k.v / V_MAX);
-    const steerMax = 2.6 * (1 - 0.55 * frac);
+    const frac = Math.min(1, k.v / st.vmax);
+    // §A4 handling and §A3 ice both scale steering and grip, never top speed
+    const steerMax = 2.6 * (1 - 0.55 * frac) * st.han * grip;
 
     // ---- drift entry / charge / release --------------------------------------
     this._stepDrift(k, dt, inp);
@@ -2217,10 +1991,11 @@ export class KartGame extends Minigame {
 
     // ---- speed --------------------------------------------------------------
     const off = Math.abs(k.lat) > 1.0;
-    let target = V_MAX;
+    let target = st.vmax;
     if (k.boostT > 0) { target = k.boostTarget; k.boostT -= dt; }
-    if (k.soakT > 0) { target = Math.min(target, V_MAX * SOAK_MUL); k.soakT -= dt; }
-    if (off) target *= OFF_MUL;
+    if (k.soakT > 0) { target = Math.min(target, st.vmax * SOAK_MUL); k.soakT -= dt; }
+    if (k.hazT > 0) { target = Math.min(target, st.vmax * HAZ_SPEED_MUL); k.hazT -= dt; }
+    if (off) target *= st.offMul;
     if (this.bogT > 0) target = Math.min(target, BOG_V);
 
     let a;
@@ -2228,7 +2003,7 @@ export class KartGame extends Minigame {
       a = -COAST_DRAG;                                  // decay back to target
       if (inp.brake) a = -BRAKE;
     } else if (inp.gas && !spun) {
-      a = ACCEL * (1 - k.v / Math.max(1, target));
+      a = st.accel * (1 - k.v / Math.max(1, target));
       if (k.boostT > 0) a *= BOOST_ACCEL_MUL;
     } else if (inp.brake) {
       a = k.v > 0 ? -BRAKE : -REVERSE_ACCEL;
@@ -2236,16 +2011,32 @@ export class KartGame extends Minigame {
       a = k.v > 0 ? -COAST_DRAG : COAST_DRAG;
     }
     if (off) a -= Math.sign(k.v || 1) * OFF_DRAG;
+
+    // §A3 GRAVITY ALONG THE TANGENT. A climb always costs you. A descent is
+    // allowed to carry you PAST your top speed -- the coast drag steps aside for
+    // it -- but only as far as DOWNHILL_CEIL (25.3), which is far under the
+    // 40.9 u/s the wire clamp defends, so a hill can never fake a warp.
+    const slopeA = -G_SLOPE * Math.sin(s0.pitch);
+    if (slopeA > 0) {
+      if (k.v < DOWNHILL_CEIL) {
+        if (!inp.brake && a < 0) a = Math.min(0, a + COAST_DRAG);
+        a += slopeA;
+      }
+    } else {
+      a += slopeA;
+    }
+
     k.v += a * dt;
     const floor = inp.brake ? -REVERSE_MAX : 0;
     k.v = clamp(k.v, floor, BOOST_CEIL);
     if (!inp.gas && !inp.brake && Math.abs(k.v) < 0.05) k.v = 0;
 
     // ---- grip: the velocity direction chases the facing ---------------------
-    k.velAng = angLerp(k.velAng, k.heading, ease(dt, k.drift ? GRIP_DRIFT : GRIP));
+    k.velAng = angLerp(k.velAng, k.heading, ease(dt, (k.drift ? GRIP_DRIFT : GRIP) * st.han * grip));
 
     this._advance(k, dt, k.velAng, k.v);
     this._wall(k, dt, off);
+    this._stepVertical(k, dt);
 
     // ---- feel dressing -------------------------------------------------------
     k.wheelSpin += k.v * dt * 3;
@@ -2254,6 +2045,142 @@ export class KartGame extends Minigame {
       if (Math.random() < dt * 26) this._dust(k, 0xe4cd90);
     }
     if (k.drift && k.v > 6 && Math.random() < dt * 30) this._dust(k, 0xdcd3c4);
+  }
+
+  /**
+   * §A3 — leaving the ground. Two ways up: a jump zone's lip, which imparts its
+   * `launch` outright, and a CREST, where the road's own vertical speed falls
+   * away faster than gravity can pull the kart down after it. The second one is
+   * what makes summit's compressions and every sharp brow feel right without a
+   * single authored ramp.
+   */
+  _stepVertical(k, dt) {
+    const p = this.track.worldOf(k.q, k.lat, this._tmp3);
+    const roadVy = k.v * Math.sin(p.pitch);
+    if (k.airCool > 0) k.airCool -= dt;
+    const ready = k.airCool <= 0 && k.v > 8;
+    const launch = ready ? this.track.jumpAt(k.q) : 0;
+    // the vertical acceleration the road is DEMANDING of us this frame
+    const need = dt > 0.0005 ? (roadVy - k.roadVy) / dt : 0;
+    if (launch > 0) {
+      this._takeOff(k, roadVy + launch, p.y, true);
+    } else if (ready && need < -GRAVITY_AIR) {
+      // The road is falling away faster than gravity can pull us after it, so
+      // we keep the vertical speed we HAD and the ground goes out from under
+      // us. That is a brow, and at speed it is worth real air: summit's
+      // compression and tangle's ridge only launch a kart that is genuinely
+      // quick, which is why `airCool` is enough to stop any chatter.
+      this._takeOff(k, k.roadVy, p.y, need < -GRAVITY_AIR * 1.35);
+    } else {
+      k.wy = p.y;
+      k.roadVy = roadVy;
+    }
+  }
+
+  _takeOff(k, vy, y, big) {
+    k.air = true;
+    k.vy = vy;
+    k.wy = y + 0.02;
+    k.airMs = 0;
+    this._cancelDrift(k);
+    if (k === this.me && big) this.game.audio?.play?.('whoosh');
+  }
+
+  /**
+   * §A3 — in the air there is no throttle, no drift and no grip: `AIR_STEER` of
+   * yaw authority is the whole of it, and the landing angle decides whether the
+   * jump paid.
+   */
+  _stepAir(k, dt, inp) {
+    k.airMs += dt * 1000;
+    // the clocks keep running while we are off the ground; only the throttle,
+    // the drift and the grip are suspended
+    if (k.boostT > 0) k.boostT -= dt;
+    if (k.soakT > 0) k.soakT -= dt;
+    if (k.hazT > 0) k.hazT -= dt;
+    if (k.spinT > 0) k.spinT = Math.max(0, k.spinT - dt);
+    k.steer = lerp(k.steer, inp.steer, ease(dt, STEER_EASE));
+    k.heading = wrapPi(k.heading + k.steer * AIR_STEER * dt);
+    k.velAng = angLerp(k.velAng, k.heading, ease(dt, 1.2));
+    k.vy -= GRAVITY_AIR * dt;
+    k.wy += k.vy * dt;
+    this._advance(k, dt, k.velAng, k.v);
+    k.wheelSpin += k.v * dt * 2;
+    const p = this.track.worldOf(k.q, k.lat, this._tmp3);
+    if (k.wy <= p.y || k.vy < -70) this._land(k, p);
+  }
+
+  _land(k, p) {
+    k.air = false;
+    k.wy = p.y;
+    k.vy = 0;
+    k.roadVy = k.v * Math.sin(p.pitch);
+    k.airCool = 0.4;
+    const ms = k.airMs;
+    k.airMs = 0;
+    const skew = Math.abs(wrapPi(k.heading - p.ang));
+    const st = k === this.me ? this.stats : k.st;
+    for (let i = 0; i < 10; i++) {
+      this._spawnPart(k, rand(-0.8, 0.8), 0.1, rand(-0.5, 0.5), this.theme.dust, rand(0.2, 0.45), rand(0.2, 0.45));
+    }
+    if (ms < AIR_MIN_MS) return;   // a hop is not airtime, and earns nothing
+    if (skew >= st.landHard) {
+      k.v *= 0.7;
+      this._cancelDrift(k);
+      if (k === this.me) {
+        this.shake = Math.max(this.shake, 0.4);
+        this.game.audio?.play?.('fail');
+        this._popup('rough landing', 'bad');
+      }
+    } else if (skew < LAND_CLEAN && k === this.me) {
+      this._applyBoost(LAND_BOOST_MS / 1000, LAND_BOOST_TARGET);
+      this._flashFx('land');
+      this.game.audio?.play?.('pop');
+      this._popup(`${(ms / 1000).toFixed(1)}s AIR!`, 'gold');
+      this._hud('toast', 'boost', 'clean landing');
+    }
+    if (k === this.me) this.shake = Math.max(this.shake, 0.22);
+  }
+
+  /**
+   * §A6 — wrong way. Purely a warning: no speed loss, no lap effect. Driving
+   * backwards is already worthless, because a lap only counts with every
+   * checkpoint bit set in sequence.
+   */
+  _stepWrongWay(dt) {
+    const k = this.me;
+    const racing = this.phase === 'race' && !k.ghost && !k.air;
+    const s = this.track.at(k.q * LAP_UNITS + S_FIN, this._tmp3);
+    // the projection of the velocity onto the tangent, in u/s
+    const along = k.v * Math.cos(wrapPi(k.velAng - s.ang));
+    const speed = Math.abs(k.v);
+    if (racing && along < 0 && speed >= WRONGWAY_MIN_V) {
+      this.wrongT = this.wrongOn ? 0 : this.wrongT + dt * 1000;
+      if (!this.wrongOn && this.wrongT >= WRONGWAY_MS) this._setWrongWay(true);
+    } else if (this.wrongOn) {
+      const clearing = !racing || speed < 2.0 || along > 0;
+      this.wrongT = clearing ? this.wrongT + dt * 1000 : 0;
+      if (!racing || speed < 2.0 || this.wrongT >= WRONGWAY_CLEAR_MS) this._setWrongWay(false);
+    } else {
+      this.wrongT = 0;
+    }
+    if (!this.wrongOn) return;
+    // the arrow points along the tangent, anchored in the world, so it reads as
+    // "that way" rather than "turn left". 0 is up the screen.
+    _v3.set(Math.cos(s.ang), 0, Math.sin(s.ang));
+    _v3.transformDirection(this.camera.matrixWorldInverse);
+    this.wrongDir = Math.atan2(_v3.x, _v3.y);
+  }
+
+  _setWrongWay(on) {
+    if (this.wrongOn === on) return;
+    this.wrongOn = on;
+    this.wrongT = 0;
+    this.vig.classList.toggle('wrong', on);
+    this._hud('wrongWay', on);
+    // the engine bus ducks to WRONGWAY_LP_HZ in _updateEngines while it is on,
+    // so the mistake sounds wrong as well as looking wrong
+    if (on) this.game.audio?.play?.('fail');
   }
 
   /** §3.2 — direction locks at entry and cannot flip; three tiers, no fourth. */
@@ -2353,23 +2280,23 @@ export class KartGame extends Minigame {
    * from banking a free lap in the first second of the race.
    */
   _lapCheck(k, prevQ) {
-    for (let c = 0; c < 6; c++) {
-      const cq = c / 6;
+    for (let c = 0; c < CHECKPOINTS; c++) {
+      const cq = c / CHECKPOINTS;
       const toC = dq(prevQ, cq);
       if (toC >= 0 && toC <= dq(prevQ, k.q)) k.cp |= (1 << c);
     }
     if (prevQ > 0.85 && k.q < 0.15) {
-      if (k.cp === 0b111111) { k.cp = 0; this._localLap(k); }
+      if (k.cp === CP_MASK) { k.cp = 0; this._localLap(k); }
     }
   }
 
   _localLap(k) {
-    k.laps = Math.min(LAPS, k.laps + 1);
+    k.laps = Math.min(this.laps, k.laps + 1);
     const split = this.raceMs - (k.lapMs.length ? k.lapMs[k.lapMs.length - 1] : 0);
     k.lapMs.push(this.raceMs);
     const isBest = split > 0 && (!k.bestLap || split < k.bestLap);
     if (isBest) k.bestLap = split;
-    if (k.laps >= LAPS) { this._localFinish(k); return; }
+    if (k.laps >= this.laps) { this._localFinish(k); return; }
     if (k === this.me) this._onMyLap(k.laps, split, isBest);
   }
 
@@ -2412,10 +2339,14 @@ export class KartGame extends Minigame {
     else mult = 1 - Math.min(0.10, -dHuman / 900);
 
     const base = 19.0 + 0.55 * k.skill;
-    const sector = AI_SECTORS[Math.min(AI_SECTORS.length - 1, Math.floor(k.q * AI_SECTORS.length))];
+    // §A1: the sector table is authored per track, next to the geometry that
+    // justifies it, so an AI lifts for the corners the player lifts for.
+    const sectors = this.track.aiSectors?.length === 24 ? this.track.aiSectors : AI_SECTORS;
+    const sector = sectors[Math.min(sectors.length - 1, Math.floor(k.q * sectors.length))];
     let vTarget = Math.min(base * mult, sector);
     vTarget = clamp(vTarget, AI_MIN, AI_MAX);
     if (k.soakT > 0) { vTarget = Math.min(vTarget, V_MAX * SOAK_MUL); k.soakT -= dt; }
+    if (k.hazT > 0) { vTarget = Math.min(vTarget, V_MAX * HAZ_SPEED_MUL); k.hazT -= dt; }
     if (k.spinT > 0) { vTarget = Math.min(vTarget, 5); k.spinT -= dt; }
     k.v = lerp(k.v, vTarget, ease(dt, 2.2));
 
@@ -2526,11 +2457,14 @@ export class KartGame extends Minigame {
     k.item = item;
     k.itemAt = this.time;
     this.spinLock = ROULETTE_MS / 1000;
-    this.f.item.classList.remove('spin');
-    void this.f.item.offsetWidth;
-    this.f.item.classList.add('spin');
+    // §A7 element 3: the roulette spins for ROULETTE_MS, then locks on `item`
+    this._hud('item', { item, spinning: true, ms: ROULETTE_MS });
+    this._timers.push(setTimeout(() => {
+      if (!this.disposed) this._hud('item', { item: this.me.item, spinning: false, ms: 0 });
+    }, ROULETTE_MS));
     this.game.audio?.play?.('pop');
     this._popup('+10', 'gold');
+    this._hud('toast', 'box', ITEMS[item]?.name || 'item');
     if (Number.isFinite(box)) {
       const b = this.boxes[box];
       if (b && !this.net) b.live = false;
@@ -2560,6 +2494,7 @@ export class KartGame extends Minigame {
 
   _useFx(item) {
     this.game.audio?.play?.(item === 'bubble' ? 'splash' : item === 'berry' ? 'whoosh' : 'pop');
+    this._hud('item', { item: null, spinning: false, ms: 0 });
   }
 
   _dropPeel(k) {
@@ -2620,6 +2555,81 @@ export class KartGame extends Minigame {
     }
   }
 
+  /**
+   * §A2 — the static hazards: vines, boulders and mine carts. Their positions
+   * are a pure function of race time, so nothing about them is ever relayed and
+   * every client (and the server) already agrees on where they are.
+   *
+   * Who decides a hit follows §4's first frozen decision exactly:
+   *   practice  we are the arbiter, and apply the penalty ourselves;
+   *   race      we play a cosmetic bonk the instant we clip one and send a
+   *             CLAIM on the `hz` field of the extra kart-in the client already
+   *             fires after an event. The server recomputes at its own T and
+   *             answers on kart-hit; no speed or control is lost until then.
+   */
+  _stepStaticHazards(dt) {
+    if (this.hazImmune > 0) this.hazImmune -= dt;
+    if (!this.hazDefs.length) return;
+    const T = this.raceMs;
+    const k = this.me;
+    const live = this.phase === 'race';
+    if (!live) return;
+    for (const h of this.hazDefs) {
+      if (!k.ghost && !k.air && this.hazImmune <= 0 && hazardHits(h, k.q, k.lat, T)) {
+        if (this.net) {
+          const last = this.hazSeen.get(h.i);
+          if (!(Number.isFinite(last) && T - last < HAZ_IMMUNE_MS)) {
+            this.hazSeen.set(h.i, T);
+            this._bonkFx(k, h.kind);       // cosmetic ONLY until kart-hit lands
+            this._sendIn(true, h.i);
+          }
+        } else {
+          this._applyHaz(k, HAZ_HIT_MS);
+        }
+      }
+      // practice also arbitrates for the five locals, on the same formula
+      if (this.net) continue;
+      for (const o of this.karts) {
+        if (o === k || o.finished || o.hazImmune > 0) continue;
+        if (!hazardHits(h, o.q, o.lat, T)) continue;
+        this._applyHaz(o, HAZ_HIT_MS);
+      }
+    }
+    for (const o of this.karts) if (o.hazImmune > 0) o.hazImmune -= dt;
+  }
+
+  /** The bonk everybody sees, whoever ends up ruling on it. */
+  _bonkFx(k, kind) {
+    if (k === this.me) {
+      this._flashFx('bonk');
+      this.shake = Math.max(this.shake, 0.5);
+      this.game.audio?.play?.('fail');
+      this._popup(kind === 'cart' ? 'CLANG!' : kind === 'boulder' ? 'THUMP!' : 'WHAP!', 'bad');
+      this._hud('toast', 'hit', kind === 'vine' ? 'caught a vine' : kind === 'boulder' ? 'boulder!' : 'mine cart!');
+    }
+    for (let i = 0; i < 14; i++) {
+      this._spawnPart(k, rand(-0.8, 0.8), rand(0.2, 1.4), rand(-0.6, 0.6),
+        kind === 'cart' ? 0x9aa2ad : kind === 'boulder' ? 0x9a9186 : 0x7ac74f,
+        rand(0.2, 0.45), rand(0.3, 0.6));
+    }
+  }
+
+  /**
+   * §A2's penalty. It must read differently from a peel spin at a glance, so
+   * the steering stays yours: this is a shove and a wobble, not a spin-out.
+   */
+  _applyHaz(k, ms, fx = true) {
+    const st = k === this.me ? this.stats : k.st;
+    const sec = ((Number(ms) || HAZ_HIT_MS) / 1000) * st.hitMul;
+    k.hazT = Math.max(k.hazT, sec);
+    k.v *= HAZ_SPEED_MUL;
+    k.wobT = 0.55 * st.hitMul;
+    k.hazImmune = HAZ_IMMUNE_MS / 1000;
+    this._cancelDrift(k);
+    if (k === this.me) this.hazImmune = HAZ_IMMUNE_MS / 1000;
+    if (fx) this._bonkFx(k, 'boulder');
+  }
+
   /** The one penalty path. In a race only kart-hit reaches here. */
   _applyHit(k, kind, ms) {
     const sec = (Number(ms) || (kind === 'bubble' ? SOAK_MS : SPIN_MS)) / 1000;
@@ -2667,13 +2677,10 @@ export class KartGame extends Minigame {
       const step = left > 2400 ? 0 : left > 1600 ? 1 : left > 800 ? 2 : left > 0 ? 3 : 4;
       if (step !== this.lightStep) {
         this.lightStep = step;
-        for (let i = 0; i < this.bulbs.length; i++) {
-          this.bulbs[i].className = `mg-kart-bulb${i < step + 1 && step < 4 ? ' lit' : step === 4 ? ' go' : ''}`;
-        }
-        if (step >= 1 && step <= 3) {
-          this._big(String(4 - step), false);
-          this.game.audio?.play?.('ding');
-        }
+        // §A7 element 6 owns the five bulbs AND the numeral on them; we only
+        // say which beat this is, and keep the beat's sound
+        if (step >= 1) this._hud('countdown', 4 - step, step >= 4);
+        if (step >= 1 && step <= 3) this.game.audio?.play?.('ding');
       }
       // §3.4: the throttle is dead here, but sitting on it is what bogs you.
       // Polled in the count phase because _readInput only runs once racing.
@@ -2703,6 +2710,8 @@ export class KartGame extends Minigame {
       this._sendIn(false);
     }
 
+    this._stepStaticHazards(dt);
+    this._stepWrongWay(dt);
     if (this.phase === 'race') this._checkBoxes(dt);
     this._updatePlaces();
     this._layoutKarts(dt);
@@ -2799,37 +2808,50 @@ export class KartGame extends Minigame {
    */
   _layoutKarts(dt) {
     const t = this.track;
-    const body = this.bodyIM;
-    const trim = this.trimIM;
     const wheel = this.wheelIM;
-    let n = 0;
+    const d = dt || 0.016;
+    for (const sh of this.shells.values()) { sh.body.count = 0; sh.trim.count = 0; }
     let wn = 0;
     for (const k of this.karts) {
       const p = t.worldOf(k.q, k.lat, this._tmp);
-      const ry = Math.PI / 2 - k.heading;
-      k.anchor.position.set(p.x, 0, p.z);
+      // §A3: a kart sits ON the road, and above it while it is flying
+      const y = k === this.me && k.air ? Math.max(p.y, k.wy) : p.y;
+      if (k.wobT > 0) k.wobT = Math.max(0, k.wobT - d);
+      const wob = k.wobT > 0 ? Math.sin(this.time * 21) * k.wobT * 1.4 : 0;
+      const ry = Math.PI / 2 - k.heading + wob;
+      k.anchor.position.set(p.x, y, p.z);
       k.anchor.rotation.y = ry;
 
-      // lean: into the corner, harder while drifting, plus a squash on a hit
+      // lean: into the corner, harder while drifting, plus the road's own bank
       const slip = wrapPi(k.heading - k.velAng);
-      const wantRoll = clamp(-slip * (k.drift ? 1.1 : 0.7), -0.32, 0.32);
-      k.tilt.rotation.z = lerp(k.tilt.rotation.z, wantRoll, ease(dt || 0.016, 8));
-      k.tilt.rotation.x = lerp(k.tilt.rotation.x, k.spinT > 0 ? 0.12 : 0, ease(dt || 0.016, 6));
+      const wantRoll = clamp(-slip * (k.drift ? 1.1 : 0.7), -0.32, 0.32) - (p.bank || 0) * 0.6;
+      k.tilt.rotation.z = lerp(k.tilt.rotation.z, wantRoll, ease(d, 8));
+      // pitch with the gradient, and nose up a little while airborne
+      const wantPitch = (k.spinT > 0 ? 0.12 : 0) - (p.pitch || 0) + (k.air ? clamp(-k.vy * 0.02, -0.2, 0.2) : 0);
+      k.tilt.rotation.x = lerp(k.tilt.rotation.x, wantPitch, ease(d, 6));
       k.tilt.position.y = k.spinT > 0 ? Math.abs(Math.sin(this.time * 22)) * 0.06 : 0;
-      if (!k.onPodium) k.driver.update(dt || 0.016);
+      if (!k.onPodium) k.driver.update(d);
       k.shadow.visible = !k.ghost && !k.onPodium;
+      k.shadow.position.y = 0.03 + (y > p.y ? p.y - y : 0);
 
       _eu.set(k.tilt.rotation.x, ry, k.tilt.rotation.z, 'YXZ');
       _q4.setFromEuler(_eu);
-      _v3b.set(p.x, k.tilt.position.y, p.z);
+      _v3b.set(p.x, y + k.tilt.position.y, p.z);
       _sc.set(1, 1, 1);
       _m4.compose(_v3b, _q4, _sc);
-      body.setMatrixAt(n, _m4);
-      trim.setMatrixAt(n, _m4);
-      _col.setHex(k.color);
-      if (k.ghost) _col.lerp(_ghostCol, 0.6);
-      body.instanceColor.setXYZ(n, _col.r, _col.g, _col.b);
-      n++;
+      // every kart's shell family was built from this same roster, so the
+      // lookup always hits; the guard is only here so a hot loop can never throw
+      const sh = this.shells.get(k.kart);
+      if (sh && sh.body.count < sh.body.instanceMatrix.count) {
+        const n = sh.body.count;
+        sh.body.setMatrixAt(n, _m4);
+        sh.trim.setMatrixAt(n, _m4);
+        _col.setHex(k.color);
+        if (k.ghost) _col.lerp(_ghostCol, 0.6);
+        sh.body.instanceColor.setXYZ(n, _col.r, _col.g, _col.b);
+        sh.body.count = n + 1;
+        sh.trim.count = n + 1;
+      }
 
       // wheels: fronts steer with the wheel, all four spin with road speed
       for (const [wx, wy, wz, front] of WHEELS) {
@@ -2842,15 +2864,15 @@ export class KartGame extends Minigame {
         wheel.setMatrixAt(wn++, _m4);
       }
 
-      if (k.drift && k.tier > 0 && k.v > 6) this._driftSparks(k, dt);
+      if (k.drift && k.tier > 0 && k.v > 6 && !k.air) this._driftSparks(k, dt);
     }
-    body.count = n;
-    trim.count = n;
     wheel.count = wn;
-    body.instanceMatrix.needsUpdate = true;
-    body.instanceColor.needsUpdate = true;
-    trim.instanceMatrix.needsUpdate = true;
     wheel.instanceMatrix.needsUpdate = true;
+    for (const sh of this.shells.values()) {
+      sh.body.instanceMatrix.needsUpdate = true;
+      sh.body.instanceColor.needsUpdate = true;
+      sh.trim.instanceMatrix.needsUpdate = true;
+    }
   }
 
   _layoutBoxes(dt) {
@@ -2861,7 +2883,7 @@ export class KartGame extends Minigame {
       const p = this.track.worldOf(b.q, b.lat, this._tmp);
       _eu.set(this.time * 0.9 + b.i, this.time * 1.6 + b.i, 0);
       _q4.setFromEuler(_eu);
-      _v3b.set(p.x, 1.15 + Math.sin(this.time * 2.2 + b.i) * 0.12, p.z);
+      _v3b.set(p.x, p.y + 1.15 + Math.sin(this.time * 2.2 + b.i) * 0.12, p.z);
       const s = 1 + Math.sin(this.time * 5 + b.i) * 0.04;
       _sc.set(s, s, s);
       _m4.compose(_v3b, _q4, _sc);
@@ -2879,7 +2901,7 @@ export class KartGame extends Minigame {
       const p = this.track.worldOf(h.q, h.lat, this._tmp);
       _eu.set(0, h.i * 1.7, 0);
       _q4.setFromEuler(_eu);
-      _v3b.set(p.x, 0.06, p.z);
+      _v3b.set(p.x, p.y + 0.06, p.z);
       _sc.set(1, 1, 1);
       _m4.compose(_v3b, _q4, _sc);
       if (n < hz.instanceMatrix.count) hz.setMatrixAt(n++, _m4);
@@ -2894,7 +2916,7 @@ export class KartGame extends Minigame {
       _eu.set(0, this.time * 6, 0);
       _q4.setFromEuler(_eu);
       const s = 1 + Math.sin(this.time * 12 + p.i) * 0.08;
-      _v3b.set(w.x, 0.2, w.z);
+      _v3b.set(w.x, w.y + 0.2, w.z);
       _sc.set(s, s, s);
       _m4.compose(_v3b, _q4, _sc);
       if (m < pr.instanceMatrix.count) pr.setMatrixAt(m++, _m4);
@@ -2903,31 +2925,18 @@ export class KartGame extends Minigame {
     pr.instanceMatrix.needsUpdate = true;
   }
 
+  /**
+   * One call hands the whole circuit its frame: the hazards redraw straight off
+   * A2's phase formula at `raceMs` (never Date.now(), or two machines would
+   * disagree), the ambient life ticks, and the sky dome and the sun follow the
+   * camera so a 600-unit lap is lit everywhere.
+   */
   _updateDecor(dt) {
-    // gulls wheel over the bay, and scatter when something loud happens
-    const im = this.gulls;
-    for (let i = 0; i < this.gullSeeds.length; i++) {
-      const g = this.gullSeeds[i];
-      if (g.scare > 0) { g.scare -= dt; g.y += dt * 7; }
-      else if (g.y > 14 + (i % 12)) g.y -= dt * 2.4;
-      g.a += g.sp * dt;
-      g.flap += dt * 9;
-      _eu.set(Math.sin(g.flap) * 0.5, -g.a, 0, 'YXZ');
-      _q4.setFromEuler(_eu);
-      _v3b.set(g.x + Math.cos(g.a) * g.r, g.y, g.z + Math.sin(g.a) * g.r);
-      _sc.set(1.6, 1.6, 1.6);
-      _m4.compose(_v3b, _q4, _sc);
-      im.setMatrixAt(i, _m4);
-    }
-    im.instanceMatrix.needsUpdate = true;
-    if (this.sky) this.sky.position.copy(this.camera.position);
-    this.sun.position.set(this.me.anchor.position.x + 60, 90, this.me.anchor.position.z + 30);
-    this.sun.target.position.copy(this.me.anchor.position);
-    this.sun.target.updateMatrixWorld();
+    this.world?.update(dt, this.time, this.raceMs, this.camera.position);
   }
 
   _scareGulls() {
-    for (const g of this.gullSeeds) g.scare = rand(0.4, 1.2);
+    this.world?.scareFlock?.();
   }
 
   // ------------------------------------------------------------- particles --
@@ -2935,8 +2944,10 @@ export class KartGame extends Minigame {
     if (this.parts.length >= 240) return;
     const p = k.anchor ? k.anchor.position : k;
     _col.setHex(color);
+    // `fy` is the ground this particle settles on: the road at its own height,
+    // not y = 0, or every spark on an elevated section would rain to the floor
     this.parts.push({
-      x: p.x + ox, y: oy, z: p.z + oz,
+      x: p.x + ox, y: p.y + oy, z: p.z + oz, fy: p.y + 0.05,
       vx: rand(-1.5, 1.5), vy: rand(0.6, 3.4), vz: rand(-1.5, 1.5),
       size, life, max: life, r: _col.r, g: _col.g, b: _col.b,
       rx: Math.random() * 6.28, ry: Math.random() * 6.28, glow,
@@ -2951,7 +2962,7 @@ export class KartGame extends Minigame {
     const p = this.track.worldOf(box.q, box.lat, this._tmp);
     for (let i = 0; i < 10; i++) {
       this.parts.push({
-        x: p.x, y: 1.15, z: p.z,
+        x: p.x, y: p.y + 1.15, z: p.z, fy: p.y + 0.05,
         vx: rand(-3, 3), vy: rand(1, 5), vz: rand(-3, 3),
         size: rand(0.16, 0.34), life: 0.5, max: 0.5,
         r: 1, g: 0.95, b: 0.82, rx: 0, ry: 0, glow: true,
@@ -2973,7 +2984,8 @@ export class KartGame extends Minigame {
       _col.setHex(T.color);
       const pulse = 0.75 + 0.25 * Math.sin(this.time * Math.PI * 12);
       this.sparks.push({
-        x: k.anchor.position.x + _v3.x, y: 0.28, z: k.anchor.position.z + _v3.z,
+        x: k.anchor.position.x + _v3.x, y: k.anchor.position.y + 0.28,
+        z: k.anchor.position.z + _v3.z, fy: k.anchor.position.y + 0.05,
         vx: rand(-2.6, 2.6) - Math.cos(k.heading) * 4,
         vy: rand(1.4, 4.2),
         vz: rand(-2.6, 2.6) - Math.sin(k.heading) * 4,
@@ -2987,7 +2999,8 @@ export class KartGame extends Minigame {
     _col.setHex(color);
     for (let i = 0; i < n && this.sparks.length < 60; i++) {
       this.sparks.push({
-        x: k.anchor.position.x, y: 0.4, z: k.anchor.position.z,
+        x: k.anchor.position.x, y: k.anchor.position.y + 0.4, z: k.anchor.position.z,
+        fy: k.anchor.position.y + 0.05,
         vx: rand(-6, 6), vy: rand(2, 7), vz: rand(-6, 6),
         life: rand(0.25, 0.5), max: 0.5, size: rand(0.6, 1.3),
         r: _col.r, g: _col.g, b: _col.b,
@@ -3001,7 +3014,7 @@ export class KartGame extends Minigame {
       const c = [KERB_A, GOLD, SEA, 0x7ac74f, CREAM][i % 5];
       _col.setHex(c);
       this.confetti.push({
-        x: p.x + rand(-6, 6), y: rand(6, 14), z: p.z + rand(-6, 6),
+        x: p.x + rand(-6, 6), y: p.y + rand(6, 14), z: p.z + rand(-6, 6), fy: p.y + 0.05,
         vx: rand(-2.5, 2.5), vy: rand(-1, 2), vz: rand(-2.5, 2.5),
         life: rand(2.4, 4.2), max: 4.2, size: rand(0.7, 1.5),
         r: _col.r, g: _col.g, b: _col.b, spin: rand(-6, 6), rx: Math.random() * 6.28,
@@ -3021,7 +3034,8 @@ export class KartGame extends Minigame {
         p.x += p.vx * dt;
         p.y += p.vy * dt;
         p.z += p.vz * dt;
-        if (p.y < 0.05) { p.y = 0.05; p.vy = Math.abs(p.vy) * 0.3; }
+        const fy = p.fy ?? 0.05;
+        if (p.y < fy) { p.y = fy; p.vy = Math.abs(p.vy) * 0.3; }
         p.rx = (p.rx || 0) + (p.spin || 4) * dt;
         p.ry = (p.ry || 0) + 3 * dt;
         list[w++] = p;
@@ -3048,27 +3062,60 @@ export class KartGame extends Minigame {
     write(this.sparks, this.sparkIM, 16, 2.2);
     write(this.confetti, this.confIM, 3.2, 0.6);
 
-    // speed lines: camera-space streaks that fade in with speed and boost
-    const spd = clamp((this.me.v - 16) / 18, 0, 1) + (this.me.boostT > 0 ? 0.5 : 0);
+    this._updateSpeedLines(dt);
+  }
+
+  /**
+   * §A8 — THE SPEED-LINE FIX.
+   *
+   * The shipped emitter put each streak on a ring around the lens centre at its
+   * own random angle and slid it toward the camera, so the streaks scattered
+   * radially in every direction: wrong at any speed, and worst mid-corner or
+   * looking behind, which is exactly what the owner reported.
+   *
+   * Streaks must stream OPPOSITE the kart's velocity in SCREEN space. So:
+   * rotate the world-space velocity into camera space (the camera's own basis
+   * is the screen basis), take its x/y, and lay every streak along `-d` -- one
+   * shared direction, spawned across the band perpendicular to it, with at most
+   * +-0.18 rad of spread held for the streak's life. Dead ahead the projection
+   * collapses to nothing, and there we fall back to "down the screen", never to
+   * a random angle. Look-behind needs no special case at all: it turns the
+   * camera, the camera turns the basis, and the streaks follow.
+   */
+  _updateSpeedLines(dt) {
+    const k = this.me;
+    const spd = clamp((k.v - 16) / 18, 0, 1) + (k.boostT > 0 ? 0.5 : 0);
     this.lineMat.opacity = lerp(this.lineMat.opacity, Math.min(0.55, spd * 0.5), ease(dt, 5));
-    if (this.lineMat.opacity > 0.01) {
-      for (let i = 0; i < this.lineSeeds.length; i++) {
-        const s = this.lineSeeds[i];
-        s.z += dt * (2 + spd * 5);
-        if (s.z > 1) { s.z = 0; s.a = Math.random() * 6.28; s.r = 0.5 + Math.random() * 1.5; }
-        const z = -1.4 - (1 - s.z) * 5;
-        _eu.set(0, 0, s.a + Math.PI / 2);
-        _q4.setFromEuler(_eu);
-        _v3b.set(Math.cos(s.a) * s.r * 1.6, Math.sin(s.a) * s.r, z);
-        _sc.set(1, 0.6 + s.z * 1.6, 1);
-        _m4.compose(_v3b, _q4, _sc);
-        this.lines.setMatrixAt(i, _m4);
-      }
-      this.lines.count = this.lineSeeds.length;
-      this.lines.instanceMatrix.needsUpdate = true;
-    } else {
-      this.lines.count = 0;
+    if (this.lineMat.opacity <= 0.01) { this.lines.count = 0; return; }
+
+    // world velocity -> camera space. transformDirection ignores translation,
+    // which is what we want: this is a direction, not a point.
+    _v3.set(Math.cos(k.velAng), 0, Math.sin(k.velAng)).multiplyScalar(k.v >= 0 ? 1 : -1);
+    if (k.air) _v3.y = k.vy * 0.15;
+    this.camera.updateMatrixWorld();
+    _v3.transformDirection(this.camera.matrixWorldInverse);
+    const mag = Math.hypot(_v3.x, _v3.y);
+    // dead ahead: the screen-space velocity is (nearly) zero, so stream DOWN
+    const ang = mag < 0.06 ? -Math.PI / 2 : Math.atan2(-_v3.y, -_v3.x);
+
+    for (let i = 0; i < this.lineSeeds.length; i++) {
+      const s = this.lineSeeds[i];
+      s.t += dt * (1.6 + spd * 4.5);
+      if (s.t > 1) this._reseedLine(s, 0);
+      const a = ang + s.j;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      const travel = -1.0 + s.t * 3.6;
+      _eu.set(0, 0, a - Math.PI / 2);
+      _q4.setFromEuler(_eu);
+      // along the streak direction, then across it by the band offset
+      _v3b.set(ca * travel - sa * s.off, sa * travel + ca * s.off, -s.d);
+      _sc.set(1, s.len * (0.7 + spd), 1);
+      _m4.compose(_v3b, _q4, _sc);
+      this.lines.setMatrixAt(i, _m4);
     }
+    this.lines.count = this.lineSeeds.length;
+    this.lines.instanceMatrix.needsUpdate = true;
   }
 
   // ----------------------------------------------------------------- camera -
@@ -3087,10 +3134,15 @@ export class KartGame extends Minigame {
     this._camYaw = angLerp(this._camYaw, k.heading + (back ? Math.PI : 0), ease(dt, yawK));
     const ry = Math.PI / 2 - this._camYaw;
 
+    // §A3: the chase cam rides the road's height, and looks a little further
+    // down a descent so a blind brow still shows the corner behind it
     _v3.set(0, 3.2, -7.0).applyAxisAngle(_axisY, ry);
+    const road = this.track.at(k.q * LAP_UNITS + S_FIN, this._tmp2);
+    const base = k.anchor.position.y;
+    const pitch = road.pitch;
     const want = _v3b.set(
       k.anchor.position.x + _v3.x,
-      3.2,
+      base + 3.2 - clamp(pitch, -0.5, 0.5) * 5.0,
       k.anchor.position.z + _v3.z,
     );
     const kk = ease(dt, 9);
@@ -3099,12 +3151,12 @@ export class KartGame extends Minigame {
     _v3.set(Math.cos(this._camYaw), 0, Math.sin(this._camYaw)).multiplyScalar(back ? -4 : 4);
     cam.lookAt(
       k.anchor.position.x + _v3.x,
-      1.3,
+      base + 1.3 + clamp(pitch, -0.5, 0.5) * 3.4,
       k.anchor.position.z + _v3.z,
     );
 
-    // roll into the drift, then shake on top of everything
-    const wantRoll = k.drift ? -k.driftDir * 0.05 : 0;
+    // roll into the drift and with the banking, then shake on top of everything
+    const wantRoll = (k.drift ? -k.driftDir * 0.05 : 0) - road.bank * 0.35;
     this.roll = lerp(this.roll, wantRoll, ease(dt, 5));
     if (Math.abs(this.roll) > 0.0005) cam.rotateZ(this.roll);
     if (this.shake > 0.001) {
@@ -3120,7 +3172,12 @@ export class KartGame extends Minigame {
       cam.fov = this.fov;
       cam.updateProjectionMatrix();
     }
-    const vg = clamp((k.v - 14) / 24, 0, 1) * 0.8 + (k.boostT > 0 ? 0.2 : 0);
+    // §A6: the vignette normally fades in with speed, but the wrong-way pulse
+    // has to be visible at ANY speed -- that is the whole point of it, and a
+    // player who has turned around is usually slow.
+    const vg = this.wrongOn
+      ? 0.85
+      : clamp((k.v - 14) / 24, 0, 1) * 0.8 + (k.boostT > 0 ? 0.2 : 0);
     if (Math.abs(vg - (this.hudCache.vg ?? -1)) > 0.03) {
       this.hudCache.vg = vg;
       this.vig.style.opacity = vg.toFixed(2);
@@ -3134,7 +3191,7 @@ export class KartGame extends Minigame {
     const a = this.time * 0.22;
     _v3b.set(
       p.root.position.x + Math.cos(a) * 9.5,
-      4.6 + Math.sin(this.time * 0.5) * 0.5,
+      p.root.position.y + 4.6 + Math.sin(this.time * 0.5) * 0.5,
       p.root.position.z + Math.sin(a) * 9.5,
     );
     cam.position.lerp(_v3b, ease(dt, 3));
@@ -3154,141 +3211,94 @@ export class KartGame extends Minigame {
   }
 
   // -------------------------------------------------------------------- hud -
+  /**
+   * A7 - one reused view object a frame, handed to kart-hud.js. Nothing here
+   * touches a DOM node: GP3 owns every element of the race UI, and this method
+   * only has to be cheap and honest.
+   */
   _refreshHud(dt) {
-    const c = this.hudCache;
+    void dt;
+    const v = this.view;
     const k = this.me;
-    const place = this._placeOf.get(k) || 1;
-    if (place !== c.place) {
-      c.place = place;
-      this.f.place.textContent = ordinal(place);
-    }
-    const lap = clamp(k.laps + (this.phase === 'race' ? 1 : 0), 1, LAPS);
-    if (lap !== c.lap) {
-      c.lap = lap;
-      this.f.lap.textContent = lap;
-    }
     const lapStart = k.lapMs.length ? k.lapMs[k.lapMs.length - 1] : 0;
-    const live = this.phase === 'race' ? this.raceMs - lapStart : (k.finishMs - lapStart);
-    const shown = Math.floor(live / 10);
-    if (shown !== c.t) {
-      c.t = shown;
-      this.f.time.textContent = lapTime(live);
-    }
-    if (k.bestLap !== c.best) {
-      c.best = k.bestLap;
-      this.f.bestlap.textContent = k.bestLap ? `best ${lapTime(k.bestLap)}` : 'best --:--';
-    }
+    v.place = this._placeOf.get(k) || 1;
+    v.of = this.karts.length;
+    // the frozen view model has no lap number (lap() owns it), but sending one
+    // anyway is what keeps the panel honest through a mid-race reconnect
+    v.lap = clamp(k.laps + (this.phase === 'race' ? 1 : 0), 1, this.laps);
+    v.raceMs = this.raceMs;
+    v.lapMs = this.phase === 'race' ? this.raceMs - lapStart : Math.max(0, k.finishMs - lapStart);
+    v.bestMs = k.bestLap;
+    v.v = Math.abs(k.v);
+    v.vmax = this.stats.vmax;
+    v.boost = k.boostT > 0 ? 1 : 0;
+    // the roulette is still spinning until spinLock runs out (3.3)
+    v.drift = k.drift ? k.tier : 0;
+    v.wrong = this.wrongOn;
+    v.wrongDir = this.wrongDir;
+    v.air = !!k.air;
+    v.item = this.spinLock > 0 ? null : k.item;
+    v.track = this.row.id;
 
-    // item card: the roulette spins for 0.6s, then the real card locks in
-    const showing = this.spinLock > 0
-      ? ITEM_ORDER[Math.floor(this.time * 14) % ITEM_ORDER.length]
-      : k.item;
-    if (showing !== c.item) {
-      c.item = showing;
-      this.f.icon.innerHTML = showing ? ITEM_SVG[showing] : '';
-      const ic = this.f.icon.firstElementChild;
-      if (ic) requestAnimationFrame(() => ic.classList.add('on'));
+    // the standings, with the gap in seconds against the pace we are running.
+    // Rows are POOLED: the arrays are truncated after the fill, never before,
+    // so a frame of HUD costs no allocation at all.
+    const pace = Math.max(6, Math.abs(k.v) || 12);
+    for (let i = 0; i < this._order.length; i++) {
+      const o = this._order[i];
+      const row = v.order[i] || (v.order[i] = {});
+      row.slot = o.slot;
+      row.name = o.name;
+      row.color = o.color;
+      row.lap = clamp(o.laps + 1, 1, this.laps);
+      row.gapMs = Math.round(((this._progress(o) - this._progress(k)) * LAP_UNITS / pace) * 1000);
+      row.ghost = !!o.ghost;
+      row.me = o === k;
     }
-    const canUse = !!k.item && this.spinLock <= 0 && this.phase === 'race';
-    if (canUse !== c.canUse) {
-      c.canUse = canUse;
-      this.f.use.classList.toggle('on', canUse);
-      this.f.item.classList.toggle('pop', canUse);
-    }
+    v.order.length = this._order.length;
 
-    // the six-name order, rebuilt only when it actually changes
-    let sig = '';
-    for (const o of this._order) sig += `${o.slot}${o.ghost ? 'g' : ''}|`;
-    if (sig !== c.order) {
-      c.order = sig;
-      this.f.order.innerHTML = this._order.map((o, i) => `
-        <div class="mg-kart-orow${o === k ? ' me' : ''}${o.ghost ? ' ghost' : ''}">
-          <u>${i + 1}</u><i style="background:${hex6(o.color)}"></i>
-          <span>${esc(o.name)}</span><b>L${clamp(o.laps + 1, 1, LAPS)}</b>
-        </div>`).join('');
+    for (let i = 0; i < this.karts.length; i++) {
+      const o = this.karts[i];
+      const row = v.karts[i] || (v.karts[i] = {});
+      row.slot = o.slot;
+      row.q = o.q;
+      row.lat = o.lat;
+      row.color = o.color;
+      row.me = o === k;
+      row.ghost = !!o.ghost;
     }
+    v.karts.length = this.karts.length;
 
-    this._mapAcc = (this._mapAcc || 0) + dt;
-    if (this._mapAcc >= 0.05) { this._mapAcc = 0; this._drawMinimap(); }
-  }
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      const row = v.boxes[i] || (v.boxes[i] = {});
+      row.q = b.q;
+      row.lat = b.lat;
+      row.live = b.live;
+    }
+    v.boxes.length = this.boxes.length;
 
-  /** The centreline is painted once into an offscreen canvas; only dots move. */
-  _buildMinimapBase() {
-    const size = 148;
-    const pad = 12;
-    const t = this.track;
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    for (let i = 0; i < t.n; i++) {
-      minX = Math.min(minX, t.x[i]); maxX = Math.max(maxX, t.x[i]);
-      minZ = Math.min(minZ, t.z[i]); maxZ = Math.max(maxZ, t.z[i]);
+    // A2 statics first (they are the ones worth seeing coming), then the peels
+    let n = 0;
+    for (const h of this.hazDefs) {
+      const at = hazardPose(h, this.raceMs, this._tmp2);
+      const row = v.hazards[n] || (v.hazards[n] = {});
+      row.q = at.q;
+      row.lat = at.lat;
+      row.kind = h.kind;
+      v.hazards[n++] = row;
     }
-    const sc = Math.min((size - pad * 2) / (maxX - minX), (size - pad * 2) / (maxZ - minZ));
-    const ox = (size - (maxX - minX) * sc) / 2 - minX * sc;
-    const oz = (size - (maxZ - minZ) * sc) / 2 - minZ * sc;
-    this.mapT = { sc, ox, oz, size };
+    for (const h of this.hazards.values()) {
+      if (h.stale) continue;
+      const row = v.hazards[n] || (v.hazards[n] = {});
+      row.q = h.q;
+      row.lat = h.lat;
+      row.kind = 'peel';
+      v.hazards[n++] = row;
+    }
+    v.hazards.length = n;
 
-    const off = document.createElement('canvas');
-    off.width = size;
-    off.height = size;
-    const g = off.getContext('2d');
-    g.lineJoin = 'round';
-    g.lineCap = 'round';
-    g.beginPath();
-    for (let i = 0; i <= t.n; i++) {
-      const j = i % t.n;
-      const x = t.x[j] * sc + ox;
-      const y = t.z[j] * sc + oz;
-      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
-    }
-    g.closePath();
-    g.strokeStyle = '#cfc2a8';
-    g.lineWidth = 9;
-    g.stroke();
-    g.strokeStyle = '#5b5568';
-    g.lineWidth = 6;
-    g.stroke();
-    // finish line marker
-    const fi = Math.round((S_FIN / LAP_UNITS) * t.n) % t.n;
-    g.strokeStyle = '#fff6e2';
-    g.lineWidth = 4;
-    g.beginPath();
-    const a = t.ang[fi];
-    const fx = t.x[fi] * sc + ox;
-    const fy = t.z[fi] * sc + oz;
-    g.moveTo(fx - Math.sin(a) * 5, fy + Math.cos(a) * 5);
-    g.lineTo(fx + Math.sin(a) * 5, fy - Math.cos(a) * 5);
-    g.stroke();
-    this.mapBase = off;
-  }
-
-  _drawMinimap() {
-    const g = this.mapCtx;
-    const m = this.mapT;
-    if (!g || !m) return;
-    g.clearRect(0, 0, m.size, m.size);
-    g.drawImage(this.mapBase, 0, 0);
-    for (const b of this.boxes) {
-      if (!b.live) continue;
-      const p = this.track.worldOf(b.q, b.lat, this._tmp);
-      g.fillStyle = 'rgba(255,243,210,.95)';
-      g.fillRect(p.x * m.sc + m.ox - 1.5, p.z * m.sc + m.oz - 1.5, 3, 3);
-    }
-    for (const k of this.karts) {
-      const p = this.track.worldOf(k.q, k.lat, this._tmp);
-      const x = p.x * m.sc + m.ox;
-      const y = p.z * m.sc + m.oz;
-      g.beginPath();
-      g.arc(x, y, k === this.me ? 5 : 4, 0, Math.PI * 2);
-      g.fillStyle = hex6(k.color);
-      g.globalAlpha = k.ghost ? 0.45 : 1;
-      g.fill();
-      if (k === this.me) {
-        g.lineWidth = 2;
-        g.strokeStyle = '#fff';
-        g.stroke();
-      }
-      g.globalAlpha = 1;
-    }
+    this._hud('update', v, dt);
   }
 
   /** Name tags over rival karts, projected from the live camera. */
@@ -3298,7 +3308,7 @@ export class KartGame extends Minigame {
       if (!k.tag) continue;
       if (!k.seen || this.phase === 'results') { k.tag.classList.remove('on'); continue; }
       _v3.copy(k.anchor.position);
-      _v3.y = 2.4;
+      _v3.y += 2.4;
       _v3.project(this.camera);
       if (_v3.z > 1 || Math.abs(_v3.x) > 1.2 || Math.abs(_v3.y) > 1.2) {
         k.tag.classList.remove('on');
@@ -3376,8 +3386,10 @@ export class KartGame extends Minigame {
     }
     if (this.engineBus) {
       try {
+        // §A6: the whole bus goes muffled while the wrong-way banner is up
         this.engineBus.lp.frequency.setTargetAtTime(
-          700 + clamp(this.me.v / V_MAX, 0, 1.5) * 1600, now, 0.1,
+          this.wrongOn ? WRONGWAY_LP_HZ : 700 + clamp(this.me.v / V_MAX, 0, 1.5) * 1600,
+          now, this.wrongOn ? 0.08 : 0.1,
         );
       } catch { /* ignore */ }
     }
@@ -3402,13 +3414,16 @@ export class KartGame extends Minigame {
   }
 
   // --------------------------------------------------------------- results --
-  /** §6 — checkered flag, podium, confetti, and the payout counting up. */
+  /**
+   * The chequered flag. kart.js still owns the 3D rostrum, the confetti and the
+   * payout arithmetic; A7 element 8/9 (the board, the count-up, Play Again and
+   * Quit) belongs to kart-hud.js, which gets the whole payload in one call.
+   */
   _showResults() {
-    if (this.phase === 'results') { this._renderBoard(); return; }
+    if (this.phase === 'results') { this._hud('results', this._resultsPayload()); return; }
     this.phase = 'results';
-    this.hud.classList.remove('on');
     this.tip.style.opacity = '0';
-    this.f.lights.classList.remove('on');
+    this._hud('setPhase', 'results');
     for (const k of this.karts) k.tag?.classList.remove('on');
 
     const rows = this.results || [];
@@ -3420,7 +3435,8 @@ export class KartGame extends Minigame {
     const boxes = this.me.boxes;
     const score = 1000 * (7 - place) + 40 * laps + (fastest ? 200 : 0) + 10 * boxes;
 
-    // §4.8: a ghost or a DNF never calls finish() and is paid nothing
+    // 4.8: a ghost or a DNF never calls finish() and is paid nothing. The
+    // payout table is unchanged on every track and by every kart (A9).
     const paid = this.me.finished && !this.me.ghost;
     let payout = 0;
     if (paid) {
@@ -3429,88 +3445,53 @@ export class KartGame extends Minigame {
       this.finish(score);
     }
     const prevBest = this.game.state.bests?.kart || 0;
-    const isBest = paid && score > prevBest;
+    this._res = {
+      place, laps, boxes, fastest, score, paid, payout,
+      newBest: paid && score > prevBest,
+    };
 
     this._buildPodium(rows);
     this._confettiBurst(90);
     this.game.audio?.play?.(place === 1 ? 'success' : 'ding');
-
-    const title = place === 1 ? 'Chequered flag!'
-      : place <= 3 ? 'On the podium' : paid ? 'Good scrap out there' : 'Race over';
-    const card = document.createElement('div');
-    card.className = 'mg-kart-card';
-    card.innerHTML = `
-      <div class="mg-kart-box">
-        <div class="mg-kart-title">${title}</div>
-        <div class="mg-kart-sub">${
-  paid ? `You finished ${ordinal(place)} of 6 at Capy Speedway.` : 'You did not take the flag, so no coins this time.'}</div>
-        <div data-a="board"></div>
-        <div class="mg-kart-rows">
-          <div class="mg-kart-row"><span>Finishing place</span><b>${ordinal(place)}</b></div>
-          <div class="mg-kart-row"><span>Laps completed</span><b>${laps} / ${LAPS}</b></div>
-          <div class="mg-kart-row"><span>Paw boxes</span><b>${boxes}</b></div>
-          <div class="mg-kart-row"><span>Best lap</span><b>${lapTime(this.me.bestLap)}${
-  fastest ? '<span class="mg-kart-tag2">FASTEST</span>' : ''}</b></div>
-          <div class="mg-kart-row total"><span>Score</span><b>${score.toLocaleString()}</b></div>
-          <div class="mg-kart-row pay"><span>Coins earned</span><b>${COIN_ICO}<span data-a="coins">0</span></b></div>
-        </div>
-        <div class="mg-kart-sub">Best race score: <b>${Math.max(prevBest, paid ? score : 0).toLocaleString()}</b>${
-  isBest ? '<span class="mg-kart-tag2">NEW BEST</span>' : ''}</div>
-        <div class="mg-kart-btns">
-          <button class="mg-kart-btn" data-a="again">Race again</button>
-          <button class="mg-kart-btn alt" data-a="back">Back to the paddock</button>
-        </div>
-      </div>`;
-    this.cardHost.appendChild(card);
-    this.card = card;
-    this.boardEl = card.querySelector('[data-a="board"]');
-    this._renderBoard();
-    this._countCoins(card.querySelector('[data-a="coins"]'), payout);
-    card.querySelector('[data-a="again"]').onclick = () => {
-      this.game.audio?.play?.('click');
-      this._playAgain();
-    };
-    card.querySelector('[data-a="back"]').onclick = () => {
-      this.game.audio?.play?.('click');
-      this.exitToRoom();
-    };
+    // the count-up (and its coin ticks, through onPlay) belongs to the HUD
+    this._hud('results', this._resultsPayload());
   }
 
-  _renderBoard() {
-    const el = this.boardEl;
-    if (!el) return;
-    const rows = this.results;
-    if (!rows || !rows.length) {
-      el.innerHTML = '<div class="mg-kart-wait">waiting for the rest of the field...</div>';
-      return;
-    }
-    el.innerHTML = `<div class="mg-kart-grid">${rows.map((r) => {
-      const k = this._bySlot(r.slot);
-      const me = r.slot === this.me.slot;
-      return `<div class="mg-kart-grow${me ? ' me' : ''}">
-        <span class="n">${ordinal(r.place)}</span>
-        <i style="background:${hex6(k ? k.color : 0xb08a5a)}"></i>
-        <span>${esc(r.name)}${me ? ' (you)' : ''}</span>
-        <b>${r.laps >= LAPS ? lapTime(r.ms) : `${r.laps} laps`}</b></div>`;
-    }).join('')}</div>`;
-  }
-
-  _countCoins(el, total) {
-    if (!el) return;
-    if (total <= 0) { el.textContent = '0'; return; }
-    let shown = 0;
-    const stepN = Math.max(1, Math.round(total / 26));
-    const tick = () => {
-      if (this.disposed || !el.isConnected) return;
-      shown = Math.min(total, shown + stepN);
-      el.textContent = String(shown);
-      if (shown < total) {
-        this._coinTimer = setTimeout(tick, 34);
-      } else {
-        this.game.audio?.play?.('coin');
-      }
+  /** A7's results payload: everything the board needs, nothing it does not. */
+  _resultsPayload() {
+    const r = this._res || {};
+    const rows = (this.results || []).map((x) => {
+      const k = this._bySlot(x.slot);
+      return {
+        slot: x.slot,
+        place: x.place,
+        name: x.name,
+        color: k ? k.color : 0xb08a5a,
+        kart: k ? (KARTS[k.kart] || KARTS.coco).name : KARTS.coco.name,
+        ai: !!x.ai,
+        ghost: !!(k && k.ghost),
+        laps: x.laps,
+        ms: x.ms,
+        best: x.best,
+        me: x.slot === this.me.slot,
+      };
+    });
+    return {
+      rows,
+      you: this.me.slot,
+      place: r.place || 6,
+      coins: r.payout || 0,
+      score: r.score || 0,
+      laps: r.laps || 0,               // laps COMPLETED; the total is the HUD's
+      boxes: r.boxes || 0,
+      bestLap: this.me.bestLap,
+      fastest: !!r.fastest,
+      paid: !!r.paid,
+      newBest: !!r.newBest,
+      best: Math.max(this.game.state.bests?.kart || 0, r.paid ? r.score : 0),
+      trackName: this.row.name,
+      kartName: (KARTS[this.me.kart] || KARTS.coco).name,
     };
-    this._coinTimer = setTimeout(tick, 340);
   }
 
   /**
@@ -3523,7 +3504,7 @@ export class KartGame extends Minigame {
     const fin = t.at(S_FIN + 26, this._tmp);
     const off = t.safeOffset(-(fin.hw * WALL_LAT + 7), fin.curv);
     const root = new THREE.Group();
-    root.position.set(fin.x - Math.sin(fin.ang) * off, 0, fin.z + Math.cos(fin.ang) * off);
+    root.position.set(fin.x - Math.sin(fin.ang) * off, fin.y, fin.z + Math.cos(fin.ang) * off);
     root.rotation.y = Math.PI / 2 - fin.ang + Math.PI / 2;
     this.scene.add(root);
     this.podium = { root, hops: [] };
@@ -3564,7 +3545,7 @@ export class KartGame extends Minigame {
 
   _playAgain() {
     this._clearCard();
-    this.boardEl = null;
+    this._res = null;
     if (this.podium) {
       // hand the drivers back to their karts before the podium is torn down
       for (const h of this.podium.hops) h.seat.remove(h.driver.group);
@@ -3584,6 +3565,7 @@ export class KartGame extends Minigame {
     // a replay is always a practice run: the race we joined is over (§5)
     this._leaveRace();
     this.phase = 'splash';
+    this._mountHud();
     this._resetRace();
     this._clearCard();
     this._beginCountdown();
@@ -3627,6 +3609,9 @@ export class KartGame extends Minigame {
     this.listeners.length = 0;
     for (const off of this.subs) { try { off(); } catch { /* already gone */ } }
     this.subs.length = 0;
+    // GP3 owns every node inside hudRoot and leaves it clean behind itself
+    try { this.hud?.dispose?.(); } catch { /* nothing left to do about it */ }
+    this.hud = null;
     this._stopEngines();
     this._clearCtx();
     this.keys.clear();
@@ -3640,6 +3625,8 @@ export class KartGame extends Minigame {
     this.karts.length = 0;
     this.me = null;
 
+    try { this.world?.dispose?.(); } catch { /* nothing left to do about it */ }
+    this.world = null;
     if (this.scene) {
       disposeObject(this.scene);
       this.scene.background = null;
@@ -3669,7 +3656,7 @@ export class KartGame extends Minigame {
     this.confIM = null;
     this.lines = null;
     this.podium = null;
-    this.mapBase = null;
-    this.mapCtx = null;
+    this.shells = null;
+    this.hazProps = null;
   }
 }

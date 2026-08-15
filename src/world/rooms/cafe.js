@@ -63,6 +63,35 @@ function rng(seed) {
   };
 }
 
+/**
+ * Bake a dune tint into a flat plane's vertex colours. Two crossed sines plus a
+ * slow cool-off with distance: near the porch the sand keeps its warm bounce,
+ * further out it drifts toward the sea. The wavelengths are deliberately short
+ * (~30 units) because only the first 30 units of this plane are ever ON SCREEN
+ * - the wide camera looks 18 degrees below horizontal from y=15, so the top of
+ * the frame lands on the sand around z=-29 and the whole rest of the plane is
+ * behind the viewer or out of shot. A gentler, longer wash reads as nothing at
+ * all there; this was measured, not guessed. Numbers hover around 1 because
+ * vertex colours MULTIPLY the material colour. Build-time only.
+ */
+function tintDunes(geo) {
+  const p = geo.attributes.position;
+  const col = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) {
+    // still un-rotated here, so the plane lies in XY
+    const x = p.getX(i), z = p.getY(i);
+    const dune = Math.sin(x * 0.21 + 0.7) * Math.sin(z * 0.18 - 1.2)
+      + 0.5 * Math.sin((x - z) * 0.36 + 2.4);
+    const far = Math.min(1, Math.hypot(x, z) / 30);
+    const t = 1 + dune * 0.075 - far * 0.16;
+    col[i * 3] = t;
+    col[i * 3 + 1] = t - dune * 0.01 + far * 0.02;
+    col[i * 3 + 2] = t - dune * 0.035 + far * 0.08;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return geo;
+}
+
 // ---------------------------------------------------------------------------
 // world clock (wave 7). LIVING-COVE.md interiors rule: an interior keeps its
 // layout and only swaps the painted view past its glass, then reverses the
@@ -718,6 +747,10 @@ export class CafeRoom extends Room {
     const flat = (map, extra = {}) => new THREE.MeshBasicMaterial({ map, ...extra });
 
     scene.background = new THREE.Color(0x9fd8f0);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). Honey wood, sun off
+    // sand and three lamps: the warmest interior in the cove, and happy to say
+    // so. The shadows barely open - the shack is bright enough already.
+    this.grade = { warmth: 0.45, lift: 0.08 };
 
     // --- instanced batches --------------------------------------------------
     const white = () => makeToon(0xffffff, { unique: true });
@@ -786,7 +819,16 @@ export class CafeRoom extends Room {
     // shot: it gets tinted with the views rather than staying noon-blue all night
     this._skyMat = sky.material;
 
-    const sand = new THREE.Mesh(new THREE.PlaneGeometry(140, 140), makeToon(PAL.sand));
+    // The beach the shack stands on. The walls stop at 6.2 and the wide camera
+    // rides at 15, so this plane is not a backdrop: it wraps right round the
+    // building and is roughly a quarter of the frame, in ONE flat colour with
+    // no texture on it at all - the only surface in the room with nothing
+    // happening. Subdivided and vertex-tinted so the sand rolls a little and
+    // cools with distance, which gives the building a ground to sit on rather
+    // than a mat. Still one draw call, still no shadow, nothing per frame.
+    const sandGeo = new THREE.PlaneGeometry(140, 140, 22, 22);
+    tintDunes(sandGeo);
+    const sand = new THREE.Mesh(sandGeo, makeToon(PAL.sand, { vertexColors: true }));
     sand.rotation.x = -Math.PI / 2;
     sand.position.y = -0.08;
     scene.add(sand);

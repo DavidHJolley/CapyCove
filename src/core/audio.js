@@ -23,12 +23,41 @@
 //                           settings panel does not have to re-push them after
 //                           a reload. Mute is separate and still wins: it zeros
 //                           the master gain no matter what the trims say.
+//   audio.setOverlay(open) - force the "world recedes" duck+lowpass on or off.
+//                           Optional: the module already watches the DOM and
+//                           the 'minigame' event for itself, and the three
+//                           sources are OR'd, so a UI that calls this and one
+//                           that does not both behave.
 //
 // Everything is synthesized. Music uses lookahead scheduling: a single interval
 // wakes up every ~90ms and schedules notes ~280ms ahead on the AudioContext
 // clock, so patterns stay sample-tight regardless of frame rate. There is only
 // ever ONE interval for the whole module, so switching rooms can never orphan a
 // scheduler. No DOM access and no AudioContext at import time.
+//
+// ------------------------------------------------------------------ depth ---
+//
+// The music bed is not a flat loop under the game; it reacts:
+//
+//   * SIDECHAIN. Every UI sound, notification and reward dips the bed for a
+//     beat (DUCK below) on its own gain node, so the player's music trim is
+//     never touched and the two automations can never fight.
+//   * FOCUS. While any menu, panel or minigame overlay is on screen the bed
+//     drops ~3dB and rolls off above ~640Hz: the world is still there, just in
+//     the next room. Sfx stay bright, so minigames sound exactly as before.
+//   * TIME OF DAY. The server clock ('clock' on game.events) tilts the bed's
+//     top end down after dusk over a six-second ramp, gates the beds' own
+//     birdsong to daylight, and runs a tiny ambience layer: crickets outdoors
+//     at night, gulls on the coast by day.
+//   * KEY. Each room's arrival chord (ROOM_CHORDS) also seeds its doorway
+//     whoosh and the coin-streak run, so travel and pickups land in the key of
+//     the room you are standing in.
+//
+// Nothing here shakes or flashes, but prefers-reduced-motion still halves the
+// sidechain depth and softens the focus sweep, and mute / the music trim remain
+// the off-switch for all of it.
+
+import { game } from './game.js';
 
 // ---------------------------------------------------------------- levels ----
 
@@ -47,18 +76,25 @@ let vol = null; // { music, sfx }, lazily loaded: no localStorage at import time
 const TICK_MS = 90;        // scheduler wake-up
 const LOOKAHEAD = 0.28;    // seconds of notes queued ahead of the clock
 const CROSSFADE = 1.5;     // room-to-room music fade, seconds
+const AMB_STEP = 0.75;     // ambience decision slot, seconds
 
 // ------------------------------------------------------------ graph state ---
 
 let ctx = null;
-let master = null;      // trim -> limiter -> destination
+let master = null;      // trim -> glue -> limiter -> soft clip -> destination
 let musicBus = null;
+let musicTilt = null;   // night high-shelf
+let musicLp = null;     // "world recedes" lowpass (transparent by default)
+let musicFocus = null;  // "world recedes" level
+let musicDuck = null;   // sidechain dip under sfx; nominal 1, never the trim
 let sfxBus = null;
 let convolver = null;   // shared tiny reverb
 let verbReturn = null;
 let noiseBuf = null;
 let sfxDry = null;      // persistent sfx destinations (a little / a lot of verb)
 let sfxWet = null;
+let ambOut = null;      // crickets/gulls: rides the music trim, the focus and
+                        // the duck, but not the night tilt
 
 let muted = false;
 let currentRoom = null;
@@ -66,8 +102,19 @@ let tracks = [];        // live music tracks (usually 1, briefly 2 while fading)
 let schedTimer = null;
 let stepPans = null;    // [left, right] persistent footstep panners
 
+// World state the bed reacts to. `dayLight` is 1 in full day, 0 at deep night,
+// and crossfades through dawn and dusk; it stays 1 until a clock frame lands so
+// a server that never sends one sounds exactly like the game always has.
+let dayLight = 1;
+let ambNext = null;     // next ambience slot on the audio clock, or null
+let focusSrc = null;    // Set of reasons the world is receded ('dom'|'mg'|'api')
+let focusOn = false;
+let attached = false;   // game.events + DOM watchers installed (post-gesture)
+let reduced = null;     // prefers-reduced-motion, resolved once, lazily
+
 // ------------------------------------------------------------- utilities ----
 
+const TAU = Math.PI * 2;
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const rnd = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[(Math.random() * arr.length) | 0];
@@ -94,6 +141,18 @@ function volumes() {
 /** Authored bus level scaled by the player's trim. */
 function busLevel(bus) {
   return BUS_LEVEL[bus] * volumes()[bus];
+}
+
+/** True when the player asked the OS for less movement. Nothing in here moves
+ *  the screen, but a bed that pumps and sweeps is the audio version of it, so
+ *  the sidechain is halved and the focus sweep softened. Resolved once, and
+ *  never at import time. */
+function reducedMotion() {
+  if (reduced !== null) return reduced;
+  reduced = false;
+  try { reduced = !!globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches; }
+  catch { /* no matchMedia: assume the player wants the full mix */ }
+  return reduced;
 }
 
 /** MIDI note number -> Hz. 60 = middle C. */
@@ -134,6 +193,32 @@ function makeImpulse(seconds = 1.9, decay = 3.0, tone = 0.34) {
   return buf;
 }
 
+const CLIP_DRIVE = 1.6;
+// tanh(x*d)/tanh(d) reaches +-1 at the edges, which is what makes the shaper a
+// hard guarantee - but normalising by the ENDPOINT leaves the curve with a
+// small-signal SLOPE of d/tanh(d), x1.736 at drive 1.6. That is +4.8 dB of gain
+// on everything below the knee, i.e. on the entire game, which is the opposite
+// of what a soft clip is for. CLIP_TRIM takes exactly that back off after the
+// shaper, so the chain is unity through the linear region and only the peaks
+// are shaped. It is derived from CLIP_DRIVE so the two cannot drift apart.
+const CLIP_TRIM = Math.tanh(CLIP_DRIVE) / CLIP_DRIVE;
+
+/** tanh soft clip, exactly +-1 at the edges of the curve. A WaveShaper clamps
+ *  its input to the curve's ends, so this both warms the loudest peaks and
+ *  makes a sample over full scale physically impossible at the output. The
+ *  length is ODD on purpose: an even curve has no sample at x = 0.
+ *  See CLIP_TRIM above: the curve is a +4.8 dB amplifier on its own and is
+ *  never wired up without it. */
+function softClipCurve(n = 1025, drive = CLIP_DRIVE) {
+  const c = new Float32Array(n);
+  const norm = Math.tanh(drive);
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    c[i] = Math.tanh(x * drive) / norm;
+  }
+  return c;
+}
+
 function ensure() {
   if (ctx) {
     if (ctx.state === 'suspended') ctx.resume().catch(() => {});
@@ -143,21 +228,74 @@ function ensure() {
   if (!AC) return false;
   try { ctx = new AC(); } catch { ctx = null; return false; }
 
+  // Master chain: glue -> limiter -> soft clip -> clip trim. The glue
+  // compressor is doing musical work (it only leans on the loud moments: the
+  // club drop, a success fanfare landing on top of a full bed) and its makeup
+  // puts back the ~1 dB it takes off there; the limiter is the same brickwall
+  // this game has always had; the shaper is the guarantee, because nothing
+  // downstream of it can leave [-1, 1]; and the trim undoes the shaper's own
+  // small-signal gain so the whole chain is unity for anything that is not a
+  // peak. A quiet cozy bed comes out of here at the level it always did.
+  const clipTrim = ctx.createGain();
+  clipTrim.gain.value = CLIP_TRIM;
+  clipTrim.connect(ctx.destination);
+
+  const shaper = ctx.createWaveShaper();
+  shaper.curve = softClipCurve();
+  shaper.oversample = '2x';
+  shaper.connect(clipTrim);
+
   const limiter = ctx.createDynamicsCompressor();
   limiter.threshold.value = -6;
   limiter.knee.value = 6;
   limiter.ratio.value = 14;
   limiter.attack.value = 0.003;
   limiter.release.value = 0.22;
-  limiter.connect(ctx.destination);
+  limiter.connect(shaper);
+
+  const makeup = ctx.createGain();
+  makeup.gain.value = 1.12;
+  makeup.connect(limiter);
+
+  const glue = ctx.createDynamicsCompressor();
+  glue.threshold.value = -14;
+  glue.knee.value = 16;
+  glue.ratio.value = 1.8;
+  glue.attack.value = 0.015;
+  glue.release.value = 0.28;
+  glue.connect(makeup);
 
   master = ctx.createGain();
   master.gain.value = muted ? 0 : MASTER_LEVEL;
-  master.connect(limiter);
+  master.connect(glue);
+
+  // Music path. Four cheap stereo nodes, each owning exactly one automation, so
+  // the player's trim, the time of day, the overlay recede and the sidechain
+  // can never cancel each other out:
+  //   bus (trim) -> tilt (night) -> lowpass (focus) -> focus level -> duck
+  musicDuck = ctx.createGain();
+  musicDuck.gain.value = 1;
+  musicDuck.connect(master);
+
+  musicFocus = ctx.createGain();
+  musicFocus.gain.value = 1;
+  musicFocus.connect(musicDuck);
+
+  musicLp = ctx.createBiquadFilter();
+  musicLp.type = 'lowpass';
+  musicLp.Q.value = 0.6;
+  musicLp.frequency.value = 19000; // transparent until an overlay opens
+  musicLp.connect(musicFocus);
+
+  musicTilt = ctx.createBiquadFilter();
+  musicTilt.type = 'highshelf';
+  musicTilt.frequency.value = 1500;
+  musicTilt.gain.value = 0; // 0dB by day, a few dB down after dusk
+  musicTilt.connect(musicLp);
 
   musicBus = ctx.createGain();
   musicBus.gain.value = busLevel('music'); // authored level x the saved trim
-  musicBus.connect(master);
+  musicBus.connect(musicTilt);
 
   sfxBus = ctx.createGain();
   sfxBus.gain.value = busLevel('sfx');
@@ -185,11 +323,179 @@ function ensure() {
   // so a walk cycle sways gently instead of stacking dead centre.
   stepPans = [panNode(sfxDry, -0.16), panNode(sfxDry, 0.16)];
 
+  // Ambience (crickets, gulls) rejoins the music path at the focus lowpass
+  // rather than at the top of it: it should recede and duck with the world, but
+  // the night shelf must not mute the very crickets that say it is night.
+  // It carries the music bus level itself so it does NOT skip the player's
+  // trim: at unity it made the very same seagull() call 4.76x (+13.6 dB) louder
+  // than the beach bed's own, and left the crickets running all night with the
+  // music slider at zero.
+  ambOut = ctx.createGain();
+  ambOut.gain.value = busLevel('music');
+  ambOut.connect(musicLp);
+  // the send hangs off ambOut, so the tail is trimmed with the sound that made
+  // it (the shared verb RETURN still goes straight to master: it is the sfx
+  // reverb too, and is not ours to re-route)
+  const ambSend = ctx.createGain();
+  ambSend.gain.value = 0.3;
+  ambOut.connect(ambSend);
+  ambSend.connect(convolver);
+
   if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+
+  attachWorld();
+  applyFocus(); // an overlay may already be open, or setOverlay already called
 
   // A room may have been requested before init(); start it now.
   if (currentRoom && !tracks.some((t) => !t.dying)) startTrack(currentRoom);
+  retuneAmbience();
   return true;
+}
+
+// ------------------------------------------------- world state (the depth) --
+
+/** Subscribe to the things the bed reacts to. Called from ensure(), so it
+ *  happens with (or after) the first gesture and never at import time. Every
+ *  hook is read-only and defensive: a headless harness with no DOM, or a server
+ *  that never sends a clock, simply leaves the bed at its daytime default. */
+function attachWorld() {
+  if (attached) return;
+  attached = true;
+  // NOT a fresh Set: setOverlay(true) can be taken before init() ever runs, and
+  // wiping it here threw that state away and left the bed wide open.
+  focusSrc ||= new Set();
+  try {
+    // A clock frame may already have landed before the first gesture.
+    applyClock(game?.engine?.lastClock);
+    game.events.on('clock', applyClock);
+    game.events.on('minigame', (id) => setFocus(!!id, 'mg'));
+  } catch { /* no game singleton (a test harness): the bed still plays */ }
+  watchOverlays();
+}
+
+/** Time of day -> `dayLight`. `dayT` is the cove phase: 0 dawn, 0.25 noon,
+ *  0.5 dusk, 0.75 midnight (docs/LIVING-COVE.md). The sine is smoothstepped
+ *  into a flat day and a flat night with a real crossfade at each end, so the
+ *  change is something you hear happen rather than a value that drifts. */
+function applyClock(m) {
+  if (!m || m.dayT == null) return;
+  const n = Number(m.dayT);
+  if (!Number.isFinite(n)) return;
+  const u = ((n % 1) + 1) % 1;
+  const s = 0.5 + 0.5 * Math.sin(u * TAU); // 0 at midnight, 1 at noon
+  const lit = clamp((s - 0.34) / 0.32, 0, 1);
+  dayLight = lit * lit * (3 - 2 * lit);
+  if (!ctx || !musicTilt) return;
+  // Six seconds is longer than the gap between clock frames on purpose: the
+  // ramps overlap into one continuous slide from afternoon into evening.
+  const t = ctx.currentTime;
+  const g = musicTilt.gain;
+  try {
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(-5.5 * (1 - dayLight), t + 6);
+  } catch { /* noop */ }
+  retuneAmbience();
+}
+
+// --------------------------------------------------------------- focus -----
+
+// Any menu, panel or minigame overlay. The UI convention is a single
+// `<thing>-overlay` class on the panel root (menu-overlay, shop-overlay,
+// qb-overlay, ...) mounted into #hud-root; the minigame mount and the house
+// editor are the two that do not follow it.
+const OVERLAY_SEL = '#minigame-root:not(.hidden), [class*="-overlay"]:not(.hidden), .he-root:not(.hidden)';
+
+function domOverlayOpen() {
+  try { return !!document.querySelector(OVERLAY_SEL); } catch { return false; }
+}
+
+/** OR the three sources (DOM, the minigame event, the public setOverlay) so a
+ *  caller that opts in and one that does not both land on the same state. */
+function setFocus(on, src) {
+  if (!focusSrc) focusSrc = new Set();
+  if (on) focusSrc.add(src); else focusSrc.delete(src);
+  const next = focusSrc.size > 0;
+  if (next === focusOn) return;
+  focusOn = next;
+  applyFocus();
+}
+
+/** Land the current focus state on the graph. Separate from setFocus so a
+ *  state taken before there was an AudioContext (setOverlay during boot) is
+ *  applied by ensure() the moment the graph exists. */
+function applyFocus() {
+  if (!ctx || !musicLp || !musicFocus) return;
+  const soft = reducedMotion();
+  const t = ctx.currentTime;
+  const cut = focusOn ? (soft ? 950 : 640) : 19000;
+  const lvl = focusOn ? (soft ? 0.82 : 0.72) : 1;
+  const len = focusOn ? (soft ? 0.5 : 0.3) : 0.45;
+  try {
+    const f = musicLp.frequency;
+    f.cancelScheduledValues(t);
+    f.setValueAtTime(Math.max(20, f.value), t);
+    f.exponentialRampToValueAtTime(cut, t + len);
+    const g = musicFocus.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(Math.max(0.0001, g.value), t);
+    g.linearRampToValueAtTime(lvl, t + len);
+  } catch { /* noop */ }
+}
+
+/** Does this node look like an overlay root? #overlay-root's DIRECT children
+ *  are the churn (a div per name tag, a bubble per chat line, an exit cue on
+ *  every approach band, a prompt on every hotspot edge), so a childList record
+ *  is filtered down to this before the selector query is worth running. */
+function looksOverlay(n) {
+  if (!n || n.nodeType !== 1) return false;
+  if (n.id === 'minigame-root') return true;
+  const cls = n.className;
+  return typeof cls === 'string' && (cls.includes('-overlay') || cls.includes('he-root'));
+}
+
+/** Watch exactly the four nodes that can open or close an overlay, never a
+ *  subtree. Both root observers are childList only and their records are
+ *  filtered through looksOverlay(), so walking and chatting cost one nodeType
+ *  test per added node and never the overlay selector, which is an
+ *  attribute-substring match that cannot use the id/class rule buckets. */
+function watchOverlays() {
+  if (typeof MutationObserver !== 'function' || typeof document === 'undefined') return;
+  let mapWatched = false;
+  const recheck = () => {
+    setFocus(domOverlayOpen(), 'dom');
+    // #map-overlay is built by initHud, which can run after audio.init(): the
+    // childList hit that inserted it is where we pick it up.
+    if (!mapWatched) {
+      const mapEl = document.getElementById('map-overlay');
+      if (mapEl) {
+        mapWatched = true;
+        new MutationObserver(recheck).observe(mapEl, { attributes: true, attributeFilter: ['class'] });
+      }
+    }
+  };
+  const onKids = (recs) => {
+    // until #map-overlay has been found this stays on the old unfiltered path,
+    // because the HUD builds it inside a template and the child that carries it
+    // into the tree is not itself an overlay. That is a one-time hunt: once the
+    // map is hooked up, walking and chatting never reach the selector again.
+    if (!mapWatched) return recheck();
+    for (const r of recs) {
+      for (const n of r.addedNodes) if (looksOverlay(n)) return recheck();
+      for (const n of r.removedNodes) if (looksOverlay(n)) return recheck();
+    }
+    return undefined;
+  };
+  try {
+    const kids = new MutationObserver(onKids);
+    for (const id of ['hud-root', 'overlay-root']) {
+      const el = document.getElementById(id);
+      if (el) kids.observe(el, { childList: true });
+    }
+    const mg = document.getElementById('minigame-root');
+    if (mg) new MutationObserver(recheck).observe(mg, { attributes: true, attributeFilter: ['class'] });
+    recheck();
+  } catch { /* no DOM: the bed simply never recedes */ }
 }
 
 // ------------------------------------------------------------ voice atoms ---
@@ -398,6 +704,19 @@ function birdWhoop(dest, t) {
   }
 }
 
+/** One cricket: a short run of very narrow noise pulses. The high Q is what
+ *  makes filtered noise read as a stridulating wing rather than a hiss. */
+function cricket(dest, t, { vol = 0.045 } = {}) {
+  const f = rnd(3900, 5300);
+  const n = 3 + ((Math.random() * 3) | 0);
+  const gap = rnd(0.028, 0.042);
+  for (let i = 0; i < n; i++) {
+    const tt = t + i * gap;
+    noise(dest, tt, { dur: 0.011, vol, type: 'bandpass', freq: f, q: 14, rate: 1.6 });
+    tone(dest, tt, { type: 'sine', f0: f, dur: 0.013, vol: vol * 0.45, a: 0.002 });
+  }
+}
+
 /** Cave water drip: a bright blip that falls away, built to be reverbed. */
 function drip(dest, t, { vol = 0.13, f0 = 1650 } = {}) {
   const f = f0 * rnd(0.8, 1.28);
@@ -520,9 +839,64 @@ function tickScheduler() {
       tr.nextTime += tr.stepDur;
     }
   }
-  if (!tracks.length && schedTimer !== null) {
+  tickAmbience(now);
+  if (!tracks.length && ambNext === null && schedTimer !== null) {
     clearInterval(schedTimer);
     schedTimer = null;
+  }
+}
+
+// ------------------------------------------------------------- ambience -----
+
+// Which rooms hear what, and how thickly. Crickets are night-only and outdoor
+// only (the peak is a snowfield and the mine, den, cafe and club are indoors);
+// gulls are the coast by day. The speedway shares the beach's shoreline.
+const AMBIENCE = {
+  plaza: { cricket: 1 },
+  beach: { cricket: 0.7, gull: 1 },
+  speedway: { cricket: 0.7, gull: 1 },
+  jungle: { cricket: 0.8 },
+};
+
+function ambienceFor(id) {
+  return id && Object.prototype.hasOwnProperty.call(AMBIENCE, id) ? AMBIENCE[id] : null;
+}
+
+/** Arm or disarm the ambience slot clock for the current room and time of day.
+ *  Called from setRoom and from every clock frame; cheap and idempotent. */
+function retuneAmbience() {
+  if (!ctx || !ambOut) return;
+  const a = ambienceFor(currentRoom);
+  const wanted = !!a && ((a.cricket && dayLight < 0.92) || (a.gull && dayLight > 0.15));
+  if (!wanted) { ambNext = null; return; }
+  if (ambNext === null) {
+    ambNext = ctx.currentTime + 0.25;
+    ensureScheduler();
+  }
+}
+
+/** One decision slot: at most one critter, weighted by room and daylight. */
+function scheduleAmb(t) {
+  const a = ambienceFor(currentRoom);
+  if (!a || !ambOut) return;
+  const night = 1 - dayLight;
+  if (a.cricket && night > 0.08 && chance(0.34 * a.cricket * night)) {
+    cricket(panNode(ambOut, rnd(-0.9, 0.9)), t + rnd(0, 0.5), { vol: (0.028 + 0.03 * night) * a.cricket });
+  }
+  if (a.gull && dayLight > 0.2 && chance(0.032 * a.gull * dayLight)) {
+    seagull(panNode(ambOut, rnd(-0.9, 0.9)), t + rnd(0, 0.6));
+  }
+}
+
+function tickAmbience(now) {
+  if (ambNext === null) return;
+  // Same rule as the tracks: a throttled background tab must skip forward
+  // rather than dump every slot it slept through.
+  if (ambNext < now - 0.5) ambNext = now + 0.05;
+  let guard = 0;
+  while (ambNext < now + LOOKAHEAD && guard++ < 8) {
+    try { scheduleAmb(ambNext); } catch { ambNext = null; return; }
+    ambNext += AMB_STEP;
   }
 }
 
@@ -667,8 +1041,9 @@ TRACKS.plaza = (tr) => {
         }
       }
 
-      // birdsong: a few chirps per phrase, panned around the plaza
-      if (k === 0 && chance(0.5)) {
+      // birdsong: a few chirps per phrase, panned around the plaza. The birds
+      // go quiet after dusk (the crickets in the ambience layer take over).
+      if (k === 0 && chance(0.5 * dayLight)) {
         birdChirp(panNode(birds, rnd(-0.8, 0.8)), t + rnd(0.1, 1.6));
       }
     },
@@ -747,7 +1122,8 @@ TRACKS.beach = (tr) => {
       if (k === 8) tone(low, t, { type: 'sine', f0: mtof(ch.root + 7), dur: 0.7, vol: 0.14, a: 0.03 });
       if (k === 6 && chance(0.35)) noise(perc, t, { dur: 0.06, vol: 0.045, type: 'bandpass', freq: 3000, q: 1.2 });
       if (k === 12 && chance(0.25)) noise(perc, t, { dur: 0.09, vol: 0.03, type: 'highpass', freq: 6500, rate: 1.5 });
-      if (k === 0 && bar % 4 === 3 && chance(0.45)) {
+      // gulls are a daylight bird: after dusk the shoreline is surf and crickets
+      if (k === 0 && bar % 4 === 3 && chance(0.45 * dayLight)) {
         seagull(panNode(gulls, rnd(-0.85, 0.85)), t + rnd(0, 1.2));
       }
     },
@@ -1399,12 +1775,13 @@ TRACKS.jungle = (tr) => {
       if (k === 0) tone(low, t, { type: 'sine', f0: mtof(ch.root - 12), dur: 1.1, vol: 0.3, a: 0.02 });
       if (k === 11) tone(low, t, { type: 'sine', f0: mtof(ch.root - 5), dur: 0.4, vol: 0.12, a: 0.02 });
 
-      // birdsong in layers: near chirps, far chirps, the occasional low call
-      if (k === 0 && chance(0.6)) birdChirp(panNode(birds, rnd(-0.85, 0.85)), t + rnd(0.05, 1.2));
-      if (k === 8 && chance(0.4)) birdChirp(panNode(birds, rnd(-0.9, 0.9)), t + rnd(0, 0.9));
-      if (k === 0 && bar % 4 === 3 && chance(0.45)) birdWhoop(panNode(birds, rnd(-0.7, 0.7)), t + rnd(0, 1.4));
+      // birdsong in layers: near chirps, far chirps, the occasional low call.
+      // All three thin out with the light; the canopy insects do the opposite.
+      if (k === 0 && chance(0.6 * dayLight)) birdChirp(panNode(birds, rnd(-0.85, 0.85)), t + rnd(0.05, 1.2));
+      if (k === 8 && chance(0.4 * dayLight)) birdChirp(panNode(birds, rnd(-0.9, 0.9)), t + rnd(0, 0.9));
+      if (k === 0 && bar % 4 === 3 && chance(0.45 * dayLight)) birdWhoop(panNode(birds, rnd(-0.7, 0.7)), t + rnd(0, 1.4));
       // insects, way up in the leaves
-      if (k === 6 && bar % 2 === 1 && chance(0.3)) {
+      if (k === 6 && bar % 2 === 1 && chance(0.18 + 0.34 * (1 - dayLight))) {
         const p = panNode(air, rnd(-0.9, 0.9));
         const n = 6 + ((Math.random() * 5) | 0);
         for (let i = 0; i < n; i++) {
@@ -1551,17 +1928,39 @@ let comboN = 0;
 let comboAt = -99;
 let coinStreak = 0;
 let coinAt = -99;
-// Semitone offsets up the major scale for coin streaks (3rd coin onward).
-const COIN_LADDER = [2, 4, 5, 7, 9, 11, 12, 14, 16, 17];
+let duckUntil = -99; // audio time the sidechain dip currently in flight releases
+// Semitone offsets up the MAJOR PENTATONIC for coin streaks (3rd coin onward),
+// two octaves of it. The pentatonic is the point: every step of the run is
+// consonant with the room's bed, so a fast pickup streak turns into a little
+// tune instead of a scale exercise. Streaks reset after 2s (see SFX.coin).
+const COIN_LADDER = [2, 4, 7, 9, 12, 14, 16, 19, 21, 24];
 const lastPlayed = Object.create(null);
-const MIN_GAP = { step: 0.075, click: 0.022, tick: 0.018, hover: 0.05, coin: 0.028, pop: 0.028 };
+const MIN_GAP = {
+  step: 0.075, click: 0.022, tick: 0.018, hover: 0.05, coin: 0.028, pop: 0.028, ping: 0.4,
+};
 
 // Sounds that want to ring out in the room rather than sit in the player's face.
-const WET_SFX = new Set(['ding', 'chime', 'success', 'levelup', 'unlock', 'sparkle', 'buy']);
+const WET_SFX = new Set(['ding', 'chime', 'ping', 'success', 'levelup', 'unlock', 'sparkle', 'buy']);
 
-// Chat-adjacent notifications duck the music bed -6dB for a beat so the ping
-// reads clearly over whatever the room is playing.
-const DUCK_SFX = new Set(['pop', 'ding', 'chime']);
+// Sidechain: how far the music bed dips under each sound, and for how long.
+// [depth, hold, release] in gain and seconds. Anything not listed (hover, tick,
+// step, the world's own splashes and thuds) leaves the bed alone: a duck the
+// player cannot connect to something they did is just pumping.
+const DUCK = {
+  click: [0.82, 0.05, 0.28], select: [0.82, 0.05, 0.28],
+  open: [0.8, 0.08, 0.34], close: [0.84, 0.05, 0.28],
+  // 'pop' is both a minigame blip and the sound an incoming whisper arrives on,
+  // so it dips a little further than a plain click but nothing like a fanfare
+  pop: [0.74, 0.08, 0.34],
+  ping: [0.62, 0.14, 0.62], ding: [0.66, 0.12, 0.5], chime: [0.66, 0.12, 0.5],
+  sparkle: [0.7, 0.12, 0.5],
+  coin: [0.88, 0.03, 0.22], buy: [0.6, 0.2, 0.7],
+  success: [0.55, 0.3, 0.9], levelup: [0.55, 0.34, 1], unlock: [0.6, 0.26, 0.8],
+  fail: [0.6, 0.28, 0.85], error: [0.6, 0.28, 0.85],
+  whoosh: [0.55, 0.18, 0.9],
+  // not an sfx: the arrival chord asks for the same dip (see roomChord)
+  arrive: [0.5, 0.35, 1.1],
+};
 
 // ------------------------------------------------------------- footsteps ----
 
@@ -1649,18 +2048,22 @@ const SFX = {
     noise(d, t, { dur: 0.1, vol: 0.08, type: 'lowpass', freq: 700, sweep: 0.4 });
   },
   coin(d, t) {
-    // Streak stinger: 3+ coins within 2s of each other walk the pickup up the
-    // major scale, so a run of coins turns into a little ascending melody.
+    // Streak stinger: 3+ coins within 2s of each other walk the pickup up a
+    // major pentatonic rooted in THIS room's key, so a run of coins turns into
+    // a little melody that belongs to the bed underneath it. Two seconds of no
+    // coins and the run starts again from the bottom.
     if (t - coinAt > 2) coinStreak = 0;
     coinAt = t;
     coinStreak++;
     const up = coinStreak >= 3 ? COIN_LADDER[Math.min(coinStreak - 3, COIN_LADDER.length - 1)] : 0;
-    const base = 1046.5 * Math.pow(2, up / 12);
+    const key = roomKeyOffset();
+    const base = mtof(84 + key + up); // 84 = C6, the pitch this has always been
     tone(d, t, { type: 'square', f0: base, dur: 0.06, vol: 0.09, a: 0.002 });
     tone(d, t + 0.058, { type: 'square', f0: base * 1.5, dur: 0.16, vol: 0.085, a: 0.002 });
     tone(d, t + 0.058, { type: 'sine', f0: base * 3, dur: 0.2, vol: 0.045, a: 0.002 });
     noise(d, t, { dur: 0.03, vol: 0.045, type: 'highpass', freq: 6000 });
-    if (up >= 12) bell(sfxWet, t + 0.06, 96 + (up - 12), { vol: 0.07, dur: 1.2 }); // topped out: a glint
+    // topped out: a glint an octave over the run
+    if (up >= 12) bell(sfxWet, t + 0.06, 96 + key + (up - 12), { vol: 0.07, dur: 1.2 });
   },
   buy(d, t) {
     SFX.coin(d, t);
@@ -1685,9 +2088,21 @@ const SFX = {
     noise(d, t + 0.08, { dur: 0.02, vol: 0.04, type: 'highpass', freq: 4000 });
   },
   whoosh(d, t) {
-    noise(d, t, { dur: 0.34, vol: 0.16, type: 'bandpass', freq: 380, q: 1.1, sweep: 7, a: 0.09 });
-    noise(d, t + 0.16, { dur: 0.26, vol: 0.1, type: 'bandpass', freq: 2600, q: 1.4, sweep: 0.24 });
-    tone(d, t, { type: 'sine', f0: 150, f1: 420, dur: 0.3, vol: 0.05, a: 0.06 });
+    // The doorway takes the colour of the room you are leaving: the noise
+    // sweep's resonances and the two tuned partials under it are all built from
+    // that room's arrival chord, so plaza C, mine Dm and club Am7 each have a
+    // recognisably different door, and the arrival chord at the far end lands
+    // as an answer rather than a non sequitur.
+    const ch = roomChordFor(currentRoom);
+    const root = ch[0];
+    const top = ch[ch.length - 1];
+    noise(d, t, { dur: 0.34, vol: 0.16, type: 'bandpass', freq: mtof(root) * 1.4, q: 1.1, sweep: 7, a: 0.09 });
+    // x5 on the top voice puts the plaza's tail back on the 2.6kHz this sound
+    // has always had, and lets the darker rooms come out darker from there
+    noise(d, t + 0.16, { dur: 0.26, vol: 0.1, type: 'bandpass', freq: mtof(top) * 5, q: 1.4, sweep: 0.24 });
+    tone(d, t, { type: 'sine', f0: mtof(root - 12), f1: mtof(root), dur: 0.3, vol: 0.05, a: 0.06 });
+    tone(d, t + 0.05, { type: 'triangle', f0: mtof(top), f1: mtof(top + 7), dur: 0.24, glide: 0.2, vol: 0.03, a: 0.05 });
+    tone(d, t + 0.09, { type: 'sine', f0: mtof(root + 19), f1: mtof(root + 24), dur: 0.2, glide: 0.18, vol: 0.018, a: 0.06 });
   },
   slide(d, t) {
     noise(d, t, { dur: 0.5, vol: 0.09, type: 'bandpass', freq: 1800, q: 1.6, sweep: 0.5, a: 0.12, rate: 0.7 });
@@ -1706,6 +2121,15 @@ const SFX = {
   },
   ding(d, t) {
     bell(d, t, 88, { vol: 0.2, dur: 1.9 });
+  },
+  /** A notification voice: two soft bells a fourth apart, with a deeper, longer
+   *  dip behind them (DUCK.ping) than any other sound gets, so it reads over a
+   *  full bed. Today a whisper arrives on `pop` (src/net/client.js) and this is
+   *  the nicer voice waiting for it; anything that needs "look at me, gently"
+   *  can call it as audio.play('ping'). */
+  ping(d, t) {
+    bell(d, t, 91, { vol: 0.085, dur: 0.95 });
+    bell(d, t + 0.09, 96, { vol: 0.05, dur: 0.75 });
   },
   sparkle(d, t) {
     const notes = [84, 88, 91, 96, 100];
@@ -1758,23 +2182,52 @@ SFX.select = SFX.click;
 SFX.chime = SFX.ding;
 SFX.catch = SFX.pop;
 
-/** Pull the music bed down ~6dB for a beat, then ease it back. Reuses the one
- *  musicBus gain param: no nodes are created. */
-function duckMusic(t) {
-  if (!musicBus) return;
-  const g = musicBus.gain;
-  const lvl = busLevel('music'); // the duck is relative to the player's trim
-  g.cancelScheduledValues(t);
-  g.setValueAtTime(Math.max(0.0001, g.value), t);
-  g.linearRampToValueAtTime(lvl * 0.5, t + 0.05);
-  g.setValueAtTime(lvl * 0.5, t + 0.35);
-  g.linearRampToValueAtTime(lvl, t + 0.9);
+/**
+ * SIDECHAIN. Dip the music bed under one sound and ease it back, on the
+ * dedicated musicDuck gain: the player's trim (musicBus) and the overlay
+ * recede (musicFocus) each own their own node, so none of the three
+ * automations can ever cancel another out, and unmuting or dragging the music
+ * slider mid-duck does the right thing.
+ *
+ * The dip is taken from wherever the gain is NOW, and only ever downward, so a
+ * burst of sounds settles at the deepest of them instead of pumping once per
+ * sound. Depth is halved for prefers-reduced-motion, and halved again while an
+ * overlay is open (the bed is already down there: ducking it twice just makes
+ * the menu silent). No nodes are created.
+ */
+function duckMusic(t, name) {
+  if (!musicDuck) return;
+  const spec = Object.prototype.hasOwnProperty.call(DUCK, name) ? DUCK[name] : null;
+  if (!spec) return;
+  let [depth] = spec;
+  const [, hold, rel] = spec;
+  if (reducedMotion()) depth = 1 - (1 - depth) * 0.5;
+  if (focusOn) depth = 1 - (1 - depth) * 0.5;
+  const g = musicDuck.gain;
+  const cur = clamp(g.value, 0.0001, 1);
+  const target = Math.max(0.0001, Math.min(cur, depth));
+  const t0 = t + 0.025;
+  const end = t0 + hold + rel;
+  // A click landing inside a fanfare's duck must not cut the fanfare's recovery
+  // short: a sound that is neither deeper nor longer than the dip already
+  // running leaves it alone entirely.
+  if (end <= duckUntil && target >= cur - 0.001) return;
+  duckUntil = end;
+  try {
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(cur, t);
+    g.linearRampToValueAtTime(target, t0);
+    g.setValueAtTime(target, t0 + hold);
+    g.linearRampToValueAtTime(1, t0 + hold + rel);
+  } catch { /* noop */ }
 }
 
 // -------------------------------------------------------- room-enter chord --
 
 // A gentle ~0.8s arrival chord per room, voiced in that bed's own key so it
-// resolves straight into the music that is fading up underneath it.
+// resolves straight into the music that is fading up underneath it. It is also
+// the room's KEY as far as the rest of this file is concerned: the doorway
+// whoosh and the coin-streak run are both built from it.
 const ROOM_CHORDS = {
   plaza: [60, 64, 67, 72],  // C
   beach: [53, 60, 65, 69],  // F
@@ -1788,9 +2241,26 @@ const ROOM_CHORDS = {
   speedway: [55, 59, 62, 67], // G, bright and revvy
 };
 
+// Anywhere with no bed of its own (a player's den, a typo, a room added later)
+// still needs a key to build a doorway and a coin run from: C, the plaza's.
+const NEUTRAL_CHORD = ROOM_CHORDS.plaza;
+
+/** The chord that IS this room, own-property only so a room id like
+ *  'constructor' or 'house:dave' reads as "no key" and takes the neutral one. */
+function roomChordFor(id) {
+  return id && Object.prototype.hasOwnProperty.call(ROOM_CHORDS, id) ? ROOM_CHORDS[id] : NEUTRAL_CHORD;
+}
+
+/** The current room's key as semitones from C, folded to the nearest (-5..+6)
+ *  so pitching a sound by it moves it into key without moving it an octave. */
+function roomKeyOffset() {
+  const o = ((roomChordFor(currentRoom)[0] % 12) + 12) % 12;
+  return o > 6 ? o - 12 : o;
+}
+
 function roomChord(id) {
   if (muted || !ctx) return;
-  const chord = ROOM_CHORDS[id];
+  const chord = id && Object.prototype.hasOwnProperty.call(ROOM_CHORDS, id) ? ROOM_CHORDS[id] : null;
   if (!chord) return;
   const t = ctx.currentTime + 0.06;
   try {
@@ -1798,6 +2268,8 @@ function roomChord(id) {
       rhodes(sfxWet, t + i * 0.035, n, { vol: 0.085 - i * 0.012, dur: 0.8 });
     });
     bell(sfxWet, t + 0.12, chord[chord.length - 1] + 12, { vol: 0.045, dur: 1.1 });
+    // let the arrival stand alone for a beat, then swell the new bed in under it
+    duckMusic(t, 'arrive');
   } catch { /* an arrival flourish must never block the room switch */ }
 }
 
@@ -1824,7 +2296,7 @@ export const audio = {
     lastPlayed[name] = t;
     try {
       fn(WET_SFX.has(name) ? sfxWet : sfxDry, t + 0.001, arg);
-      if (DUCK_SFX.has(name)) duckMusic(t);
+      duckMusic(t, name); // no-op for anything not in DUCK
     } catch { /* a dropped sfx must never break gameplay */ }
   },
 
@@ -1839,7 +2311,22 @@ export const audio = {
     if (!ctx) return; // init() will start it
     fadeOutAll();
     if (id && TRACKS[id]) startTrack(id);
+    retuneAmbience(); // the crickets belong to the room, not to the track
     if (changed) roomChord(id);
+  },
+
+  /**
+   * Force the "world recedes" state (a soft lowpass and ~3dB off the bed) on or
+   * off. Optional: this module already watches the overlay mount points and the
+   * 'minigame' event, and all three sources are OR'd, so calling it is only
+   * ever needed for something the DOM cannot show (a cutscene, a modal drawn on
+   * the canvas). Pass false to release the one YOU took; the DOM keeps its own.
+   */
+  setOverlay(open) {
+    // Recorded even before there is a graph, and never a reason to BUILD one:
+    // ensure() applies whatever state this left behind when audio really starts.
+    setFocus(!!open, 'api');
+    return focusOn;
   },
 
   /**
@@ -1855,14 +2342,20 @@ export const audio = {
     const next = Number.isFinite(n) ? clamp(n, 0, 1) : 1;
     volumes()[bus] = next;
     try { localStorage.setItem(VOL_KEY, JSON.stringify(volumes())); } catch { /* private mode */ }
-    const node = bus === 'music' ? musicBus : sfxBus;
-    if (node && ctx) {
+    // the ambience out carries the music level too, so the slider moves both
+    const nodes = bus === 'music' ? [musicBus, ambOut] : [sfxBus];
+    if (ctx) {
       const t = ctx.currentTime;
-      const g = node.gain;
-      // cancel first: a music duck may have ramps queued past this moment
-      g.cancelScheduledValues(t);
-      g.setValueAtTime(g.value, t);
-      g.linearRampToValueAtTime(busLevel(bus), t + 0.06);
+      for (const node of nodes) {
+        if (!node) continue;
+        const g = node.gain;
+        // cancel first: nothing else automates these params any more (the
+        // sidechain and the overlay recede each own a node of their own), but a
+        // slider dragged fast queues ramps of its own to overtake
+        g.cancelScheduledValues(t);
+        g.setValueAtTime(g.value, t);
+        g.linearRampToValueAtTime(busLevel(bus), t + 0.06);
+      }
     }
     return next;
   },

@@ -561,6 +561,10 @@ export class HouseRoom extends Room {
     this._rand = rng(this.ownerLower.length * 7919 + this.ownerLower.charCodeAt(0) * 131 || 4242);
 
     scene.background = new THREE.Color(0x9ed6ef);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). Somebody's home, so
+    // it leans warm - but less than the cafe, because a den is mostly cream
+    // plaster and a heavy warm skew turns cream into custard.
+    this.grade = { warmth: 0.3, lift: 0.1 };
 
     // ---- instanced prop batches -------------------------------------------
     const white = () => makeToon(0xffffff, { unique: true });
@@ -1023,7 +1027,29 @@ export class HouseRoom extends Room {
     // gets tinted with the glass rather than staying noon-blue all night
     this._skyMat = sky.material;
 
-    const grass = new THREE.Mesh(new THREE.PlaneGeometry(150, 150), makeToon(PAL.grass));
+    // The den is a cutaway with half-height south stubs, so this lawn is not a
+    // backdrop: from the wide camera it is the whole border of the frame, and
+    // as one flat green sheet it was the emptiest surface in the game. Tinted
+    // in the geometry: broad mown-and-shaded patches, brightest right around
+    // the cottage where the light spills out and cooling off toward the hedge,
+    // so the den reads as sitting in a garden rather than pasted on felt.
+    const grassGeo = new THREE.PlaneGeometry(150, 150, 24, 24);
+    {
+      const p = grassGeo.attributes.position;
+      const col = new Float32Array(p.count * 3);
+      for (let i = 0; i < p.count; i++) {
+        const x = p.getX(i), z = p.getY(i); // un-rotated: the plane lies in XY
+        const patch = Math.sin(x * 0.19 - 0.4) * Math.sin(z * 0.16 + 1.1)
+          + 0.45 * Math.sin((x + z) * 0.33 + 0.8);
+        const far = Math.min(1, Math.hypot(x, z) / 34);
+        const t = 1 + patch * 0.06 - far * 0.16;
+        col[i * 3] = t - patch * 0.02;
+        col[i * 3 + 1] = t;
+        col[i * 3 + 2] = t - patch * 0.025 + far * 0.05;
+      }
+      grassGeo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    }
+    const grass = new THREE.Mesh(grassGeo, makeToon(PAL.grass, { vertexColors: true }));
     grass.rotation.x = -Math.PI / 2;
     grass.position.y = -0.3;
     scene.add(grass);

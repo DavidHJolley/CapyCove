@@ -978,7 +978,19 @@ export class SpeedwayRoom extends Room {
       label: this._joinLabel(),
       action: (g) => {
         if (g.net?.connected) {
-          g.net.send({ t: this._signedOn ? 'kart-leave' : 'kart-join' });
+          // grand prix: the sign-on carries this capy's kart pick and track
+          // vote (kart.js's own localStorage keys, §A4/§A5); the server
+          // coerces unknown ids to coco/sunny, so this is safe standalone
+          if (this._signedOn) {
+            g.net.send({ t: 'kart-leave' });
+          } else {
+            let kart = 'coco'; let track = 'sunny';
+            try {
+              kart = localStorage.getItem('cove.kart.pick') || kart;
+              track = localStorage.getItem('cove.kart.track') || track;
+            } catch { /* storage off: race the defaults */ }
+            g.net.send({ t: 'kart-join', kart, track });
+          }
         } else {
           // offline: no sheet to sign, so the pit wall just starts a solo race
           g.__kartCtx = null;

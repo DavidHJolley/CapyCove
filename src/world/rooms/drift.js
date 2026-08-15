@@ -680,6 +680,12 @@ export class DriftRoom extends Room {
     this._shallow = new THREE.Color(C.shallow);
     this._deep = new THREE.Color(C.deep);
 
+    // Per-room colour grade (src/core/postfx.js; -1..+1). The coldest grade in
+    // the cove: a warm cast underwater reads as murk rather than as evening.
+    // A little lift stays, because Big Blue is a dark silhouette against dark
+    // water and losing her outline loses the room's one big moment.
+    this.grade = { warmth: -0.45, lift: 0.2 };
+
     const hemi = new THREE.HemisphereLight(0x9fe0ff, 0x3a7f9c, 1.05);
     scene.add(hemi);
     this._hemi = hemi;

@@ -998,6 +998,11 @@ export class LoftRoom extends Room {
     this._glowK = 1;
 
     scene.background = new THREE.Color(0x2b1e14);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). The quiet floor:
+    // firelight, portraits and a chess board. It runs warmer than the lounge
+    // below it and keeps its shoulders darker, which is the whole difference
+    // between the two rooms in one line.
+    this.grade = { warmth: 0.5, lift: 0.05 };
     scene.fog = new THREE.Fog(0xd8e8f6, 46, 112);
     this._fog = scene.fog;
 
@@ -1404,7 +1409,30 @@ export class LoftRoom extends Room {
     // --- the floor ---------------------------------------------------------
     const floorTex = texPlanks();
     floorTex.repeat.set(5, (ZS - ZN) * 0.3125);
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW, ZS - ZN), this._toonMap(floorTex));
+    // A wall-to-wall plank floor is the biggest surface in the room, and with a
+    // tiling grain and nothing else it reads as one even sheet of brown from
+    // the wide camera - the props sit ON it instead of IN it. This tints the
+    // boards in the geometry rather than adding a light: a broad warm pool
+    // under the fireplace and the chandelier, cooler and darker into the corners the fixtures never
+    // reach, plus slow blotches so the wear is not symmetrical. Build-time
+    // only, same one draw call, and the plank texture still carries the grain.
+    const floorGeo = new THREE.PlaneGeometry(2 * HW, ZS - ZN, 14, 12);
+    {
+      const p = floorGeo.attributes.position;
+      const col = new Float32Array(p.count * 3);
+      for (let i = 0; i < p.count; i++) {
+        const x = p.getX(i), y = p.getY(i); // un-rotated: the plane lies in XY
+        const wear = Math.sin(x * 0.51 + 1.9) * Math.sin(y * 0.44 - 0.6)
+          + 0.5 * Math.sin((x + y) * 0.87 + 2.2);
+        const out = Math.min(1, Math.hypot(x / HW, y / ((ZS - ZN) * 0.5)));
+        const t = 1 + wear * 0.045 - out * out * 0.17;
+        col[i * 3] = t + wear * 0.012;
+        col[i * 3 + 1] = t;
+        col[i * 3 + 2] = t - wear * 0.02 - out * 0.03;
+      }
+      floorGeo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    }
+    const floor = new THREE.Mesh(floorGeo, this._toonMap(floorTex, 0xffffff, { vertexColors: true }));
     floor.rotation.x = -Math.PI / 2;
     floor.position.z = (ZN + ZS) / 2;
     floor.receiveShadow = true;

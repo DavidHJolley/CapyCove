@@ -215,6 +215,22 @@ number, never zero. Reader UI src/ui/courier.js (cove-timezone dates), plaza
 newsstand src/world/newsstand.js. Public GET /api/now (no auth, 60s cache) is
 events.frame() for the title screen's "this week in the cove" line; the
 first-run tour covers the remap, the map, the speedway and the quest board.
+Wave GP (grand prix): FOUR tracks (`sunny`, `summit`, `tangle`, `glimmer`,
+docs/KARTS.md GRAND PRIX AMENDMENT incl. the AS-BUILT corrections in §A1.4);
+elevation is CLIENT geometry from the track table (src/minigames/games/
+kart-tracks.js) and never rides the wire (still q/lat/yaw). FIVE karts
+(coco/reef/biscuit/dart/fern, equal stat totals; dart/fern unlock at 10/25
+races run, client-side ceremony, server accepts all five). NO new frames:
+the kart choice + track vote ride `kart-join` {kart, track} and echo on
+`kart-lobby`/`kart-grid`; `kart-board`/`kart-end` gained additive track/
+trackName; hazards are a frozen deterministic phase formula shared by
+kart-tracks.js and server/kart.js (a cross-check test deep-equals the two
+tables - keep it green). Race HUD lives in src/minigames/games/kart-hud.js
+behind the frozen §A7 interface (the HUD owns countdown/GO/FINAL LAP; `lap`
+means COMPLETED). Wrong-way banner per §A6, never a penalty. Feel wave:
+postfx.setScene(scene, camera, room, {arrive}) is the explicit arrival
+signal (switchRoom true, rebuildRoom false); rooms may set this.grade =
+{warmth, lift, dusk} (jungle pins dusk: 0).
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

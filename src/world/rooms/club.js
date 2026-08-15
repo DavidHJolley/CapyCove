@@ -224,6 +224,12 @@ export class ClubRoom extends Room {
     this._moonSpill = new THREE.Color(0x8f7ce0);
 
     scene.background = new THREE.Color(0x090612);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). The one room that
+    // must NOT be warmed and must NOT be lifted: the whole look is saturated
+    // neon over near-black purple, and a warm shadow lift turns the grotto
+    // brown and greys out the only thing the room is for. Darks stay dark; the
+    // dance floor and the crystals do the lighting.
+    this.grade = { warmth: -0.2, lift: -0.5 };
     scene.fog = new THREE.FogExp2(0x110a20, 0.017);
 
     this.cameraHint = { offset: new THREE.Vector3(0, 11, 15), lookHeight: 1 };
@@ -288,14 +294,50 @@ export class ClubRoom extends Room {
 
     // Walkable rock floor (kept well inside the wall) + a non-walkable apron
     // so the cave reads as solid rock all the way to the wall base.
-    const floorMat = makeToon(PAL.floor);
-    const floor = new THREE.Mesh(new THREE.CircleGeometry(FLOOR_R, 44), floorMat);
+    // The floor is the biggest single surface in the room and it was one flat
+    // purple, which is why the grotto read as a lit stage standing on a sheet
+    // of card: the LED floor had an edge, the rock around it had none. A vertex
+    // tint puts damp, uneven rock under it - broad blotches, and a slow
+    // darkening out toward the wall base so the middle of the cave stays the
+    // brightest thing that is not a light. RingGeometry (inner radius 0) is the
+    // same disc as CircleGeometry with rings of vertices for the tint to live
+    // in; the fan is degenerate and costs nothing. Build-time, one draw call.
+    const floorMat = makeToon(PAL.floor, { vertexColors: true });
+    const floorGeo = new THREE.RingGeometry(0, FLOOR_R, 44, 4);
+    {
+      const p = floorGeo.attributes.position;
+      const col = new Float32Array(p.count * 3);
+      for (let i = 0; i < p.count; i++) {
+        const x = p.getX(i), y = p.getY(i); // un-rotated: the disc lies in XY
+        const blot = Math.sin(x * 0.42 - 0.9) * Math.sin(y * 0.37 + 1.6)
+          + 0.5 * Math.sin((x - y) * 0.78 + 0.4);
+        const far = Math.min(1, Math.hypot(x, y) / FLOOR_R);
+        const t = 1 + blot * 0.09 - far * far * 0.22;
+        col[i * 3] = t + blot * 0.02;
+        col[i * 3 + 1] = t - blot * 0.01;
+        col[i * 3 + 2] = t + blot * 0.03;
+      }
+      floorGeo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    }
+    const floor = new THREE.Mesh(floorGeo, floorMat);
     floor.rotation.x = -Math.PI / 2;
     scene.add(floor);
     this.groundMeshes.push(floor);
 
-    const apron = new THREE.Mesh(new THREE.RingGeometry(FLOOR_R - 0.1, 22, 44, 1), floorMat);
+    // The apron keeps the PLAIN material: a vertexColors material over geometry
+    // with no colour attribute renders black (the disabled attribute reads as
+    // 0,0,0), so the two cannot share one material any more. It is a separate
+    // mesh either way, so this costs a cache entry and no draw call - and it
+    // wants to be a shade darker than the floor it rings anyway.
+    // It also has to drop out of the floor's plane now. The two rings overlap
+    // by 0.1 at r 13.5..13.6, which was invisible while they shared one
+    // material and is a crawling dashed ring the moment they do not. 2mm is the
+    // spacing the plaza uses for its stacked ground layers.
+    const apron = new THREE.Mesh(
+      new THREE.RingGeometry(FLOOR_R - 0.1, 22, 44, 1), makeToon(PAL.rockDeep),
+    );
     apron.rotation.x = -Math.PI / 2;
+    apron.position.y = -0.002;
     scene.add(apron);
 
     const r = rng(20260806);

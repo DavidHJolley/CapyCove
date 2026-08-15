@@ -218,7 +218,11 @@ export class Engine {
       attachCharm(this.room, this.scene, this.game, id);
       if (!this.room.groundMeshes?.length) console.warn(`[engine] room '${id}' has no groundMeshes`);
       this.scene.add(this.remoteGroup);
-      postfx.setScene(this.scene, this.camera);
+      // {arrive:true}: the player is walking into this room behind a closed
+      // iris, so postfx stages the fade-up and tints the wipe. A rebuild says
+      // false. postfx cannot tell the two apart by itself: we keep rendering
+      // the old scene through the whole wipe, so there is no render gap.
+      postfx.setScene(this.scene, this.camera, this.room, { arrive: true });
 
       const spawn = this.room.getSpawn(fromId);
       this.playerAvatar.group.position.copy(spawn);
@@ -359,7 +363,9 @@ export class Engine {
     attachOverlay(this.room, this.scene, this.game, this.room.id);
     attachCharm(this.room, this.scene, this.game, this.room.id);
     this.scene.add(this.remoteGroup);
-    postfx.setScene(this.scene, this.camera);
+    // in-place rebuild (the layout editor, after every dragged handle): nothing
+    // covered the screen, so no arrival staging and no tinted wipe
+    postfx.setScene(this.scene, this.camera, this.room, { arrive: false });
 
     this.playerAvatar.group.position.copy(pos);
     this.playerAvatar.group.rotation.y = rot;

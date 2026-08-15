@@ -794,6 +794,15 @@ export class JungleRoom extends Room {
 
     scene.background = new THREE.Color(0x2a4426);
     scene.fog = new THREE.Fog(0x33502c, 20, 64);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). The darkest daylight
+    // room in the cove, so it asks for real shadow lift - a jungle that
+    // crushes to black stops being cozy and starts being a cave, and there is
+    // already a cave. Warmth stays near zero: the sun that gets through is
+    // green by the time it lands.
+    // dusk: 0 opts out of the darkness-responsive bloom: the jungle's canopy
+    // background reads near-black at noon, which postfx would misread as
+    // permanent dusk and over-bloom every light shaft (see postfx._duskOf)
+    this.grade = { warmth: 0.15, lift: 0.35, dusk: 0 };
     // world clock (wave 7): the canopy light dims after dusk and the fireflies
     // take the clearing over. Preallocated so onClock never allocates.
     this._bg = scene.background;
@@ -1175,6 +1184,14 @@ export class JungleRoom extends Room {
     const vCount = (SEG + 1) * (RINGS + 1);
     const pos = new Float32Array(vCount * 3);
     const uv = new Float32Array(vCount * 2);
+    // Canopy dapple, baked into vertex colours. texFloor() repeats every 6.5
+    // units, so from the wide camera the whole clearing was one even green
+    // sheet with a tiling grain on it - the least jungle-like thing a jungle
+    // can do. Two crossed sines at different scales make broad pools of light
+    // and shade, warm where the sun gets through and cool-green where it does
+    // not, and the rim darkens so the eye stays on the clearing. Build-time:
+    // one Float32Array, nothing per frame, no extra draw call.
+    const col = new Float32Array(vCount * 3);
     const idx = new Uint16Array(SEG * RINGS * 6);
     for (let j = 0; j <= RINGS; j++) {
       // rings bunch up toward the middle where the play space is
@@ -1187,6 +1204,14 @@ export class JungleRoom extends Room {
         const k = j * (SEG + 1) + i;
         pos[k * 3] = x; pos[k * 3 + 1] = groundH(x, z); pos[k * 3 + 2] = z;
         uv[k * 2] = x / 6.5; uv[k * 2 + 1] = z / 6.5;
+        const dap = Math.sin(x * 0.31 + 0.8) * Math.sin(z * 0.27 - 1.3)
+          + 0.55 * Math.sin((x - z) * 0.62 + 2.1);
+        // the last third of the plate falls off into the undergrowth
+        const rim = 1 - 0.3 * smoothstep(0.58, 1, rf);
+        const t = (1 + dap * 0.055) * rim;
+        col[k * 3] = t + Math.max(0, dap) * 0.05;
+        col[k * 3 + 1] = t + Math.max(0, dap) * 0.02;
+        col[k * 3 + 2] = t - Math.max(0, dap) * 0.02;
       }
     }
     let ii = 0;
@@ -1201,10 +1226,11 @@ export class JungleRoom extends Room {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
     g.setIndex(new THREE.BufferAttribute(idx, 1));
     g.computeVertexNormals();
 
-    const floor = new THREE.Mesh(g, texMat(texFloor()));
+    const floor = new THREE.Mesh(g, texMat(texFloor(), { vc: true }));
     floor.receiveShadow = true;
     scene.add(floor);
     this.groundMeshes = [floor];

@@ -1183,6 +1183,11 @@ export class PeakRoom extends Room {
 
     scene.background = new THREE.Color(0xc3dcf1);
     scene.fog = new THREE.Fog(0xd9e9f7, 26, 82);
+    // Per-room colour grade (src/core/postfx.js; -1..+1). Snow is the palette
+    // that must not be warmed: the blue in the shadows is what the room is
+    // about, and an amber skew turns a snowbank into sand. No extra lift
+    // either - snow shadows are already the brightest darks in the game.
+    this.grade = { warmth: -0.3, lift: -0.05 };
     this._bgColor = scene.background; // mutated in place by the clock
     this._fog = scene.fog;
 
@@ -1739,6 +1744,23 @@ export class PeakRoom extends Room {
         ry: rng() * TAU, x, y: -4.2 + hgt * 0.8, z,
       });
     }
+    // A second, further range was tried here and taken out again: THIS ring
+    // already fills the sky where it would have gone. Sampling the top 12% of
+    // the default follow-cam frame from the default spawn, 1200 of 1200 samples
+    // land on the near ring at d = 54-59 and none on sky, so anything past it
+    // is occluded whatever its height.
+    // It was first removed for a framing reason that does not hold, and the
+    // arithmetic is left corrected here so nobody rebuilds on it: the peak's
+    // STATIC camera looks 38.8 degrees down, but 'static' is opt-in
+    // (engine.js:88 defaults cameraMode to 'follow'), and this room's follow
+    // camera looks 25.9 degrees down. Measured against it, the top of frame
+    // sits at y = +6.4 at 40 units beyond the player, +5.5 at 50, +4.7 at 60
+    // and +3.0 at 80 - well above the "y = 19 - 0.32 * distance" line that was
+    // written here, which is 5-10 units low at exactly those distances. Camera
+    // pitch across the cove runs 10.6-39.0 degrees static and 25.9-36.0 follow,
+    // and The Drift's frame has the true horizon inside it, so there is no
+    // cove-wide skyline rule. Project the apex through the room's OWN follow
+    // camera before adding anything to a skyline in this project.
     const mat = makeToon(0xffffff, { vertexColors: true, unique: true });
     mat.fog = false;
     const mesh = new THREE.Mesh(mergeParts(p), mat);

@@ -21,8 +21,18 @@
  *   7. kart-join from outside the speedway is refused; the lobby caps at 6
  *   8. handleMessage observes 'join' without consuming it and eats every kart-*
  *
+ * Wave GP adds the GRAND PRIX AMENDMENT's own list (§A9, tests 9-15):
+ *   9.  every registry row is well formed (11 boxes, clean checkpoints, >= 545)
+ *   10. a lap on glimmer needs all EIGHT checkpoints
+ *   11. the per-track 40.9 u/s clamp holds, above every track's sanity floor
+ *   12. the vote resolves plurality, ties by rotation, rotation moves on start
+ *   13. a repeat kart-join updates the preference in place
+ *   14. hazard claims are arbitrated, not trusted, and the frozen phase formula
+ *       matches the contract's table digit for digit
+ *   15. an unknown kart id is coerced to 'coco'
+ *
  * Plus the one the owner's law demands: a clean, honest, well-driven race is
- * paid in full and nothing anywhere truncates it.
+ * paid in full and nothing anywhere truncates it — on any of the four tracks.
  */
 
 import test from 'node:test';
@@ -49,8 +59,10 @@ function boot(opts = {}) {
   kart.install({
     now: () => clock,
     rng: () => { rngState = (rngState * 9301 + 0.49297) % 1; return rngState; },
-    sendTo: (p, m) => { sent.push({ to: p.id, ...m }); },
-    broadcastToRoom: (room, m) => { sent.push({ room, ...m }); },
+    // `_at` is the harness's own stamp (never the module's): it is what lets a
+    // test reason about the GAP between two frames, e.g. a hazard immunity.
+    sendTo: (p, m) => { sent.push({ to: p.id, _at: clock, ...m }); },
+    broadcastToRoom: (room, m) => { sent.push({ room, _at: clock, ...m }); },
     audit: (e) => { lines.push(e); },
     autoTick: false,
     ...opts,
@@ -96,6 +108,16 @@ function soloRace(p = player()) {
   run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
   const seat = kart.peek(p);
   assert.ok(seat.race, 'a race should be running');
+  return seat;
+}
+
+/** The same, on a named track: one voter is a plurality of one (§A5). */
+function soloRaceOn(trackId, p = player()) {
+  kart.handleMessage(p, { t: 'kart-join', track: trackId });
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  const seat = kart.peek(p);
+  assert.ok(seat.race, 'a race should be running');
+  assert.equal(seat.race.trackId, trackId, 'the lone vote wins');
   return seat;
 }
 
@@ -795,7 +817,9 @@ test('the server, not the client, decides what a kart run is worth', () => {
 
   me.lap = 2; me.cps = 63; me.q = 0.99; me.boxes = 4; me.bestLap = 14_000;
   race.bestLap = 14_000; race.bestLapSlot = me.slot;
-  advanceMs(10);
+  // a plausible three-lap time: comfortably over sunny's 36 s sanity floor
+  // (docs/KARTS.md §A9), which is what a real race always is
+  advanceMs(80_000);
   kart._internals.advance(race, me, 0.02, clock);
   assert.equal(me.place, 1);
   kart._internals.endRace(race, clock);
@@ -901,6 +925,548 @@ test('install() resets everything, so a restart never inherits a stale race', ()
   assert.equal(kart.stats().lobby, 0);
   assert.equal(kart.stats().races, 0);
   assert.equal(kart.peek(p).race, null);
+});
+
+// ---------------------------------------------------------------------------
+// GRAND PRIX AMENDMENT (docs/KARTS.md §A9 tests 9-15)
+//
+// 9.  every registry row is well formed: 11 boxes, a clean checkpoint count,
+//     LAP_UNITS >= 545
+// 10. a lap on glimmer needs all EIGHT checkpoints
+// 11. the 40.9 u/s ceiling holds per track, above every track's sanity floor
+// 12. the vote resolves plurality; a tie resolves by rotation, and the rotation
+//     advances only on race start
+// 13. a repeat kart-join updates the preference in place
+// 14. a hazard claim the server rejects declares no hit; a good one declares
+//     exactly one, by:null, and the immunity swallows the next
+// 15. an unknown kart id is coerced to 'coco' and never reaches kart-grid raw
+// ---------------------------------------------------------------------------
+
+test('9. every track row carries 11 boxes, a clean checkpoint count and a real lap', () => {
+  boot();
+  assert.deepEqual(Object.keys(kart.TRACKS), ['sunny', 'summit', 'tangle', 'glimmer']);
+  assert.deepEqual([...kart.TRACK_ORDER], ['sunny', 'summit', 'tangle', 'glimmer']);
+
+  for (const id of kart.TRACK_ORDER) {
+    const t = kart.TRACKS[id];
+    assert.equal(t.id, id);
+    assert.equal(typeof t.name, 'string');
+    assert.ok(t.LAP_UNITS >= 545, `${id} laps are at least as long as the shipped one`);
+    assert.ok(Number.isInteger(t.checkpoints) && t.checkpoints >= 6);
+    assert.equal(t.allCps, (1 << t.checkpoints) - 1);
+    assert.ok(t.floors >= 1 && Number.isInteger(t.floors));
+    assert.equal(t.gridSlots, 'standard');
+
+    // eleven boxes, in (q, lat), inside the road, in row order
+    assert.equal(t.itemBoxes.length, 11, `${id} has eleven boxes`);
+    for (const b of t.itemBoxes) {
+      assert.ok(b.q > 0 && b.q < 1, `${id} box q ${b.q}`);
+      assert.ok(Math.abs(b.lat) <= 1.0, `${id} box lat ${b.lat} is on the road`);
+    }
+    const qs = t.itemBoxes.map((b) => b.q);
+    assert.deepEqual(qs, [...qs].sort((a, b) => a - b), `${id} boxes are in row order`);
+    assert.equal(new Set(qs).size, 3, `${id} has three rows`);
+
+    // A single relay step can never skip a checkpoint or wrap twice: that is
+    // what makes the one-step advance() correct on every track.
+    assert.ok(t.maxQ * (kart.MAX_FRAME_DT_MS / 1000) < 1 / t.checkpoints,
+      `${id}: one clamped step (${t.maxQ * 1.5}) must stay under a checkpoint gap`);
+
+    // the clamp is the same 40.9 u/s of physical speed everywhere
+    assert.ok(Math.abs(t.maxQ - 40.9 / t.LAP_UNITS) < 1e-4, `${id} maxQ ${t.maxQ}`);
+
+    // the sanity floor sits BELOW what is physically reachable, so it can only
+    // ever fire on something that did not happen (the owner's law)
+    const arithmeticMin = (3 * t.LAP_UNITS / 40.9) * 1000;
+    assert.ok(t.minRunMs < arithmeticMin,
+      `${id}: floor ${t.minRunMs} must sit under the arithmetic minimum ${Math.round(arithmeticMin)}`);
+
+    // the AI table: 24 sectors, all in [12, 22], at least four real corners
+    assert.equal(t.aiSectors.length, 24, `${id} sector table`);
+    for (const s of t.aiSectors) assert.ok(s >= 12 && s <= 22, `${id} sector ${s}`);
+    assert.ok(t.aiSectors.filter((s) => s < 17).length >= 4, `${id} lifts for at least four corners`);
+  }
+
+  // sunny is untouched to the digit: a run of it must feel identical
+  assert.equal(kart.TRACKS.sunny.LAP_UNITS, 545);
+  assert.equal(kart.TRACKS.sunny.checkpoints, 6);
+  assert.equal(kart.TRACKS.sunny.maxQ, 0.075);
+  assert.deepEqual(kart.TRACKS.sunny.itemBoxes.map((b) => b.q),
+    [0.220, 0.220, 0.220, 0.220, 0.550, 0.550, 0.550, 0.790, 0.790, 0.790, 0.790]);
+  assert.deepEqual([...kart.TRACKS.sunny.aiSectors], [...kart.AI_SECTORS]);
+  assert.equal(kart.BOXES, kart.TRACKS.sunny.itemBoxes);
+});
+
+test('9b. the registry is metadata only: no spline, no mesh, no theme ever reaches the server', () => {
+  boot();
+  const allowed = new Set([
+    'id', 'name', 'LAP_UNITS', 'checkpoints', 'floors', 'minRunMs', 'gridSlots',
+    'itemBoxes', 'hazards', 'aiSectors', 'allCps', 'maxQ',
+  ]);
+  for (const id of kart.TRACK_ORDER) {
+    for (const key of Object.keys(kart.TRACKS[id])) {
+      assert.ok(allowed.has(key), `${id} carries '${key}', which is client geometry, not metadata`);
+    }
+    // and the elevation the amendment adds never appears here in any form
+    assert.equal(kart.TRACKS[id].points, undefined);
+    assert.equal(kart.TRACKS[id].theme, undefined);
+    assert.equal(kart.TRACKS[id].grip, undefined);
+    assert.equal(kart.TRACKS[id].jumps, undefined);
+  }
+});
+
+test('10. a lap on glimmer needs all EIGHT checkpoints, not six', () => {
+  boot();
+  const p = player();
+  const seat = soloRaceOn('glimmer', p);
+  const race = seat.race;
+  const r = seat.racer;
+  const { _internals } = kart;
+  assert.equal(race.checkpoints, 8);
+
+  // six of eight is what a sunny-shaped client would have collected: not a lap
+  r.q = 0.99; r.lap = 0; r.wraps = 1; r.cps = 0b00111111;
+  _internals.advance(race, r, 0.02, clock);
+  assert.equal(r.lap, 0, 'six bits is not a lap on an eight-checkpoint track');
+  assert.equal(r.cps, 1, 'and the bits reset for an honest attempt');
+
+  // now collect all eight in sequence
+  for (const cp of [1, 2, 3, 4, 5, 6, 7]) _internals.advance(race, r, (cp / 8 + 0.001) - r.q, clock);
+  assert.equal(r.cps, 0b11111111);
+  _internals.advance(race, r, 0.99 - r.q, clock);
+  _internals.advance(race, r, 0.02, clock);
+  assert.equal(r.lap, 1, 'eight in sequence is a lap');
+});
+
+test('11. the forward clamp holds per track: three laps always cost the full 40.9 u/s of time', () => {
+  for (const id of kart.TRACK_ORDER) {
+    boot();
+    const t = kart.TRACKS[id];
+    const p = player();
+    const seat = soloRaceOn(id, p);
+    const r = seat.racer;
+    const startedAt = clock;
+
+    // the same teleport-every-frame client as the shipped test, on every track
+    for (let i = 0; i < 1200; i++) {
+      advanceMs(100);
+      kart.handleMessage(p, { t: 'kart-in', q: (r.q + 0.4) % 1, lat: 0, yaw: 0, v: 999, d: 0 });
+      kart.tick(clock);
+      if (r.lap >= 3) break;
+    }
+    const elapsed = clock - startedAt;
+    assert.equal(r.lap, 3, `${id}: three laps do come, honestly paced`);
+    const floorMs = (3 * t.LAP_UNITS / 40.9) * 1000;
+    assert.ok(elapsed >= floorMs - 100,
+      `${id}: three laps took ${elapsed}ms, under the ${Math.round(floorMs)}ms the clamp demands`);
+    assert.ok(elapsed > t.minRunMs,
+      `${id}: ${elapsed}ms must clear the ${t.minRunMs}ms sanity floor, or the floor could bite an honest run`);
+    assert.ok(elapsed < floorMs + 6_000, `${id}: the clamp must not punish a real driver`);
+  }
+});
+
+test('11b. a race whose winner beats the track floor parks a zero and audits once', () => {
+  boot();
+  const p = player();
+  const seat = soloRaceOn('glimmer', p);
+  const race = seat.race;
+  const me = seat.racer;
+
+  // a finish that could not have happened: the third lap validating seconds
+  // after the lights, far under glimmer's 40.5 s floor
+  me.lap = 2; me.cps = race.allCps; me.q = 0.99;
+  advanceMs(5_000);
+  kart._internals.advance(race, me, 0.02, clock);
+  assert.equal(me.place, 1);
+  kart._internals.endRace(race, clock);
+
+  assert.equal(kart.peek(p).payout.coins, 0, 'an impossible race is worth nothing');
+  assert.equal(kart.peek(p).payout.score, 0);
+  const fast = lines.filter((l) => l.op === kart.OPS.FAST);
+  assert.equal(fast.length, 1, 'audited exactly once, log-only');
+  assert.equal(fast[0].args.track, 'glimmer');
+  assert.equal(fast[0].args.floor, kart.TRACKS.glimmer.minRunMs);
+});
+
+// ---------------------------------------------------------------------------
+// 12 + 13. the track vote
+// ---------------------------------------------------------------------------
+
+test('12. the vote resolves by plurality, and every track is always in the tally', () => {
+  boot();
+  const votes = ['summit', 'summit', 'tangle'];
+  for (const track of votes) kart.handleMessage(player(), { t: 'kart-join', track });
+  const board = lastOf('kart-lobby');
+  assert.deepEqual(board.votes, { sunny: 0, summit: 2, tangle: 1, glimmer: 0 });
+  assert.equal(board.track, 'summit', 'plurality wins');
+  assert.deepEqual(Object.keys(board.votes), [...kart.TRACK_ORDER], 'all four keys, always');
+  for (const row of board.players) {
+    assert.ok(kart.TRACK_ORDER.includes(row.track));
+    assert.ok(kart.KART_IDS.includes(row.kart));
+  }
+
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  const grid = lastOf('kart-grid');
+  assert.equal(grid.track, 'summit', 'the grid names the registry id, not an opaque label');
+  assert.equal(grid.trackName, 'Frosty Peak');
+  assert.equal(grid.laps, 3);
+});
+
+test('12b. a tie resolves by rotation, and the rotation advances only when a race starts', () => {
+  boot();
+  // 2-2: sunny and tangle. Rotation starts at 0 (sunny), so sunny takes it.
+  const a = player(); const b = player(); const c = player(); const d = player();
+  kart.handleMessage(a, { t: 'kart-join', track: 'sunny' });
+  kart.handleMessage(b, { t: 'kart-join', track: 'sunny' });
+  kart.handleMessage(c, { t: 'kart-join', track: 'tangle' });
+  kart.handleMessage(d, { t: 'kart-join', track: 'tangle' });
+  assert.deepEqual(lastOf('kart-lobby').votes, { sunny: 2, summit: 0, tangle: 2, glimmer: 0 });
+  assert.equal(lastOf('kart-lobby').track, 'sunny');
+  assert.equal(kart.stats().rotate, 0, 'a preference change never moves the rotation');
+
+  // changing a mind (and changing it back) still does not move it
+  kart.handleMessage(d, { t: 'kart-join', track: 'glimmer' });
+  kart.handleMessage(d, { t: 'kart-join', track: 'tangle' });
+  assert.equal(kart.stats().rotate, 0);
+
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  assert.equal(lastOf('kart-grid').track, 'sunny');
+  assert.equal(kart.stats().rotate, 1, 'the rotation moves on, once, at the lights');
+
+  // the very same 2-2 tie now falls to the next id at or after the rotation
+  const e = player(); const f = player(); const g = player(); const h = player();
+  for (const [pl, track] of [[e, 'sunny'], [f, 'sunny'], [g, 'tangle'], [h, 'tangle']]) {
+    kart.handleMessage(pl, { t: 'kart-join', track });
+  }
+  assert.equal(lastOf('kart-lobby').track, 'tangle', 'the tiebreak walked past sunny');
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  assert.equal(lastOf('kart-grid').track, 'tangle');
+  assert.equal(kart.stats().rotate, kart.TRACK_ORDER.indexOf('tangle') + 1);
+});
+
+test('12c. an empty sheet still advertises a real track, and a bad id is coerced', () => {
+  boot();
+  const board = lastOf('kart-lobby');
+  assert.equal(board, null, 'nothing is broadcast until something changes');
+  assert.equal(kart.lobbyPayload().track, 'sunny', 'an empty lobby resolves to the rotation');
+  assert.deepEqual(kart.lobbyPayload().votes, { sunny: 0, summit: 0, tangle: 0, glimmer: 0 });
+
+  const p = player();
+  kart.handleMessage(p, { t: 'kart-join', track: 'rainbow-road', kart: 'jetski' });
+  const row = lastOf('kart-lobby').players[0];
+  assert.equal(row.track, 'sunny', 'an unknown track is the default, never a crash');
+  assert.equal(row.kart, 'coco');
+  for (const bad of [null, 42, {}, [], '', '__proto__', 'constructor']) {
+    assert.equal(kart.coerceTrack(bad), 'sunny');
+    assert.equal(kart.coerceKart(bad), 'coco');
+  }
+  assert.equal(kart.trackOf('nope').id, 'sunny');
+});
+
+test('13. a repeat kart-join updates the preference in place, keeping sign-on order', () => {
+  boot();
+  const first = player();
+  const second = player();
+  kart.handleMessage(first, { t: 'kart-join', track: 'sunny', kart: 'reef' });
+  kart.handleMessage(second, { t: 'kart-join', track: 'summit', kart: 'fern' });
+  assert.equal(kart.stats().lobby, 2);
+  assert.equal(kart.peek(first).entry.order, 0, 'first to sign on');
+
+  // first changes their mind, twice
+  kart.handleMessage(first, { t: 'kart-join', track: 'glimmer', kart: 'dart' });
+  assert.equal(kart.stats().lobby, 2, 'no duplicate row');
+  assert.equal(kart.peek(first).entry.order, 0, 'and no lost pole');
+  assert.equal(kart.peek(first).entry.track, 'glimmer');
+  assert.equal(kart.peek(first).entry.kart, 'dart');
+  assert.deepEqual(lastOf('kart-lobby').votes, { sunny: 0, summit: 1, tangle: 0, glimmer: 1 });
+
+  // the fill window is measured from the ORIGINAL sign-on, not the change
+  const startsAt = lastOf('kart-lobby').startsAt;
+  advanceMs(4_000);
+  kart.handleMessage(first, { t: 'kart-join', track: 'tangle' });
+  assert.equal(lastOf('kart-lobby').startsAt, startsAt, 'changing your mind never delays the lights');
+  // and a frame that mentions only the track keeps the kart they picked
+  assert.equal(kart.peek(first).entry.kart, 'dart', 'an omitted field is sticky, never a reset');
+  assert.equal(kart.peek(first).entry.track, 'tangle');
+  kart.handleMessage(first, { t: 'kart-join', kart: 'biscuit' });
+  assert.equal(kart.peek(first).entry.track, 'tangle', 'and the same the other way round');
+  kart.handleMessage(first, { t: 'kart-join', kart: 'dart', track: 'glimmer' });
+
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  const grid = lastOf('kart-grid');
+  assert.equal(grid.slots[0].id, first.id, 'pole is still the first to sign on');
+  assert.equal(grid.slots[0].kart, 'dart', 'and they race the kart they last chose');
+  assert.equal(grid.slots[1].kart, 'fern');
+});
+
+// ---------------------------------------------------------------------------
+// 14. static hazards: the frozen phase formula, arbitrated by the server
+// ---------------------------------------------------------------------------
+
+test('14a. the phase formula reproduces the contract table exactly', () => {
+  boot();
+
+  // docs/KARTS.md §A2, transcribed column for column. If GP1's client table and
+  // this one ever drift apart, a vine is in two places at once and this fails.
+  // track  i kind      q     lat   dqAmp latAmp psi  wave period off   hq    hl
+  const TABLE = [
+    ['tangle', 0, 'vine', 0.180, 0.00, 0, 0.85, 0, 'sin', 3000, 0, 0.006, 0.34],
+    ['tangle', 1, 'vine', 0.205, 0.00, 0, 0.85, Math.PI, 'sin', 3000, 0, 0.006, 0.34],
+    ['tangle', 2, 'boulder', 0.470, -0.35, 0.055, 0, 0, 'saw', 5200, 0, 0.006, 0.40],
+    ['tangle', 3, 'boulder', 0.470, +0.40, 0.055, 0, 0, 'saw', 5200, 2600, 0.006, 0.40],
+    ['tangle', 4, 'vine', 0.720, 0.00, 0, 0.70, 0, 'sin', 2400, 1200, 0.006, 0.30],
+    ['glimmer', 0, 'cart', 0.310, 0.00, 0, 1.30, 0, 'sin', 4000, 0, 0.007, 0.42],
+    ['glimmer', 1, 'cart', 0.315, 0.00, 0, 1.30, Math.PI, 'sin', 4000, 2000, 0.007, 0.42],
+    ['glimmer', 2, 'cart', 0.660, 0.00, 0, 1.10, 0, 'sin', 3200, 800, 0.007, 0.42],
+  ];
+  for (const [track, i, kind, q, lat, dqAmp, latAmp, psi, wave, period, off, hq, hl] of TABLE) {
+    const h = kart.TRACKS[track].hazards[i];
+    assert.ok(h, `${track}/${i} is missing`);
+    assert.deepEqual(
+      [h.i, h.kind, h.q, h.lat, h.dqAmp, h.latAmp, h.psi, h.wave, h.period, h.off, h.hq, h.hl],
+      [i, kind, q, lat, dqAmp, latAmp, psi, wave, period, off, hq, hl],
+      `${track} hazard ${i} does not match the contract row`,
+    );
+  }
+  assert.equal(kart.TRACKS.tangle.hazards.length, 5, 'and no extras were invented');
+
+  const rows = kart.TRACKS.tangle.hazards;
+  assert.deepEqual(rows.map((h) => h.kind), ['vine', 'vine', 'boulder', 'boulder', 'vine']);
+  assert.equal(kart.TRACKS.glimmer.hazards.length, 3);
+  assert.equal(kart.TRACKS.sunny.hazards.length, 0, 'the beach throws nothing but peels');
+  assert.equal(kart.TRACKS.summit.hazards.length, 0, 'summit hazard is the ice, and ice is client feel');
+
+  // the reference implementation, written straight off docs/KARTS.md §A2
+  const frac = (v) => v - Math.floor(v);
+  const ref = (h, T) => {
+    const ph = frac((T + h.off) / h.period);
+    const w = h.wave === 'saw' ? (1 - 2 * ph) : Math.sin(2 * Math.PI * ph);
+    return {
+      q: frac(h.q + h.dqAmp * w),
+      lat: h.lat + h.latAmp * (h.psi ? Math.sin(2 * Math.PI * ph + h.psi) : w),
+    };
+  };
+  for (const id of ['tangle', 'glimmer']) {
+    for (const h of kart.TRACKS[id].hazards) {
+      for (let T = 0; T < 12_000; T += 37) {
+        const got = kart.hazardAt(h, T);
+        const want = ref(h, T);
+        assert.ok(Math.abs(got.q - want.q) < 1e-12, `${id}/${h.i} q at T=${T}`);
+        assert.ok(Math.abs(got.lat - want.lat) < 1e-12, `${id}/${h.i} lat at T=${T}`);
+      }
+    }
+  }
+
+  // the two paired vines really do swing in opposite phase (psi = PI)
+  const [v0, v1] = kart.TRACKS.tangle.hazards;
+  for (const T of [400, 900, 2100]) {
+    assert.ok(Math.abs(kart.hazardAt(v0, T).lat + kart.hazardAt(v1, T).lat) < 1e-12,
+      'the pair mirrors, so there is always a gap to thread');
+  }
+  // a boulder rolls in q and never leaves its lane
+  const b = kart.TRACKS.tangle.hazards[2];
+  assert.ok(Math.abs(kart.hazardAt(b, 0).q - (b.q + b.dqAmp)) < 1e-12, 'the saw starts at +1');
+  assert.equal(kart.hazardAt(b, 1234).lat, b.lat);
+});
+
+test('14. a rejected hz claim declares nothing; a good one declares exactly one, by:null', () => {
+  boot();
+  const p = player();
+  const seat = soloRaceOn('tangle', p);
+  const race = seat.race;
+  const r = seat.racer;
+  const vine = race.hazards[0];   // q 0.180, swings ±0.85 in lat, period 3000
+
+  // line the clock up with the phase where the vine hangs dead centre
+  const align = () => {
+    const T = clock - race.startAt;
+    advanceMs(vine.period - ((T % vine.period) + vine.period) % vine.period);
+  };
+  align();
+  assert.ok(Math.abs(kart.hazardAt(vine, clock - race.startAt).lat) < 1e-9, 'the vine is centred');
+
+  const mine = () => framesOf('kart-hit').filter((h) => h.s === r.slot);
+  r.q = vine.q;
+  sent = [];
+
+  // (a) a claim the server's own recomputation throws out: the kart is nowhere
+  // near the vine's lat. Silently ignored — never a refusal, never an audit.
+  kart.handleMessage(p, { t: 'kart-in', q: r.q, lat: 1.6, yaw: 0, v: 20, d: 0, hz: 0 });
+  assert.equal(mine().length, 0, 'a wrong claim buys nothing');
+  // (b) a claim for a hazard that is somewhere else entirely
+  advanceMs(100);
+  kart.handleMessage(p, { t: 'kart-in', q: r.q, lat: 0, yaw: 0, v: 20, d: 0, hz: 4 });
+  assert.equal(mine().length, 0, 'claiming the wrong hazard buys nothing');
+  // (c) junk indices never throw and never hit
+  for (const bad of [-1, 5, 99, 'x', null, {}, NaN]) {
+    advanceMs(10);
+    kart.handleMessage(p, { t: 'kart-in', q: r.q, lat: 0, yaw: 0, v: 20, d: 0, hz: bad });
+  }
+  assert.equal(mine().length, 0);
+  assert.equal(lines.filter((l) => String(l.op).startsWith('kart.anomaly')).length, 0,
+    'a mispredicted vine is not an anomaly and is never audited');
+
+  // (d) the real thing, on the phase where the vine is where the kart is
+  align();
+  kart.handleMessage(p, { t: 'kart-in', q: vine.q, lat: 0, yaw: 0, v: 20, d: 0, hz: 0 });
+  const hits = mine();
+  assert.equal(hits.length, 1, 'exactly one bonk');
+  assert.equal(hits[0].kind, 'haz');
+  assert.equal(hits[0].by, null, 'nobody threw it, so nobody is credited');
+  assert.equal(hits[0].ms, kart.HAZ_HIT_MS);
+  assert.equal(hits[0].ms, 900);
+  assert.equal(hits[0].i, vine.i);
+
+  // (e) a second claim inside the immunity window declares nothing
+  advanceMs(200);
+  kart.handleMessage(p, { t: 'kart-in', q: vine.q, lat: 0, yaw: 0, v: 20, d: 0, hz: 0 });
+  assert.equal(mine().length, 1, 'a boulder cannot chain-bonk one capy');
+  assert.ok(kart.HAZ_IMMUNE_MS === 1200);
+
+  // ...and once it lapses, the same vine can catch them again
+  advanceMs(kart.HAZ_IMMUNE_MS);
+  align();
+  kart.handleMessage(p, { t: 'kart-in', q: vine.q, lat: 0, yaw: 0, v: 20, d: 0, hz: 0 });
+  assert.equal(mine().length, 2, 'the hazard keeps swinging: it is not one-shot');
+});
+
+test('14b. a track with no hazard rows can never produce a hazard hit', () => {
+  boot();
+  const p = player();
+  const seat = soloRaceOn('sunny', p);
+  for (const hz of [0, 1, 2, 3, 4]) {
+    advanceMs(100);
+    kart.handleMessage(p, { t: 'kart-in', q: seat.racer.q, lat: 0, yaw: 0, v: 20, d: 0, hz });
+  }
+  run(5_000);
+  assert.equal(framesOf('kart-hit').filter((h) => h.kind === 'haz').length, 0);
+});
+
+test('14c. the server bonks its own AI unprompted, and never twice inside the immunity', () => {
+  boot();
+  const p = player();
+  const seat = soloRaceOn('tangle', p);
+  run(90_000, 100);
+  const hazHits = framesOf('kart-hit').filter((h) => h.kind === 'haz');
+  assert.ok(hazHits.length > 0, 'a lap of Tangle Ruins should catch somebody');
+  for (const h of hazHits) {
+    assert.equal(h.by, null);
+    assert.equal(h.ms, kart.HAZ_HIT_MS);
+    assert.notEqual(h.s, seat.racer.slot, 'a human is only ever judged on their own claim');
+  }
+  // never two bonks for the same kart inside the immunity window: a boulder
+  // that could chain-bonk would be a capy parked in a hedge for a whole lap
+  const last = new Map();
+  for (const h of hazHits) {
+    const prev = last.get(h.s);
+    if (prev !== undefined) {
+      assert.ok(h._at - prev >= kart.HAZ_IMMUNE_MS,
+        `slot ${h.s} was bonked twice ${h._at - prev}ms apart`);
+    }
+    last.set(h.s, h._at);
+  }
+  assert.equal(kart.stats().hazHits, hazHits.length, 'the counter and the wire agree');
+});
+
+// ---------------------------------------------------------------------------
+// 15. the kart roster
+// ---------------------------------------------------------------------------
+
+test('15. an unknown kart is coerced to coco and never reaches kart-grid raw', () => {
+  boot();
+  const p = player();
+  kart.handleMessage(p, { t: 'kart-join', kart: 'rocket-sled-9000' });
+  assert.equal(lastOf('kart-lobby').players[0].kart, 'coco');
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  const grid = lastOf('kart-grid');
+  assert.equal(grid.slots[0].kart, 'coco');
+  for (const s of grid.slots) {
+    assert.ok(kart.KART_IDS.includes(s.kart), `slot ${s.slot} rides '${s.kart}'`);
+  }
+  // AI are handed out round-robin, so the field is never five identical shells
+  const aiKarts = grid.slots.filter((s) => s.ai).map((s) => s.kart);
+  assert.ok(new Set(aiKarts).size >= 4, `a varied field, got ${aiKarts.join(',')}`);
+});
+
+test('15b. all five karts are accepted from anybody: unlocks are a ceremony, never a gate', () => {
+  boot();
+  assert.deepEqual([...kart.KART_IDS], ['coco', 'reef', 'biscuit', 'dart', 'fern']);
+  const ps = kart.KART_IDS.map((id) => {
+    const p = player();
+    kart.handleMessage(p, { t: 'kart-join', kart: id });
+    return p;
+  });
+  assert.equal(kart.stats().lobby, 5, 'nobody is refused a kart, and nobody is kicked');
+  assert.deepEqual(lastOf('kart-lobby').players.map((x) => x.kart), [...kart.KART_IDS]);
+  run(kart.KART_WAIT_MS + kart.GRID_LEAD_MS + kart.KART_LIGHTS_MS + 200);
+  assert.deepEqual(lastOf('kart-grid').slots.slice(0, 5).map((s) => s.kart), [...kart.KART_IDS]);
+  // and the results carry it, so a podium can show what everybody drove
+  const race = kart.peek(ps[0]).race;
+  kart._internals.endRace(race, clock + 90_000);
+  const humans = lastOf('kart-end').results.filter((r) => !r.ai);
+  assert.deepEqual(humans.map((r) => r.kart).sort(), [...kart.KART_IDS].sort());
+});
+
+// ---------------------------------------------------------------------------
+// the hard law, on every track
+// ---------------------------------------------------------------------------
+
+test('the AI hard law survives all four sector tables', () => {
+  boot();
+  for (const id of kart.TRACK_ORDER) {
+    const sectors = kart.TRACKS[id].aiSectors;
+    for (let skill = 0; skill <= 4; skill++) {
+      for (let qi = 0; qi < 240; qi++) {
+        for (const gap of [0, 100, 500, 1635, 100_000, -500, -1e6]) {
+          const v = kart.aiSpeed(skill, qi / 240, gap, false, sectors);
+          assert.ok(v <= kart.AI_SPEED_MAX + 1e-9, `${id} skill ${skill} gap ${gap} -> ${v}`);
+          assert.ok(v >= kart.AI_SPEED_MIN - 1e-9, `${id} -> ${v}`);
+          const boosted = kart.aiSpeed(skill, qi / 240, gap, true, sectors);
+          assert.ok(boosted <= kart.AI_BOOST_MAX + 1e-9, `${id} boosted -> ${boosted}`);
+        }
+      }
+    }
+  }
+  // 21.8 < the SLOWEST kart's V_MAX of 22.0 (§A4), so no kart choice and no
+  // track choice can ever put a player below the AI band
+  assert.ok(kart.AI_SPEED_MAX < 22.0);
+  assert.ok(kart.AI_BOOST_MAX < 32);
+});
+
+test('a full field of AI drives a real race on every track', () => {
+  for (const id of kart.TRACK_ORDER) {
+    boot();
+    const p = player();
+    const seat = soloRaceOn(id, p);
+    run(320_000, 100);
+    const end = lastOf('kart-end');
+    assert.ok(end, `${id}: the race ends on its own`);
+    assert.equal(end.track, id);
+    const finishers = end.results.filter((r) => r.ai && r.laps >= 3);
+    assert.equal(finishers.length, 5, `${id}: every AI completed three valid laps`);
+    for (const r of finishers) {
+      assert.ok(r.ms > kart.TRACKS[id].minRunMs, `${id}: AI time ${r.ms}ms beat the sanity floor`);
+      assert.ok(r.ms < 220_000, `${id}: AI race time ${r.ms}ms is implausible`);
+    }
+    assert.equal(seat.race.ended, true);
+  }
+});
+
+test('per-track item boxes are the ones a race actually uses', () => {
+  boot();
+  const p = player();
+  const seat = soloRaceOn('glimmer', p);
+  const race = seat.race;
+  assert.deepEqual(race.boxes.map((b) => b.q).slice(0, 4), [0.230, 0.230, 0.230, 0.230]);
+  const box = race.boxes[10];
+  assert.equal(box.q, 0.860);
+  // a sunny box coordinate is not a glimmer one: claiming there grants nothing
+  seat.racer.q = 0.790; seat.racer.lat = 0.62;
+  kart.handleMessage(p, { t: 'kart-box', box: 10 });
+  assert.equal(seat.racer.item, null, 'the shipped track\'s coordinates do not carry over');
+  seat.racer.q = box.q; seat.racer.lat = box.lat;
+  kart.handleMessage(p, { t: 'kart-box', box: 10 });
+  assert.ok(['peel', 'bubble', 'berry'].includes(seat.racer.item));
 });
 
 test('nothing in this module throws when the ctx is empty', () => {
