@@ -167,6 +167,21 @@ pop), friends get a coral ring/pin on the map and a join-them button in the
 panel (from fpresence). Sled: the gate lobby shows n/need + countdownAt, a
 Start Now button appears at 2+, and 'mgstart' for sled drops the sender from
 the gate board server-side before econ consumes it.
+Shipped Capy Karts (docs/KARTS.md is the FROZEN contract; read it before
+touching anything kart): room 'speedway' (paddock only; the circuit lives in
+the minigame), minigame 'kart' (MINIGAMES.kart, coins via the normal
+mgstart/score road, honest max 152 under maxCoinsPerRun 160). Frame family
+kart-join/leave/start-now/kart-in/kart-box/kart-use (client->server) and
+kart-lobby/grid/go/state/item/box/haz/hit/fx/lap/fin/end/board/resume
+(server->client), ALL handled in server/kart.js (index.js dispatch after
+econ; kart also observes 'join' and 'score' without consuming). Wire carries
+normalized lap progress q (=u/545), lat, yaw - never x/z. Hits are SERVER-
+ARBITRATED; AI is server-simulated and hard-capped below a perfect player;
+laps validate a checkpoint sequence with a forward-rate clamp (the cut-lap
+and speed-hack guard in one rule); standings rank VALIDATED laps, never raw
+line crossings. kart-resume restores a reconnecting racer (speedway.js parks
+it on game.__kartCtx.resume; kart.js applies it on mount; `lap` = laps
+COMPLETED, `laps` = race total).
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

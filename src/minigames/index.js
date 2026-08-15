@@ -11,4 +11,5 @@ export const GAMES = {
   cards: () => import('./games/cards.js').then((m) => m.CardsGame),
   prophunt: () => import('./games/prophunt.js').then((m) => m.PropHuntGame),
   doodle: () => import('./games/doodle.js').then((m) => m.DoodleGame),
+  kart: () => import('./games/kart.js').then((m) => m.KartGame),
 };

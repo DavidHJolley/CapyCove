@@ -18,6 +18,7 @@ import * as filter from './filter.js';
 import * as chatlog from './chatlog.js';
 import * as reports from './reports.js';
 import * as econ from './econ.js';
+import * as kart from './kart.js';
 import * as log from './log.js';
 import { flush, markSeen, adminSeed, renameAccount, banActive } from './db.js';
 import { writeJsonAtomic } from './store.js';
@@ -379,6 +380,7 @@ function joinRoom(p, roomId) {
   // the lobby only broadcasts on change, so a late arrival would stare at an
   // empty sign-up board until someone else joined or left
   if (roomId === SLED_ROOM) sendTo(p, lobbyPayload());
+  if (roomId === kart.ROOM) sendTo(p, kart.lobbyPayload());
   // and the den boards standing in THIS room, for the same reason
   if (DEN_ROOMS.includes(roomId)) sendTables(p, roomId);
   // ...and the party boards in the mine and the jungle
@@ -406,6 +408,7 @@ function leaveWorld(p) {
   if (p.room) leaveRoomSet(p);
   chatlog.drop(p); // covers every disconnect path, not just ws 'close'
   econ.dropPlayer(p);
+  kart.dropPlayer(p);
   world.players.delete(p.id);
   pushPresenceAbout(p); // runs after the delete, so friends see room: null
 }
@@ -482,6 +485,7 @@ chatlog.install({ audit: audit.log, recordFor });
 reports.install({ audit: audit.log, sendTo, recordFor, findEntity, chatlog });
 layouts.install({ sendTo, broadcastAll, recordFor, audit: audit.log });
 econ.install({ sendTo, audit: audit.log, recordFor });
+kart.install({ sendTo, broadcastToRoom, world, has, log, audit: audit.log });
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -2329,6 +2333,11 @@ wss.on('connection', (ws) => {
       if (p && m.t === 'mgstart' && m.game === 'sled') removeFromLobby(p);
       // wave 11: econ owns the run token. It consumes 'mgstart' and nothing else.
       if (p && econ.handleMessage(p, m)) return;
+      // Capy Karts: kart owns every kart-* frame. It also OBSERVES 'join'
+      // (walking out of the paddock drops your sign-on) and 'score' for game
+      // 'kart' (placement rewritten to the one the server assigned) without
+      // consuming either.
+      if (p && kart.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
           if (p) return;

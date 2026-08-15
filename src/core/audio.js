@@ -1567,11 +1567,15 @@ const DUCK_SFX = new Set(['pop', 'ding', 'chime']);
 
 // Which ground a room puts underfoot. Dynamic 'house:<owner>' rooms are wood
 // (handled in roomSurfaceKey); anything unknown falls back to stone.
+// The speedway shares the beach bed (same shoreline, same sun); the kart
+// minigame brings its own engine putter on top.
+TRACKS.speedway = TRACKS.beach;
+
 const STEP_SURFACE = {
   cafe: 'wood', lounge: 'wood', house: 'wood',
   beach: 'sand',
   peak: 'snow',
-  mine: 'stone', club: 'stone', drift: 'stone',
+  mine: 'stone', club: 'stone', drift: 'stone', speedway: 'stone',
   plaza: 'grass', jungle: 'grass',
 };
 
@@ -1781,6 +1785,7 @@ const ROOM_CHORDS = {
   mine: [50, 57, 62, 65],   // Dm
   jungle: [52, 59, 64, 67], // Em7
   drift: [50, 57, 62, 66],  // Dmadd9-ish, watery
+  speedway: [55, 59, 62, 67], // G, bright and revvy
 };
 
 function roomChord(id) {

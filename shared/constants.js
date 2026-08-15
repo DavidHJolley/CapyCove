@@ -2,7 +2,7 @@
 
 export const GAME_NAME = 'Capy Cove';
 
-export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'loft', 'mine', 'jungle', 'drift'];
+export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'loft', 'mine', 'jungle', 'drift', 'speedway'];
 export const DEFAULT_ROOM = 'plaza';
 
 export const ROOM_INFO = {
@@ -16,6 +16,7 @@ export const ROOM_INFO = {
   mine: { name: 'The Glimmer Mine', desc: 'Coins in the walls, hiders in the props' },
   jungle: { name: 'The Tangle Jungle', desc: 'Vines, ruins and doodles' },
   drift: { name: 'The Drift', desc: 'Deep water, soft light, one very big friend' },
+  speedway: { name: 'Capy Speedway', desc: 'Six karts, three laps, one very smug capybara' },
 };
 // NOTE: 'drift' deliberately has NO BOT_ZONES entry: citizens do not dive.
 
@@ -38,6 +39,9 @@ export const MINIGAMES = {
   connect4: { name: 'Four in a Row', room: 'lounge', maxCoinsPerRun: 60, minRunMs: 5_000, minMatchMs: 5_000, minMoves: 3 },
   cards: { name: 'Capy Clash', room: 'loft', maxCoinsPerRun: 100, minRunMs: 12_000, minMatchMs: 12_000, minMoves: 4 },
   prophunt: { name: 'Prop Hunt', room: 'mine', maxCoinsPerRun: 90, minRunMs: 9_000 },
+  // honest kart max is 152 (placement + laps + fastest lap + boxes), so 160
+  // never truncates honest play; three validated laps cannot beat ~40s
+  kart: { name: 'Capy Karts', room: 'speedway', maxCoinsPerRun: 160, minRunMs: 40_000 },
   doodle: { name: 'Capy Doodles', room: 'jungle', maxCoinsPerRun: 90, minRunMs: 10_000 },
 };
 
@@ -85,6 +89,7 @@ export const BOT_ZONES = {
   // as capys who had signed up for a hunt they were not in
   mine: { x: 1, z: 5.8, r: 3 },
   jungle: { x: 0, z: 3, r: 4.5 },
+  speedway: { x: 0, z: 3, r: 4.5 },
 };
 
 // Furniture catalog for player houses. Client builders live in

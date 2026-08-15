@@ -640,6 +640,7 @@ export class PlazaRoom extends Room {
       from_peak: new THREE.Vector3(0.9, 0, -9.4),
       from_cafe: new THREE.Vector3(9.44, 0, 1.45),
       from_club: new THREE.Vector3(6.72, 0, 8.21),
+      from_speedway: new THREE.Vector3(-6.5, 0, 6.5),
     };
     this.cameraHint = { offset: new THREE.Vector3(0, 15, 20), lookHeight: 1.2 };
     // Static camera: the whole cobbled circle, all three gate arches and the
@@ -1427,6 +1428,7 @@ export class PlazaRoom extends Room {
       { to: 'beach', x: -13, z: 0, name: 'Driftwood Beach' },
       { to: 'peak', x: 0, z: -13, name: 'Frosty Peak' },
       { to: 'cafe', x: 13, z: 2, name: 'The Smoothie Shack' },
+      { to: 'speedway', x: -9.2, z: 9.2, name: 'Capy Speedway' },
     ];
     const stone = makeToon(C.stone);
     const planeGeo = new THREE.PlaneGeometry(2.4, 0.8);

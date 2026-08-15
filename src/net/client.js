@@ -102,6 +102,8 @@ export class NetClient {
       // the server drops us from the sled lobby on disconnect, so clear the
       // lobby UI too rather than leaving a frozen roster of ghosts on the sign
       this.game.events.emit('lobby', { t: 'lobby', players: [], starting: false });
+      // same for the speedway sign-on sheet and the jumbotron roster
+      this.game.events.emit('kart-lobby', { t: 'kart-lobby', players: [], starting: false });
       // emit even when we never got as far as 'welcome': a first connection that
       // simply fails must not leave the HUD saying "paddling out" forever
       this.game.events.emit('net', 'offline');
@@ -302,6 +304,12 @@ export class NetClient {
       case 'a-ok': case 'a-err': case 'announce': case 'report': case 'dd-vote': case 'a-schat':
       // wave 12 co-presence: room populations + friends' whereabouts
       case 'pop': case 'fpresence':
+      // Capy Karts: the whole kart-* family rides through raw; the speedway
+      // room owns lobby/grid/resume/board, the racer owns the rest
+      case 'kart-lobby': case 'kart-grid': case 'kart-go': case 'kart-state':
+      case 'kart-board': case 'kart-item': case 'kart-box': case 'kart-haz':
+      case 'kart-hit': case 'kart-fx': case 'kart-lap': case 'kart-fin':
+      case 'kart-end': case 'kart-resume':
         game.events.emit(m.t, m);
         break;
       // ---- den tables / PvP matches (wave 4) -------------------------------

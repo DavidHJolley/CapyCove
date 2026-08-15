@@ -1089,6 +1089,7 @@ const MAP_SPOTS = [
   { id: 'jungle', bx: 48, by: 60, dir: 'left' },
   { id: 'drift', bx: 9, by: 68, dir: 'up' },
   { id: 'club', bx: 69, by: 80, dir: 'up' },
+  { id: 'speedway', bx: 30, by: 74, dir: 'up' },
 ];
 
 // The lodge window and chimney, as offsets from the lounge landmark centre in
