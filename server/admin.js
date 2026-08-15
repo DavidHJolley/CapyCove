@@ -53,6 +53,22 @@
  *     the orchestrator adds to src/net/client.js; it must NOT be a `chat`,
  *     which would be filtered, rate-limited and impersonatable).
  *
+ * Wave 12 adds the STAFF surface — the real menu the owner asked for — on the
+ * same road (`performOp`), with two new capabilities and no index.js edit:
+ *   client -> server
+ *     {t:'a-role',    <target>, role}           grant / revoke a staff role
+ *     {t:'a-staff'}                             the staff roster
+ *     {t:'a-schat',   text}                     one line to the staff channel
+ *     {t:'a-reports', state?, kind?, limit?, offset?}   the report queue
+ *     {t:'a-resolve', id, state?, note?}        close one report
+ *   server -> the SUBJECT of a role change (their open sessions, so a fresh
+ *     mod gets the panel without relogging)
+ *     {t:'a-role', role, caps, by, at}          + the usual {t:'toast'}
+ *   server -> every ONLINE session holding any capability
+ *     {t:'a-schat', from, role, text, at}       ephemeral, never stored
+ * Both subject frames need ONE line each in src/net/client.js (re-emit onto
+ * game.events); nothing else outside this file moves.
+ *
  * ---------------------------------------------------------------------------
  * DESIGN NOTES (judgment calls are marked DECISION)
  *
@@ -429,6 +445,16 @@ export function resolveTarget(m) {
     if (entity) {
       bot = !!entity.bot;
       if (!bot && ctx.recordFor) rec = ctx.recordFor(entity) || null;
+    }
+  }
+  // A GUEST has no record, so a name that found no account still has to reach
+  // the live world: "kick KickMeGuest" typed at a panel must land on the
+  // connected guest wearing that name. (Accounts resolve above; bots are found
+  // by a-who's id path and refused by the mutating ops themselves.)
+  if (!rec && !entity && typeof m.name === 'string' && m.name.trim() && ctx?.world?.players) {
+    const q = m.name.trim().toLowerCase();
+    for (const p of ctx.world.players.values()) {
+      if (!p.bot && !p.username && String(p.name || '').toLowerCase() === q) { entity = p; break; }
     }
   }
   if (!rec && !entity) return null;
