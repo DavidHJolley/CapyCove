@@ -280,6 +280,7 @@ function openEditor(game) {
   let dragOp = null;
   let dragStart = null;
   let marquee = null;
+  let lastCluster = null;           // whole-prop click selection; Tab drills into it
   let lastPick = null;
   let hint = null;
 
@@ -1414,6 +1415,83 @@ function openEditor(game) {
     return b.applyMatrix4(mesh.matrixWorld);
   }
 
+  // ===========================================================================
+  // prop clusters: what a player means by "the bench"
+  //
+  // Rooms batch identical parts for draw calls (all plank instances in one
+  // InstancedMesh, all legs in another), so no scene object knows that plank #5
+  // and legs #5 are one bench. Recover it geometrically: parts whose bounds
+  // touch (within EPS) are one prop, found by union-find over a coarse grid.
+  // Built lazily per scene, from the room's built layout; parts the session has
+  // since dragged apart keep their original grouping, which is what you want.
+  // ===========================================================================
+
+  let clusterIdx = null;
+
+  const elemKey = (obj, instanceId, pieceIndex) =>
+    obj.uuid + (instanceId != null ? `#${instanceId}` : pieceIndex != null ? `:p${pieceIndex}` : '');
+
+  function buildClusters() {
+    const elems = [];
+    for (const child of engine.scene.children) {
+      if (!isPickable(child)) continue;
+      if (child.isInstancedMesh) {
+        const g = child.geometry;
+        if (!g.boundingBox) g.computeBoundingBox();
+        for (let i = 0; i < child.count; i++) {
+          child.getMatrixAt(i, _m);
+          const b = new THREE.Box3().copy(g.boundingBox).applyMatrix4(_m).applyMatrix4(child.matrixWorld);
+          elems.push({ obj: child, instanceId: i, box: b });
+        }
+        continue;
+      }
+      const pk = child.isMesh && child.geometry ? piecesOf(child.geometry) : null;
+      if (pk && pk.pieces.length > 1) {
+        pk.pieces.forEach((p, i) => elems.push({ obj: child, piece: p, pieceIndex: i, pack: pk, box: pieceBox(child, p) }));
+        continue;
+      }
+      const b = new THREE.Box3().setFromObject(child);
+      if (!b.isEmpty()) elems.push({ obj: child, box: b });
+    }
+    const EPS = 0.06, CELL = 2.5;
+    const parent = elems.map((_, i) => i);
+    const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+    const grid = new Map();
+    elems.forEach((el, i) => {
+      el.eb = el.box.clone().expandByScalar(EPS);
+      for (let cx = Math.floor(el.eb.min.x / CELL); cx <= Math.floor(el.eb.max.x / CELL); cx++) {
+        for (let cz = Math.floor(el.eb.min.z / CELL); cz <= Math.floor(el.eb.max.z / CELL); cz++) {
+          const k = `${cx},${cz}`;
+          let bucket = grid.get(k);
+          if (!bucket) grid.set(k, bucket = []);
+          for (const j of bucket) {
+            if (el.eb.intersectsBox(elems[j].eb)) { const a = find(i), b2 = find(j); if (a !== b2) parent[b2] = a; }
+          }
+          bucket.push(i);
+        }
+      }
+    });
+    const byKey = new Map(), groups = new Map();
+    elems.forEach((el, i) => {
+      const r = find(i);
+      let g = groups.get(r);
+      if (!g) groups.set(r, g = []);
+      g.push(el);
+      byKey.set(elemKey(el.obj, el.instanceId ?? null, el.pieceIndex ?? null), r);
+    });
+    clusterIdx = { scene: engine.scene, byKey, groups };
+  }
+
+  function clusterFor(obj, instanceId, pieceIndex) {
+    if (!clusterIdx || clusterIdx.scene !== engine.scene) buildClusters();
+    const r = clusterIdx.byKey.get(elemKey(obj, instanceId ?? null, pieceIndex ?? null));
+    return r == null ? null : clusterIdx.groups.get(r);
+  }
+
+  const clusterEntry = (el) => (el.instanceId != null ? makeEntry(el.obj, el.instanceId)
+    : el.piece ? makeEntry(el.obj, null, el.piece, el.pieceIndex, el.pack.pieces.length)
+      : makeEntry(el.obj));
+
   function isGround(obj) {
     const gm = room?.groundMeshes || [];
     let o = obj;
@@ -1516,21 +1594,40 @@ function openEditor(game) {
 
   function applyDelta(d, record = true) {
     if (!selection.length) return;
-    for (const e of selection) {
-      entryDelta(e, d);
+    // Rotating or resizing MANY parts acts about the selection's shared centre,
+    // so a bench turns like a bench instead of each plank spinning in place.
+    // The undo replay stays exact: the centre is recomputed at apply time, and
+    // rotating about a centre keeps that centre fixed, so the inverse delta
+    // finds the same pivot (shifted by its own dx/dz) and lands parts back.
+    let per = null;
+    if (selection.length > 1 && ((d.dyaw || 0) !== 0 || (d.ds || 1) !== 1)) {
+      const c = new THREE.Vector3();
+      const tmp = new THREE.Vector3();
+      for (const e of selection) c.add(entryPos(e, tmp));
+      c.divideScalar(selection.length);
+      const rot = new THREE.Matrix4().makeRotationY(d.dyaw || 0);
+      per = selection.map((e) => {
+        const p = entryPos(e, new THREE.Vector3());
+        const target = p.clone().sub(c).applyMatrix4(rot).multiplyScalar(d.ds || 1).add(c);
+        return { dx: (d.dx || 0) + target.x - p.x, dy: (d.dy || 0) + target.y - p.y, dz: (d.dz || 0) + target.z - p.z, dyaw: d.dyaw || 0, ds: d.ds || 1 };
+      });
+    }
+    selection.forEach((e, i) => {
+      const de = per ? per[i] : d;
+      entryDelta(e, de);
       const cur = entryPos(e);
       const st = entryState(e);
       const rec = edits.get(e.path);
       if (rec) { rec.to = [cur.x, cur.y, cur.z]; rec.toRot = st.rot; rec.toScale = st.scale; } else {
         edits.set(e.path, {
           label: e.label, entry: e,
-          from: [cur.x - (d.dx || 0), cur.y - (d.dy || 0), cur.z - (d.dz || 0)],
+          from: [cur.x - (de.dx || 0), cur.y - (de.dy || 0), cur.z - (de.dz || 0)],
           to: [cur.x, cur.y, cur.z],
-          fromRot: st.rot - (d.dyaw || 0), toRot: st.rot,
-          fromScale: st.scale / (d.ds || 1), toScale: st.scale,
+          fromRot: st.rot - (de.dyaw || 0), toRot: st.rot,
+          fromScale: st.scale / (de.ds || 1), toScale: st.scale,
         });
       }
-    }
+    });
     if (record) inspectUndo.push({ kind: 'delta', entries: selection.slice(), d });
     showBoxes();
     paint();
@@ -1721,12 +1818,27 @@ function openEditor(game) {
     const h = list[index];
     const chain = topChain(h.object);
     const levels = levelsFor(chain, h.instanceId ?? null, h.faceIndex ?? null);
-    // An InstancedMesh's "whole prop" is the room's ENTIRE batch (every bench
-    // at once), so a click starts at the single instance that was hit; Tab
-    // still wraps up to the batch. Authored groups and welded pieces keep the
-    // whole-prop-first order, where depth 0 really is one prop.
-    const depth = levels[levels.length - 1]?.kind === 'instance' ? levels.length - 1 : 0;
-    selectEntries([entryFromLevel({ chain, levels, depth })]);
+    const leaf = levels[levels.length - 1];
+    const batched = leaf?.kind === 'instance' || leaf?.kind === 'piece';
+    // A click means "this prop": batched parts (instances, welded pieces) whose
+    // bounds touch are selected together, so a bench made of a plank instance
+    // and a legs instance grabs as one bench. Tab drills to the single part.
+    const group = clusterFor(
+      batched ? chain[chain.length - 1] : chain[0],
+      leaf?.kind === 'instance' ? leaf.instanceId : null,
+      leaf?.kind === 'piece' ? leaf.pieceIndex : null,
+    );
+    const depth = leaf?.kind === 'instance' ? levels.length - 1 : 0;
+    const hit = { chain, levels, depth };
+    if (group && group.length > 1 && group.length <= 64) {
+      const entries = group.map(clusterEntry);
+      lastCluster = { entries, hit };
+      selectEntries(entries);
+      startInspectDrag(e);
+      return;
+    }
+    lastCluster = null;
+    selectEntries([entryFromLevel(hit)]);
     startInspectDrag(e);
   }
 
@@ -1984,8 +2096,18 @@ function openEditor(game) {
       '-': () => applyDelta({ ds: e.shiftKey ? 0.8 : 0.95 }),
       '=': () => applyDelta({ ds: e.shiftKey ? 1.25 : 1.0526 }),
       Tab: () => {
+        // a whole-prop cluster drills into the part that was clicked first;
+        // Shift+Tab from a lone part climbs back out to its whole prop
+        if (selection.length > 1 && lastCluster && selection === lastCluster.entries) {
+          selectEntries([entryFromLevel(lastCluster.hit)]);
+          return;
+        }
         const nav = selection[0]?.nav;
         if (!nav || selection.length !== 1) return;
+        if (e.shiftKey && lastCluster && nav === lastCluster.hit) {
+          selectEntries(lastCluster.entries);
+          return;
+        }
         const next = ((nav.depth + (e.shiftKey ? -1 : 1)) % nav.levels.length + nav.levels.length) % nav.levels.length;
         selectEntries([entryFromLevel({ ...nav, depth: next })]);
       },
@@ -2326,7 +2448,7 @@ function openEditor(game) {
 
     const info = document.createElement('div');
     info.className = 'ed-sel';
-    if (selection.length > 1) info.innerHTML = `${selection.length} objects selected<br><span>they move together; rotate and resize about their own centres</span>`;
+    if (selection.length > 1) info.innerHTML = `${selection.length} parts selected${lastCluster && selection === lastCluster.entries ? ' (one prop)' : ''}<br><span>they move, rotate and resize as one, about the group centre - Tab drills to a single part</span>`;
     else if (selection.length === 1) {
       const e = selection[0];
       const c = entryPos(e);
