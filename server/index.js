@@ -21,6 +21,7 @@ import * as econ from './econ.js';
 import * as kart from './kart.js';
 import * as events from './events.js';
 import * as charms from './charms.js';
+import * as courier from './courier.js';
 import * as stats from './stats.js';
 import * as log from './log.js';
 import { flush, markSeen, adminSeed, renameAccount, banActive } from './db.js';
@@ -243,7 +244,9 @@ app.get('/api/me', (req, res) => {
 // `rooms` counts the live room sets: the fixed ROOM_IDS plus however many dens
 // currently have someone standing in them. Handy for spotting a den that failed
 // to get reaped when its last visitor left.
-app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, sockets: wss.clients.size, audit: audit.stats(), econ: econ.stats(), events: events.eventStats(), charms: charms.stats(), stats: stats.stats(), ...log.health() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, sockets: wss.clients.size, audit: audit.stats(), econ: econ.stats(), events: events.eventStats(), charms: charms.stats(), courier: courier.stats(), stats: stats.stats(), ...log.health() }));
+// public, no auth: the title screen's "this week in the cove" line
+app.get('/api/now', (_req, res) => { res.set('Cache-Control', 'public, max-age=60'); res.json(events.frame()); });
 app.get('/api/layout/:room', (req, res) => layouts.httpGet(req, res));
 
 // dev-only: lets automated playtests save canvas captures to disk
@@ -499,6 +502,11 @@ kart.install({ sendTo, broadcastToRoom, world, has, log, audit: audit.log });
 events.install({ sendTo, broadcastAll, recordFor, audit: audit.log });
 charms.install({ users, saveSoon, grantCoins, sendTo, broadcastAll, broadcastToRoom, recordFor, audit: audit.log, requireCap: admin.requireCap });
 stats.install({ recordFor }); // wave 13B: the aggregate tee (data/stats/, npm run report)
+courier.install({
+  sendTo, charms, stats, events, kart,
+  clean: (s) => filter.check(s, { mask: true }).cleaned,
+  log: (msg, err) => console.warn(`[courier] ${msg}`, err?.message || err || ''),
+});
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -2373,6 +2381,8 @@ wss.on('connection', (ws) => {
       if (p && events.handleMessage(p, m)) return;
       // wave 13E: the weekly charm hunt owns 'charm', 'charm-claim', 'a-charm'
       if (p && charms.handleMessage(p, m)) return;
+      // wave 14A: the Cove Courier owns 'courier' (a read) and nothing else.
+      if (p && courier.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
           if (p) return;
@@ -3184,6 +3194,12 @@ setInterval(() => {
   }
   try { events.tick(Date.now()); } catch (e) {
     console.error('[events] tick failed:', e?.message || e);
+  }
+  try {
+    const printed = courier.tick(Date.now());
+    if (printed) broadcastAll({ t: 'courier-new', week: printed.week, issueN: printed.issueN, headline: printed.headline });
+  } catch (e) {
+    console.error('[courier] tick failed:', e?.message || e);
   }
 }, CLOCK_MS);
 

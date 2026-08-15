@@ -305,6 +305,8 @@ export class NetClient {
       // wave 13: the calendar bus, the consignment stall, the dye receipt,
       // and the weekly charm hunt (src/world/charm.js + src/ui/events.js)
       case 'events': case 'shop-rot': case 'dye': case 'charm': case 'charm-found':
+      // wave 14: the weekly paper (server/courier.js, src/ui/courier.js)
+      case 'courier': case 'courier-new':
       // wave 12 co-presence: room populations + friends' whereabouts
       case 'pop': case 'fpresence':
       // Capy Karts: the whole kart-* family rides through raw; the speedway

@@ -203,6 +203,18 @@ renders the glint via src/world/charm.js attachCharm (engine calls it beside
 attachOverlay). Stats (server/stats.js) tee off signal/grantCoins/sessions/
 buy sinks into data/stats/ NDJSON; npm run report prints the twelve numbers;
 aggregates only, never content, never per-player rows.
+Shipped wave 14 (the Cove Courier + launch polish): `courier` (client->server
+read, rate-limited) -> `courier` {week, issueN, headline, printedAt,
+nextPrintAt, articles:[{k,h,body}]}; `courier-new` broadcast once at print
+time. The paper prints FRIDAY 10:00 America/New_York (server/courier.js,
+dispatch after charms), is assembled once per week from charms/stats/events/
+kart and cached immutably; every source is optional (a missing source drops
+its article, never the issue); the only named credit is the week's fastest
+kart lap, filtered and vetoable at render time, and an absent count prints NO
+number, never zero. Reader UI src/ui/courier.js (cove-timezone dates), plaza
+newsstand src/world/newsstand.js. Public GET /api/now (no auth, 60s cache) is
+events.frame() for the title screen's "this week in the cove" line; the
+first-run tour covers the remap, the map, the speedway and the quest board.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

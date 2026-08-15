@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
+import { buildNewsstand } from '../newsstand.js';
 // The mural overlay publishes the grid size, the palette and the decoder for
 // exactly this reason: the in-world wall must paint the SAME pixels the overlay
 // paints, and an index is the wire contract, so a second copy of the palette
@@ -619,6 +620,7 @@ export class PlazaRoom extends Room {
     this._buildTopiary(scene);
     this._buildQuestBoard(scene);
     this._buildMural(scene, game);
+    this.anim.newsstand = buildNewsstand(scene, game, this);
     this._buildShop(scene);
     this._buildGates(scene);
     this._buildClubEntrance(scene);
@@ -1815,6 +1817,7 @@ export class PlazaRoom extends Room {
     if (!a) return;
     this.t += dt;
     const t = this.t;
+    if (this.anim.newsstand) this.anim.newsstand.update(dt);
 
     // ---- world clock: run the phase locally, ease onto the server's value.
     // Frames land every 10s; interpolating between them keeps the sky moving

@@ -1,13 +1,13 @@
 import { Vector3 } from 'three';
 
 /**
- * First-run guided tour: five cozy tooltip cards that teach the cove by doing.
+ * First-run guided tour: six cozy tooltip cards that teach the cove by doing.
  *
  * Rules this file lives by:
  *  - Nothing advances on a timer alone. Each beat waits for the player to
- *    actually walk, travel, open the map, wander up to a game, or dress up.
- *    (Two beats have an 8s mercy release so a player who ignores them is never
- *    stuck; the first three have none.)
+ *    actually walk, travel, open the map, wander up to a game, find the quest
+ *    board, or dress up. (The last three beats have an 8s mercy release so a
+ *    player who ignores them is never stuck; the first three have none.)
  *  - The cards NEVER take input. `.tour-card` is pointer-events:none, and only
  *    the little "skip tour" button opts back in, so every click still reaches
  *    the world underneath.
@@ -168,6 +168,11 @@ const isExit = (h) => typeof h?.id === 'string' && h.id.startsWith('exit-');
 const GAME_ID = /^(play-|race-join|hunt-|doodle-|table-)|^(pong|shuffle|connect4|chess|cards)$/;
 const isGame = (h) => typeof h?.id === 'string' && !isExit(h) && GAME_ID.test(h.id);
 
+// The plaza's notice board, redressed as the Quest Board (plaza.js hotspot
+// 'quest-board'). It only exists in the plaza, so the beat that teaches it has
+// to work from anywhere and simply name the place when the board is elsewhere.
+const isBoard = (h) => h?.id === 'quest-board';
+
 /** Nearest hotspot to the player that passes `pick`, or null. */
 function nearestHotspot(engine, pick) {
   const room = engine?.room;
@@ -198,6 +203,10 @@ function dressUpOpen() {
   return !!document.querySelector('.shop-overlay, .pf-overlay');
 }
 
+function questsOpen() {
+  return !!document.querySelector('.qb-overlay');
+}
+
 function menusOpen(game) {
   return !!game.activeMinigame || mapOpen() || !!document.querySelector(MODAL_SEL);
 }
@@ -205,13 +214,19 @@ function menusOpen(game) {
 // --- the beats --------------------------------------------------------------
 // Each beat: copy, an anchor resolved fresh every frame, and a `done` test.
 // `mercy` (seconds) is the only way a beat can pass without the player acting,
-// and only beats 4 and 5 have one.
+// and only the last three beats have one.
+//
+// EVERY string below is checked against the shipped game before it ships: the
+// two-button walk/interact scheme (engine._onPointer, CLAUDE.md "Shipped input
+// remap"), the map's live head counts and friend rings (hud.js buildMap, the
+// wave-12 `pop`/`fpresence` frames), Capy Speedway, and the plaza quest board.
+// A tour that teaches a control the game no longer has is worse than no tour.
 
 const BEATS = [
   {
     id: 'walk',
     title: 'Right-click the cobbles to waddle',
-    body: 'Aim at any patch of ground with the RIGHT mouse button and your capy ambles over. Hold it down to steer. (On a touch screen, just tap.)',
+    body: 'Aim at any patch of ground with the RIGHT mouse button and your capy ambles over; hold it down to steer. LEFT click is for touching things: capys, props and prompts. (On a touch screen, tap for both.)',
     anchor: (t) => {
       const s = project(t.engine, t.engine?.playerAvatar?.group?.position, 3.1);
       return s && { ...s, side: 'down' };
@@ -223,7 +238,7 @@ const BEATS = [
       // very first thing we teach must not be the wrong button.
       if (t.engine?.walkButton === 'left') {
         t.say('Click the cobbles to waddle',
-          'Tap any patch of ground and your capy ambles over. No arrow keys needed.');
+          'Tap any patch of ground and your capy ambles over, and clicking a capy or a prop touches it instead. No arrow keys needed.');
       }
     },
     done(t) {
@@ -251,14 +266,14 @@ const BEATS = [
   {
     id: 'map',
     title: 'Press M or the Map button',
-    body: 'The island map shows every spot in the cove, and where you are on it.',
+    body: 'Every pin is a place - tap one to head over, and a coral ring means a friend is there. The newest pin is Capy Speedway: six karts, three laps, one very smug capybara.',
     anchor: () => domAnchor('btn-map', 'down'),
     done: () => mapOpen(),
   },
   {
     id: 'games',
     title: 'That glowing prompt is a game',
-    body: 'Every location has one. Waddle up to it and it will ask you to play.',
+    body: 'There are eleven of them around the island. Waddle up to one and it will ask you to play.',
     aim: true,
     mercy: 8,
     start(t) {
@@ -276,6 +291,34 @@ const BEATS = [
       return s && { ...s, side: 'down' };
     },
     done(t) {
+      const h = t.spot;
+      const p = t.engine?.playerAvatar?.group?.position;
+      if (!h || !p) return false;
+      return Math.hypot(p.x - h.position.x, p.z - h.position.z) <= (h.radius || 2.5) + 1.2;
+    },
+  },
+  {
+    id: 'quests',
+    title: 'The quest board pays for playing',
+    body: 'It stands in Sunny Plaza: fresh little jobs every morning, coins for each, and a streak that grows every day you come back.',
+    mercy: 8,
+    // No aim disc. The board only exists in the plaza, and a gold disc parked on
+    // the player's own head while the copy says "over in Sunny Plaza" would be
+    // pointing at the wrong thing.
+    start(t) {
+      if (nearestHotspot(t.engine, isBoard)) {
+        t.say('That cork board is the Quest Board',
+          'Fresh little jobs every morning, coins for each, and a streak that grows every day you come back. Waddle up and read it.');
+      }
+    },
+    anchor: (t) => {
+      const h = nearestHotspot(t.engine, isBoard);
+      t.spot = h;
+      const s = project(t.engine, h ? h.position : t.engine?.playerAvatar?.group?.position, h ? 2.1 : 3.1);
+      return s && { ...s, side: 'down' };
+    },
+    done(t) {
+      if (questsOpen()) return true;
       const h = t.spot;
       const p = t.engine?.playerAvatar?.group?.position;
       if (!h || !p) return false;
