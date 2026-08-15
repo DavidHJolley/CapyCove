@@ -2247,7 +2247,9 @@ wss.on('connection', (ws) => {
             const rec = users.get(username.toLowerCase());
             if (rec) {
               markSeen(rec);
-              const banned = admin.banMessage?.(rec) || (banActive(rec) ? 'This account is banned' : null);
+              // banMessage always returns a line (even "not banned"); gate on
+              // banActive FIRST or every clean login is denied
+              const banned = banActive(rec) ? (admin.banMessage?.(rec) || 'This account is banned') : null;
               if (banned) return sendTo({ ws }, { t: 'denied', msg: banned });
             }
             profile = publicProfile(rec);
