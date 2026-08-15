@@ -13,7 +13,9 @@ import { visitHouse } from '../net/client.js';
 
 // How to play, in the order a new capybara needs it.
 const HOW_TO = [
-  ['Click', 'Click the ground to waddle over there.'],
+  ['Move', 'RIGHT-click the ground to waddle over there, or hold the button down to steer. On a touch screen, tap.'],
+  ['Click', 'LEFT click is for the world: a capybara opens their player card, the beach ball bops, a prompt starts a game.'],
+  ['T', 'Up on Frosty Peak: hold T to pack a snowball, aim with the mouse, let go to throw.'],
   ['W', 'Wave at whoever is nearby.'],
   ['D', 'Dance. Press it again to stop (you will not want to).'],
   ['M', 'Open the island map and hop to any room.'],

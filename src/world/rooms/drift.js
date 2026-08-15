@@ -1636,10 +1636,20 @@ export class DriftRoom extends Room {
 
   // -------------------------------------------------------------- movement --
 
+  /**
+   * Swimming follows the island's input map (engine WALK_KEY): the RIGHT button
+   * moves you, the LEFT button is for the things down here you can touch (Big
+   * Blue, the bottle). Touch, and the classic left-walk setting, keep the old
+   * one-button behaviour where the same press does both.
+   */
   _pointer(e) {
     const game = this._game;
     const eng = game?.engine;
-    if (!eng || eng.paused || game.activeMinigame || e.button !== 0 || !this._swim) return;
+    if (!eng || eng.paused || game.activeMinigame || !this._swim) return;
+    const swimBtn = eng.walkButtonFor ? eng.walkButtonFor(e) : 0;
+    const isSwim = e.button === swimBtn;
+    const isInteract = e.button === 0;
+    if (!isSwim && !isInteract) return;
     _ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
     this._ray.setFromCamera(_ndc, eng.camera);
     // the engine already turns a click on another capy into a profile card
@@ -1647,13 +1657,17 @@ export class DriftRoom extends Room {
 
     const hits = this._ray.intersectObjects(this._clickTargets(), false);
     const hit = hits.length ? hits[0] : null;
-    if (hit && hit.object === this._whaleBody) {
+    // climbing onto the whale is an interaction; a swim press aimed at her just
+    // swims you over to say hello
+    if (isInteract && hit && hit.object === this._whaleBody) {
       this._beginMount();
       return;
     }
+    if (hit && hit.object === this._bottleMesh) this._claimBottle();
+    if (!isSwim) return;
+
     if (this._riding) this._dismount();
     this._mountPending = false;
-    if (hit && hit.object === this._bottleMesh) this._claimBottle();
 
     this._swim.setTarget(this._aim(hit, _v));
     this._showMark(this._swim.target);
@@ -1771,7 +1785,8 @@ export class DriftRoom extends Room {
     this._avatar?.setAnim('ride');
     this._sendPose('sit', 1);
     this._game.audio?.play?.('success');
-    this._game.toast?.('You are riding Big Blue. Click the water to hop off.');
+    const off = this._game.engine?.walkButton === 'left' ? 'Click' : 'Right-click';
+    this._game.toast?.(`You are riding Big Blue. ${off} the water to hop off.`);
   }
 
   _dismount() {
@@ -1942,9 +1957,11 @@ export class DriftRoom extends Room {
       // Reset our wire pose: a capy who arrives still flagged 'sit' from a
       // bench or a chairlift would otherwise read as a rider to everyone else.
       this._sendPose('idle');
+      // the swim press is whatever walking is bound to (Settings > Walking)
+      const press = this._game.engine?.walkButton === 'left' ? 'Click' : 'Right-click';
       this._game.toast?.(
-        'Click where you want to swim. Scroll (or up/down) to rise and sink, '
-        + 'left/right to look around.',
+        `${press} where you want to swim. Scroll (or up/down) to rise and `
+        + 'sink, left/right to look around.',
         5600,
       );
     }

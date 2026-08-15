@@ -1,4 +1,4 @@
-import { ROOM_INFO, GAME_NAME } from '../../shared/constants.js';
+import { ROOM_INFO, GAME_NAME, MINIGAMES } from '../../shared/constants.js';
 import { stampById, paintStampCanvas } from './profile.js';
 import { visitHouse } from '../net/client.js';
 
@@ -123,11 +123,165 @@ const COVE_CSS = `
 }
 `;
 
+// ---------------------------------------------------------------------------
+// wave 12 shell: co-presence. Who is where, painted where the player already
+// looks: counts on the map pills, a lobby strip under the island, one travelling
+// chip in the world, a live count on the room chip and a marker where a friend
+// is standing. Same reasoning as the wave 7 block above: the whole feature is
+// one file, so its styles live with it instead of in styles.css.
+// ---------------------------------------------------------------------------
+
+const COVE12_CSS = `
+/* A capybara head is the unit the island counts in: a rounded blob with two
+   ears, 8px wide, legible on the cream pills and on the dark chip alike. */
+.pop-capy, .pip {
+  display: block; width: 8px; height: 7px; border-radius: 46% 46% 52% 52%; flex: none;
+}
+.pip { background: rgba(45, 36, 23, 0.16); box-shadow: inset 0 0 0 1px rgba(45, 36, 23, 0.09); }
+.pop-capy {
+  position: relative; background: #a2743f;
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.3);
+}
+.pop-capy::before, .pop-capy::after {
+  content: ''; position: absolute; top: -2px; width: 3.2px; height: 3.2px;
+  border-radius: 50%; background: #a2743f;
+}
+.pop-capy::before { left: 0.4px; }
+.pop-capy::after { right: 0.4px; }
+
+/* ---- the map pills carry their room's head-count ---- */
+/* inline-flex, so the count grows the pill's own box symmetrically about its
+   anchor point and the measured pill spacing (see MAP_SPOTS) still holds */
+.map-island .map-spot { display: inline-flex; align-items: center; gap: 5px; }
+.map-spot .map-pop {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding-left: 5px; border-left: 1.5px dotted rgba(45, 36, 23, 0.24);
+}
+.map-spot .map-pop b { font-size: 9.5px; font-weight: 900; color: #7a5a33; }
+/* an empty count must not leave the flex gap behind */
+.map-spot .map-pop:empty { display: none; }
+/* a friend is standing there: a coral ring on the pill (costs no layout width,
+   so it survives every card size) and a pin on its shoulder */
+.map-spot.has-friend {
+  box-shadow: 0 0 0 2.5px rgba(232, 101, 122, 0.55),
+    0 3px 0 rgba(45, 36, 23, 0.2), 0 6px 14px rgba(16, 52, 78, 0.32);
+}
+.map-spot .map-friend { display: none; }
+.map-spot.has-friend .map-friend {
+  display: block; position: absolute; left: -7px; top: -9px; width: 13px; height: 13px;
+  border-radius: 50%; border: 2px solid #fff;
+  background: linear-gradient(180deg, #ffd3dd 0%, var(--accent) 100%);
+  box-shadow: 0 2px 6px rgba(16, 52, 78, 0.45);
+  animation: friend-bob 2.6s ease-in-out infinite;
+}
+.map-spot.has-friend .map-friend::after {
+  content: ''; position: absolute; inset: 3px; border-radius: 50%;
+  background: #fff6e3; opacity: 0.92;
+}
+@keyframes friend-bob { 50% { translate: 0 -2px; } }
+
+/* Phone-width cards cannot spare the width. Measured pairwise (the same rect
+   sweep styles.css .map-spot documents): with counts on, the closest pair is
+   still loft/lounge (13.4px) at a 480px viewport and upward, but below that the
+   card shrinks faster than the pills do and Smoothie Shack vs Glimmer Mine
+   closes to 2px at 440 and overlaps by 12px at 400. So the counts step off
+   there; the island total in the hint line and the lobby strip still say how
+   busy the cove is, and the coral ring still says where a friend is.
+   These rules must stay BELOW the ones they turn off: same specificity, so it
+   is document order that decides, not the media query. */
+@media (max-width: 500px) {
+  .map-spot .map-pop { display: none; }
+  /* the pin pokes 9px above the pill and would land on the Trophy Loft when a
+     friend is in the Game Den under it (measured at 360x640) */
+  .map-spot.has-friend .map-friend { display: none; }
+}
+
+/* ---- the lobby strip, moored at the bottom of the island ---- */
+/* inside the island box on purpose: the map card's height is measured to the
+   pixel (styles.css .map-card) and another row would push it past 94vh */
+.map-lobby {
+  position: absolute; left: 50%; bottom: 9px; translate: -50% 0; z-index: 6;
+  display: flex; align-items: center; gap: 9px; max-width: 94%;
+  padding: 6px 8px 6px 11px; border-radius: 999px;
+  background: rgba(255, 246, 227, 0.95); color: var(--ink);
+  box-shadow: 0 8px 20px rgba(16, 52, 78, 0.42), inset 0 0 0 2px rgba(255, 255, 255, 0.9);
+  animation: lobby-in 0.28s var(--spring);
+}
+.map-lobby[hidden] { display: none; }
+.map-lobby-txt { min-width: 0; text-align: left; font-size: 12px; font-weight: 800; }
+.map-lobby-txt small {
+  display: block; font-size: 10.5px; font-weight: 700; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pips { display: flex; align-items: center; gap: 3px; flex: none; }
+@keyframes lobby-in { from { opacity: 0; translate: -50% 8px; } }
+/* On a phone-width card the strip has to be one short line or it climbs into
+   the Groove Grotto pill above it (measured: 18px of overlap at 360x640 once
+   the text wrapped, 4px of daylight after this). The room name is already on
+   the pill the strip is pointing at, and "2/3" says what the pips say. */
+@media (max-width: 520px) {
+  .map-lobby { bottom: 4px; padding: 4px 6px 4px 9px; gap: 7px; }
+  .map-lobby .pips { display: none; }
+  .map-lobby-txt {
+    font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .map-lobby-txt small { display: none; }
+  /* scoped, not bare .cove-go: the shared button's own rule is declared further
+     down this sheet and would otherwise win on document order */
+  .map-lobby .cove-go { padding: 5px 11px; }
+}
+
+/* ---- the same invitation, out in the world ---- */
+.lobby-chip {
+  position: absolute; right: 14px; bottom: 92px; z-index: 34;
+  display: flex; align-items: center; gap: 10px; max-width: min(330px, 76vw);
+  padding: 8px 9px 8px 13px; border-radius: 20px;
+  background: rgba(255, 246, 227, 0.96); color: var(--ink);
+  box-shadow: 0 10px 26px rgba(16, 52, 78, 0.42), inset 0 0 0 2px rgba(255, 255, 255, 0.9);
+  animation: chip-in 0.42s var(--spring);
+}
+.lobby-chip[hidden] { display: none; }
+.lobby-chip-txt { flex: 1; min-width: 0; text-align: left; font-size: 12.5px; font-weight: 800; }
+.lobby-chip-txt small { display: block; font-size: 11px; font-weight: 700; color: var(--muted); }
+.lobby-chip-x {
+  border: 0; background: transparent; cursor: pointer; flex: none;
+  font-family: var(--font); font-size: 13px; font-weight: 900; color: var(--muted);
+  padding: 4px 6px; border-radius: 999px; line-height: 1;
+}
+.lobby-chip-x:hover { color: var(--ink); background: rgba(45, 36, 23, 0.08); }
+.lobby-chip-x:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
+@keyframes chip-in { from { opacity: 0; translate: 0 14px; scale: 0.92; } }
+@media (max-width: 560px) {
+  .lobby-chip { right: 10px; left: 10px; bottom: 80px; max-width: none; }
+}
+
+/* the go button, shared by the strip and the chip */
+.cove-go {
+  border: 0; cursor: pointer; font-family: var(--font); font-weight: 900; font-size: 12px;
+  padding: 7px 15px; border-radius: 999px; color: #fff; flex: none;
+  background: linear-gradient(180deg, #f07f90 0%, var(--accent) 100%);
+  box-shadow: 0 4px 0 rgba(150, 55, 72, 0.32);
+  transition: scale 0.12s ease, filter 0.16s ease;
+}
+.cove-go:hover { scale: 1.06; filter: brightness(1.05); }
+.cove-go:active { scale: 0.95; }
+.cove-go:focus-visible { outline: 3px solid var(--accent2); outline-offset: 3px; }
+
+/* ---- the room chip's live count ---- */
+#pop-count.is-solo { color: var(--muted); font-weight: 700; }
+#pop-count.bump { display: inline-block; animation: pop-bump 0.5s var(--spring); }
+@keyframes pop-bump { 0%, 100% { scale: 1; } 40% { scale: 1.22; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .map-lobby, .lobby-chip, .map-spot.has-friend .map-friend, #pop-count.bump { animation: none; }
+}
+`;
+
 function ensureCoveStyles() {
   if (typeof document === 'undefined' || document.getElementById(COVE_STYLE_ID)) return;
   const s = document.createElement('style');
   s.id = COVE_STYLE_ID;
-  s.textContent = COVE_CSS;
+  s.textContent = COVE_CSS + COVE12_CSS;
   document.head.appendChild(s);
 }
 
@@ -163,6 +317,157 @@ function parseParty(m) {
 }
 
 const partyLive = () => !!party && party.endsAt > Date.now();
+
+// ---- co-presence: who is where (wave 12) ----------------------------------
+// The server broadcasts, to EVERYONE, every 5s and once on hello:
+//   {t:'pop', rooms:{<roomId>:count,...}, lobbies:[{game, room, n, need}]}
+// (bots excluded from the counts; n = capys waiting in that game's lobby,
+// need = seats to start), and pushes to one player, on hello and whenever one
+// of THEIR friends changes room:
+//   {t:'fpresence', friends:[{name, room|null}]}   (null = offline)
+// Module level for the same reason `party` is: the map painter, the map pills
+// and the HUD shell are separate functions with no shared handle.
+
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
+/** Latest head count per room, plus the island total and when it was taken. */
+const POP = { rooms: Object.create(null), total: 0, seen: false, at: 0 };
+
+/** Where WE are, so a count taken before we moved can be corrected on sight. */
+const SELF = { room: null, prev: null, at: 0 };
+
+/** Lobbies worth joining, nearest-to-starting first. */
+let LOBBIES = [];
+
+/** roomId -> friend names standing there (offline friends are simply absent). */
+const FRIEND_AT = new Map();
+
+/** Read a 'pop' frame's counts. Null-prototype: room ids come off the wire. */
+function readPop(m) {
+  const rooms = Object.create(null);
+  let total = 0;
+  const src = m && typeof m.rooms === 'object' && m.rooms ? m.rooms : null;
+  if (src) {
+    for (const key of Object.keys(src)) {
+      const n = Math.floor(Number(src[key]));
+      if (!Number.isFinite(n) || n <= 0) continue;
+      rooms[key] = Math.min(n, 999);
+      total += rooms[key];
+    }
+  }
+  POP.rooms = rooms;
+  POP.total = total;
+  POP.seen = true;
+  POP.at = Date.now();
+}
+
+/**
+ * Read a 'pop' frame's lobbies. Only ones a capy can still join are kept (an
+ * empty lobby is not an invitation and a full one is already leaving), sorted
+ * by how close they are to going.
+ */
+function readLobbies(m) {
+  const out = [];
+  const arr = m && Array.isArray(m.lobbies) ? m.lobbies : [];
+  for (const row of arr) {
+    if (!row || typeof row !== 'object') continue;
+    const game = typeof row.game === 'string' ? row.game : '';
+    const n = Math.floor(Number(row.n));
+    const need = Math.floor(Number(row.need));
+    if (!game || !Number.isFinite(n) || !Number.isFinite(need)) continue;
+    if (n <= 0 || need <= 1 || n >= need) continue;
+    const room = typeof row.room === 'string' && row.room
+      ? row.room
+      : (hasOwn(MINIGAMES, game) ? MINIGAMES[game].room : '');
+    if (!room) continue;
+    out.push({ game, room, n, need, seats: need - n });
+  }
+  out.sort((a, b) => a.seats - b.seats || b.n - a.n);
+  LOBBIES = out;
+}
+
+/** Read an 'fpresence' frame into FRIEND_AT. */
+function readPresence(m) {
+  FRIEND_AT.clear();
+  const arr = m && Array.isArray(m.friends) ? m.friends : [];
+  for (const f of arr) {
+    if (!f || typeof f !== 'object') continue;
+    const name = typeof f.name === 'string' ? f.name.trim().slice(0, 24) : '';
+    const room = typeof f.room === 'string' ? f.room : '';
+    if (!name || !room) continue; // no room = offline, and offline is not a marker
+    const list = FRIEND_AT.get(room) || [];
+    if (list.length < 6) list.push(name);
+    FRIEND_AT.set(room, list);
+  }
+}
+
+// The gate, not the game: a capy waiting for a race is standing at the sled
+// gate, and that is where you are being asked to walk. Anything not named here
+// falls back to the game's own name, so a new minigame still reads sensibly.
+const GATE_NAME = {
+  sled: 'the sled gate',
+  fishing: 'the fishing dock',
+  smoothie: 'the smoothie counter',
+  prophunt: 'the prop hunt',
+  doodle: 'the doodle circle',
+  pong: 'the pong table',
+  shuffle: 'the shuffle table',
+  connect4: 'the four-in-a-row table',
+  chess: 'the chess table',
+  cards: 'the Capy Clash table',
+};
+
+const gateLabel = (game) => (hasOwn(GATE_NAME, game) ? GATE_NAME[game]
+  : hasOwn(MINIGAMES, game) ? MINIGAMES[game].name : 'a game');
+
+const roomLabel = (id) => (hasOwn(ROOM_INFO, id) ? ROOM_INFO[id].name
+  : typeof id === 'string' && id.startsWith('house:') ? `${id.slice(6)}'s Den` : id);
+
+/**
+ * This room's head count, corrected for a move we made after the count was
+ * taken: the frame still has us standing in the room we left, and a five second
+ * old "0 here" in a room you are visibly standing in reads as broken.
+ */
+function roomPop(id) {
+  if (!id || !POP.seen) return 0;
+  const n = hasOwn(POP.rooms, id) ? POP.rooms[id] : 0;
+  if (SELF.at <= POP.at) return n;
+  if (SELF.room === id) return n + 1;
+  if (SELF.prev === id) return Math.max(0, n - 1);
+  return n;
+}
+
+/** Up to three capy heads, then one head and a count: the pills are 11px tall. */
+function fillHeads(el, n) {
+  el.textContent = '';
+  if (!(n > 0)) return;
+  for (let i = 0; i < (n <= 3 ? n : 1); i++) {
+    const h = document.createElement('i');
+    h.className = 'pop-capy';
+    el.appendChild(h);
+  }
+  if (n > 3) {
+    const b = document.createElement('b');
+    b.textContent = `x${n}`;
+    el.appendChild(b);
+  }
+}
+
+/** Seats as heads: taken ones are capys, free ones are empty cushions. */
+function fillPips(el, n, need) {
+  el.textContent = '';
+  const max = Math.min(Math.max(need, 0), 6);
+  for (let i = 0; i < max; i++) {
+    const d = document.createElement('i');
+    d.className = i < n ? 'pip pop-capy' : 'pip';
+    el.appendChild(d);
+  }
+}
+
+/** "one more capy and they're off" / "2 seats left": never a countdown. */
+const seatsLine = (l) => (l.seats <= 1
+  ? "one more capy and they're off"
+  : `${l.seats} seats still open`);
 
 // ---- stamp slam -----------------------------------------------------------
 // A stamp is the game saying "that thing you just did was worth doing", so it
@@ -287,6 +592,12 @@ export function initHud(game) {
       <div class="chat-history-empty" id="chat-history-empty">The cove is quiet. Say hello!</div>
     </div>
     <div class="toasts" id="toasts"></div>
+    <div class="lobby-chip" id="lobby-chip" role="status" hidden>
+      <i class="pips" id="lobby-chip-pips"></i>
+      <div class="lobby-chip-txt"></div>
+      <button class="cove-go" id="lobby-chip-go" type="button">Go</button>
+      <button class="lobby-chip-x" id="lobby-chip-x" type="button" title="Not right now" aria-label="Not right now">&#10005;</button>
+    </div>
     <div class="map-overlay hidden" id="map-overlay"></div>
   `;
 
@@ -325,7 +636,31 @@ export function initHud(game) {
     $('room-name').textContent = `${owner}'s Den`;
     game.toast(`${owner}'s Den : ${mine ? 'home sweet home' : 'make yourself at home'}`, 2200);
   });
-  game.events.on('population', (n) => { $('pop-count').textContent = n > 1 ? ` * ${n} here` : ''; });
+  // The room chip's live count. Until the first 'pop' frame lands this is the
+  // room snapshot's own player list (bots included, which is what it always
+  // was); after that it is the island's own count for this room, which excludes
+  // bots, so the two are never mixed and the number never jumps for a bot.
+  let roomPeers = 0;
+  let lastShown = -1;
+  function paintRoomChip() {
+    const el = $('pop-count');
+    if (!el) return;
+    const n = POP.seen ? roomPop(game.roomId) : roomPeers;
+    el.classList.toggle('is-solo', POP.seen && n === 1);
+    el.textContent = n > 1 ? ` * ${n} here` : (POP.seen && n === 1 ? ' * just you' : '');
+    // a bump when someone walks in, never when they leave: arrivals are the
+    // news, and a chip that flinches at goodbyes is not a cozy chip
+    if (n > lastShown && lastShown >= 0 && n > 1) {
+      el.classList.remove('bump');
+      void el.offsetWidth; // restart the keyframes
+      el.classList.add('bump');
+    }
+    lastShown = n;
+  }
+  game.events.on('population', (n) => {
+    roomPeers = Number.isFinite(n) ? n : 0;
+    paintRoomChip();
+  });
 
   // net status
   let lastNet = null;
@@ -582,6 +917,94 @@ export function initHud(game) {
       : 'Daily quest done!', 3600);
   });
   game.events.on('stamp', (m) => queueSlam(game, m));
+
+  // ---- co-presence (wave 12) -----------------------------------------------
+  // 'pop' and 'fpresence' land HERE first and are read into module state, then
+  // everything else (the room chip, the chip below, the map's pills, strip and
+  // markers) repaints off that state. Registered before buildMap so the map's
+  // own listeners can never run against a stale frame.
+
+  const chip = $('lobby-chip');
+  const chipTxt = chip.querySelector('.lobby-chip-txt');
+  const chipPips = $('lobby-chip-pips');
+  const CHIP_MS = 15000;      // how long one invitation sits on screen
+  const CHIP_QUIET = 150000;  // and how long that game then keeps its peace
+  let chipGame = null;
+  let chipRoom = null;
+  let chipTimer = 0;
+  const chipQuiet = new Map(); // game -> "don't ask again before"
+
+  function hideChip() {
+    if (chipTimer) { clearTimeout(chipTimer); chipTimer = 0; }
+    chip.hidden = true;
+    chipGame = null;
+    chipRoom = null;
+  }
+
+  function fillChip(l) {
+    chipRoom = l.room;
+    fillPips(chipPips, l.n, l.need);
+    chipTxt.textContent = '';
+    const head = document.createElement('span');
+    head.textContent = `${l.n}/${l.need} at ${gateLabel(l.game)}. Go?`;
+    const sub = document.createElement('small');
+    // the chip is narrow: the strip's longer line would wrap to three lines
+    sub.textContent = `${roomLabel(l.room)} : one more capy!`;
+    chipTxt.append(head, sub);
+  }
+
+  /**
+   * One invitation at a time, and only when a lobby is one capy short of
+   * going: that is the moment where walking over actually starts a game. It
+   * never nags (one showing per game per CHIP_QUIET, dismissable), never talks
+   * over a minigame, and never asks you to travel to the room you are in.
+   */
+  function refreshLobbyChip() {
+    if (game.activeMinigame) { hideChip(); return; }
+    const now = Date.now();
+    const live = LOBBIES.filter((l) => l.seats <= 1 && l.room !== game.roomId);
+    if (chipGame) {
+      // keep the chip on its slot while its lobby is still short a capy, so the
+      // count ticks up in place rather than the chip flickering out and back
+      const same = live.find((l) => l.game === chipGame);
+      if (same) { fillChip(same); return; }
+      hideChip();
+    }
+    const pick = live.find((l) => (chipQuiet.get(l.game) || 0) <= now);
+    if (!pick) return;
+    chipQuiet.set(pick.game, now + CHIP_QUIET);
+    chipGame = pick.game;
+    fillChip(pick);
+    chip.hidden = false;
+    game.audio?.play?.('pop');
+    chipTimer = setTimeout(hideChip, CHIP_MS);
+  }
+
+  $('lobby-chip-go').onclick = () => {
+    const room = chipRoom;
+    hideChip();
+    game.audio?.play?.('whoosh');
+    if (room && game.roomId !== room) game.goToRoom(room);
+  };
+  $('lobby-chip-x').onclick = () => {
+    if (chipGame) chipQuiet.set(chipGame, Date.now() + CHIP_QUIET * 2);
+    game.audio?.play?.('click');
+    hideChip();
+  };
+
+  game.events.on('pop', (m) => {
+    readPop(m);
+    readLobbies(m);
+    paintRoomChip();
+    refreshLobbyChip();
+  });
+  game.events.on('fpresence', (m) => { readPresence(m); });
+  game.events.on('room', (id) => {
+    if (id !== SELF.room) { SELF.prev = SELF.room; SELF.room = id; SELF.at = Date.now(); }
+    paintRoomChip();
+    refreshLobbyChip();
+  });
+  game.events.on('minigame', (id) => { if (id) hideChip(); });
 
   // map
   buildMap(game, $('map-overlay'));
@@ -2384,6 +2807,11 @@ function buildMap(game, el) {
       <div class="map-island" id="map-island">
         <canvas class="map-canvas" id="map-canvas"></canvas>
         <div class="map-here hidden" id="map-here"><i></i><i></i><b></b></div>
+        <div class="map-lobby" id="map-lobby" hidden>
+          <i class="pips" id="map-lobby-pips"></i>
+          <div class="map-lobby-txt"></div>
+          <button class="cove-go" id="map-lobby-go" type="button">Go</button>
+        </div>
       </div>
       <div class="map-hint" id="map-hint">${MAP_HINT}</div>
       <div class="map-party" id="map-party" hidden>
@@ -2400,8 +2828,33 @@ function buildMap(game, el) {
   const partyGo = partyRow.querySelector('.map-party-go');
   const painter = createIslandPainter(el.querySelector('#map-canvas'));
   const buttons = [];
+  const lobbyRow = el.querySelector('#map-lobby');
+  const lobbyPips = el.querySelector('#map-lobby-pips');
+  const lobbyTxt = lobbyRow.querySelector('.map-lobby-txt');
+  const lobbyGo = el.querySelector('#map-lobby-go');
+  // a pointer resting on a pill owns the hint line: a 'pop' repaint must not
+  // yank the room's description out from under it
+  let hoverPill = false;
 
-  const setHint = (msg) => { hint.textContent = msg || MAP_HINT; };
+  // the default line doubles as the island's own pulse: how many capys are out
+  // there at all. It REPLACES the "press M" tail rather than adding to it, so
+  // the hint stays one line on a phone-width card.
+  const idleHint = () => (POP.total > 0
+    ? `${POP.total} cap${POP.total === 1 ? 'y' : 'ys'} out and about. Pick a spot to waddle over.`
+    : MAP_HINT);
+  const setHint = (msg) => { hint.textContent = msg || idleHint(); };
+
+  /** "Frosty Peak : Snow, sleds and cocoa" plus who is up there right now. */
+  function spotHint(id) {
+    const bits = [`${ROOM_INFO[id].name} : ${ROOM_INFO[id].desc || ''}`];
+    const n = roomPop(id);
+    if (n > 0) bits.push(`${n} cap${n === 1 ? 'y' : 'ys'} here`);
+    const friends = FRIEND_AT.get(id);
+    if (friends && friends.length) {
+      bits.push(friends.length === 1 ? `${friends[0]} is here` : `${friends.slice(0, 3).join(', ')} are here`);
+    }
+    return bits.join(' : ');
+  }
 
   for (const { id, bx, by, dir } of MAP_SPOTS) {
     const b = document.createElement('button');
@@ -2409,15 +2862,21 @@ function buildMap(game, el) {
     b.dataset.room = id;
     b.style.left = `${bx}%`;
     b.style.top = `${by}%`;
-    b.textContent = ROOM_INFO[id].name;
+    const label = document.createElement('span');
+    label.textContent = ROOM_INFO[id].name;
+    const pop = document.createElement('i'); // head count, empty when nobody is in
+    pop.className = 'map-pop';
+    const friend = document.createElement('i'); // friend pin, shown by .has-friend
+    friend.className = 'map-friend';
+    b.append(label, pop, friend);
     b.title = ROOM_INFO[id].desc || '';
     b.onclick = () => {
       el.classList.add('hidden');
       if (game.roomId !== id) { game.audio?.play?.('whoosh'); game.goToRoom(id); }
       else game.audio?.play?.('click');
     };
-    b.addEventListener('pointerenter', () => setHint(`${ROOM_INFO[id].name} : ${ROOM_INFO[id].desc || ''}`));
-    b.addEventListener('pointerleave', () => setHint(null));
+    b.addEventListener('pointerenter', () => { hoverPill = true; setHint(spotHint(id)); });
+    b.addEventListener('pointerleave', () => { hoverPill = false; setHint(null); });
     const hat = document.createElement('i'); // party hat, shown only by .is-party
     hat.className = 'map-hat';
     b.appendChild(hat);
@@ -2453,6 +2912,56 @@ function buildMap(game, el) {
   }
   for (const ev of ['party', 'party-start', 'party-end']) game.events.on(ev, refreshParty);
 
+  // ---- co-presence on the map (wave 12) ------------------------------------
+
+  /** Head counts and friend pins on every pill, and the island's own total. */
+  function refreshPop() {
+    for (const b of buttons) {
+      const id = b.dataset.room;
+      const n = roomPop(id);
+      fillHeads(b.querySelector('.map-pop'), n);
+      const friends = FRIEND_AT.get(id);
+      const hasFriend = !!(friends && friends.length);
+      b.classList.toggle('has-friend', hasFriend);
+      const desc = ROOM_INFO[id].desc || '';
+      const who = n > 0 ? ` (${n} here${hasFriend ? `, including ${friends.slice(0, 3).join(', ')}` : ''})` : '';
+      b.title = `${desc}${who}`;
+    }
+    if (!hoverPill) setHint(null); // the island total lives in the idle hint
+  }
+
+  /**
+   * The nearest-to-starting lobby, moored under the island with a Go button.
+   * Any joinable lobby shows here (the map is a place you came to on purpose);
+   * only a near-full one is allowed to travel out to the world chip.
+   */
+  function refreshLobbyStrip() {
+    const l = LOBBIES[0] || null;
+    lobbyRow.hidden = !l;
+    if (!l) return;
+    const here = game.roomId === l.room;
+    fillPips(lobbyPips, l.n, l.need);
+    lobbyTxt.textContent = '';
+    const head = document.createElement('span');
+    head.textContent = `${l.n}/${l.need} at ${gateLabel(l.game)}`;
+    const sub = document.createElement('small');
+    sub.textContent = here
+      ? `You are in ${roomLabel(l.room)} : ${seatsLine(l)}`
+      : `${roomLabel(l.room)} : ${seatsLine(l)}`;
+    lobbyTxt.append(head, sub);
+    lobbyGo.textContent = here ? 'Right here' : 'Go';
+    lobbyGo.onclick = () => {
+      el.classList.add('hidden');
+      game.audio?.play?.(here ? 'click' : 'whoosh');
+      if (!here) game.goToRoom(l.room);
+    };
+  }
+
+  // These land whether the map is open or not: repainting ten pills costs
+  // nothing, and an open map then never shows a stale count.
+  game.events.on('pop', () => { refreshPop(); refreshLobbyStrip(); });
+  game.events.on('fpresence', () => { refreshPop(); });
+
   function refreshHere() {
     const spot = ART[game.roomId];
     for (const b of buttons) b.classList.toggle('is-here', b.dataset.room === game.roomId);
@@ -2470,9 +2979,12 @@ function buildMap(game, el) {
     if (now === open) return;
     open = now;
     if (open) {
+      hoverPill = false;
       setHint(null);
       refreshHere();
       refreshParty();
+      refreshPop();
+      refreshLobbyStrip();
       painter.refresh();
       painter.start();
     } else {
@@ -2485,7 +2997,7 @@ function buildMap(game, el) {
   if (typeof ResizeObserver === 'function') {
     new ResizeObserver(() => { if (open) painter.refresh(); }).observe(island);
   }
-  game.events.on('room', () => { refreshHere(); });
+  game.events.on('room', () => { refreshHere(); refreshPop(); refreshLobbyStrip(); });
   // The clock lands every 10s; the painters advance dayT themselves in
   // between. Repaint on arrival so a reduced-motion map (which never runs the
   // rAF loop) still keeps up with the light.

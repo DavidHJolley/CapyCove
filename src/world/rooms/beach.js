@@ -2739,8 +2739,9 @@ export class BeachRoom extends Room {
   /**
    * Capture-phase press. We only ever take a press that lands on the ball while
    * the player is close enough to reach it; everything else falls through to
-   * the engine untouched (a click on a ball across the cove walks you to it,
-   * which is exactly what you wanted anyway).
+   * the engine untouched. Bopping is an INTERACTION, so it is the left button
+   * (or a tap): the right button walks past it, which is exactly what you
+   * wanted when the ball is across the cove anyway.
    */
   _pointerDown(e) {
     const game = this._game;

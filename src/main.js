@@ -133,6 +133,21 @@ game.net = net;
 // minigame lifecycle
 let activeGame = null;
 const mgRoot = document.getElementById('minigame-root');
+// Staff only: pull the panel chunk the moment a profile with capabilities
+// lands (welcome OR /api/me path - both emit 'profile'), so staff-chat lines
+// sent before the first Ctrl+Shift+A are buffered instead of missed. An
+// ordinary player's profile has no caps and never fetches a byte of it.
+{
+  let armed = false;
+  const armStaffChat = () => {
+    if (armed || !game.state.caps?.length) return;
+    armed = true;
+    import('./ui/admin.js').then((m) => m.installStaffChat?.(game)).catch(() => { armed = false; });
+  };
+  game.events.on('profile', armStaffChat);
+  armStaffChat();
+}
+
 game.events.on('minigame', async (id) => {
   if (id) {
     if (activeGame) return;
@@ -189,6 +204,17 @@ game.events.on('minigame', async (id) => {
  * player never fetches, parses or pays for a byte of it.
  */
 
+/*
+ * THE ISLAND'S CONTROLS, in one place (session task #20):
+ *   right-click / right-drag  walk (src/core/engine.js; Settings > Walking can
+ *                             put this back on the left button)
+ *   left click                interact only: a capybara's card, a prop a room
+ *                             picks up itself, a hotspot prompt
+ *   tap (touch)               walks and interacts, same as it always did
+ *   W wave, D groove, M map, Enter chat, C camera (hud.js), T snowball on
+ *   Frosty Peak (src/world/rooms/peak.js, live only while you are up there)
+ * Anything added here must not collide with that list.
+ */
 // keyboard shortcuts (skipped while typing in inputs, and while a minigame owns
 // the screen: Enter used to focus the chat box hidden underneath it, which left
 // the running game with no keyboard at all)

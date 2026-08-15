@@ -131,20 +131,20 @@
   </div>
   <script>
     /* One tip per boot. Every line here was read out of the game code before it
-       was written down (hotkeys in main.js/hud.js, right-click snowballs in
+       was written down (hotkeys in main.js/hud.js, the T-key snowball in
        rooms/peak.js, passive payouts in rooms/mine.js, the 20s mural cooldown
        in ui/mural.js, avatar clicks in core/engine.js). The markup above ships
        with a real tip already in it, so this only shuffles: JS off still reads. */
     (function () {
       var tips = [
         'Press C to swap between following your capy and seeing the whole room.',
-        'Up on Frosty Peak, hold the RIGHT mouse button to pack a snowball, let go to throw it.',
+        'Up on Frosty Peak, hold T to pack a snowball, aim with the mouse, let go to throw it.',
         'Type /w Name hello to whisper. Click a whisper in the log to fire one straight back.',
         'The Glimmer Mine pays you for standing around in it. Honest, cozy work.',
-        'Click your own capybara to open your player card.',
+        'Left click another capybara to open their player card.',
         'W waves, D grooves, M opens the map, Enter jumps to the chat box.',
         'The plaza mural takes one pixel every twenty seconds, and it stays on the wall for good.',
-        'Click anywhere on the ground and your capy waddles over to the marker.'
+        'Right-click the ground and your capy waddles to the marker. Hold the button down to steer.'
       ];
       var el = document.getElementById('boot-tip');
       if (el) el.textContent = tips[Math.floor(Math.random() * tips.length)];

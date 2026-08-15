@@ -176,15 +176,25 @@ const AUR_COLS = 40;   // columns per band (vertices are COLS+1 wide)
 const AUR_ROWS = 4;    // rows per band (ROWS+1 tall); row 0 and ROWS fade to black
 const AUR_BANDS = 3;
 
-// Snowball toy, on the RIGHT mouse button. It used to share the left button
-// with walking, which playtested badly: every attempt to cross the clearing
-// wound up a throw instead. Left click is now pure walking, exactly as in every
-// other room. (A right button is a mouse thing: there is no snowball on touch
-// any more, which is the price of never stealing the walk tap again.)
+// Snowball toy, on the T KEY (session task #20). It started on the left button,
+// sharing it with walking, which playtested badly: every attempt to cross the
+// clearing wound up a throw instead. It moved to the right button, and the
+// island-wide input remap then took THAT for walking, so the throw is a key
+// now: hold T, aim with the mouse, let go. That also frees both mouse buttons
+// to mean the same thing here as everywhere else on the island. (A key is a
+// keyboard thing: there is still no snowball on touch, which is the price of
+// never stealing the walk tap again.)
 // The server allows one throw a second; the local cooldown sits a beat outside
 // that so a throw is never eaten by the rate limiter.
+const SNOW_KEY = 't';         // the throw key, lower-cased
+// A panel that owns the screen owns the keyboard with it. Our listener is on
+// window in the capture phase and was installed when the room was built, so it
+// runs BEFORE the overlay's own key handler can stop the event: the check has
+// to be ours. One root class per overlay, the same list the first-run tour uses.
+const SNOW_BLOCKERS = '.shop-overlay, .menu-overlay, .pf-overlay, .qb-overlay, .mu-overlay,'
+  + ' .fr-overlay, .he-root, .cove-ed, #settings-overlay';
 const SNOW_HOLD_CAP = 1.0;    // seconds of hold = full power
-const SNOW_RANGE_MIN = 3.5;   // a quick right-click lobs this far; hold for more
+const SNOW_RANGE_MIN = 3.5;   // a quick tap of T lobs this far; hold for more
 const SNOW_RANGE_MAX = 13.0;
 const SNOW_COOLDOWN = 1.15;
 const SNOW_HIT_R = 0.8;       // LIVING-COVE: a capy within 0.8 of the landing
@@ -197,8 +207,8 @@ const _ndc = new THREE.Vector2();
 const _aimV = new THREE.Vector3();
 
 // Shown once per session, the first time someone stands around in the snow:
-// nobody discovers a right-click hold-to-aim toy on their own (module scope so
-// a second visit to the peak does not nag).
+// nobody discovers a hold-to-aim toy on their own (module scope so a second
+// visit to the peak does not nag).
 let _hintShown = false;
 
 /** Flight time and apex of a thrown snowball. Every client runs these on the
@@ -1315,32 +1325,26 @@ export class PeakRoom extends Room {
     }
 
     /*
-     * Aiming lives on the RIGHT button, so it can never collide with walking:
-     * engine._onPointer bails on any button but 0, which means a right press is
-     * not a walk target and we have nothing to swallow. Left clicks, clicks on
-     * other capybaras (profile cards), hotspot prompt buttons and every HUD
-     * element are therefore untouched by this room.
+     * Aiming lives on the T key, so it can never collide with the mouse: both
+     * buttons mean here exactly what they mean everywhere else (right walks,
+     * left interacts) and this room swallows neither. The pointer listener is
+     * only a tracker: it remembers where the cursor is, so a hold of T aims at
+     * whatever you are already pointing at, and keeps aiming while you move.
      *
-     * The listeners sit on window in the CAPTURE phase so a drag that wanders
-     * off the canvas (or over a HUD panel) still tracks and still lands.
-     *
-     * The one thing that has to go is the browser context menu: it pops on the
-     * very press-and-release that throws the ball. _contextMenu kills it over
-     * the world canvas (and while a throw is charging) and nowhere else, and
-     * the listener leaves with the room in dispose(), so right-click is back to
-     * normal the moment you walk out of the peak.
+     * Everything sits on window in the CAPTURE phase so an aim that wanders off
+     * the canvas (or over a HUD panel) still tracks and still lands, and every
+     * handle is dropped in dispose(), so T is an ordinary letter again the
+     * moment you walk out of the peak.
      */
-    this._onDown = (e) => this._pointerDown(e);
     this._onMove = (e) => this._pointerMove(e);
-    this._onUp = (e) => this._pointerUp(e);
+    this._onKeyDown = (e) => this._keyDown(e);
+    this._onKeyUp = (e) => this._keyUp(e);
     this._onCancel = () => this._cancelAim();
-    this._onContext = (e) => this._contextMenu(e);
-    addEventListener('pointerdown', this._onDown, true);
     addEventListener('pointermove', this._onMove, true);
-    addEventListener('pointerup', this._onUp, true);
     addEventListener('pointercancel', this._onCancel, true);
+    addEventListener('keydown', this._onKeyDown, true);
+    addEventListener('keyup', this._onKeyUp, true);
     addEventListener('blur', this._onCancel);
-    addEventListener('contextmenu', this._onContext, true);
   }
 
   /* --- race lobby --------------------------------------------------------- */
@@ -3200,8 +3204,9 @@ export class PeakRoom extends Room {
   /* --- snowballs (LIVING-COVE A2: ambient play toys) ---------------------- */
 
   /**
-   * Hold the RIGHT button on the snow, an arc preview grows out of your
-   * capybara, let go and it flies (left click stays plain old walking).
+   * Hold T with the cursor over the snow, an arc preview grows out of your
+   * capybara, let go of the key and it flies (the mouse keeps walking and
+   * interacting throughout).
    * The frame that goes out is {t:'snow', to:[x,z]}; every client
    * in the room (the thrower included, locally, so their own throw never waits
    * on the round trip) runs the SAME arc from the sender's feet to that point,
@@ -3472,7 +3477,7 @@ export class PeakRoom extends Room {
       if (this._hintT > 7) {
         this._hintT = -1;
         _hintShown = true;
-        this._game?.toast?.('Right-click and hold on the snow to lob a snowball at someone.');
+        this._game?.toast?.('Hold T and aim with the mouse to lob a snowball at someone.');
       }
     }
 
@@ -3646,28 +3651,20 @@ export class PeakRoom extends Room {
     return true;
   }
 
-  /**
-   * The browser menu would land on top of the aim (and on Windows it pops on
-   * the very release that throws), so it is suppressed over the world canvas
-   * and while a throw is charging. Anywhere else - the HUD, the chat box, a
-   * name tag - right-click keeps its normal menu, and once this room is
-   * disposed the listener goes with it.
-   */
-  _contextMenu(e) {
-    const engine = this._game?.engine;
-    if (this._aim || (engine?.canvas && e.target === engine.canvas)) e.preventDefault();
-  }
-
-  _pointerDown(e) {
-    // RIGHT button only: the left button walks, and this room never touches it.
-    if (e.button !== 2 || this._aim) return;
+  /** Press T to start packing a snowball. Aim is wherever the cursor already
+   *  is (screen centre if the mouse has not moved yet); hold for range. */
+  _keyDown(e) {
+    if (this._aim || e.repeat) return;
+    if (e.key?.toLowerCase?.() !== SNOW_KEY) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;                 // a browser shortcut
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (document.querySelector(SNOW_BLOCKERS)) return;               // a panel owns the screen
     const game = this._game;
     const engine = game?.engine;
     if (!engine || engine.paused || game.activeMinigame) return;
-    if (e.target !== engine.canvas) return;   // a HUD or prompt click: not ours
     if (this._cool > 0) return;               // still packing the last one
     if (this._localSlot !== null) return;     // seated in the race lineup
-    if (!this._setRay(e)) return;
+    if (!this._setRay(this._cursor || { clientX: innerWidth / 2, clientY: innerHeight / 2 })) return;
     if (!this._groundPoint(_aimV)) return;
     this._aim = { t: 0, x: _aimV.x, z: _aimV.z, cx: _aimV.x, cz: _aimV.z };
     // A release before the first update() must still throw somewhere sane, so
@@ -3676,23 +3673,22 @@ export class PeakRoom extends Room {
     engine.controller?.stop?.(); // plant your feet to throw
   }
 
-  _pointerMove(e) {
+  _keyUp(e) {
     if (!this._aim) return;
-    // The button came up somewhere we never heard about (the window lost the
-    // pointer, another listener ate the event): the first buttonless move is
-    // the release, rather than leaving the capybara wound up forever.
-    if (e.buttons !== undefined && !(e.buttons & 2)) { this._release(); return; }
+    if (e.key?.toLowerCase?.() !== SNOW_KEY) return;
+    this._release();
+  }
+
+  /** Pointer tracker. Always remembers the cursor (so a press of T knows where
+   *  you are pointing); while a throw is charging it also walks the aim. */
+  _pointerMove(e) {
+    this._cursor = { clientX: e.clientX, clientY: e.clientY };
+    if (!this._aim) return;
     if (!this._setRay(e)) return;
     if (this._groundPoint(_aimV)) {
       this._aim.x = _aimV.x;
       this._aim.z = _aimV.z;
     }
-  }
-
-  _pointerUp(e) {
-    if (!this._aim) return;
-    if (e && e.button !== undefined && e.button !== 2) return; // a left click, mid-aim
-    this._release();
   }
 
   /** Let the wound-up throw go. */
@@ -4092,15 +4088,15 @@ export class PeakRoom extends Room {
   dispose() {
     // Input first: these live on window, and a press landing between here and
     // the next room's build would have nothing left to aim with.
-    removeEventListener('pointerdown', this._onDown, true);
     removeEventListener('pointermove', this._onMove, true);
-    removeEventListener('pointerup', this._onUp, true);
     removeEventListener('pointercancel', this._onCancel, true);
+    // ...and T is an ordinary letter again everywhere else on the island
+    removeEventListener('keydown', this._onKeyDown, true);
+    removeEventListener('keyup', this._onKeyUp, true);
     removeEventListener('blur', this._onCancel);
-    // ...and the browser's own right-click menu is handed back to the page
-    removeEventListener('contextmenu', this._onContext, true);
-    this._onDown = this._onMove = this._onUp = this._onCancel = null;
-    this._onContext = null;
+    this._onMove = this._onCancel = null;
+    this._onKeyDown = this._onKeyUp = null;
+    this._cursor = null;
     this._aim = null;
 
     // The player's avatar (and the remotes') outlive this room, so anything we

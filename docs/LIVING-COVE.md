@@ -12,8 +12,9 @@ CLAUDE.md + CONTRACT.md + DESIGN.md first, as always.
 ## A2. Ambient play toys (no lobby, no menus, no scores)
 
 Instant physical play between people who have never spoken:
-- SNOWBALLS (peak): click-hold anywhere on the snow aims from your capy, a
-  short arc preview grows with hold time (cap 1s), release lofts a snowball
+- SNOWBALLS (peak): hold T with the cursor anywhere on the snow to aim from
+  your capy (it was the right mouse button until the input remap took that for
+  walking), a short arc preview grows with hold time (cap 1s), release lofts a snowball
   {t:'snow', from, to} relayed to the room; everyone simulates the same arc.
   A hit is a puff + a wobble + a 'boop' sfx + a brief snowcap on the target's
   head: no damage, no score, pure mischief. 1/s rate limit server-side.

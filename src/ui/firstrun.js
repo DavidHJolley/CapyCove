@@ -210,13 +210,22 @@ function menusOpen(game) {
 const BEATS = [
   {
     id: 'walk',
-    title: 'Click the cobbles to waddle',
-    body: 'Tap any patch of ground and your capy ambles over. No arrow keys needed.',
+    title: 'Right-click the cobbles to waddle',
+    body: 'Aim at any patch of ground with the RIGHT mouse button and your capy ambles over. Hold it down to steer. (On a touch screen, just tap.)',
     anchor: (t) => {
       const s = project(t.engine, t.engine?.playerAvatar?.group?.position, 3.1);
       return s && { ...s, side: 'down' };
     },
-    start(t) { t.walked = 0; t.lastPos = null; },
+    start(t) {
+      t.walked = 0;
+      t.lastPos = null;
+      // Settings > Walking can put movement back on the left button, and the
+      // very first thing we teach must not be the wrong button.
+      if (t.engine?.walkButton === 'left') {
+        t.say('Click the cobbles to waddle',
+          'Tap any patch of ground and your capy ambles over. No arrow keys needed.');
+      }
+    },
     done(t) {
       const p = t.engine?.playerAvatar?.group?.position;
       // a room change behind an open menu is a teleport, not a waddle
@@ -275,7 +284,7 @@ const BEATS = [
   },
   {
     id: 'dressup',
-    title: 'Click yourself or the hat button to dress up',
+    title: 'Tap the hat button to dress up',
     body: 'Colors and hats are yours forever, and everyone in the cove can see them.',
     mercy: 8,
     anchor: () => domAnchor('btn-shop', 'up'),

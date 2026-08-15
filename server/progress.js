@@ -14,7 +14,11 @@
  *    'party-attend', 'mural-pixel', 'chat', 'wave', 'room' {room},
  *    'whale-ride' {riders}, 'doodle-correct', 'bottle'.
  *  - tick(dtSeconds, worldClock) is called from the main interval so dailies
- *    can roll over on the cove-day boundary.
+ *    can roll over on the day boundary (wave 12: the REAL America/New_York
+ *    calendar day, not the 40-minute cove day; the clock argument is now only
+ *    read for `aurora`).
+ *  - install() also accepts an optional `now()` for tests; production does not
+ *    pass one and gets Date.now.
  *
  * ---------------------------------------------------------------------------
  * DESIGN NOTES (deviations and decisions are called out inline as DEVIATION)
@@ -31,7 +35,8 @@
  * Frames this module owns (add to the CLAUDE.md registry when the wave ships):
  *   client -> server : {t:'quests'}  ask for the board
  *                      {t:'stamps'}  ask for the album
- *   server -> client : {t:'quests', day, locked, ends, bonus, quests[]}
+ *   server -> client : {t:'quests', day, locked, ends, resetIn, bonus, quests[],
+ *                        streak:{days,show,plus,best,gift,next,claimed}}
  *                      {t:'quest-done', id, name, coins, all?, fanfare}
  *                      {t:'stamp', id, name, desc, how, total, of, fanfare}
  *                      {t:'stamps', ...album, milestones[], title, colors}
@@ -39,9 +44,12 @@
  *   sync with no new plumbing: {t:'shop', ok:true, ownedHats} for hats (no
  *   `bought` field, so nothing is auto-equipped) and {t:'furn', ok:true,
  *   ownedFurniture} for furniture, plus a {t:'toast'}.
+ *   The wave-12 login gift does the same: ctx.grantCoins sends the {t:'coins'}
+ *   frame, the warm line rides {t:'toast'}, and the streak itself is a block on
+ *   the 'quests' board frame. NO new wire frame was added for any of it.
  *
  * Robustness: index.js may call tick()/signal() from a later wiring pass, or
- * never. Nothing here depends on tick running: the cove-day rollover is also
+ * never. Nothing here depends on tick running: the day rollover is also
  * checked lazily whenever a board is touched, so a server whose tick is not
  * wired still hands out correct dailies (it just cannot push the new board
  * unprompted). Every entry point is wrapped: a throw in progression must never
@@ -51,23 +59,76 @@
 import { QUESTS, STAMPS, MILESTONES, ROOM_IDS } from '../shared/constants.js';
 import { ensureOwnedFurniture } from './db.js';
 
-// One cove day = 40 real minutes (docs/LIVING-COVE.md section A). The clock
-// module owns the broadcast clock; this module only needs the DAY INDEX, so it
-// derives it from the epoch (the same boundary a wall-clock-derived cove clock
-// lands on) and prefers `clock.day` if the clock ever starts sending one.
-// DEVIATION-adjacent note: the spec says "per cove-day", so the board rerolls
-// every 40 minutes rather than every calendar day. At 3 quests x 30-60 coins
-// + 50 bonus that is at most ~345 coins/hour, far under the 12k/hour backstop.
-const COVE_DAY_MS = 40 * 60 * 1000;
+/**
+ * WAVE 12 (N-25/N-26): the quest day is the REAL CALENDAR DAY in
+ * America/New_York, not the 40-minute cove day.
+ *
+ * The sky still turns every 40 minutes (docs/LIVING-COVE.md section A) and
+ * nothing here touches it. What changed is the ritual: a board that rerolled 36
+ * times a real day was not a daily anything, "finish all three on five days"
+ * was a 3.3-hour achievement, and the whole point of a daily is that it waits
+ * for you until tomorrow. Everything day-shaped in this module now keys off
+ * `dayKey()`, the same YYYY-MM-DD America/New_York string `touchDate` has
+ * always used for "days played" (and server/store.js for backup rotation, and
+ * server/auth.js for ban notices: the whole live-ops stack reads one clock).
+ */
+const DAY_TZ = 'America/New_York';
+const DAY_MS = 86_400_000;
 
 const DAILY_COUNT = 3;
-const ALL_THREE_BONUS = 50;
+// The board is now a once-a-day event rather than a 40-minute treadmill, so the
+// clear bonus is worth a real moment. A full board is ~250-300 coins a day
+// against ~1,500-2,000/hour of honest play: a warm nudge, never the income.
+const ALL_THREE_BONUS = 100;
 const READ_BURST = 6; // {t:'quests'}/{t:'stamps'} reads per second, per player
 const DRIFT_FLUSH_MS = 15_000; // how often a Drift stay is folded into the total
 const MAX_ROOMS_TRACKED = 32; // keeps the persisted record small
 const AURORA_ROOM = 'peak'; // the only room that renders the ribbons
 
-const QUEST_BY_ID = new Map(QUESTS.map((q) => [q.id, q]));
+/**
+ * Day-sized quest asks (N-25, second half: "raise per-quest counts to suit a
+ * full day"). shared/constants.js is contract data owned by the orchestrator,
+ * so the numbers are re-stated HERE as a diff on top of the shared table rather
+ * than edited in place; `QUEST_LIST` below is what the rest of this module
+ * (board draw, payload, progress, payout) actually reads, so a raised count and
+ * its sentence can never drift apart. Fold this table into QUESTS whenever the
+ * orchestrator wants it there; deleting an entry simply restores the old ask.
+ *
+ * Sizing rule: a quest should be a good afternoon, not a second job. One-shot
+ * feats (win a race, strike a gem, find the bottle, throw a party) stay at 1,
+ * because doing it once is the whole story. Repeatable verbs move to roughly
+ * 3x the old 40-minute ask, and their coins move with them so the trade never
+ * gets worse than it was.
+ */
+const DAY_SCALE = {
+  q_sled: { count: 3, coins: 60, desc: 'Take three runs down Summit Sprint.' },
+  q_three_runs: { count: 6, coins: 80, desc: 'Play six minigame runs today.' },
+  q_hunt: { count: 2, coins: 55, desc: 'Play two rounds of Prop Hunt in the mine.' },
+  q_match: { count: 3, coins: 80, desc: 'Win three duels at the Game Den.' },
+  q_pong: { count: 2, coins: 55, desc: 'Win two rounds of Paddle Panic.' },
+  q_cards: { count: 2, coins: 75, desc: 'Win two Capy Clash duels.' },
+  q_connect4: { count: 2, coins: 55, desc: 'Win two games of Four in a Row.' },
+  q_shuffle: { count: 2, coins: 55, desc: 'Win two rounds of Shuffle Showdown.' },
+  q_race: { count: 2, coins: 60, desc: 'Finish two three-capy sled races.' },
+  q_doodle: { count: 8, coins: 70, desc: 'Guess eight doodles right in the jungle.' },
+  q_mural: { count: 12, coins: 60, desc: 'Add twelve pixels to the plaza mural.' },
+  q_chat: { count: 20, coins: 45, desc: 'Chat twenty times with the cove.' },
+  q_wave: { count: 10, coins: 40, desc: 'Wave at the cove ten times.' },
+  q_ball: { count: 30, coins: 60, desc: 'Bop the beach ball thirty times.' },
+  q_snow: { count: 20, coins: 60, desc: 'Land twenty snowballs on the peak.' },
+  q_bonfire: { count: 5, coins: 45, desc: 'Warm up by the beach bonfire for five minutes.' },
+  q_dig: { count: 30, coins: 55, desc: 'Prospect thirty times in the Glimmer Mine.' },
+  // deliberately unscaled: q_fish / q_smoothie (a scoring threshold, not a
+  // count), q_race_win, q_gem, q_bottle, q_pod, q_drift, q_chess, q_party_*
+  // (one-shot feats), q_tour (five DISTINCT rooms is already a real tour).
+};
+
+/** The shared quest table with the day-sized asks folded in. */
+const QUEST_LIST = QUESTS.map((q) => (
+  Object.prototype.hasOwnProperty.call(DAY_SCALE, q.id) ? { ...q, ...DAY_SCALE[q.id] } : q
+));
+
+const QUEST_BY_ID = new Map(QUEST_LIST.map((q) => [q.id, q]));
 const STAMP_BY_ID = new Map(STAMPS.map((s) => [s.id, s]));
 const FIXED_ROOMS = new Set(ROOM_IDS); // dens ('house:<owner>') never count
 
@@ -82,7 +143,7 @@ const CORE_SIGNALS = [
   'score', 'match-win', 'race-done', 'dig', 'party-host', 'party-attend',
   'mural-pixel', 'chat', 'wave', 'room', 'whale-ride', 'doodle-correct', 'bottle',
 ];
-const QUEST_SIGNALS = new Set(QUESTS.map((q) => q.signal));
+const QUEST_SIGNALS = new Set(QUEST_LIST.map((q) => q.signal));
 const liveSignals = new Set(CORE_SIGNALS);
 
 /** Names other agents might plausibly use for the same moment. */
@@ -105,10 +166,18 @@ const own = (obj, key) => typeof key === 'string' && Object.prototype.hasOwnProp
 let ctx = null;
 /** Players seen this boot; pruned as their sockets die (index.js owns the map). */
 const live = new Set();
-let lastDay = -1;
+let lastDay = '';
+
+/**
+ * The clock. index.js does not pass one, so this is Date.now in production;
+ * tests install a fake so a whole week (and a DST weekend) can pass in a
+ * millisecond. Everything time-shaped in this module reads through it.
+ */
+let now = () => Date.now();
 
 export function install(c) {
   ctx = c || null;
+  now = typeof c?.now === 'function' ? c.now : () => Date.now();
   lastDay = today();
   // A stamp with no rule can never be earned: shout about it once at boot
   // rather than silently shipping dead album art.
@@ -120,47 +189,102 @@ export function install(c) {
 // day + seeded selection
 // ---------------------------------------------------------------------------
 
-/**
- * The current cove-day index. Epoch-derived by default (index.js's world clock
- * derives its own the same way, so the two agree before a single tick lands);
- * once tick() sees a clock frame it latches that clock's day, day length and
- * phase, and EVERYTHING (board seeds, rollover, payloads) follows those. That
- * way a board can never be built against one day and sent stamped with another,
- * and the clock's test hooks (COVE_DAY_MS / COVE_CLOCK_OFFSET_MS) move the
- * quest board with the sky instead of leaving it on wall-clock time.
- */
-let clockDay = null;
-let clockDayMs = null;
-let clockT = null;
-let clockTAt = 0;
+let partFmt = null;
 
-const dayMs = () => (clockDayMs || COVE_DAY_MS);
+/**
+ * The America/New_York wall clock at `ms`, as plain numbers.
+ *
+ * Intl is the only thing in Node that knows when the US moved its clocks, so it
+ * is the authority here; a build without ICU tz data (small-icu) falls back to
+ * UTC, which keeps a stable 24-hour day rather than crashing a player's board.
+ */
+function wallParts(ms) {
+  try {
+    if (!partFmt) {
+      partFmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: DAY_TZ,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hourCycle: 'h23',
+      });
+    }
+    const o = {};
+    for (const part of partFmt.formatToParts(new Date(ms))) {
+      if (part.type !== 'literal') o[part.type] = part.value;
+    }
+    const p = {
+      y: Number(o.year), mo: Number(o.month), d: Number(o.day),
+      // some ICU versions still say "24" for midnight under h23
+      h: Number(o.hour) % 24, mi: Number(o.minute), s: Number(o.second),
+    };
+    if (!Object.values(p).every(Number.isFinite)) throw new Error('bad parts');
+    return p;
+  } catch {
+    const dt = new Date(ms);
+    return {
+      y: dt.getUTCFullYear(), mo: dt.getUTCMonth() + 1, d: dt.getUTCDate(),
+      h: dt.getUTCHours(), mi: dt.getUTCMinutes(), s: dt.getUTCSeconds(),
+    };
+  }
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+/**
+ * The quest day: 'YYYY-MM-DD' in America/New_York. Exported for the tests and
+ * for anything else that ever needs to agree with the board about what "today"
+ * means. Same shape and same timezone as `touchDate`'s "days played" key, so
+ * the two can never disagree about whether a player showed up.
+ */
+export function dayKey(ms = now()) {
+  const p = wallParts(ms);
+  return `${p.y}-${pad2(p.mo)}-${pad2(p.d)}`;
+}
+
+/** ET wall clock minus UTC at this instant, in ms (-5h EST, -4h EDT). */
+function offsetMs(ms) {
+  const p = wallParts(ms);
+  return Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000;
+}
+
+/**
+ * The instant ET midnight opened the day containing `ms`.
+ *
+ * The naive "subtract the offset" answer is wrong twice a year, because the
+ * offset at noon is not the offset at midnight, so the first answer is checked
+ * against the offset AT that answer and redone if the clocks moved in between.
+ * US transitions happen at 2am local, so ET midnight always exists and is never
+ * ambiguous; one correction is always enough.
+ */
+export function dayStartMs(ms = now()) {
+  const off = offsetMs(ms);
+  const localMidnight = Math.floor((ms + off) / DAY_MS) * DAY_MS;
+  const start = localMidnight - off;
+  const off2 = offsetMs(start);
+  return off2 === off ? start : localMidnight - off2;
+}
+
+/**
+ * When the current quest day ends (= next ET midnight), for the countdown.
+ * Stepping 26 hours lands inside the next day whether it is 23, 24 or 25 hours
+ * long, and then that day's own start is the exact boundary.
+ */
+export function dayEndMs(ms = now()) {
+  return dayStartMs(dayStartMs(ms) + 26 * 3_600_000);
+}
+
+/** The day key before the one containing `ms`. */
+export function prevDayKey(ms = now()) {
+  return dayKey(dayStartMs(ms) - 1);
+}
 
 function today() {
-  return Number.isFinite(clockDay) ? clockDay : Math.floor(Date.now() / dayMs());
+  return dayKey(now());
 }
 
-/** When the current cove-day ends, for the board's countdown. */
+/** When the current quest day ends, for the board's countdown. */
 function dayEnds() {
-  const span = dayMs();
-  if (Number.isFinite(clockT)) {
-    // exact even under a phase offset: the last clock frame is at most one
-    // broadcast (10s) old, which no countdown will notice
-    const now = Date.now();
-    return now + Math.max(0, (1 - clockT) * span - (now - clockTAt));
-  }
-  return (Math.floor(Date.now() / span) + 1) * span;
-}
-
-/** Latch whatever the world clock chose to tell us. */
-function readClock(clock) {
-  if (!clock || typeof clock !== 'object') return;
-  if (Number.isFinite(clock.day)) clockDay = Math.floor(clock.day);
-  if (Number.isFinite(clock.dayMs) && clock.dayMs > 0) clockDayMs = clock.dayMs;
-  if (Number.isFinite(clock.dayT) && clock.dayT >= 0 && clock.dayT < 1) {
-    clockT = clock.dayT;
-    clockTAt = Date.now();
-  }
+  return dayEndMs(now());
 }
 
 function hash32(str) {
@@ -191,8 +315,8 @@ function drawOne(pool, rnd, taken) {
  */
 function pickDaily(key, day) {
   const rnd = mulberry32(hash32(`${key}|${day}`));
-  const pool = QUESTS.filter((q) => liveSignals.has(q.signal));
-  const usable = pool.length ? pool : QUESTS;
+  const pool = QUEST_LIST.filter((q) => liveSignals.has(q.signal));
+  const usable = pool.length ? pool : QUEST_LIST;
   const taken = new Set();
   const out = [];
   const byKind = (k) => usable.filter((q) => q.kind === k);
@@ -234,7 +358,11 @@ const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 function progFor(rec) {
   let pr = rec.progress;
   if (!pr || typeof pr !== 'object' || Array.isArray(pr)) pr = rec.progress = {};
-  if (!Number.isFinite(pr.day)) pr.day = -1;
+  // wave 12: `day` is a 'YYYY-MM-DD' America/New_York key, not the old
+  // 40-minute cove-day index. A record still carrying a number reads as "no
+  // board yet" and gets one fresh board on first touch: a one-off reroll on the
+  // deploy that lands this, and nothing already earned is touched.
+  if (typeof pr.day !== 'string') pr.day = '';
   if (!Array.isArray(pr.q)) pr.q = [];
   // Entries for quests that no longer exist in the pool are dropped, which
   // leaves a short board; ensureBoard() then reseeds the day. That only happens
@@ -292,7 +420,7 @@ function sweep() {
 /** The stable per-account seed key: the board must survive a reconnect. */
 const seedKey = (rec) => String(rec?.username || 'capy').toLowerCase();
 
-/** Refresh the board if the cove-day turned over (or it was never built). */
+/** Refresh the board if the calendar day turned over (or it was never built). */
 function ensureBoard(pr, key, day) {
   if (pr.day === day && pr.q.length === DAILY_COUNT) return false;
   pr.day = day;
@@ -333,11 +461,18 @@ function questPayload(rec, day) {
     t: 'quests',
     day,
     ends,
-    resetIn: Math.max(0, Math.round((ends - Date.now()) / 1000)), // seconds, for the countdown
+    // seconds to the next America/New_York midnight (up to a full day now that
+    // the board is a real daily; the client's own cove-clock guess is a
+    // 40-minute number and must not be allowed to win)
+    resetIn: Math.max(0, Math.round((ends - now()) / 1000)),
+    dayLength: DAY_MS,
     locked,
     quests,
     bonus: { coins: ALL_THREE_BONUS, reward: ALL_THREE_BONUS, done: !locked && !!pr.bonus },
     done: quests.filter((q) => q.done).length,
+    // the login streak rides the board frame rather than a new one; guests see
+    // the shape with zeros, exactly like their locked quest rows
+    streak: pr ? streakPayload(pr) : { days: 0, show: 0, plus: false, best: 0, gift: STREAK_GIFTS[0], next: STREAK_GIFTS[0], claimed: false },
   };
 }
 
@@ -463,15 +598,22 @@ function counters(pr) {
   const keys = ['chats', 'waves', 'mural', 'digs', 'gems', 'runs', 'wins', 'races',
     'raceWins', 'sweeps', 'doodles', 'hosted', 'attended', 'maxGuests', 'snow',
     'ball', 'bonfire', 'whale', 'whaleMax', 'bottles', 'driftMs', 'days',
-    'questsDone', 'questDays'];
+    'questsDone', 'questDays',
+    // wave 12: login streak. `streak` is the live run, `bestStreak` is the
+    // high-water mark that never goes down, `gifted` is lifetime gift coins.
+    'streak', 'bestStreak', 'gifted'];
   for (const k of keys) if (!Number.isFinite(c[k])) c[k] = 0;
+  // day keys are strings ('YYYY-MM-DD', America/New_York); anything else in the
+  // record is treated as "not today", which at worst gives one extra gift
+  if (typeof c.lastDate !== 'string') c.lastDate = '';
+  if (typeof c.giftDate !== 'string') c.giftDate = '';
   return c;
 }
 
 /** Idempotent by construction: an id already in the record returns false. */
 function award(p, rec, pr, id) {
   if (!STAMP_BY_ID.has(id) || own(pr.stamps, id)) return false;
-  pr.stamps[id] = Date.now();
+  pr.stamps[id] = now();
   const s = STAMP_BY_ID.get(id);
   const total = stampCount(pr);
   if (p) {
@@ -563,21 +705,121 @@ function grantReward(p, rec, reward) {
 // counters + quest progress, driven by signals
 // ---------------------------------------------------------------------------
 
-/** Real calendar days played (the "Regular"/"Veteran" stamps mean real days). */
+// ---------------------------------------------------------------------------
+// login streak + the daily gift (N-26)
+// ---------------------------------------------------------------------------
+
+/**
+ * The ramp. Day 1 pays before you have done anything, because the gift is a
+ * hello, not a wage. Seven days is the top of the ladder and it STAYS there:
+ * day 30 pays the same 120 as day 7, so nobody is ever farming a login.
+ */
+export const STREAK_GIFTS = [25, 35, 50, 65, 80, 100, 120];
+/** Displayed streak tops out here ("day 7+"); the count itself keeps going. */
+export const STREAK_CAP = STREAK_GIFTS.length;
+
+/** What a given streak day is worth. Clamped both ends; never returns 0. */
+export function giftFor(streak) {
+  const n = Math.max(1, Math.floor(Number(streak) || 1));
+  return STREAK_GIFTS[Math.min(n, STREAK_CAP) - 1];
+}
+
+/**
+ * The streak after showing up at `ms`, given the previous streak and the last
+ * day key seen.
+ *
+ * OWNER'S LAW, the whole reason this function is three lines and not thirty:
+ * a missed day starts the ramp OVER, it does not take anything away. Coins
+ * already granted are granted, `bestStreak` is a high-water mark that only ever
+ * goes up, and `days` (the Regular/Veteran stamps) counts every day you ever
+ * played and can never go down. Coming back after a month is a welcome, not a
+ * penalty screen.
+ */
+export function nextStreak(prev, lastKey, ms = now()) {
+  const p = Math.max(0, Math.floor(Number(prev) || 0));
+  const key = dayKey(ms);
+  if (lastKey === key) return Math.max(1, p); // already counted today
+  // Yesterday: climb. `Math.max(1, p)` reads a missing or nonsense streak as
+  // "they were here yesterday, so that was at least day 1", which is how a
+  // record written before this wave (lastDate but no streak) lands on day 2
+  // instead of being quietly knocked back to day 1. Round up, always.
+  if (lastKey && lastKey === prevDayKey(ms)) return Math.max(1, p) + 1;
+  return 1; // first day ever, or a gap: start the ramp again
+}
+
+/**
+ * Real calendar days played, in America/New_York (the "Regular"/"Veteran"
+ * stamps mean real days), plus the login streak that rides the same key.
+ * Returns true when this is the first touch of a new day.
+ */
 function touchDate(c) {
-  const today = new Date().toISOString().slice(0, 10);
-  if (c.lastDate !== today) { c.lastDate = today; c.days += 1; }
+  const at = now();
+  const key = dayKey(at);
+  if (c.lastDate === key) return false;
+  const streak = nextStreak(c.streak, c.lastDate, at);
+  c.lastDate = key;
+  c.days += 1;
+  c.streak = streak;
+  c.bestStreak = Math.max(Math.floor(num(c.bestStreak)), streak); // never shrinks
+  return true;
+}
+
+/** The streak block that rides the existing 'quests' frame. */
+function streakPayload(pr) {
+  const c = counters(pr);
+  const n = Math.max(1, Math.floor(num(c.streak)) || 1);
+  return {
+    days: n,
+    show: Math.min(n, STREAK_CAP),
+    plus: n > STREAK_CAP,
+    best: Math.max(Math.floor(num(c.bestStreak)), n),
+    gift: giftFor(n),
+    next: giftFor(n + 1),
+    claimed: c.giftDate === dayKey(now()),
+  };
+}
+
+/** The warm line. Never mentions what a gap cost, because it cost nothing. */
+function giftMessage(streak, coins, firstEver) {
+  if (firstEver) return `Welcome to the cove! Here are ${coins} coins to get you started.`;
+  if (streak <= 1) return `Welcome back! Lovely to see you. Here are ${coins} coins.`;
+  if (streak < STREAK_CAP) return `Day ${streak} in a row! Here are ${coins} coins.`;
+  if (streak === STREAK_CAP) return `A whole week in a row! Here are ${coins} coins.`;
+  return `${streak} days running! Here are ${coins} coins.`;
+}
+
+/**
+ * Pay today's gift, once per real day, through the EXISTING frames: ctx.grantCoins
+ * sends {t:'coins'} itself and the warm line rides {t:'toast'}. No new frame,
+ * and no claim button to forget: showing up IS the claim.
+ *
+ * If the hourly backstop refuses the payout (a player already at the ceiling),
+ * `giftDate` is deliberately left unset so the gift is still waiting on their
+ * next connect. A gift is never lost to a rate limit.
+ */
+function dailyGift(p, rec, pr) {
+  const c = counters(pr);
+  const key = dayKey(now());
+  if (c.giftDate === key) return 0;
+  const streak = Math.max(1, Math.floor(num(c.streak)) || 1);
+  const coins = giftFor(streak);
+  const paid = ctx.grantCoins(p, coins, 'daily gift');
+  if (paid <= 0) return 0;
+  c.giftDate = key;
+  c.gifted = Math.floor(num(c.gifted)) + paid; // lifetime total, only ever grows
+  ctx.sendTo(p, { t: 'toast', msg: giftMessage(streak, paid, num(c.days) <= 1) });
+  return paid;
 }
 
 /** Fold an in-progress Drift stay into the total; safe to call at any time. */
-function accrueDrift(p, now) {
+function accrueDrift(p, at) {
   const s = scratch(p);
   const inDrift = p.room === 'drift';
-  if (inDrift && !s.driftAt) { s.driftAt = now; return 0; }
+  if (inDrift && !s.driftAt) { s.driftAt = at; return 0; }
   if (!s.driftAt) return 0;
-  const add = Math.max(0, Math.min(now - s.driftAt, 10 * 60_000));
+  const add = Math.max(0, Math.min(at - s.driftAt, 10 * 60_000));
   if (inDrift && add < DRIFT_FLUSH_MS) return 0;
-  s.driftAt = inDrift ? now : 0;
+  s.driftAt = inDrift ? at : 0;
   if (add <= 0) return 0;
   const rec = recFor(p);
   if (!rec) return 0;
@@ -723,8 +965,8 @@ export function handleMessage(p, m) {
     // consumed either way: an over-eager UI must not be able to turn one socket
     // into a board-rebuild pump
     const s = scratch(p);
-    const now = Date.now();
-    if (now - s.w > 1000) { s.w = now; s.n = 0; }
+    const at = now();
+    if (at - s.w > 1000) { s.w = at; s.n = 0; }
     if (++s.n > READ_BURST) return true;
     const rec = recFor(p);
     if (m.t === 'quests') {
@@ -755,12 +997,20 @@ function greet(p, push = true) {
   s.greeted = 1;
   try {
     const rec = recFor(p);
-    if (push) sendBoard(p, rec);
     if (rec) {
       const pr = progFor(rec);
+      // order matters: count the day (which rolls the streak) BEFORE paying the
+      // gift, so a returning player is paid for the day they just started
       touchDate(counters(pr));
+      // the gift rides ctx.grantCoins ({t:'coins'}) + {t:'toast'}, both frames
+      // the client has always understood, and lands before the board so the
+      // board's `streak.claimed` is already true when it arrives
+      dailyGift(p, rec, pr);
+      if (push) sendBoard(p, rec);
       checkStamps(p, rec, pr);
       ctx.saveSoon();
+    } else if (push) {
+      sendBoard(p, rec);
     }
   } catch (e) {
     console.error('[progress] greet failed:', e?.message || e);
@@ -779,9 +1029,9 @@ export function signal(name, p, data) {
     if (!rec) return;
     const pr = progFor(rec);
     const c = counters(pr);
-    touchDate(c);
+    if (touchDate(c)) dailyGift(p, rec, pr); // belt and braces if tick is not wired
     ensureBoard(pr, seedKey(rec), today());
-    if (canon === 'room') accrueDrift(p, Date.now());
+    if (canon === 'room') accrueDrift(p, now());
     bumpCounters(canon, c, data, p);
     advanceQuests(p, rec, pr, canon, data);
     checkStamps(p, rec, pr);
@@ -795,21 +1045,32 @@ export function tick(_dt, clock) {
   if (!ctx) return;
   try {
     sweep();
-    const now = Date.now();
-    readClock(clock);
+    const at = now();
+    // NOTE (wave 12): the world clock is no longer consulted for the day. The
+    // sky still turns every 40 minutes; the quest day is the real ET calendar
+    // day. `clock` is still read for the aurora, which is a sky fact.
     const day = today();
     const rolled = day !== lastDay;
     lastDay = day;
     const auroraNow = !!(clock && clock.aurora);
     for (const p of live) {
       try {
-        accrueDrift(p, now);
+        accrueDrift(p, at);
         // "Night owl: see the aurora": you have to actually be standing on the
         // peak while it is up, which is the only room that renders it
         if (auroraNow && p.room === AURORA_ROOM) awardTo(p, 'night_owl');
         if (rolled) {
           const rec = recFor(p);
-          if (rec) ensureBoard(progFor(rec), seedKey(rec), day);
+          if (rec) {
+            const pr = progFor(rec);
+            // somebody who was already standing in the plaza at ET midnight has
+            // absolutely shown up today: count the day, roll the streak, pay
+            // the gift, exactly as a fresh connect would
+            touchDate(counters(pr));
+            dailyGift(p, rec, pr);
+            ensureBoard(pr, seedKey(rec), day);
+            checkStamps(p, rec, pr);
+          }
           sendBoard(p, rec); // fresh dailies, unprompted
         }
       } catch (e) {

@@ -17,6 +17,7 @@ import * as postfx from '../core/postfx.js';
  *   graphics  localStorage 'capycove-gfx'    -> applySavedSettings()
  *   audio     localStorage 'capycove-vol'    -> src/core/audio.js, in init()
  *   camera    localStorage 'capycove-cam'    -> src/core/engine.js, in its ctor
+ *   walking   localStorage 'capycove-walkbtn'-> src/core/engine.js, in its ctor
  *   motion    localStorage 'capycove-motion' -> applySavedSettings()
  *
  * Styles: the panel reuses the menu's cream card classes from styles.css
@@ -345,6 +346,15 @@ export function openSettings(game) {
       </section>
 
       <section class="set-sec">
+        <h3>Walking</h3>
+        <div class="set-seg" data-seg="walk" role="group" aria-label="Which mouse button walks">
+          <button type="button" data-val="right"><span class="menu-ico">&#128433;</span>Right click</button>
+          <button type="button" data-val="left"><span class="menu-ico">&#128070;</span>Left click</button>
+        </div>
+        <p class="set-note" data-note="walk"></p>
+      </section>
+
+      <section class="set-sec">
         <h3>Motion</h3>
         <div class="set-seg" data-seg="motion" role="group" aria-label="Motion">
           <button type="button" data-val="auto"><span class="menu-ico">&#9881;</span>Auto</button>
@@ -465,6 +475,23 @@ export function openSettings(game) {
   camCopy();
   const offCam = game.events?.on?.('camera-mode', () => { syncCam(); camCopy(); }) || null;
 
+  // ---- walking -------------------------------------------------------------
+  // The engine owns the binding and persists it ('capycove-walkbtn'); this only
+  // mirrors it, the same way the camera row mirrors engine.cameraMode. Touch is
+  // never affected: a tap always walks, whatever is picked here.
+  const walkNote = q('[data-note="walk"]');
+  function walkCopy() {
+    walkNote.textContent = (game.engine?.walkButton || 'right') === 'left'
+      ? 'Left click: the classic scheme. One button does everything, so a click on the ground walks you and a click on a capybara opens their card.'
+      : 'Right click: hold it down to steer, and the left button is free for capybaras, props and prompts. On a phone or tablet, a tap still does both.';
+  }
+  const syncWalk = seg('walk', () => game.engine?.walkButton || 'right', (v) => {
+    game.engine?.setWalkButton?.(v);
+    walkCopy();
+  });
+  walkCopy();
+  const offWalk = game.events?.on?.('walk-button', () => { syncWalk(); walkCopy(); }) || null;
+
   // ---- motion --------------------------------------------------------------
   const motionNote = q('[data-note="motion"]');
   function motionCopy() {
@@ -488,6 +515,7 @@ export function openSettings(game) {
     root.removeEventListener('pointerdown', onBackdrop);
     offMute?.();
     offCam?.();
+    offWalk?.();
     root.classList.add('is-closing');
     setTimeout(() => root.remove(), 160);
     blip('click');

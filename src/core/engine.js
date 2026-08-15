@@ -23,6 +23,27 @@ const _corner = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
 
+/*
+ * INPUT MAP (session task #20, owner's call 2026-08-14)
+ *
+ *   RIGHT button  walk. A click sends you to the spot; holding it down and
+ *                 dragging keeps re-aiming the walk, so you can steer.
+ *   LEFT button   interact, and nothing else: another capybara's profile card,
+ *                 a prop the room picks up itself (the beach ball, the whale),
+ *                 the hotspot prompt buttons. It never moves you any more.
+ *   Touch         unchanged: a finger has no second button, so a tap still
+ *                 walks AND still interacts, exactly as before.
+ *
+ * Anyone whose pointer cannot comfortably right-click can put walking back on
+ * the left button in Settings > Walking; that is the ONLY other configuration,
+ * and it restores the old behaviour verbatim (left walks and interacts).
+ */
+const WALK_KEY = 'capycove-walkbtn';
+const WALK_REPEAT_MS = 60; // how often a held walk button re-aims
+// One nudge per session for the muscle memory the remap breaks. Module scope:
+// a room change must not start the counting over.
+let _walkHintShown = false;
+
 /**
  * Engine: renderer, camera, main loop, room lifecycle, click-to-move,
  * hotspot prompts, and world-anchored DOM overlays (name tags, chat bubbles).
@@ -67,6 +88,13 @@ export class Engine {
       try { return localStorage.getItem('capycove-cam') === 'static' ? 'static' : 'follow'; } catch { return 'follow'; }
     })();
     this._staticCam = null;
+    // 'right' (the shipped remap) | 'left' (the classic scheme, Settings)
+    this.walkButton = (() => {
+      try { return localStorage.getItem(WALK_KEY) === 'left' ? 'left' : 'right'; } catch { return 'right'; }
+    })();
+    this._walkHold = 0;  // MouseEvent.buttons mask of the held walk button, 0 when idle
+    this._walkNext = 0;  // performance.now() the held walk may re-aim again
+    this._leftOnGround = 0; // left clicks that landed on the floor and did nothing
     this._camEase = 0; // seconds left in the entry/arrival ease
     this._camFrom = new THREE.Vector3();
     this._lookFrom = new THREE.Vector3();
@@ -78,6 +106,17 @@ export class Engine {
     this._resize();
 
     canvas.addEventListener('pointerdown', (e) => this._onPointer(e));
+    // hold-to-walk: while the walk button is down, a drag keeps re-aiming
+    canvas.addEventListener('pointermove', (e) => this._onPointerDrag(e));
+    // the browser menu would pop on the very press that starts a walk. The
+    // layout editor suppresses it too (right-drag orbits there), and the
+    // classic left-walk setting hands it straight back.
+    canvas.addEventListener('contextmenu', (e) => { if (this.walkButton !== 'left') e.preventDefault(); });
+    // a release anywhere ends the hold, including off the canvas or over the HUD
+    const endHold = () => { this._walkHold = 0; };
+    addEventListener('pointerup', endHold);
+    addEventListener('pointercancel', endHold);
+    addEventListener('blur', endHold);
 
     // Background tabs freeze requestAnimationFrame, which used to freeze the
     // player mid-walk (locally AND for everyone else, since move frames stop).
@@ -371,43 +410,110 @@ export class Engine {
   }
 
   // ---- input ---------------------------------------------------------------
+  /** 'right' | 'left'. Persisted; a no-op if already there. See WALK_KEY. */
+  setWalkButton(mode) {
+    const next = mode === 'left' ? 'left' : 'right';
+    if (next === this.walkButton) return next;
+    this.walkButton = next;
+    this._walkHold = 0;
+    try { localStorage.setItem(WALK_KEY, next); } catch { /* private mode: session only */ }
+    this.game.events.emit('walk-button', next);
+    return next;
+  }
+
+  /** Which mouse button walks for THIS event: 0 for touch/pen and for the
+   *  classic setting, 2 otherwise. Rooms that drive their own movement (The
+   *  Drift's swim) ask the same question, so it lives here. */
+  walkButtonFor(e) {
+    if (e?.pointerType && e.pointerType !== 'mouse') return 0; // a finger has one button
+    return this.walkButton === 'left' ? 0 : 2;
+  }
+
   _onPointer(e) {
-    if (this.paused || !this.room || e.button !== 0) return;
+    if (this.paused || !this.room) return;
+    const walkBtn = this.walkButtonFor(e);
+    const isWalk = e.button === walkBtn;
+    const isInteract = e.button === 0; // left, or the one tap a finger has
+    if (!isWalk && !isInteract) return;
+
     const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
     this.ray.setFromCamera(ndc, this.camera);
 
-    // Clicking ANOTHER capybara opens their profile instead of walking. Your
-    // own capy is deliberately not clickable (playtester call, 2026-08-07:
-    // a click on yourself is almost always a mis-aimed walk); your card is a
-    // click away in the friends list instead.
-    const avatarHits = this.ray.intersectObjects(this.remoteGroup.children, true);
-    if (avatarHits.length) {
-      let root = avatarHits[0].object;
-      while (root.parent && root.parent !== this.remoteGroup && root.parent !== this.scene) root = root.parent;
-      const remotes = this.game.net?.remotes;
-      if (remotes) {
-        for (const [id, r] of remotes) {
-          if (r.avatar.group === root) {
-            this.game.audio?.play?.('pop');
-            this.game.events.emit('avatar-click', id);
-            return;
+    // Clicking ANOTHER capybara opens their profile. Your own capy is
+    // deliberately not clickable (playtester call, 2026-08-07); your card is a
+    // click away in the friends list instead. This is the LEFT button's job
+    // now, so a right-click aimed past someone still walks you there.
+    if (isInteract) {
+      const avatarHits = this.ray.intersectObjects(this.remoteGroup.children, true);
+      if (avatarHits.length) {
+        let root = avatarHits[0].object;
+        while (root.parent && root.parent !== this.remoteGroup && root.parent !== this.scene) root = root.parent;
+        const remotes = this.game.net?.remotes;
+        if (remotes) {
+          for (const [id, r] of remotes) {
+            if (r.avatar.group === root) {
+              this.game.audio?.play?.('pop');
+              this.game.events.emit('avatar-click', id);
+              return;
+            }
           }
         }
       }
     }
 
+    if (!isWalk) { this._maybeWalkHint(); return; }
+    // rooms that move the player themselves (The Drift's swim) own the walk
+    if (this.controller?.enabled === false) return;
+    this._walkHold = walkBtn === 2 ? 2 : 1; // MouseEvent.buttons: 1 = left, 2 = right
+    this._walkNext = 0;
     const hits = this.ray.intersectObjects(this.room.groundMeshes, false);
-    if (hits.length) {
-      const pt = hits[0].point;
-      // rooms with multiple storeys route the walk (stairs between floors):
-      // routeTo returns the intermediate waypoints, or null for a direct walk
-      const route = this.room.routeTo?.(this.playerAvatar.group.position, pt);
-      if (Array.isArray(route) && route.length) this.controller.setPath([...route, pt]);
-      else this.controller.setTarget(pt);
-      this._showClickMarker(pt);
-      if (this.playerAvatar.state.anim === 'dance') this.playerAvatar.setAnim('idle');
-      this.game.audio?.play?.('step');
+    if (hits.length) this._walkTo(hits[0].point, true);
+  }
+
+  /** Held walk button: keep re-aiming while the pointer drags. Cheap enough at
+   *  WALK_REPEAT_MS, and it stops the moment the button comes up (or the
+   *  pointer comes back over the canvas without it). */
+  _onPointerDrag(e) {
+    if (!this._walkHold || this.paused || !this.room) return;
+    if (e.buttons !== undefined && !(e.buttons & this._walkHold)) { this._walkHold = 0; return; }
+    if (this.controller?.enabled === false) return;
+    const now = performance.now();
+    if (now < this._walkNext) return;
+    this._walkNext = now + WALK_REPEAT_MS;
+    const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+    this.ray.setFromCamera(ndc, this.camera);
+    const hits = this.ray.intersectObjects(this.room.groundMeshes, false);
+    if (hits.length) this._walkTo(hits[0].point, false);
+  }
+
+  /** Send the walker at a ground point. `announce` is the press itself (ring,
+   *  step blip, drop out of a dance); a drag only moves the destination. */
+  _walkTo(pt, announce) {
+    // rooms with multiple storeys route the walk (stairs between floors):
+    // routeTo returns the intermediate waypoints, or null for a direct walk
+    const route = this.room.routeTo?.(this.playerAvatar.group.position, pt);
+    if (Array.isArray(route) && route.length) this.controller.setPath([...route, pt]);
+    else this.controller.setTarget(pt);
+    if (!announce) {
+      // a live drag drags the marker with it rather than re-blooming a new one
+      if (this._marker?.visible && this._markerScene === this.scene) {
+        this._marker.position.set(pt.x, pt.y + 0.05, pt.z);
+      }
+      return;
     }
+    this._showClickMarker(pt);
+    if (this.playerAvatar.state.anim === 'dance') this.playerAvatar.setAnim('idle');
+    this.game.audio?.play?.('step');
+  }
+
+  /** A left click that landed on the floor and did nothing at all: say so, once
+   *  per session, on the second one. Muscle memory deserves one sentence. */
+  _maybeWalkHint() {
+    if (_walkHintShown || this.walkButton === 'left') return;
+    if (!this.ray.intersectObjects(this.room.groundMeshes, false).length) return;
+    if (++this._leftOnGround < 2) return;
+    _walkHintShown = true;
+    this.game.toast?.('Right-click the ground to waddle over. Left click is for capybaras and props.', 5200);
   }
 
   /** Brief expanding ring where the player clicked, so the destination reads. */

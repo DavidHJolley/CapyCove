@@ -47,6 +47,16 @@ const RACE_SEND_HZ = 5;      // race-progress messages per second
 const RIVAL_HIDE = 60;       // hide a rival past this |distance delta|
 const RIVAL_HIDE_BACK = 52;  // ...and sooner behind us, where ground runs out
 
+// ---- the start gate lineup (wave 12: races start at two) --------------------
+// The peak's gate owns the lobby, but this menu is one hotspot away from it and
+// a rider standing in here is invisible to the sign outside. So the menu shows
+// the same board: how many are signed on, how long the fill window has left,
+// and the two ways to act on it.
+const LOBBY_GAME = 'sled';   // the only lobby these frames can be about
+const LOBBY_MIN = 2;         // riders that make a race; the server agrees
+const LOBBY_BAIL_MS = 3000;  // hand the screen back this long before the gate drops
+const LOBBY_TICK_MS = 250;   // countdown repaint cadence
+
 const SKY_TOP = 0x4e9fd6;
 const SKY_MID = 0xa9d8f2;
 const SKY_LOW = 0xe6f3fc;
@@ -622,6 +632,31 @@ const CSS = `
 .mg-sled-vsrow{display:flex;align-items:center;gap:9px;background:var(--card);border-radius:12px;
   padding:7px 13px;font-weight:800;font-size:13.5px;}
 .mg-sled-vsrow i{width:15px;height:15px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
+
+/* ---- the start gate strip: who is waiting, the countdown, and the way in ---- */
+.mg-sled-gate{display:none;}
+.mg-sled-gate.on{display:block;margin:15px 0 2px;}
+.mg-sled-gwrap{background:var(--card);border-radius:16px;padding:11px 14px;
+  display:flex;flex-direction:column;gap:9px;}
+.mg-sled-grow{display:flex;align-items:center;gap:9px;font-size:13.5px;font-weight:800;
+  color:#5c5140;text-align:left;}
+.mg-sled-gdots{display:flex;gap:5px;flex:none;}
+.mg-sled-gdot{width:11px;height:11px;border-radius:99px;background:#ded5c2;
+  box-shadow:inset 0 -3px 0 rgba(0,0,0,.1);}
+.mg-sled-gdot.on{background:var(--accent);}
+.mg-sled-gclock{display:flex;align-items:center;gap:9px;font-size:12.5px;font-weight:800;color:#8a7a5a;}
+.mg-sled-gclock b{color:var(--accent);font-size:15px;min-width:36px;text-align:left;}
+.mg-sled-gbar{flex:1;height:6px;border-radius:99px;background:#e7ecf2;overflow:hidden;}
+.mg-sled-gbar i{display:block;height:100%;width:100%;border-radius:99px;
+  background:linear-gradient(90deg,#4fb3e8,var(--accent));transition:width .25s linear;}
+.mg-sled-gnote{font-size:12.5px;font-weight:700;color:#8a7a5a;text-align:left;}
+.mg-sled-gbtns{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;}
+.mg-sled-gbtns .mg-sled-btn{font-size:14px;padding:9px 19px;}
+/* START NOW is the whole point of the strip: it breathes so it reads as the
+   live control on a card full of static text. */
+.mg-sled-go{animation:mg-sled-go 1.25s ease-in-out infinite;}
+@keyframes mg-sled-go{50%{scale:1.06;box-shadow:0 0 0 7px rgba(232,101,122,.16),var(--shadow)}}
+@media (prefers-reduced-motion:reduce){.mg-sled-go{animation:none;}}
 `;
 
 const HEART = '<svg class="mg-sled-heart" viewBox="0 0 24 22"><path d="M12 20.8S1.6 14 1.6 7.5C1.6 4 4.4 1.4 7.5 1.4c1.9 0 3.6 1 4.5 2.5.9-1.5 2.6-2.5 4.5-2.5 3.1 0 5.9 2.6 5.9 6.1 0 6.5-10.4 13.3-10.4 13.3z"/></svg>';
@@ -641,7 +676,20 @@ export class SledGame extends Minigame {
     this.disposed = false;
     this.geos = [];        // geometries we own outside the scene graph churn
     this.listeners = [];
-    this.subs = [];        // game.events unsubscribers (race wiring)
+    this.subs = [];        // game.events unsubscribers (race wiring, dropped on _leaveRace)
+    this.gsubs = [];       // ...and the ones that outlive a race (the gate lineup)
+    // Last word from the start gate. `mine` only ever comes from a 'lobby'
+    // frame's roster; the island-wide 'pop' frame knows head counts, not who.
+    this.lobby = { n: 0, need: 3, mine: false, countdownAt: 0, starting: false, known: false };
+    this.cdSpan = 0;       // length of the armed window, for the bar
+    this.gateEl = null;
+    this.gateSig = '';
+    this.gateSec = null;
+    this.gateBar = null;
+    this._cdTxt = '';
+    this.lobbyTimer = 0;
+    this._seatFreed = false;
+    this._bailed = false;
     this.props = [];
     this.parts = [];       // live particles
     this.keys = new Set();
@@ -665,6 +713,7 @@ export class SledGame extends Minigame {
     this._resetWorld(this.race ? this.race.seed : null);
     this._bindInput();
     this._bindRace();
+    this._bindLobby();
     this._last = performance.now();
     this.raf = requestAnimationFrame(this._tick);
   }
@@ -846,6 +895,7 @@ export class SledGame extends Minigame {
             Pines, rocks and ice cost a heart. You have three.</div>
         </div>`}
         <div class="mg-sled-best">Best run: <b>${best.toLocaleString()}</b></div>
+        <div class="mg-sled-gate" data-a="gate"></div>
         <div class="mg-sled-btns">
           ${race ? '' : '<button class="mg-sled-btn" data-a="play">Drop in</button>'}
           <button class="mg-sled-btn ghost" data-a="back">${
@@ -855,6 +905,7 @@ export class SledGame extends Minigame {
       </div>`;
     this.cardHost.appendChild(card);
     this.card = card;
+    this._mountGate(card);
     const play = card.querySelector('[data-a="play"]');
     if (play) play.onclick = () => this._beginCountdown();
     card.querySelector('[data-a="back"]').onclick = () => {
@@ -867,6 +918,10 @@ export class SledGame extends Minigame {
     if (!this.card) return;
     const c = this.card;
     this.card = null;
+    this.gateEl = null;
+    this.gateSec = null;
+    this.gateBar = null;
+    this.gateSig = '';
     c.classList.add('out');
     c.addEventListener('animationend', () => c.remove());
   }
@@ -1376,6 +1431,253 @@ export class SledGame extends Minigame {
     this.ctxRef = null;
   }
 
+  // ------------------------------------------------------- the start gate ---
+  /**
+   * The lineup outside. Two frames feed it and neither is required:
+   *   'lobby' {game,n,need,countdownAt?,starting,players[]} - room-scoped, and
+   *      the only one that knows whether WE are signed on (players[] roster).
+   *   'pop'   {lobbies:[{game,room,n,need,countdownAt?}]}   - island-wide, 5s.
+   * Both are optional and either may arrive first, so every field is merged
+   * rather than replaced and the strip stays hidden until something lands.
+   */
+  _bindLobby() {
+    const ev = this.game.events;
+    if (!ev?.on) return;
+    this.gsubs.push(ev.on('lobby', (m) => this._onLobbyFrame(m)));
+    this.gsubs.push(ev.on('pop', (m) => this._onPopFrame(m)));
+    // the board drains the moment a race leaves; the server says so too, but a
+    // strip still counting down at a gate that has already gone reads as a bug
+    this.gsubs.push(ev.on('race-start', () => {
+      if (!this.disposed) this._setLobby({ n: 0, need: this.lobby.need, mine: false, countdownAt: 0, starting: false });
+    }));
+    // Deliberately an interval and not the rAF loop: rAF stops dead in a
+    // background tab, and the one thing this clock must never do is miss the
+    // moment to hand the screen back. A throttled interval still fires.
+    this.lobbyTimer = setInterval(() => {
+      if (this.disposed) return;
+      this._paintCountdown();
+      this._lobbyGuard();
+    }, LOBBY_TICK_MS);
+  }
+
+  _onLobbyFrame(m) {
+    if (this.disposed || !m || typeof m !== 'object') return;
+    if (m.game && m.game !== LOBBY_GAME) return;
+    const players = Array.isArray(m.players) ? m.players : null;
+    const n = Number.isFinite(m.n) ? m.n : (players ? players.length : this.lobby.n);
+    let mine = this.lobby.mine;
+    if (this._seatFreed) {
+      // we handed the seat back when this run started: a frame still carrying
+      // us was already in flight, and re-arming the strip on it would drag a
+      // rider out of a run they chose
+      mine = false;
+    } else if (players) {
+      // id first; a socket that has not been told its own id yet falls back to
+      // the display name, exactly as the race handshake does
+      const selfId = this.game.net?.selfId ?? null;
+      mine = selfId != null
+        ? players.some((p) => p && p.id === selfId)
+        : players.some((p) => p && p.name === this.game.state.name);
+    }
+    this._setLobby({
+      n,
+      need: Number.isFinite(m.need) ? m.need : this.lobby.need,
+      mine,
+      countdownAt: Number(m.countdownAt) || 0,
+      starting: !!m.starting,
+    });
+  }
+
+  _onPopFrame(m) {
+    if (this.disposed || !m || !Array.isArray(m.lobbies)) return;
+    const row = m.lobbies.find((l) => l && l.game === LOBBY_GAME);
+    if (!row) return;
+    this._setLobby({
+      n: Number.isFinite(row.n) ? row.n : this.lobby.n,
+      need: Number.isFinite(row.need) ? row.need : this.lobby.need,
+      mine: this.lobby.mine,          // 'pop' counts heads, it does not name them
+      countdownAt: Number(row.countdownAt) || 0,
+      starting: this.lobby.starting,
+    });
+  }
+
+  _setLobby(next) {
+    const L = this.lobby;
+    // a fresh epoch means a fresh window: remember how long it was so the bar
+    // drains over the real fill time (20s) or the real countdown (1.5s)
+    if (next.countdownAt && next.countdownAt !== L.countdownAt) {
+      this.cdSpan = Math.max(1000, next.countdownAt - Date.now());
+    }
+    if (!next.countdownAt) this.cdSpan = 0;
+    L.n = clamp(Math.round(next.n) || 0, 0, 99);
+    L.need = clamp(Math.round(next.need) || 3, 1, 8);
+    L.mine = !!next.mine;
+    L.countdownAt = next.countdownAt;
+    L.starting = !!next.starting;
+    L.known = true;
+    this._renderLobby();
+    this._lobbyGuard();
+  }
+
+  /**
+   * Wire the strip on a card (splash or results). One delegated listener, so a
+   * repaint can rebuild the buttons without ever dropping a press.
+   */
+  _mountGate(card) {
+    const el = card.querySelector('[data-a="gate"]');
+    this.gateEl = el || null;
+    this.gateSig = '';
+    this.gateSec = null;
+    this.gateBar = null;
+    if (!el) return;
+    el.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('button[data-g]');
+      if (!btn) return;
+      this.game.audio?.play?.('click');
+      const act = btn.dataset.g;
+      if (act === 'start') this._gateStart();
+      else if (act === 'join') this._gateJoin();
+      else if (act === 'gate') this._backToGate(null);
+    });
+    this._renderLobby();
+  }
+
+  _renderLobby() {
+    const el = this.gateEl;
+    if (!el) return;
+    const L = this.lobby;
+    // during a race the lineup is already empty (the server drained it); on the
+    // race RESULTS card it is live again and is the fastest road to a rematch
+    const busy = !!this.race && this.phase !== 'results';
+    const show = !!this.game.net?.connected && !busy && L.known && (L.mine || L.n > 0);
+    if (!show) {
+      if (this.gateSig !== 'off') {
+        this.gateSig = 'off';
+        el.innerHTML = '';
+        el.classList.remove('on');
+        this.gateSec = null;
+        this.gateBar = null;
+      }
+      return;
+    }
+
+    const armed = L.starting || L.countdownAt > 0;
+    const sig = `${L.n}/${L.need}/${L.mine ? 1 : 0}/${armed ? 1 : 0}`;
+    if (sig !== this.gateSig) {
+      this.gateSig = sig;
+      const full = L.n >= L.need;
+      let dots = '';
+      for (let i = 0; i < L.need; i++) dots += `<span class="mg-sled-gdot${i < L.n ? ' on' : ''}"></span>`;
+      const head = L.mine
+        ? `You are in the lineup &middot; <b>${L.n}/${L.need}</b> at the gate`
+        : `<b>${L.n}</b> at the start gate &middot; <b>${LOBBY_MIN}</b> makes a race`;
+      let clock = '';
+      if (armed) {
+        clock = '<div class="mg-sled-gclock"><span>Gate drops in</span>'
+          + '<b data-c="sec">--</b><span class="mg-sled-gbar"><i data-c="bar"></i></span></div>';
+      } else if (L.mine && L.n < LOBBY_MIN) {
+        clock = '<div class="mg-sled-gnote">One more capybara and you are racing.</div>';
+      } else if (!L.mine && !full) {
+        clock = '<div class="mg-sled-gnote">Hop in and the mountain is yours together.</div>';
+      }
+      const btns = [];
+      if (L.mine && L.n >= LOBBY_MIN) {
+        btns.push('<button class="mg-sled-btn mg-sled-go" type="button" data-g="start">Start now</button>');
+      }
+      if (L.mine) {
+        btns.push('<button class="mg-sled-btn ghost" type="button" data-g="gate">Back to the gate</button>');
+      } else if (!full) {
+        btns.push('<button class="mg-sled-btn alt" type="button" data-g="join">Join the lineup</button>');
+      }
+      el.innerHTML = '<div class="mg-sled-gwrap">'
+        + `<div class="mg-sled-grow"><span class="mg-sled-gdots">${dots}</span><span>${head}</span></div>`
+        + clock
+        + (btns.length ? `<div class="mg-sled-gbtns">${btns.join('')}</div>` : '')
+        + '</div>';
+      el.classList.add('on');
+      this.gateSec = el.querySelector('[data-c="sec"]');
+      this.gateBar = el.querySelector('[data-c="bar"]');
+      this._cdTxt = '';
+    }
+    this._paintCountdown();
+  }
+
+  /**
+   * `countdownAt` is a server epoch, so a skewed client clock can read it a
+   * second or two out. It drives the READOUT only: the race itself fires on the
+   * server's timer, and the bail-out below keeps a fat margin for the same
+   * reason. Never shows a negative number.
+   */
+  _paintCountdown() {
+    if (!this.gateSec) return;
+    const L = this.lobby;
+    const left = L.starting ? 0 : Math.max(0, L.countdownAt - Date.now());
+    const txt = left <= 0 ? 'now' : `${Math.min(99, Math.ceil(left / 1000))}s`;
+    if (txt !== this._cdTxt) {
+      this._cdTxt = txt;
+      this.gateSec.textContent = txt;
+    }
+    if (this.gateBar) {
+      const span = this.cdSpan || 1;
+      this.gateBar.style.width = `${(clamp(left / span, 0, 1) * 100).toFixed(1)}%`;
+    }
+  }
+
+  /**
+   * The GATE launches the race, not this menu: the peak room refuses to start
+   * one while a minigame owns the screen (it sends race-done 0 and apologises).
+   * So a rider who signed the board and then wandered into this menu has to be
+   * standing back in the snow before the countdown fires. Hand the screen back
+   * with a margin big enough to cover clock skew and one slow room rebuild.
+   */
+  _lobbyGuard() {
+    const L = this.lobby;
+    if (this.disposed || this.race || !L.mine) return;
+    if (this.phase !== 'splash' && this.phase !== 'results') return;
+    if (!L.starting && !L.countdownAt) return;
+    const left = L.starting ? 0 : L.countdownAt - Date.now();
+    if (left <= LOBBY_BAIL_MS) this._backToGate('The gate is dropping. Back to your sled!');
+  }
+
+  /**
+   * Riding solo while signed on to the board would drag us into the race as a
+   * rider who is not there: the room bows out with a zero and the other capy
+   * "wins" a race nobody rode. Free the seat instead, and say so.
+   */
+  _releaseSeat() {
+    if (this._seatFreed || !this.lobby.mine) return;
+    this._seatFreed = true;
+    this.lobby.mine = false;
+    this.game.net?.send?.({ t: 'lobby-leave' });
+    this.game.toast?.('Riding solo, so your spot at the gate is free for the next capy.');
+    this._renderLobby();
+  }
+
+  /** Leave the menu for the snow. Everything here unmounts us synchronously. */
+  _backToGate(msg, sfx = true) {
+    if (this._bailed || this.disposed) return;
+    this._bailed = true;
+    if (msg) this.game.toast?.(msg);
+    if (sfx) this.game.audio?.play?.('whoosh');
+    this.exitToRoom();
+  }
+
+  _gateStart() {
+    const net = this.game.net;
+    if (!net?.connected) return;
+    // order matters: hand the screen back FIRST so the peak room is the thing
+    // on screen when the server answers with race-start
+    this._backToGate('Dropping the gate!', false);
+    net.send?.({ t: 'lobby-start', game: LOBBY_GAME });
+  }
+
+  _gateJoin() {
+    const net = this.game.net;
+    if (!net?.connected) return;
+    this._backToGate(null, false);
+    net.send?.({ t: 'lobby-join' });
+  }
+
   // ------------------------------------------------------------ run control -
   /**
    * @param {number|null} seed track seed; solo runs roll a fresh one from the
@@ -1431,6 +1733,9 @@ export class SledGame extends Minigame {
 
   _beginCountdown() {
     if (this.phase !== 'splash') return;
+    // A race empties the board on its own; a solo drop-in has to give the seat
+    // back by hand, or the lineup wedges on a rider who is already gone.
+    if (!this.race) this._releaseSeat();
     this.game.audio?.play?.('click');
     this._clearCard();
     this.phase = 'countdown';
@@ -2108,6 +2413,7 @@ export class SledGame extends Minigame {
         ${racing ? '<div data-a="board"></div>' : ''}
         <div class="mg-sled-best">Best run: <b>${Math.max(prevBest, score).toLocaleString()}</b>${
   isBest ? '<span class="mg-sled-tag">NEW BEST</span>' : ''}</div>
+        <div class="mg-sled-gate" data-a="gate"></div>
         <div class="mg-sled-btns">
           <button class="mg-sled-btn" data-a="again">${racing ? 'Sled again' : 'Play again'}</button>
           <button class="mg-sled-btn alt" data-a="back">Back to the peak</button>
@@ -2116,6 +2422,9 @@ export class SledGame extends Minigame {
     this.cardHost.appendChild(card);
     this.card = card;
     this.boardEl = card.querySelector('[data-a="board"]');
+    // "someone is waiting at the gate" is the shortest road from a finished run
+    // back into company, so the strip rides the results card too
+    this._mountGate(card);
     if (racing) this._renderBoard();
     card.querySelector('[data-a="again"]').onclick = () => {
       this.game.audio?.play?.('click');
@@ -2177,12 +2486,19 @@ export class SledGame extends Minigame {
     this.disposed = true;
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
+    if (this.lobbyTimer) clearInterval(this.lobbyTimer);
+    this.lobbyTimer = 0;
     for (const [target, type, fn, opts] of this.listeners) {
       target.removeEventListener(type, fn, opts);
     }
     this.listeners.length = 0;
     for (const off of this.subs) { try { off(); } catch {} }
     this.subs.length = 0;
+    for (const off of this.gsubs) { try { off(); } catch {} }
+    this.gsubs.length = 0;
+    this.gateEl = null;
+    this.gateSec = null;
+    this.gateBar = null;
     for (const r of this.race?.rivals || []) { r.tag?.remove(); r.root = null; r.rig = null; }
     this.race = null;
     this._clearCtx(); // the race is over: never leak into the next run

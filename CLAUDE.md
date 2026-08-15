@@ -152,6 +152,21 @@ whenever one of THEIR friends connects/moves/disconnects; `lobby` gained
 full board keeps the quick countdown); `lobby-start` (client->server) lets
 anyone on the board start a pair race immediately. Client re-emits pop and
 fpresence via game.events.
+Shipped input remap (task #20): the RIGHT mouse button walks (click, or hold
+and drag to steer); the LEFT button interacts only (player cards, room props,
+prompts). Touch is unchanged (tap walks and interacts). Snowballs on Frosty
+Peak throw with T at the cursor. Settings > Walking restores the classic
+left-click scheme; the binding lives in engine._onPointer, not controller.js.
+Shipped wave 12 client (daily ritual): quest day is the REAL America/New_York
+calendar day (progress.dayKey(), exported); the quest board countdown trusts
+the server's resetIn and shows hours; login streak + daily gift ride the
+existing coins/toast/quests frames (m.streak on the quests frame); bottle and
+bonfire daily caps follow the same real day. HUD: map pills carry live head
+counts, an island lobby strip and a travelling "one seat short" chip (from
+pop), friends get a coral ring/pin on the map and a join-them button in the
+panel (from fpresence). Sled: the gate lobby shows n/need + countdownAt, a
+Start Now button appears at 2+, and 'mgstart' for sled drops the sender from
+the gate board server-side before econ consumes it.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.
@@ -179,7 +194,7 @@ aurora, snowballs/beach ball/bonfire, parties, the plaza mural, daily quests +
 stamp album + milestone cosmetics, and The Drift (swimming, shaders, Big
 Blue). A wave-7.5 playtest-polish pass followed (doodle word sync, prop hunt
 arena rebuild + free prop movement + wall-clock timers, mine declutter,
-music beds for mine/jungle/drift, right-click snowballs, plaza tidy, Den
+music beds for mine/jungle/drift, snowballs, plaza tidy, Den
 floor decongestion, Drift swim-cam overhaul, click-to-move marker, the den's
 two-floor split into 'lounge' + 'loft' (the old in-room mezzanine and its
 floor-hop hotspots are GONE: a balcony is opaque from a camera 9.5 up, and

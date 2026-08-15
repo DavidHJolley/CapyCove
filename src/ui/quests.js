@@ -175,6 +175,9 @@ function mountPoint() {
 
 let board = { quests: [], bonus: null, resetAt: 0, loaded: false };
 let listening = false;
+// wave 12: resetIn is a REAL-DAY number now; once the server has spoken the
+// 40-minute cove clock must never overwrite it again.
+let serverReset = false;
 
 const num = (v, fb) => (Number.isFinite(Number(v)) ? Number(v) : fb);
 const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
@@ -216,7 +219,10 @@ function parseBoard(m) {
   // resetIn (seconds) beats our own clock maths; dayT is the fallback
   const resetIn = num(m?.resetIn ?? m?.resetsIn, NaN);
   let resetAt = board.resetAt;
-  if (Number.isFinite(resetIn) && resetIn >= 0) resetAt = Date.now() + resetIn * 1000;
+  if (Number.isFinite(resetIn) && resetIn >= 0) {
+    resetAt = Date.now() + resetIn * 1000;
+    serverReset = true;
+  }
   return { quests, bonus, resetAt, loaded: true };
 }
 
@@ -228,6 +234,7 @@ function parseBoard(m) {
  * quietly overwrote the server's number twice a minute.)
  */
 function resetFromClock(m) {
+  if (serverReset) return; // the sky's 40-minute day is not the quest day
   const dayMs = num(m?.dayMs, NaN);
   if (Number.isFinite(dayMs) && dayMs > 1000) COVE_DAY_MS = dayMs;
   const dayT = num(m?.dayT, NaN);
@@ -241,8 +248,10 @@ function countdown() {
   if (!board.resetAt) return 'New jobs at dawn';
   const ms = board.resetAt - Date.now();
   if (ms <= 0) return 'New jobs any moment';
-  const mins = Math.floor(ms / 60000);
+  const hrs = Math.floor(ms / 3600000);
+  const mins = Math.floor((ms % 3600000) / 60000);
   const secs = Math.floor((ms % 60000) / 1000);
+  if (hrs >= 1) return `New jobs in ${hrs}h ${String(mins).padStart(2, '0')}m`;
   if (mins >= 1) return `New jobs in ${mins}m ${String(secs).padStart(2, '0')}s`;
   return `New jobs in ${secs}s`;
 }
@@ -287,7 +296,7 @@ export function openQuests(game) {
       <button class="hud-btn qb-x" type="button" title="Close" aria-label="Close">&#10005;</button>
       <div class="qb-head">
         <h2>Quest Board</h2>
-        <div class="qb-sub">Three jobs pinned up every cove day. Do them in any order.</div>
+        <div class="qb-sub">Three jobs pinned up every day. Do them in any order.</div>
         <div class="qb-timer"></div>
       </div>
       <div class="qb-list"></div>

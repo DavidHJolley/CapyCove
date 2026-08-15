@@ -1837,7 +1837,9 @@ function bonfireTick(dtMs) {
     // sitting, or simply standing still by the fire (the spec's "idle 5s": the
     // 10s clock tick is the dwell test, since a walker is never idle across one)
     if (!near || (p.anim !== 'sit' && p.anim !== 'idle')) { p.bonfireMs = 0; continue; }
-    if (p.bonfireDay !== clock.day) { p.bonfireDay = clock.day; p.bonfireCoins = 0; }
+    // wave 12: the bonfire cap follows the REAL day, like the quest board
+    const day = progress.dayKey();
+    if (p.bonfireDay !== day) { p.bonfireDay = day; p.bonfireCoins = 0; }
     if (p.bonfireCoins >= BONFIRE_CAP) continue;
     p.bonfireMs = (p.bonfireMs || 0) + dtMs;
     while (p.bonfireMs >= BONFIRE_MINUTE_MS && p.bonfireCoins < BONFIRE_CAP) {
@@ -2238,7 +2240,7 @@ function bottleFor(day) {
 /** Have they already found today's? Guests have no account to remember it on. */
 function bottleFound(p) {
   const rec = recordFor(p);
-  return !!rec && Number(rec.bottleDay) === clock.day;
+  return !!rec && rec.bottleDay === progress.dayKey();
 }
 
 function sendBottle(p) {
@@ -2259,8 +2261,8 @@ function findBottle(p) {
     return;
   }
   const rec = recordFor(p);
-  if (!rec || Number(rec.bottleDay) === clock.day) { sendBottle(p); return; }
-  rec.bottleDay = clock.day;
+  if (!rec || rec.bottleDay === progress.dayKey()) { sendBottle(p); return; }
+  rec.bottleDay = progress.dayKey();
   saveSoon();
   const paid = grantCoins(p, BOTTLE_COINS, 'message in a bottle');
   // The finder alone: the note is theirs, and the bottle is per account, so
@@ -2321,6 +2323,10 @@ wss.on('connection', (ws) => {
       if (p && reports.handleMessage(p, m)) return;
       if (p && layouts.handleMessage(p, m)) return;
       if (p && progress.handleMessage(p, m)) return;
+      // wave 12 (verifier-required): opening the sled game takes you off the
+      // gate board BEFORE econ consumes the frame, so a pair countdown can
+      // never deal a race to a rider already halfway down the mountain.
+      if (p && m.t === 'mgstart' && m.game === 'sled') removeFromLobby(p);
       // wave 11: econ owns the run token. It consumes 'mgstart' and nothing else.
       if (p && econ.handleMessage(p, m)) return;
       switch (m.t) {
