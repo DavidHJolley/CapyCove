@@ -8,11 +8,14 @@ import {
   users, saveSoon, ensureFriends, FRIEND_CAP,
   ensureHouse, ensureOwnedFurniture, HOUSE_INVITE_CAP, HOUSE_BOUNDS,
 } from './db.js';
-import { signup, login, verifyToken, publicProfile } from './auth.js';
+import { signup, login, verifyToken, publicProfile, recover, issueRecoveryCodes } from './auth.js';
 import { BotManager } from './bots.js';
 import * as progress from './progress.js';
 import * as admin from './admin.js';
 import * as audit from './audit.js';
+import * as filter from './filter.js';
+import * as chatlog from './chatlog.js';
+import * as reports from './reports.js';
 import { flush, markSeen, adminSeed, renameAccount, banActive } from './db.js';
 import { writeJsonAtomic } from './store.js';
 import {
@@ -205,6 +208,25 @@ app.post('/api/login', async (req, res) => {
   try { res.json(await login(req.body || {})); }
   catch (e) { console.error('[auth] login failed:', e.message); res.json({ ok: false, msg: 'Something went wrong, try again' }); }
 });
+// wave 10E: redeem a recovery code / re-issue after admin reset. Same shape
+// and rate limit as login; without these the reveal card would promise a way
+// back into the account that does not exist.
+app.post('/api/recover', async (req, res) => {
+  if (authLimited(req.ip)) return res.json({ ok: false, msg: 'Slow down a moment' });
+  try {
+    const r = await recover(req.body || {});
+    if (r.ok) audit.log({ actor: null, via: 'api', op: 'account.reset.used', target: { name: String(req.body?.username || '').slice(0, 24) } });
+    res.json(r);
+  } catch (e) { console.error('[auth] recover failed:', e.message); res.json({ ok: false, msg: 'Something went wrong, try again' }); }
+});
+app.post('/api/recovery', async (req, res) => {
+  if (authLimited(req.ip)) return res.json({ ok: false, msg: 'Slow down a moment' });
+  try {
+    const r = await issueRecoveryCodes(req.body || {});
+    if (r.ok) audit.log({ actor: null, via: 'api', op: 'account.password.change', target: { name: String(req.body?.username || '').slice(0, 24) } });
+    res.json(r);
+  } catch (e) { console.error('[auth] recovery reissue failed:', e.message); res.json({ ok: false, msg: 'Something went wrong, try again' }); }
+});
 app.get('/api/me', (req, res) => {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   const username = verifyToken(token);
@@ -232,6 +254,10 @@ if (process.env.NODE_ENV !== 'production') {
 const DIST = path.join(ROOT, 'dist');
 if (fs.existsSync(DIST)) {
   app.use(express.static(DIST));
+  // clean /privacy and /terms URLs (must sit before the SPA catch-all)
+  for (const pg of ['privacy', 'terms']) {
+    app.get(`/${pg}`, (_req, res) => res.sendFile(path.join(DIST, `${pg}.html`)));
+  }
   app.get(/^\/(?!api|ws).*/, (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
 }
 
@@ -372,6 +398,7 @@ function leaveWorld(p) {
   exitPropHunt(p);
   exitDoodle(p);
   if (p.room) leaveRoomSet(p);
+  chatlog.drop(p); // covers every disconnect path, not just ws 'close'
   world.players.delete(p.id);
 }
 
@@ -433,8 +460,10 @@ if (adminSeed.name) {
 }
 admin.install({
   users, saveSoon, sendTo, broadcastToRoom, broadcastAll, sessionsFor, recordFor,
-  findEntity, world, grantCoins, joinRoom, has, audit,
+  findEntity, world, grantCoins, joinRoom, has, audit: audit.log, auditOps: audit.OPS,
 });
+chatlog.install({ audit: audit.log, recordFor });
+reports.install({ audit: audit.log, sendTo, recordFor, findEntity, chatlog });
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -1243,7 +1272,7 @@ function startDoodle(members) {
     players: new Map(), // id -> { id, name, score }; a capy who walks out is dropped
     rounds: Math.min(members.length, DD_MAX_ROUNDS),
     round: 0, drawerId: null, word: null, norm: '', mask: null, choices: [],
-    used: new Set(), guessed: new Set(), correct: 0, drawStartedAt: 0,
+    used: new Set(), guessed: new Set(), skips: new Set(), correct: 0, drawStartedAt: 0,
     timer: null, reveals: [],
   };
   for (const p of members) {
@@ -1283,6 +1312,7 @@ function nextDoodleRound(g) {
   g.norm = '';
   g.mask = null;
   g.guessed.clear();
+  g.skips.clear(); // every round starts unvoted
   g.correct = 0;
   g.choices = pickWords(g.used);
   g.phaseEndsAt = Date.now() + DD_PICK_MS;
@@ -2197,6 +2227,10 @@ wss.on('connection', (ws) => {
       // admin gets FIRST refusal: mute/ban pre-emption and every a-* op happen
       // here, before any feature handler can see the frame
       if (p && admin.handleMessage(p, m)) return;
+      // order is load-bearing: a muted player's line died above and must never
+      // be logged as something they said; observe never consumes
+      if (p) chatlog.observe(p, m);
+      if (p && reports.handleMessage(p, m)) return;
       if (p && progress.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
@@ -2219,6 +2253,10 @@ wss.on('connection', (ws) => {
           } else {
             const name = cleanName(m.guestName);
             if (name.length < NAME_MIN_LEN) return sendTo({ ws }, { t: 'denied', msg: 'Invalid name' });
+            // AUDIT F-26: a guest could be called anything. shape:false because
+            // cleanName permits spaces/hyphens; the suggestion is offered back.
+            const gn = filter.checkName(name, { shape: false, suggest: true });
+            if (!gn.ok) return sendTo({ ws }, { t: 'denied', msg: gn.msg, suggestion: gn.suggestion });
             // Guest progress lives only on the client (nothing is stored here), so
             // we take what it remembers and clamp it. Minting a blank profile on
             // every hello wiped coins/hats/bests on each reconnect and reload.
@@ -2308,7 +2346,10 @@ wss.on('connection', (ws) => {
           p.lastChat = now;
           const text = String(m.text || '').slice(0, CHAT_MAX_LEN).trim();
           if (!text) return;
-          broadcastToRoom(p.room, { t: 'chat', id: p.id, name: p.name, text }, p.id);
+          const f = filter.check(text);
+          if (!f.ok) return sendTo(p, { t: 'toast', msg: f.msg });
+          if (f.changed) chatlog.context?.(p, { severity: f.severity, hits: f.hits });
+          broadcastToRoom(p.room, { t: 'chat', id: p.id, name: p.name, text: f.cleaned }, p.id);
           signal('chat', p, { room: p.room });
           break;
         }
@@ -2317,14 +2358,20 @@ wss.on('connection', (ws) => {
           const now = Date.now();
           if (now - p.lastChat < 400) return;
           p.lastChat = now;
-          const text = String(m.text || '').slice(0, CHAT_MAX_LEN).trim();
+          let text = String(m.text || '').slice(0, CHAT_MAX_LEN).trim();
           const toName = String(m.to || '').trim().toLowerCase();
           if (!text || !toName) return;
+          const fw = filter.check(text);
+          if (!fw.ok) return sendTo(p, { t: 'toast', msg: fw.msg });
+          // echo the cleaned text to the sender too, or they cannot tell they
+          // were masked
+          text = fw.cleaned;
           const target = [...world.players.values()].find((q) => !q.bot && q.name.toLowerCase() === toName);
           if (!target) return sendTo(p, { t: 'toast', msg: 'Nobody by that name is in the cove right now' });
           if (target.id === p.id) return sendTo(p, { t: 'toast', msg: 'Whispering to yourself is free, out loud' });
           sendTo(target, { t: 'whisper', from: p.name, text });
           sendTo(p, { t: 'whisper', to: target.name, text }); // sender echo
+          chatlog.whisper(p, target, text); // recipient's ring holds it too
           break;
         }
         case 'emote':
@@ -2737,6 +2784,9 @@ wss.on('connection', (ws) => {
           if (p.id === g.drawerId || g.guessed.has(p.id)) break; // no second bite
           if (t0 - p.ddGuessWindow > 1000) { p.ddGuessWindow = t0; p.ddGuessCount = 0; }
           if (++p.ddGuessCount > DD_GUESS_LIMIT) break;
+          // dropped silently, no toast: a doodle guess is timed and a refusal
+          // toast would leak that the guess was even sent
+          if (!filter.check(String(m.text || '')).ok) break;
           const guess = normalizeWord(String(m.text || '').slice(0, CHAT_MAX_LEN));
           if (!guess) break;
           if (guess === g.norm) {
@@ -2751,6 +2801,25 @@ wss.on('connection', (ws) => {
           }
           // A wrong guess is answered with silence: the round's guess box is not
           // a second chat channel, so nothing unmoderated fans out from here.
+          break;
+        }
+        case 'dd-vote': {
+          // majority skip-drawer vote (wave 10D): guessers only, one vote each,
+          // strict majority of CURRENT guessers so a walkout does not wedge it
+          const g = p.dd;
+          if (!g || g.ended || g.phase !== 'draw' || p.id === g.drawerId) break;
+          if (socialLimited(p, t0)) break;
+          if (!m.skip) break;
+          if (g.skips.has(p.id)) break;
+          g.skips.add(p.id);
+          const guessers = doodleMembers(g).filter((q) => q.id !== g.drawerId);
+          const of = guessers.length;
+          const need = Math.floor(of / 2) + 1;
+          let votes = 0;
+          for (const q of guessers) if (g.skips.has(q.id)) votes++;
+          const passed = votes >= need;
+          broadcastDoodle(g, { t: 'dd-vote', round: g.round, votes, need, of, id: p.id, name: p.name, passed });
+          if (passed) revealDoodle(g, 'skipped');
           break;
         }
 
@@ -2792,7 +2861,8 @@ wss.on('connection', (ws) => {
           break;
         case 'mural-report':
           if (socialLimited(p, t0)) break;
-          reportMural(p, t0);
+          // absorbed into the wave-10 report queue (old reportMural retired)
+          reports.mural(p, { w: MURAL_W, h: MURAL_H, rle: muralRLE(), recent: mural.ops.slice(-400) }, t0);
           break;
         case 'bottle':
           if (socialLimited(p, t0)) break;

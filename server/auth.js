@@ -6,6 +6,7 @@ import {
 } from './db.js';
 import { NAME_MAX_LEN, NAME_MIN_LEN } from '../shared/constants.js';
 import { profileBits } from './admin.js';
+import { checkName as filterCheckName } from './filter.js';
 
 // Accounts: password hashing, session tokens, and the recovery codes that
 // stand in for an email subsystem this project deliberately does not have
@@ -380,6 +381,11 @@ const pendingSignups = new Set();
  */
 export async function signup({ username, password, color, hat }) {
   if (!NAME_RE.test(username || '')) return { ok: false, msg: `Name: ${NAME_MIN_LEN}-${NAME_MAX_LEN} letters, numbers or _` };
+  {
+    // wave 10A: the name filter, with a clean one-click alternative on refusal
+    const nf = filterCheckName(username);
+    if (!nf.ok) return { ok: false, msg: nf.msg, suggestion: nf.suggestion };
+  }
   if (typeof password !== 'string' || password.length < PASSWORD_MIN_LEN) {
     return { ok: false, msg: `Password too short (${PASSWORD_MIN_LEN}+)` };
   }

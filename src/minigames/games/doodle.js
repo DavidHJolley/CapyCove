@@ -26,11 +26,28 @@ import { MINIGAMES } from '../../../shared/constants.js';
  *                  dd-state   {phase, round, rounds, drawer, left, dur,
  *                              scores:[{id,name,score}], strokes?, word?}
  *                  dd-end     {standings:[{id,name,score}]}
+ *                  dd-vote    {votes, need, of, id?, name?, passed?}   (wave 10)
  *   us -> server   dd-pick    {i, word}
  *                  dd-stroke  {s, c, w, pts, e}   (batched at ~10Hz, capped)
  *                  dd-stroke  {op:'undo'|'clear'}
  *                  dd-guess   {text}
  *                  dd-leave                        (walking out mid-round)
+ *                  dd-vote    {skip:true}          (wave 10, one per round)
+ *                  report     {kind:'doodle', id, name, reason, room, round,
+ *                              png}                (wave 10, canvas snapshot)
+ *
+ * WAVE 10 (Trust & Safety), this file's half:
+ *  - REPORT A DRAWING. A guesser can hand the caretakers the easel exactly as
+ *    they saw it: the snapshot is taken the moment the report card opens, so a
+ *    drawer who wipes the canvas while the reporter is choosing a reason does
+ *    not erase the evidence. The image rides `{t:'report'}` as a data URL and
+ *    is bounded here (see SNAP_*) before the server ever sees it — a report the
+ *    server has to drop for being too large is a report that never existed.
+ *  - MAJORITY SKIP. Guessers vote to move past a drawer; the SERVER counts and
+ *    the SERVER ends the round (`dd-vote` tally -> its own reveal). This file
+ *    shows a local tally the instant you click so the button feels alive, but a
+ *    server tally always overwrites it, and nothing here ever ends a round.
+ *    A client that could skip a round on its own would be a griefing tool.
  *
  * DEVIATIONS from the spec, on purpose:
  *  - Near-miss ("so close!") is server-driven in party mode (dd-correct.near).
@@ -73,6 +90,30 @@ const MAX_PTS = 700;             // numbers per stroke (350 points)
 const SEND_HZ = 10;              // stroke batches per second
 const SEND_CHUNK = 90;           // numbers per batch
 const MIN_STEP = 3.2;            // logical units between recorded points
+
+// ---- wave 10: report-a-drawing + the skip vote ----------------------------
+// The snapshot is small on purpose. A report is evidence, not a print: a
+// caretaker needs to see what the crayon said, and a 400px crayon drawing says
+// it. Every candidate below is tried in order until one fits SNAP_MAX_CHARS,
+// which bounds the ws frame no matter how busy the easel got.
+const SNAP_TRIES = [
+  { w: 420, h: 294, type: 'image/png', q: undefined },
+  { w: 280, h: 196, type: 'image/png', q: undefined },
+  { w: 420, h: 294, type: 'image/jpeg', q: 0.7 },
+  { w: 280, h: 196, type: 'image/jpeg', q: 0.6 },
+];
+const SNAP_MAX_CHARS = 60_000;    // data-URL length ceiling (~44KB of image)
+const REPORT_COOLDOWN_MS = 20_000; // one report per 20s, whatever the round
+
+// Adult-audience categories: the things that must die (slurs, harassment,
+// sexual content) get their own row; "rude scribble" does not, because the
+// answer to a boring drawing is the skip vote sitting right next to this.
+const REPORT_REASONS = [
+  { id: 'hate', label: 'Hateful or slurs' },
+  { id: 'sexual', label: 'Sexual content' },
+  { id: 'harassment', label: 'Targeting someone' },
+  { id: 'other', label: 'Something else' },
+];
 
 const SOLO_ROUNDS = 6;
 const SOLO_TIMES = [45, 42, 38, 34, 31, 28];   // escalation: the clock tightens
@@ -683,6 +724,28 @@ const STYLE = `
   box-shadow:0 5px 0 rgba(24,50,20,.35);transition:.14s;}
 .mg-dd-guess button:hover{transform:translateY(-2px);}
 .mg-dd-guess button:active{transform:translateY(3px);box-shadow:0 2px 0 rgba(24,50,20,.35);}
+/* wave 10: the round's two safety verbs, always in the same place */
+.mg-dd-acts{width:min(560px,100%);display:none;align-items:center;gap:8px;justify-content:center;
+  flex-wrap:wrap;}
+.mg-dd-acts.mg-dd-on{display:flex;}
+.mg-dd-act{border:0;border-radius:999px;background:rgba(255,253,246,.86);color:#33291c;font-family:inherit;
+  font-weight:900;font-size:11px;letter-spacing:.1em;padding:7px 15px;cursor:pointer;transition:.14s;
+  box-shadow:0 3px 0 rgba(24,50,20,.3);}
+.mg-dd-act:hover:not(:disabled){transform:translateY(-2px);background:#fffdf6;}
+.mg-dd-act:disabled{opacity:.6;cursor:default;}
+.mg-dd-act.mg-dd-voted{background:#f2b64a;}
+.mg-dd-act.mg-dd-flag:hover:not(:disabled){background:#e8657a;color:#fff;}
+.mg-dd-act.mg-dd-sent{background:#c9edb0;}
+.mg-dd-votes{font-size:11px;font-weight:900;letter-spacing:.1em;color:#e8ffcf;opacity:.9;
+  text-shadow:0 2px 6px rgba(0,0,0,.4);}
+.mg-dd-votes:empty{display:none;}
+.mg-dd-rr{display:flex;flex-direction:column;gap:8px;margin:14px 0 6px;}
+.mg-dd-rbtn{border:4px solid #fff;border-radius:16px;background:#fffdf6;color:#33291c;font-family:inherit;
+  font-weight:900;font-size:14px;letter-spacing:.02em;padding:12px 18px;cursor:pointer;text-align:left;
+  box-shadow:0 5px 0 rgba(24,50,20,.28);transition:.14s;}
+.mg-dd-rbtn:hover{transform:translateY(-2px);background:#e8657a;color:#fff;}
+.mg-dd-shot{width:min(300px,100%);border-radius:12px;border:3px solid #a5702f;background:${PAPER};
+  display:block;margin:12px auto 0;}
 .mg-dd-feed{width:min(560px,100%);height:74px;overflow:hidden;display:flex;flex-direction:column-reverse;
   gap:4px;}
 .mg-dd-fl{background:rgba(255,253,246,.86);border-radius:999px;padding:4px 14px;font-size:12.5px;
@@ -821,6 +884,9 @@ export class DoodleGame extends Minigame {
     this.party = null;
     this.ctxRef = null;
     this.serverNear = false;
+
+    // wave 10: last time we handed a drawing to the caretakers
+    this._lastReportAt = 0;
   }
 
   // ---------------------------------------------------------- lifecycle ----
@@ -865,6 +931,10 @@ export class DoodleGame extends Minigame {
       guessbar: q('guessbar'),
       input: q('input'),
       send: q('send'),
+      acts: q('acts'),
+      skip: q('skip'),
+      report: q('report'),
+      votes: q('votes'),
       feed: q('feed'),
       ping: q('ping'),
       over: q('over'),
@@ -978,6 +1048,11 @@ export class DoodleGame extends Minigame {
               placeholder="Type your guess, hit Enter">
             <button data-el="send">GUESS</button>
           </div>
+          <div class="mg-dd-acts" data-el="acts">
+            <button class="mg-dd-act" data-el="skip">SKIP THIS DRAWER</button>
+            <button class="mg-dd-act mg-dd-flag" data-el="report">REPORT DRAWING</button>
+            <span class="mg-dd-votes" data-el="votes"></span>
+          </div>
           <div class="mg-dd-feed" data-el="feed"></div>
         </div>
       </div>
@@ -1035,6 +1110,9 @@ export class DoodleGame extends Minigame {
     undo.addEventListener('click', () => this._undo());
     clear.addEventListener('click', () => this._clearPressed());
 
+    this.el.skip?.addEventListener('click', () => this._voteSkip());
+    this.el.report?.addEventListener('click', () => this._openReport());
+
     this._onResize = () => { this._resize(); };
     addEventListener('resize', this._onResize);
     // The engine can un-hide #minigame-root a frame AFTER mount, so the easel
@@ -1065,6 +1143,10 @@ export class DoodleGame extends Minigame {
       on('dd-correct', (m) => this._onCorrect(m));
       on('dd-state', (m) => this._onState(m));
       on('dd-end', (m) => this._onEnd(m));
+      on('dd-vote', (m) => this._onVote(m));
+      // Optional: the T&S store may answer a report. If it never does, the
+      // local confirmation below stands on its own and nothing here waits.
+      on('report-ack', (m) => this._onReportAck(m));
     }
   }
 
@@ -1953,6 +2035,10 @@ export class DoodleGame extends Minigame {
       picked: false,
       remote: null,
       remoteSeq: -1,
+      // wave 10: the skip tally for THIS round, and the rounds we have already
+      // handed to the caretakers (one report per round, per reporter)
+      skip: { votes: 0, need: 0, of: 0, mine: false, passed: false },
+      reported: new Set(),
     };
     this.maxScore = Math.max(120, (this.party.rounds - 1) * 100 + 15 * (players.length - 1));
   }
@@ -1970,6 +2056,7 @@ export class DoodleGame extends Minigame {
     this._setRole('GETTING THE CRAYONS OUT');
     this._showGuess(false);
     this._showTools(false);
+    this._paintActs();
     const names = P.players.map((p) => esc(p.name)).join(', ');
     this._over(`
       <div class="mg-dd-card">
@@ -2027,7 +2114,7 @@ export class DoodleGame extends Minigame {
     const rounds = num(m.rounds, m.of);
     if (round != null) {
       const r = Math.max(1, Math.round(round));
-      if (r !== P.round) { P.picked = false; P.word = ''; P.correct.clear(); }
+      if (r !== P.round) { P.picked = false; P.word = ''; P.correct.clear(); this._resetSkip(); }
       P.round = r;
     }
     if (rounds != null && rounds > 0) {
@@ -2097,7 +2184,11 @@ export class DoodleGame extends Minigame {
       else if (phase === 'draw') this._enterDraw();
       else if (phase === 'reveal') this._enterReveal(typeof m.word === 'string' ? m.word : P.word);
     }
+    // A server that would rather carry the skip tally on the state frame than
+    // spend a message type on it is answered here, with the same reader.
+    if (m.votes != null || m.skipVotes != null || m.skipNeed != null) this._onVote(m);
     this._updateRows();
+    this._paintActs();
   }
 
   _enterPick() {
@@ -2107,11 +2198,13 @@ export class DoodleGame extends Minigame {
     this.live = null;
     P.remote = null;
     P.correct.clear();
+    this._resetSkip();
     this._recommit();
     this._setRound(`ROUND ${P.round}/${P.rounds}`);
     this._setDot(P.round - 1, 'now');
     this._showGuess(false);
     this._showTools(false);
+    this._paintActs();
     this._setMask('');
     if (this._iAmDrawer()) {
       this._setRole('YOUR TURN: PICK A WORD');
@@ -2152,6 +2245,7 @@ export class DoodleGame extends Minigame {
     const mine = this._iAmDrawer();
     this._showTools(mine);
     this._showGuess(!mine && !P.correct.has(P.meId), 'Type your guess, hit Enter');
+    this._paintActs();
     this.el.paper?.classList.toggle('mg-dd-draw', mine);
     if (mine) {
       this._drawerWord();
@@ -2198,6 +2292,9 @@ export class DoodleGame extends Minigame {
       this._setRole('ROUND OVER');
     }
     this._setDot(P.round - 1, P.correct.has(P.meId) ? 'hit' : 'miss');
+    // the easel still holds the drawing through the reveal, so the report
+    // button stays live for the beat after the round it belongs to
+    this._paintActs();
     this.game.audio?.play?.('ding');
   }
 
@@ -2445,6 +2542,7 @@ export class DoodleGame extends Minigame {
     this.phase = 'results';
     this._showGuess(false);
     this._showTools(false);
+    this._paintActs();
     this._badge('');
     // the server's own bookkeeping wins over our running tally: it refereed
     // every guess, and its `scores` is the list the podium coins were paid from
@@ -2535,6 +2633,227 @@ export class DoodleGame extends Minigame {
     this.endAt = 0; // the solo clock counts itself down
     if (this.ctxRef && this.game.__partyCtx === this.ctxRef) this.game.__partyCtx = null;
     this.ctxRef = null;
+    this._paintActs(); // solo has one drawer and she is a bot: nothing to vote on
+  }
+
+  // ============================================== wave 10: skip + report ====
+  /**
+   * The action row. Guessers get both verbs; the drawer gets neither, but does
+   * see the tally, because a drawer who is about to be skipped should know it
+   * is happening rather than have the easel yanked away.
+   */
+  _paintActs() {
+    const { acts, skip, report, votes } = this.el;
+    if (!acts) return;
+    const P = this.party;
+    const live = this.mode === 'party' && !!P && !P.over
+      && (this.phase === 'draw' || this.phase === 'reveal');
+    acts.classList.toggle('mg-dd-on', live);
+    if (!live) return;
+    const mine = this._iAmDrawer();
+    const S0 = P.skip;
+    const need = S0.need || this._skipNeed();
+
+    if (skip) {
+      // nothing to skip once the round is being revealed: the report button
+      // stays, because that is the moment people decide to press it
+      skip.style.display = mine || this.phase !== 'draw' ? 'none' : '';
+      const done = S0.passed || this.phase !== 'draw';
+      skip.disabled = S0.mine || done;
+      skip.classList.toggle('mg-dd-voted', S0.mine && !S0.passed);
+      skip.textContent = S0.passed ? 'SKIPPED'
+        : S0.mine ? `VOTED ${S0.votes}/${need}`
+          : 'SKIP THIS DRAWER';
+    }
+    if (report) {
+      const already = P.reported.has(P.round);
+      report.style.display = mine ? 'none' : '';
+      report.disabled = already;
+      report.classList.toggle('mg-dd-sent', already);
+      report.textContent = already ? 'REPORT SENT' : 'REPORT DRAWING';
+    }
+    if (votes) {
+      // the drawer's read-only copy of the same number
+      votes.textContent = mine && S0.votes > 0 && !S0.passed
+        ? `${S0.votes}/${need} VOTED TO SKIP` : '';
+    }
+  }
+
+  /** Majority of the capys who could be guessing, drawer excluded. */
+  _skipNeed() {
+    const P = this.party;
+    if (!P) return 0;
+    const guessers = Math.max(1, P.players.length - 1);
+    return Math.floor(guessers / 2) + 1;
+  }
+
+  _resetSkip() {
+    const P = this.party;
+    if (!P) return;
+    P.skip = { votes: 0, need: 0, of: 0, mine: false, passed: false };
+    this._paintActs();
+  }
+
+  /**
+   * Cast our vote. The optimistic bump is cosmetic: the server owns the tally
+   * and owns the reveal, and its next `dd-vote` overwrites everything here.
+   */
+  _voteSkip() {
+    const P = this.party;
+    if (!P || P.over || this.phase !== 'draw' || this._iAmDrawer()) return;
+    const S0 = P.skip;
+    if (S0.mine || S0.passed) return;
+    S0.mine = true;
+    S0.votes = Math.max(1, S0.votes + 1);
+    this.game.audio?.play?.('click');
+    this.game.net?.send?.({ t: 'dd-vote', skip: true });
+    this._feed('<b>you</b> voted to skip');
+    this._paintActs();
+  }
+
+  /**
+   * The server's tally. Also reads the same fields off a `dd-state` frame, so
+   * whichever way the tally ends up travelling this screen agrees with it.
+   */
+  _onVote(m) {
+    const P = this.party;
+    if (!P || this.dead || P.over || !m) return;
+    const round = num(m.round, m.r);
+    if (round != null && Math.round(round) !== P.round) return; // a stale round's tally
+    const S0 = P.skip;
+    const votes = num(m.votes, m.skipVotes, m.n);
+    // `of` is deliberately NOT an alias for `need`: it means "of N guessers",
+    // and reading a headcount as a threshold makes a 4-player round unskippable
+    const need = num(m.need, m.skipNeed, m.threshold);
+    const total = num(m.of, m.guessers);
+    if (need != null && need > 0) S0.need = Math.round(need);
+    if (total != null && total > 0) S0.of = Math.round(total);
+    if (votes != null) S0.votes = Math.max(0, Math.round(votes));
+    const voter = this._idOf(m.id ?? m.by ?? m.who);
+    if (voter && voter === P.meId) S0.mine = true;
+    if (m.you || m.mine) S0.mine = true;
+    // a named voter on a real dd-vote frame is worth a line; a state frame
+    // carrying a tally is not (its `id` means something else entirely)
+    if (m.t === 'dd-vote' && voter && voter !== P.meId) {
+      this._feed(`<b>${esc(this._nameOf(voter))}</b> voted to skip`);
+    }
+    if (m.passed || m.skipped || (S0.need > 0 && S0.votes >= S0.need)) {
+      if (!S0.passed) {
+        S0.passed = true;
+        this._badge('SKIPPED BY THE JUNGLE');
+        this._feed('<b>the jungle</b> voted to move on', 'mg-dd-close');
+        this.game.audio?.play?.('whoosh');
+      }
+    }
+    this._paintActs();
+  }
+
+  /**
+   * Flatten the easel exactly as it stands into a bounded data URL. Called at
+   * the moment the report card opens, never at send time: the drawing is the
+   * evidence, and the drawing is one CLEAR away from being gone.
+   */
+  _snapshot() {
+    const strokes = this.strokes;
+    const live = this.live && this.live.p?.length >= 2 ? this.live : null;
+    for (const t of SNAP_TRIES) {
+      let url = '';
+      try {
+        const c = document.createElement('canvas');
+        c.width = t.w;
+        c.height = t.h;
+        const x = c.getContext('2d');
+        if (!x) return '';
+        x.fillStyle = PAPER;
+        x.fillRect(0, 0, t.w, t.h);
+        x.setTransform(t.w / W, 0, 0, t.h / H, 0, 0);
+        for (const s of strokes) {
+          strokePath(x, s.p, PALETTE[s.c] || PALETTE[0], WIDTHS[s.w] ?? WIDTHS[1]);
+        }
+        if (live) strokePath(x, live.p, PALETTE[live.c] || PALETTE[0], WIDTHS[live.w] ?? WIDTHS[1]);
+        url = t.q == null ? c.toDataURL(t.type) : c.toDataURL(t.type, t.q);
+      } catch {
+        return ''; // no canvas export here: the report still travels, unillustrated
+      }
+      if (url && url.startsWith('data:image/') && url.length <= SNAP_MAX_CHARS) return url;
+    }
+    return '';
+  }
+
+  /** The report card: pick a reason, see what you are sending, send it. */
+  _openReport() {
+    const P = this.party;
+    if (!P || P.over || this._iAmDrawer() || !P.drawerId) return;
+    if (P.reported.has(P.round)) return;
+    const target = P.drawerId;
+    const name = this._nameOf(target);
+    const round = P.round;
+    const png = this._snapshot();
+    this.game.audio?.play?.('open');
+    this._over(`
+      <div class="mg-dd-card">
+        <h2>Report this drawing</h2>
+        <div class="mg-dd-sub">GOES TO THE CARETAKERS WITH THE PICTURE BELOW. ${esc(name.toUpperCase())} IS NOT TOLD.</div>
+        <div class="mg-dd-rr">
+          ${REPORT_REASONS.map((r) => `<button class="mg-dd-rbtn" data-r="${r.id}">${esc(r.label)}</button>`).join('')}
+        </div>
+        ${png ? `<img class="mg-dd-shot" src="${png}" alt="The drawing as you see it">` : ''}
+        <div class="mg-dd-btns" style="margin-top:14px">
+          <button class="mg-dd-btn mg-dd-ghost" data-a="cancel">Never mind</button>
+        </div>
+      </div>`);
+    this.el.over.querySelectorAll('[data-r]').forEach((b) => {
+      b.addEventListener('click', () => this._sendReport(b.dataset.r, { target, name, round, png }));
+    });
+    this.el.over.querySelector('[data-a="cancel"]')?.addEventListener('click', () => {
+      this.game.audio?.play?.('click');
+      this._closeOver();
+    });
+  }
+
+  _sendReport(reason, ev) {
+    const P = this.party;
+    if (!P || !ev || P.reported.has(ev.round)) return;
+    const now = Date.now();
+    if (this._lastReportAt && now - this._lastReportAt < REPORT_COOLDOWN_MS) {
+      this._closeOver();
+      this._feed('<b>caretakers</b> one report at a time, please');
+      return;
+    }
+    const known = REPORT_REASONS.some((r) => r.id === reason) ? reason : 'other';
+    this._lastReportAt = now;
+    P.reported.add(ev.round);
+    // flat id/name so the server's resolveTarget({uid|name|id}) reads it as-is
+    const frame = {
+      t: 'report',
+      kind: 'doodle',
+      id: String(ev.target),
+      name: ev.name,
+      reason: known,
+      room: this.game?.roomId || '',
+      round: ev.round,
+    };
+    if (ev.png) frame.png = ev.png;
+    this.game.net?.send?.(frame);
+    this._closeOver();
+    this._feed('<b>you</b> reported this drawing', 'mg-dd-close');
+    this._ping('sent to the caretakers');
+    this._paintActs();
+  }
+
+  /** If the store answers, say so honestly; if it refuses, give the button back. */
+  _onReportAck(m) {
+    const P = this.party;
+    if (!P || this.dead || !m || (m.kind && m.kind !== 'doodle')) return;
+    if (m.ok === false) {
+      const round = num(m.round);
+      P.reported.delete(round != null ? Math.round(round) : P.round);
+      this._lastReportAt = 0;
+      this._feed(`<b>caretakers</b> ${esc(String(m.msg || 'that report did not go through'))}`);
+    } else {
+      this._feed('<b>caretakers</b> thanks, we have it', 'mg-dd-good');
+    }
+    this._paintActs();
   }
 
   // -------------------------------------------------------------- guessing -

@@ -19,10 +19,45 @@ import { visitHouse } from '../net/client.js';
  *   openProfile(game, playerId)   - the card (also opened from the friends list)
  *   ensureSocialStyles()          - injects the single <style> tag for pf-/fr-
  *   normalizeFriends(payload)     - shared parser for the 'friends-data' event
+ *   REPORT_REASONS                - the reason vocabulary (wave 10C)
  *
  * Data flow: we paint instantly from whatever the net client already knows
  * about that remote (name/color/hat/bot), fire {t:'inspect', id} and enrich the
  * card when 'profile-data' arrives. 'friends-data' keeps the button honest.
+ *
+ * ---------------------------------------------------------------------------
+ * WAVE 10C: Report a player, and the Moderate section
+ *
+ * Both hang off the existing action row, because the card is where you already
+ * clicked the capybara. A report that needs a menu, a console or a second
+ * overlay is a report that does not get filed mid-incident, and a moderator
+ * who has to alt-tab to a panel is a moderator who is slower than the problem
+ * (accounts-admin.md section 2.4 item 3).
+ *
+ * WIRE. Out:
+ *   {t:'report', kind:'chat'|'name'|'other', reason, uid?, name?, id, room?, note?}
+ *     - reason is one of REPORT_REASONS' ids and `kind` is derived from it;
+ *       both vocabularies are server/reports.js's (KINDS, REASONS), and an id
+ *       off that list is filed as 'other' rather than refused
+ *     - note is free text, <= 240 chars (the store takes 300)
+ *     - uid / name / id are all sent when known: the server resolves in that
+ *       order, so the report survives a rename or a reconnect
+ *     - the client attaches NO evidence. The chat ring, the room and the
+ *       timestamps are server-side facts (server/chatlog.js); a client-supplied
+ *       transcript is a client-supplied lie.
+ *   {t:'a-inspect'|'a-mute'|'a-unmute'|'a-kick'|'a-ban'|'a-unban', <target>, ...}
+ *     - exactly server/admin.js's frames, exactly src/ui/admin.js's shapes
+ * In:
+ *   'report'  {ok:true, id} | {ok:false, msg, code}   (refusal rides the same
+ *             name, as `mural` already does)
+ *   'a-ok' / 'a-err'  matched to THIS card's target, because Cove Watch is
+ *             listening to the same two events.
+ *
+ * GATING. The Moderate section is drawn from `game.can(cap)` — the caps list
+ * the server put on the welcome profile — and never from a role name or a
+ * client guess. Every button it draws is re-authorised by performOp anyway, so
+ * this is ergonomics, not security: the rule it follows is simply never to
+ * paint a button the server is going to refuse.
  */
 
 // ---------------------------------------------------------------------------
@@ -711,6 +746,96 @@ export function paintStampCanvas(canvas, stamp, earned, px) {
 }
 
 // ---------------------------------------------------------------------------
+// reporting + moderation (wave 10C, N-10 + the ergonomic half of N-04)
+//
+// Both live on the card for the same reason: the operator, and the player, are
+// ALREADY looking at the capybara they mean. A separate console is a console
+// nobody opens mid-incident (accounts-admin.md section 2.4 item 3).
+// ---------------------------------------------------------------------------
+
+/**
+ * The reason vocabulary. `id` is what travels; the label and the line under it
+ * are the whole moderation policy as far as most players will ever read it, so
+ * they are written for an adult audience that is here for the nostalgia:
+ * slurs and harassment are named, "he swore" is deliberately not a category.
+ *
+ * THE IDS ARE PINNED TO server/reports.js's REASONS. An id that is not on that
+ * list is not refused — the server files it as 'other' and keeps the original
+ * in the note — but it also stops being countable, and a queue you cannot count
+ * is a queue nobody triages. If that list changes, this one changes with it.
+ * ('bullying' is the stored id; 'Harassment' is what an adult calls it.)
+ */
+export const REPORT_REASONS = [
+  ['language', 'Slurs or hate speech', 'Aimed at who someone is.'],
+  ['bullying', 'Harassment', 'Following, targeting, piling on.'],
+  ['spam', 'Spam or ads', 'Flooding, links, selling things.'],
+  ['name', 'Their name', 'The name itself is the problem.'],
+  ['cheating', 'Cheating', 'Coin farming, exploits, rigged scores.'],
+  ['other', 'Something else', 'Tell the keepers what happened.'],
+].map(([id, name, desc]) => ({ id, name, desc }));
+
+/**
+ * reason -> the store's `kind`, which is what decides the evidence the SERVER
+ * freezes onto the report (server/reports.js buildEvidence). 'chat', 'name'
+ * and 'other' all attach the reported capy's recent lines, which is the whole
+ * context a caretaker needs for a player-directed report; 'player' is not a
+ * kind the store knows, so sending it would land every one of these in the
+ * 'other' bucket and lose the sort.
+ */
+const REASON_KIND = { name: 'name', cheating: 'other', other: 'other' };
+
+/** server/reports.js NOTE_MAX is 300; ask for less than the server will take. */
+const NOTE_MAX = 240;
+
+/** One report per capybara per quarter hour, and a breath between any two. */
+const REPORT_REPEAT_MS = 15 * 60_000;
+const REPORT_COOLDOWN_MS = 20_000;
+/** The server may be older than this build; never leave the button spinning. */
+const REPORT_ANSWER_MS = 5000;
+
+/** Keyed by uid when we have one, else the connection id: survives re-opening. */
+const reportedAt = new Map();
+let lastReportAt = 0;
+
+function reportKey(who) {
+  return who.uid ? `u:${who.uid}` : `c:${who.id}`;
+}
+
+/** Have we already filed against THIS capy inside the repeat window? */
+function reportedRecently(who, now = Date.now()) {
+  return now - (reportedAt.get(reportKey(who)) || 0) < REPORT_REPEAT_MS;
+}
+
+/** '' when a report may go now, otherwise the sentence explaining why not. */
+function reportBlocked(who, now = Date.now()) {
+  if (reportedRecently(who, now)) {
+    return 'You have already reported them. The keepers have it, and a second copy does not make it louder.';
+  }
+  if (now - lastReportAt < REPORT_COOLDOWN_MS) return 'Give the last report a moment to land.';
+  return '';
+}
+
+/** Mute/ban lengths offered on the card. The SERVER owns the per-role ceiling:
+ *  it refuses what it will not do, in a sentence it has already written, so a
+ *  number copied out of server/admin.js here would go stale in silence. */
+const MUTE_CHIPS = [['10m', 10], ['1h', 60], ['6h', 360], ['24h', 1440], ['7d', 10080]];
+const BAN_CHIPS = [['1h', 60], ['24h', 1440], ['7d', 10080], ['30d', 43200]];
+
+/** Ranks, for not painting a button the rank guard is going to turn down.
+ *  server/admin.js's RANK is the authority; this only decides what is drawn. */
+const RANK = { player: 0, mod: 1, admin: 2 };
+const rankOf = (role) => RANK[role] ?? 0;
+
+/** "4m", "2h", "3d": a duration in a moderation drawer is glanced at. */
+function shortMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0m';
+  if (ms >= 86_400_000) return `${Math.round(ms / 86_400_000)}d`;
+  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)}m`;
+  return `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
+// ---------------------------------------------------------------------------
 // payload parsing (server shapes are tolerated loosely on purpose)
 // ---------------------------------------------------------------------------
 
@@ -726,6 +851,10 @@ function normalizeProfile(raw) {
   const color = Number(p.color);
   return {
     id: id == null ? null : String(id),
+    // The account key, when the server volunteers it. A report and every a-*
+    // op resolve uid -> name -> id, so having it makes the target survive a
+    // rename and a reconnect; not having it costs nothing but precision.
+    uid: typeof p.uid === 'string' && p.uid ? p.uid : null,
     name: typeof p.name === 'string' && p.name.trim() ? p.name.trim() : null,
     color: Number.isFinite(color) && color > 0 ? color : null,
     hat: typeof p.hat === 'string' && Object.prototype.hasOwnProperty.call(HATS, p.hat) ? p.hat : null,
@@ -901,6 +1030,92 @@ const CSS = `
 }
 .pf-note b { color: var(--ink); }
 
+/* ---- report + moderate (wave 10C) ----------------------------------------
+   Two drawers that open under the action row, never a second overlay: the
+   whole point of doing this here is that you are already looking at the capy. */
+.pf-fbtn.is-report {
+  background: linear-gradient(180deg, #fffefa 0%, #f6e3e5 100%); color: #a3565f;
+  box-shadow: 0 4px 0 rgba(150, 80, 90, 0.18), 0 8px 18px rgba(45, 36, 23, 0.12);
+  font-size: 12.5px; padding: 8px 15px;
+}
+.pf-fbtn.is-mod {
+  background: linear-gradient(180deg, #8fd0f2 0%, var(--accent2) 100%); color: #fff;
+  box-shadow: 0 4px 0 rgba(38, 116, 160, 0.32), 0 8px 18px rgba(45, 36, 23, 0.16);
+  font-size: 12.5px; padding: 8px 15px;
+}
+
+.pf-drawer[hidden] { display: none; }
+.pf-drawer {
+  margin-top: 9px; padding: 11px 13px 12px; border-radius: 16px;
+  background: rgba(45, 36, 23, 0.05); box-shadow: inset 0 0 0 2px rgba(45, 36, 23, 0.07);
+  animation: pf-pop 0.26s backwards var(--spring);
+}
+.pf-drawer.is-report { background: rgba(232, 101, 122, 0.09); box-shadow: inset 0 0 0 2px rgba(232, 101, 122, 0.2); }
+.pf-drawer.is-mod { background: rgba(79, 179, 232, 0.1); box-shadow: inset 0 0 0 2px rgba(79, 179, 232, 0.26); }
+.pf-dr-h { display: flex; align-items: center; gap: 7px; font-weight: 900; font-size: 13px; margin-bottom: 8px; }
+.pf-dr-h b { color: var(--accent); overflow-wrap: anywhere; }
+.pf-dr-sub { font-size: 11.5px; font-weight: 700; color: var(--muted); line-height: 1.45; margin-bottom: 8px; }
+.pf-dr-sub b { color: var(--ink); }
+
+/* small chunky button, the drawer's workhorse */
+.pf-sb {
+  border: 0; cursor: pointer; font-family: var(--font); font-weight: 900; font-size: 11px;
+  letter-spacing: 0.03em; padding: 6px 11px; border-radius: 999px; color: var(--ink);
+  background: linear-gradient(180deg, #fffefa 0%, #fdf1da 100%);
+  box-shadow: 0 2px 0 rgba(45, 36, 23, 0.14);
+  transition: scale 0.12s ease, filter 0.16s ease;
+}
+.pf-sb:hover:not(:disabled) { scale: 1.06; filter: brightness(1.04); }
+.pf-sb:active:not(:disabled) { scale: 0.94; }
+.pf-sb:disabled { opacity: 0.45; cursor: default; box-shadow: none; }
+.pf-sb:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
+.pf-sb.on { background: linear-gradient(180deg, #f07f90 0%, var(--accent) 100%); color: #fff; }
+.pf-sb.warm { background: linear-gradient(180deg, #ffd98a 0%, var(--gold) 100%); box-shadow: 0 2px 0 rgba(158, 111, 20, 0.32); }
+.pf-sb.hot { background: linear-gradient(180deg, #f07f90 0%, var(--accent) 100%); color: #fff; box-shadow: 0 2px 0 rgba(150, 55, 72, 0.35); }
+.pf-sb.calm { background: linear-gradient(180deg, #8fd0f2 0%, var(--accent2) 100%); color: #fff; box-shadow: 0 2px 0 rgba(38, 116, 160, 0.32); }
+.pf-dr-x { margin-left: auto; }
+
+/* the reason picker: a grid of little cards, one tap each */
+.pf-reasons { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 5px; }
+.pf-reason {
+  border: 0; cursor: pointer; font-family: var(--font); text-align: left; color: var(--ink);
+  background: #fffdf6; border-radius: 12px; padding: 7px 10px;
+  box-shadow: 0 2px 0 rgba(45, 36, 23, 0.1);
+  transition: scale 0.12s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+.pf-reason:hover { scale: 1.02; background: #fff; }
+.pf-reason:active { scale: 0.97; }
+.pf-reason:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
+.pf-reason.on { background: var(--accent); box-shadow: 0 2px 0 rgba(150, 55, 72, 0.35); }
+.pf-reason.on .pf-reason-n, .pf-reason.on .pf-reason-d { color: #fff; }
+.pf-reason-n { display: block; font-weight: 900; font-size: 11.5px; line-height: 1.2; }
+.pf-reason-d { display: block; font-weight: 700; font-size: 10px; color: #a3906c; line-height: 1.3; margin-top: 2px; }
+
+.pf-why {
+  width: 100%; border: 0; border-radius: 12px; padding: 8px 11px; margin-top: 8px;
+  background: #fff; font-family: var(--font); font-weight: 700; font-size: 12px; color: var(--ink);
+  box-shadow: inset 0 0 0 2px rgba(45, 36, 23, 0.08);
+}
+.pf-why:focus { outline: none; box-shadow: inset 0 0 0 2px var(--accent2); }
+.pf-dr-btns { display: flex; gap: 6px; margin-top: 8px; }
+.pf-dr-btns .pf-sb { flex: 1; font-size: 12px; padding: 8px 10px; }
+.pf-dr-foot { font-size: 10px; font-weight: 700; color: #b6a688; line-height: 1.45; margin-top: 8px; }
+
+/* moderate */
+.pf-mod-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.pf-mod-facts { display: grid; grid-template-columns: 78px 1fr; gap: 1px 8px; font-size: 11px; margin-bottom: 8px; }
+.pf-mod-facts dt { font-weight: 800; color: #a3906c; }
+.pf-mod-facts dd { margin: 0; font-weight: 700; overflow-wrap: anywhere; font-family: ui-monospace, Consolas, monospace; }
+.pf-mod-chip {
+  font-size: 8.5px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px; flex: none;
+}
+.pf-mod-chip.role { background: rgba(232, 101, 122, 0.16); color: #b34156; }
+.pf-mod-chip.guest { background: rgba(45, 36, 23, 0.08); color: #8a7a5a; }
+.pf-mod-chip.mute { background: rgba(242, 182, 74, 0.3); color: #8a6a1f; }
+.pf-mod-chip.ban { background: rgba(232, 101, 122, 0.28); color: #a32f47; }
+.pf-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 2px; }
+
 /* ---- friends list ---- */
 .fr-head { display: flex; align-items: baseline; gap: 9px; padding-right: 44px; }
 .fr-head h2 { font-size: 24px; margin: 0; color: var(--accent); letter-spacing: 0.02em; }
@@ -1061,7 +1276,7 @@ const CSS = `
 }
 @media (prefers-reduced-motion: reduce) {
   .pf-card, .fr-card, .pf-row, .fr-row, .fr-den, .fr-dot.is-on::after,
-  .fr-hud-badge, .fr-empty-art, .pf-stamp { animation: none; }
+  .fr-hud-badge, .fr-empty-art, .pf-stamp, .pf-drawer { animation: none; }
   .pf-mile-fill { transition: none; }
 }
 `;
@@ -1210,6 +1425,7 @@ export function openProfile(game, playerId) {
   // what we believe about them; profile-data overwrites the parts it knows
   const who = {
     id,
+    uid: null, // only the server knows it; `inspect` or a-inspect fills it in
     name: isSelf ? game.state.name : (local?.name || null),
     color: isSelf ? game.state.color : (local?.color ?? null),
     hat: isSelf ? game.state.hat : (local?.hat ?? null),
@@ -1260,6 +1476,8 @@ export function openProfile(game, playerId) {
             <div class="pf-album"></div>
           </div>
           <div class="pf-actions"></div>
+          <div class="pf-drawer is-report" hidden></div>
+          <div class="pf-drawer is-mod" hidden></div>
         </div>
       </div>
     </div>
@@ -1282,6 +1500,8 @@ export function openProfile(game, playerId) {
   const mileTop = q('.pf-mile-top');
   const mileFill = q('.pf-mile-fill');
   const mileNodes = q('.pf-mile-nodes');
+  const reportEl = q('.pf-drawer.is-report');
+  const modEl = q('.pf-drawer.is-mod');
 
   // ---- 3D stage ------------------------------------------------------------
   let stage = null;
@@ -1458,8 +1678,403 @@ export function openProfile(game, playerId) {
     return b;
   }
 
+  // ---- report a player -----------------------------------------------------
+  // Deliberately NOT a second overlay: a modal on top of a modal is how a
+  // report gets abandoned. The drawer opens under the buttons you just used.
+
+  let report = null;      // {reason, note, sending, done, err}
+  let reportTimer = 0;
+
+  function reportable() {
+    // Bots have nobody to answer for them, and reporting yourself is a joke the
+    // queue does not need. Everyone else is fair game, guests included: a guest
+    // has no record to punish but very much has a session to end.
+    return !isSelf && !who.bot && !!(who.name || who.id);
+  }
+
+  function closeReport(silent = false) {
+    if (!report) return;
+    report = null;
+    if (reportTimer) { clearTimeout(reportTimer); reportTimer = 0; }
+    renderReport();
+    renderActions();
+    if (!silent) game.audio?.play?.('click');
+  }
+
+  function sendReport() {
+    if (!report || report.sending || report.done || !report.reason) return;
+    if (!game.net?.connected) {
+      game.toast('The cove is offline for a moment, so nothing is listening.');
+      return;
+    }
+    const blocked = reportBlocked(who);
+    if (blocked) { game.toast(blocked, 4400); return; }
+
+    const now = Date.now();
+    lastReportAt = now;
+    reportedAt.set(reportKey(who), now);
+
+    const text = String(report.note || '').replace(/\s+/g, ' ').trim().slice(0, NOTE_MAX);
+    // uid -> name -> id is the server's own resolution order (resolveTarget);
+    // send every key we hold so the report still points at the right account
+    // after they rename, reconnect, or log off before anyone reads it.
+    const frame = {
+      t: 'report',
+      // 'name' is its own surface in the store: an offensive name needs a
+      // forced rename, not a mute, and the queue sorts on it.
+      kind: REASON_KIND[report.reason] || 'chat',
+      reason: report.reason,
+      id: who.id,
+    };
+    if (who.uid) frame.uid = who.uid;
+    if (who.name) frame.name = who.name;
+    if (text) frame.note = text;
+    if (game.roomId) frame.room = game.roomId;
+    game.net.send(frame);
+
+    report.sending = true;
+    report.err = '';
+    renderReport();
+    game.audio?.play?.('click');
+    // An older server has no reports module and will never answer. Thanking
+    // them anyway beats a button that spins forever; the server is still the
+    // one that decides whether the report exists.
+    reportTimer = setTimeout(() => {
+      reportTimer = 0;
+      if (report?.sending) { report.sending = false; report.done = true; renderReport(); }
+    }, REPORT_ANSWER_MS);
+  }
+
+  function renderReport() {
+    reportEl.textContent = '';
+    if (!report) { reportEl.hidden = true; return; }
+    reportEl.hidden = false;
+
+    const h = elm('div', 'pf-dr-h');
+    h.append(report.done ? 'Reported ' : 'Report ', elm('b', null, who.name || 'this capybara'));
+    const x = elm('button', 'pf-sb pf-dr-x', 'Close');
+    x.type = 'button';
+    x.addEventListener('click', () => closeReport());
+    h.appendChild(x);
+    reportEl.appendChild(h);
+
+    if (report.done) {
+      reportEl.appendChild(elm('div', 'pf-dr-sub',
+        'Thank you. A cove keeper will look at this with the chat around it, and you will not hear back unless they need you.'));
+      reportEl.appendChild(elm('div', 'pf-dr-foot',
+        'If they are ruining your evening right now, you do not have to wait for us: walk to another room, and they cannot follow you into your own den.'));
+      return;
+    }
+
+    reportEl.appendChild(elm('div', 'pf-dr-sub', 'What happened? Pick the closest one.'));
+
+    const grid = elm('div', 'pf-reasons');
+    for (const r of REPORT_REASONS) {
+      const b = elm('button', `pf-reason${report.reason === r.id ? ' on' : ''}`);
+      b.type = 'button';
+      b.setAttribute('aria-pressed', report.reason === r.id ? 'true' : 'false');
+      b.appendChild(elm('span', 'pf-reason-n', r.name));
+      b.appendChild(elm('span', 'pf-reason-d', r.desc));
+      b.addEventListener('click', () => {
+        report.reason = r.id;
+        report.err = '';
+        renderReport();
+        game.audio?.play?.('click');
+      });
+      grid.appendChild(b);
+    }
+    reportEl.appendChild(grid);
+
+    const why = elm('input', 'pf-why');
+    why.type = 'text';
+    why.maxLength = NOTE_MAX;
+    why.value = report.note;
+    why.placeholder = 'Anything else worth knowing (optional)';
+    why.setAttribute('aria-label', 'What happened');
+    why.disabled = !!report.sending;
+    why.addEventListener('input', () => { report.note = why.value; });
+    why.addEventListener('keydown', (e) => {
+      e.stopPropagation(); // the card owns the keyboard; typing is not walking
+      if (e.key === 'Enter' && report.reason) sendReport();
+    });
+    reportEl.appendChild(why);
+
+    const btns = elm('div', 'pf-dr-btns');
+    const cancel = elm('button', 'pf-sb', 'Never mind');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => closeReport());
+    const go = elm('button', 'pf-sb hot', report.sending ? 'Sending...' : 'Send report');
+    go.type = 'button';
+    go.disabled = !report.reason || !!report.sending || !game.net?.connected;
+    go.addEventListener('click', sendReport);
+    btns.append(cancel, go);
+    reportEl.appendChild(btns);
+
+    if (report.err) reportEl.appendChild(elm('div', 'pf-dr-sub', report.err));
+    reportEl.appendChild(elm('div', 'pf-dr-foot',
+      'Reports go to the cove keepers with the last few minutes of chat attached. False reports are themselves reportable, so please only use this when you mean it.'));
+  }
+
+  // ---- moderate ------------------------------------------------------------
+  // The same `a-*` frames Cove Watch (src/ui/admin.js) sends, and the same
+  // server-side performOp re-authorises every one of them. This is only the
+  // ergonomics: acting where you already clicked the player.
+
+  let mod = null;         // {account, asked, drawer:{kind,mins,reason}|null}
+  // The frame names this card is still waiting on. A SET, not one slot: the
+  // auto re-read fires 450ms after an op, and on a bad connection it would
+  // otherwise overwrite the op we are still expecting an answer to — the toast
+  // carrying the server's refusal sentence is exactly the one you cannot lose.
+  const modAwait = new Set();
+
+  function caps() {
+    const can = (c) => (typeof game.can === 'function' ? !!game.can(c) : false);
+    return {
+      inspect: can('inspect'),
+      mute: can('mute'),
+      kick: can('kick'),
+      ban: can('ban'),
+      perm: can('ban-perm'),
+      unban: can('unban'),
+    };
+  }
+
+  function canModerate() {
+    if (isSelf || who.bot) return false;
+    const c = caps();
+    return c.inspect || c.mute || c.kick || c.ban || c.unban;
+  }
+
+  /** uid -> name -> id, the server's resolution order, best key first. */
+  function modTarget() {
+    if (who.uid) return { uid: who.uid };
+    if (who.registered !== false && who.name) return { name: who.name };
+    return { id: who.id };
+  }
+
+  function askInspect() {
+    if (!mod || !caps().inspect || !game.net?.connected) return;
+    mod.asked = true;
+    modAwait.add('a-inspect');
+    game.net.send({ t: 'a-inspect', ...modTarget() });
+  }
+
+  function modOp(t, extra = {}) {
+    if (!game.net?.connected) {
+      game.toast('The cove is offline for a moment, so nothing is listening.');
+      return;
+    }
+    modAwait.add(t);
+    game.net.send({ t, ...modTarget(), ...extra });
+    game.audio?.play?.('click');
+    // let the record settle, then re-read it so the chips tell the truth
+    setTimeout(() => { if (mod) askInspect(); }, 450);
+  }
+
+  function closeMod(silent = false) {
+    if (!mod) return;
+    mod = null;
+    modAwait.clear();
+    renderMod();
+    renderActions();
+    if (!silent) game.audio?.play?.('click');
+  }
+
+  function renderModDrawer(host) {
+    const d = mod.drawer;
+    if (!d) return;
+    const verb = d.kind === 'mute' ? 'Mute' : d.kind === 'ban' ? 'Ban' : 'Kick';
+
+    if (d.kind !== 'kick') {
+      const chips = elm('div', 'pf-chips');
+      const list = d.kind === 'mute' ? MUTE_CHIPS : BAN_CHIPS;
+      const opts = d.kind === 'ban' && caps().perm ? [...list, ['Forever', 0]] : list;
+      for (const [label, mins] of opts) {
+        const b = elm('button', `pf-sb${d.mins === mins ? ' on' : ''}`, label);
+        b.type = 'button';
+        b.addEventListener('click', () => { d.mins = mins; renderMod(); });
+        chips.appendChild(b);
+      }
+      host.appendChild(chips);
+    }
+
+    const why = elm('input', 'pf-why');
+    why.type = 'text';
+    why.maxLength = 140;
+    why.value = d.reason;
+    why.placeholder = d.kind === 'kick'
+      ? 'Reason (optional, they will see it)'
+      : 'Reason (required, they will see it)';
+    why.setAttribute('aria-label', 'Reason');
+    const ready = () => (d.kind === 'kick' ? true : d.reason.trim().length >= 3 && d.mins !== null);
+    why.addEventListener('input', () => { d.reason = why.value; go.disabled = !ready(); });
+    why.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter' && ready()) confirm();
+    });
+    host.appendChild(why);
+
+    const btns = elm('div', 'pf-dr-btns');
+    const cancel = elm('button', 'pf-sb', 'Cancel');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => { mod.drawer = null; renderMod(); });
+    const go = elm('button', `pf-sb ${d.kind === 'ban' ? 'hot' : 'warm'}`, verb);
+    go.type = 'button';
+    go.disabled = !ready();
+    go.addEventListener('click', confirm);
+    btns.append(cancel, go);
+    host.appendChild(btns);
+
+    function confirm() {
+      if (!ready()) return;
+      const reason = d.reason.trim();
+      if (d.kind === 'kick') modOp('a-kick', reason ? { reason } : {});
+      else if (d.kind === 'mute') modOp('a-mute', { mins: d.mins, reason });
+      // mins 0 is the server's own spelling of permanent, and it needs 'ban-perm'
+      else modOp('a-ban', { mins: d.mins, reason });
+      mod.drawer = null;
+      renderMod();
+    }
+
+    setTimeout(() => why.focus({ preventScroll: true }), 0);
+  }
+
+  function renderMod() {
+    modEl.textContent = '';
+    if (!mod) { modEl.hidden = true; return; }
+    modEl.hidden = false;
+    const c = caps();
+    const acc = mod.account;
+
+    const h = elm('div', 'pf-dr-h');
+    h.append('Moderate ', elm('b', null, who.name || 'this capybara'));
+    if (acc?.guest || who.registered === false) h.appendChild(elm('span', 'pf-mod-chip guest', 'guest'));
+    if (acc?.role && acc.role !== 'player') h.appendChild(elm('span', 'pf-mod-chip role', acc.role));
+    if (acc?.mute?.remaining > 0) h.appendChild(elm('span', 'pf-mod-chip mute', `muted ${shortMs(acc.mute.remaining)}`));
+    if (acc?.ban && !acc.ban.expired) h.appendChild(elm('span', 'pf-mod-chip ban', 'banned'));
+    const x = elm('button', 'pf-sb pf-dr-x', 'Close');
+    x.type = 'button';
+    x.addEventListener('click', () => closeMod());
+    h.appendChild(x);
+    modEl.appendChild(h);
+
+    if (acc && !acc.guest) {
+      const kv = elm('dl', 'pf-mod-facts');
+      const put = (k, v) => {
+        if (v === undefined || v === null || v === '') return;
+        kv.appendChild(elm('dt', null, k));
+        kv.appendChild(elm('dd', null, String(v)));
+      };
+      put('uid', acc.uid);
+      put('coins', acc.coins);
+      put('ip hash', acc.lastIpH);
+      if (acc.mute) put('mute', `${shortMs(acc.mute.remaining)} left, by ${acc.mute.by || '?'} (${acc.mute.reason || 'no reason given'})`);
+      if (acc.ban) put('ban', `${acc.ban.expired ? 'expired, ' : ''}by ${acc.ban.by || '?'} (${acc.ban.reason || 'no reason given'})`);
+      if (Array.isArray(acc.sessions) && acc.sessions.length > 1) put('sessions', acc.sessions.length);
+      modEl.appendChild(kv);
+    } else if (acc?.guest) {
+      modEl.appendChild(elm('div', 'pf-dr-sub',
+        'A guest: nothing to mute and nothing to ban, because there is no record to hold either. A kick is the whole toolbox.'));
+    } else {
+      modEl.appendChild(elm('div', 'pf-dr-sub',
+        c.inspect ? 'Reading their record...' : 'Your role cannot read records, only act on them.'));
+    }
+
+    // The rank guard is the server's, and it is strictly greater: never paint a
+    // button that is going to come back as 'rank'.
+    const outranks = !!acc && !acc.guest && rankOf(acc.role) >= rankOf(game.state?.role);
+    if (outranks) {
+      modEl.appendChild(elm('div', 'pf-dr-sub', `${who.name || 'They'} outranks that action. Take it to an admin.`));
+      return;
+    }
+
+    if (mod.drawer) { renderModDrawer(modEl); return; }
+
+    const row = elm('div', 'pf-mod-row');
+    const add = (label, cls, fn, on = true, why = '') => {
+      if (!on) return;
+      const b = elm('button', `pf-sb${cls ? ` ${cls}` : ''}`, label);
+      b.type = 'button';
+      if (why) b.title = why;
+      b.addEventListener('click', fn);
+      row.appendChild(b);
+    };
+    // A guest has no account: the server refuses mute and ban for them by name,
+    // so the card does not offer them either.
+    const hasRecord = acc ? !acc.guest : who.registered !== false;
+
+    add(acc ? 'Re-read' : 'Inspect', '', () => { askInspect(); game.audio?.play?.('click'); }, c.inspect);
+    if (hasRecord && acc?.mute?.remaining > 0) add('Unmute', 'warm', () => modOp('a-unmute'), c.mute);
+    else add('Mute', 'warm', () => { mod.drawer = { kind: 'mute', mins: 60, reason: '' }; renderMod(); }, c.mute && hasRecord);
+    add('Kick', '', () => { mod.drawer = { kind: 'kick', mins: null, reason: '' }; renderMod(); }, c.kick);
+    if (hasRecord && acc?.ban && !acc.ban.expired) add('Unban', 'hot', () => modOp('a-unban'), c.unban);
+    else add('Ban', 'hot', () => { mod.drawer = { kind: 'ban', mins: 1440, reason: '' }; renderMod(); }, c.ban && hasRecord);
+    modEl.appendChild(row);
+
+    modEl.appendChild(elm('div', 'pf-dr-foot',
+      'Every action here is logged with your name, the reason and the before-and-after. Duration limits belong to your role; the server will say so if you ask for more.'));
+  }
+
+  /**
+   * The action row is two rows of intent that share one strip: the social half
+   * (message, friend, den) and the safety half (report, moderate). The social
+   * half has five early returns in it, so the safety half is appended after it
+   * rather than threaded through them — otherwise a guest, a bot-adjacent
+   * "Checking..." state or an offline note would each quietly eat the report
+   * button, and the one button you need during an incident would be missing
+   * exactly when the card is in an unusual state.
+   */
   function renderActions() {
     actionsEl.textContent = '';
+    renderSocialActions();
+    renderSafetyActions();
+  }
+
+  function renderSafetyActions() {
+    if (reportable()) {
+      // Only the per-target lock changes the button; the shorter global breath
+      // between any two reports is a toast at send time, because "Reported" on
+      // a capy you have never reported is a lie.
+      const already = reportedRecently(who);
+      const b = elm('button', 'pf-fbtn is-report', already ? 'Reported' : 'Report');
+      b.type = 'button';
+      b.disabled = already || !game.net?.connected;
+      b.title = already
+        ? reportBlocked(who)
+        : (game.net?.connected
+          ? `Tell the cove keepers about ${who.name || 'this capybara'}`
+          : 'Reports need a connection to the cove.');
+      b.setAttribute('aria-expanded', report ? 'true' : 'false');
+      b.addEventListener('click', () => {
+        if (b.disabled) return;
+        if (report) { closeReport(); return; }
+        closeMod(true);
+        report = { reason: '', note: '', sending: false, done: false, err: '' };
+        renderReport();
+        renderActions();
+        game.audio?.play?.('click');
+      });
+      actionsEl.appendChild(b);
+    }
+
+    if (!canModerate()) return;
+    const m = elm('button', 'pf-fbtn is-mod', 'Moderate');
+    m.type = 'button';
+    m.title = `Operator tools for ${who.name || 'this capybara'} (logged)`;
+    m.setAttribute('aria-expanded', mod ? 'true' : 'false');
+    m.addEventListener('click', () => {
+      if (mod) { closeMod(); return; }
+      closeReport(true);
+      mod = { account: null, asked: false, drawer: null };
+      renderMod();
+      renderActions();
+      askInspect();
+      game.audio?.play?.('open');
+    });
+    actionsEl.appendChild(m);
+  }
+
+  function renderSocialActions() {
     const den = denButton();
     if (isSelf) {
       if (den) actionsEl.appendChild(den);
@@ -1553,6 +2168,7 @@ export function openProfile(game, playerId) {
       const p = normalizeProfile(raw);
       if (!p) return;
       if (p.id != null && p.id !== who.id) return; // someone else's card
+      if (p.uid) who.uid = p.uid;
       if (p.name) who.name = p.name;
       if (p.color != null) who.color = p.color;
       if (p.hat != null) who.hat = p.hat;
@@ -1594,6 +2210,62 @@ export function openProfile(game, playerId) {
       who.stamps = [...new Set([...(who.stamps || []), m.id])];
       renderAlbum();
     }),
+    // The report answer rides its OWN name, the same way `mural` answers a
+    // mural op: {ok:true, id} or {ok:false, msg, code}. A refusal releases the
+    // per-target lock, or a rate-limited report would look like a delivered one.
+    game.events.on('report', (m) => {
+      if (!report) return;
+      if (reportTimer) { clearTimeout(reportTimer); reportTimer = 0; }
+      report.sending = false;
+      if (m && m.ok === false) {
+        reportedAt.delete(reportKey(who));
+        // A refusal that arrives AFTER the optimistic fallback has to be able
+        // to take the thank-you back, or the one case where the report did not
+        // land is the one case the player is told it did.
+        report.done = false;
+        report.err = m.msg || 'The keepers could not take that one. Try again in a moment.';
+        game.audio?.play?.('pop');
+      } else {
+        report.done = true;
+        game.audio?.play?.('ding');
+      }
+      renderReport();
+      renderActions();
+    }),
+    // Operator answers. Cove Watch listens to these too, so everything here is
+    // matched to THIS card's target (or to an op this card actually sent) —
+    // otherwise a panel action would repaint a card about somebody else.
+    game.events.on('a-ok', (m) => {
+      if (!mod || !m || typeof m.op !== 'string') return;
+      if (m.op === 'a-inspect') {
+        const acc = m.account && typeof m.account === 'object' ? m.account : null;
+        if (!acc) return;
+        const mine = (who.uid && acc.uid === who.uid)
+          || (!!who.name && String(acc.name || '').toLowerCase() === who.name.toLowerCase());
+        if (!mine) return; // the panel asked about someone else
+        if (acc.uid) who.uid = acc.uid;
+        if (typeof acc.guest === 'boolean') who.registered = !acc.guest;
+        mod.account = acc;
+        modAwait.delete('a-inspect');
+        renderMod();
+        renderHead();
+        return;
+      }
+      if (m.uid && who.uid && m.uid !== who.uid) return;
+      if (!modAwait.has(m.op)) return; // the panel's op, not ours
+      modAwait.delete(m.op);
+      if (m.msg) game.toast(m.msg, 3200);
+      game.audio?.play?.('pop');
+    }),
+    game.events.on('a-err', (m) => {
+      if (!mod || !m || !modAwait.has(m.op)) return;
+      modAwait.delete(m.op);
+      game.toast(m.msg || 'That did not work', 3600);
+      game.audio?.play?.('pop');
+      // The refusal often IS the answer (rank, guest, role ceiling): show the
+      // buttons again rather than leaving a drawer half-open over it.
+      if (mod) { mod.drawer = null; renderMod(); }
+    }),
     game.events.on('friends-data', (payload) => {
       if (isSelf || who.bot) return;
       const list = normalizeFriends(payload);
@@ -1627,6 +2299,7 @@ export function openProfile(game, playerId) {
     if (openInstance?.id === id) openInstance = null;
     clearTimeout(settle);
     if (stampsTimer) { clearTimeout(stampsTimer); stampsTimer = 0; }
+    if (reportTimer) { clearTimeout(reportTimer); reportTimer = 0; }
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
     root.removeEventListener('pointerdown', onBackdrop);
@@ -1641,7 +2314,14 @@ export function openProfile(game, playerId) {
   function onKey(e) {
     // the card owns the keyboard while it is up (no walking off mid-chat)
     e.stopPropagation();
-    if (e.key === 'Escape') { e.preventDefault(); close(); }
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    // Escape unwinds one layer at a time: a half-typed ban reason should not
+    // take the whole card with it.
+    if (mod?.drawer) { mod.drawer = null; renderMod(); return; }
+    if (report) { closeReport(); return; }
+    if (mod) { closeMod(); return; }
+    close();
   }
 
   root.addEventListener('pointerdown', onBackdrop);
