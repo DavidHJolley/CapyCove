@@ -394,6 +394,8 @@ function joinRoom(p, roomId) {
   if (roomId === DRIFT_ROOM) sendBottle(p);
   markPartyAttendance(p);
   signal('room', p, { room: roomId });
+  // wave 12: friends watching this capy see the move at once
+  pushPresenceAbout(p);
 }
 
 function leaveWorld(p) {
@@ -405,6 +407,7 @@ function leaveWorld(p) {
   chatlog.drop(p); // covers every disconnect path, not just ws 'close'
   econ.dropPlayer(p);
   world.players.delete(p.id);
+  pushPresenceAbout(p); // runs after the delete, so friends see room: null
 }
 
 /** The stored account behind a connection, or null for guests. */
@@ -563,6 +566,46 @@ function sendFriends(p) {
   sendTo(p, rec ? friendsPayload(rec) : { t: 'friends', friends: [] });
 }
 
+// ---------- co-presence (wave 12) ----------
+// The island must look alive: room populations for the map pills, and a push
+// when one of YOUR friends moves, so "join them" is always one click old, not
+// one panel-open old. Bots are deliberately absent from every count.
+
+function popFrame() {
+  const rooms = {};
+  for (const p of world.players.values()) if (p.room) rooms[p.room] = (rooms[p.room] || 0) + 1;
+  return {
+    t: 'pop', rooms,
+    lobbies: [{ game: 'sled', room: SLED_ROOM, n: sledLobby.length, need: SLED_LOBBY_MAX, ...(lobbyStartAt ? { countdownAt: lobbyStartAt } : {}) }],
+  };
+}
+
+function fpresenceFrame(rec) {
+  return {
+    t: 'fpresence',
+    friends: ensureFriends(rec).map((key) => {
+      const online = sessionsFor(key)[0] || null;
+      const other = users.get(key);
+      return { name: other?.username || key, room: online?.room || null };
+    }),
+  };
+}
+
+/**
+ * q's room just changed (connect, move, disconnect): refresh the presence view
+ * of every online player whose friends list names q. Guests are never on a
+ * friends list, so they cost nothing here.
+ */
+function pushPresenceAbout(q) {
+  const qKey = q?.username ? q.username.toLowerCase() : null;
+  if (!qKey) return;
+  for (const p of world.players.values()) {
+    if (p === q || !p.username) continue;
+    const rec = recordFor(p);
+    if (rec && ensureFriends(rec).includes(qKey)) sendTo(p, fpresenceFrame(rec));
+  }
+}
+
 // ---------- player dens ----------
 // Every registered capy owns exactly one den, addressed as 'house:<ownerLower>'.
 // Guests own none but may visit the open ones. The room set is created when the
@@ -681,6 +724,12 @@ function validatePlacements(list, owned) {
 
 const sledLobby = []; // player ids, in sign-up order
 let lobbyStartTimer = null;
+let lobbyStartAt = 0; // epoch the pending countdown fires; 0 = none
+
+// wave 12: two riders ARE a race. A pair arms a generous fill window (the third
+// seat stays open and joining shortens it to the real countdown); a full board
+// keeps the original quick countdown. Anyone in the lobby can also Start Now.
+const LOBBY_FILL_MS = 20_000;
 
 function lobbyPayload(starting = false) {
   const players = [];
@@ -688,20 +737,38 @@ function lobbyPayload(starting = false) {
     const p = world.players.get(id);
     if (p) players.push({ id: p.id, name: p.name });
   }
-  return { t: 'lobby', players, starting };
+  return {
+    t: 'lobby', players, starting,
+    game: 'sled', n: players.length, need: SLED_LOBBY_MAX,
+    ...(lobbyStartAt ? { countdownAt: lobbyStartAt } : {}),
+  };
 }
 
 function broadcastLobby(starting = false) {
   broadcastToRoom(SLED_ROOM, lobbyPayload(starting));
 }
 
+function armLobbyStart(ms, starting) {
+  if (lobbyStartTimer) clearTimeout(lobbyStartTimer);
+  lobbyStartAt = Date.now() + ms;
+  lobbyStartTimer = setTimeout(() => {
+    lobbyStartTimer = null;
+    lobbyStartAt = 0;
+    try { startRace(); } catch (e) { console.error('[race] start failed:', e?.message || e); }
+  }, ms);
+  broadcastLobby(starting);
+}
+
 function removeFromLobby(p) {
   const i = sledLobby.indexOf(p.id);
   if (i < 0) return false;
   sledLobby.splice(i, 1);
-  // a rider who backs out during the countdown cancels it: the race only ever
-  // starts with a full board, otherwise the last one in gets a solo run
-  if (lobbyStartTimer) { clearTimeout(lobbyStartTimer); lobbyStartTimer = null; }
+  // the countdown survives while a pair remains; below two there is no race
+  if (lobbyStartTimer && sledLobby.length < 2) {
+    clearTimeout(lobbyStartTimer);
+    lobbyStartTimer = null;
+    lobbyStartAt = 0;
+  }
   broadcastLobby(false);
   return true;
 }
@@ -710,13 +777,9 @@ function joinLobby(p) {
   if (p.room !== SLED_ROOM || p.race) return;
   if (sledLobby.includes(p.id) || sledLobby.length >= SLED_LOBBY_MAX) return;
   sledLobby.push(p.id);
-  if (sledLobby.length >= SLED_LOBBY_MAX) {
-    broadcastLobby(true);
-    if (lobbyStartTimer) clearTimeout(lobbyStartTimer);
-    lobbyStartTimer = setTimeout(() => { try { startRace(); } catch (e) { console.error('[race] start failed:', e?.message || e); } }, RACE_COUNTDOWN_MS);
-  } else {
-    broadcastLobby(false);
-  }
+  if (sledLobby.length >= SLED_LOBBY_MAX) armLobbyStart(RACE_COUNTDOWN_MS, true);
+  else if (sledLobby.length >= 2) armLobbyStart(LOBBY_FILL_MS, false);
+  else broadcastLobby(false);
 }
 
 function startRace() {
@@ -731,6 +794,7 @@ function startRace() {
       const p = world.players.get(sledLobby[i]);
       if (!p || p.room !== SLED_ROOM || p.race) sledLobby.splice(i, 1);
     }
+    lobbyStartAt = 0;
     broadcastLobby(false);
     return;
   }
@@ -2334,6 +2398,14 @@ wss.on('connection', (ws) => {
           // that joins mid-evening must not open at noon and snap
           sendTo(p, clockFrame());
           sendTo(p, partiesFrame());
+          // wave 12: the island's pulse and your friends' whereabouts arrive
+          // with the welcome, and your friends hear that you are on
+          sendTo(p, popFrame());
+          {
+            const rec0 = recordFor(p);
+            if (rec0) sendTo(p, fpresenceFrame(rec0));
+          }
+          pushPresenceAbout(p);
           log.info('ws.connect', { id: p.id, name: p.name, account: p.registered, online: world.players.size });
           break;
         }
@@ -2662,6 +2734,16 @@ wss.on('connection', (ws) => {
         case 'lobby-leave':
           if (socialLimited(p, t0)) break;
           removeFromLobby(p);
+          break;
+        case 'lobby-start':
+          // wave 12: anyone signed on the board can start a pair race now
+          if (socialLimited(p, t0)) break;
+          if (sledLobby.includes(p.id) && sledLobby.length >= 2) {
+            if (lobbyStartTimer) { clearTimeout(lobbyStartTimer); lobbyStartTimer = null; }
+            lobbyStartAt = 0;
+            broadcastLobby(true);
+            try { startRace(); } catch (e) { console.error('[race] start failed:', e?.message || e); }
+          }
           break;
         case 'race-progress': {
           // hot path: no broadcast here, the relay tick reads the latest values
@@ -3014,6 +3096,15 @@ setInterval(() => {
     console.error('[progress] tick failed:', e?.message || e);
   }
 }, CLOCK_MS);
+
+// ---------- tick: co-presence pulse (wave 12) ----------
+// Room populations + lobby fill to everyone every 5s. Cheap: one small frame,
+// counts only humans, and the map/HUD simply repaint what arrives.
+setInterval(() => {
+  try { if (world.players.size) broadcastAll(popFrame()); } catch (e) {
+    console.error('[pop] tick failed:', e?.message || e);
+  }
+}, 5_000);
 
 // ---------- tick: the beach ball (wave 7) ----------
 setInterval(() => {

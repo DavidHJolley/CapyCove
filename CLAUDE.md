@@ -144,6 +144,14 @@ to the SUBJECT (profileBits verbatim -> game.applyModeration) and `a-schat`
 chat is EPHEMERAL, passes server/filter.js, ~1 line/s per sender, audited as
 a COUNT never content, and 'a-schat' is in MUTED_FRAMES (a muted mod is muted
 there too). a-reports/a-resolve ride server/reports.js's existing queue().
+Shipped wave 12 server side (co-presence): `pop` {rooms:{roomId:count},
+lobbies:[{game,room,n,need,countdownAt?}]} to ALL every 5s and on hello (bots
+excluded); `fpresence` {friends:[{name,room|null}]} to a player on hello and
+whenever one of THEIR friends connects/moves/disconnects; `lobby` gained
+{game,n,need,countdownAt?} and a race now arms at TWO riders (20s fill window,
+full board keeps the quick countdown); `lobby-start` (client->server) lets
+anyone on the board start a pair race immediately. Client re-emits pop and
+fpresence via game.events.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

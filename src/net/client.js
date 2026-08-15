@@ -300,6 +300,8 @@ export class NetClient {
         game.events.emit('a-role', m);
         break;
       case 'a-ok': case 'a-err': case 'announce': case 'report': case 'dd-vote': case 'a-schat':
+      // wave 12 co-presence: room populations + friends' whereabouts
+      case 'pop': case 'fpresence':
         game.events.emit(m.t, m);
         break;
       // ---- den tables / PvP matches (wave 4) -------------------------------
