@@ -2,7 +2,7 @@
 
 export const GAME_NAME = 'Capy Cove';
 
-export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'mine', 'jungle', 'drift'];
+export const ROOM_IDS = ['plaza', 'beach', 'peak', 'cafe', 'club', 'lounge', 'loft', 'mine', 'jungle', 'drift'];
 export const DEFAULT_ROOM = 'plaza';
 
 export const ROOM_INFO = {
@@ -11,7 +11,8 @@ export const ROOM_INFO = {
   peak: { name: 'Frosty Peak', desc: 'Snow, sleds and cocoa' },
   cafe: { name: 'The Smoothie Shack', desc: 'Blend it like you mean it' },
   club: { name: 'Groove Grotto', desc: 'Underground dance cave' },
-  lounge: { name: 'The Game Den', desc: 'Tables, trophies and tussles' },
+  lounge: { name: 'The Game Den', desc: 'Tables, tussles and hot cocoa' },
+  loft: { name: 'The Trophy Loft', desc: 'Upstairs at the den: fireside, chess and cards' },
   mine: { name: 'The Glimmer Mine', desc: 'Coins in the walls, hiders in the props' },
   jungle: { name: 'The Tangle Jungle', desc: 'Vines, ruins and doodles' },
   drift: { name: 'The Drift', desc: 'Deep water, soft light, one very big friend' },
@@ -25,9 +26,11 @@ export const MINIGAMES = {
   smoothie: { name: 'Smoothie Scramble', room: 'cafe', maxCoinsPerRun: 130 },
   pong: { name: 'Paddle Panic', room: 'lounge', maxCoinsPerRun: 60 },
   shuffle: { name: 'Shuffle Showdown', room: 'lounge', maxCoinsPerRun: 70 },
-  chess: { name: 'Grand Capy Chess', room: 'lounge', maxCoinsPerRun: 100 },
+  // chess and cards are upstairs in the Trophy Loft; the server reads `room`
+  // to decide which room a table may be joined from (see TABLE_GAMES)
+  chess: { name: 'Grand Capy Chess', room: 'loft', maxCoinsPerRun: 100 },
   connect4: { name: 'Four in a Row', room: 'lounge', maxCoinsPerRun: 60 },
-  cards: { name: 'Capy Clash', room: 'lounge', maxCoinsPerRun: 100 },
+  cards: { name: 'Capy Clash', room: 'loft', maxCoinsPerRun: 100 },
   prophunt: { name: 'Prop Hunt', room: 'mine', maxCoinsPerRun: 90 },
   doodle: { name: 'Capy Doodles', room: 'jungle', maxCoinsPerRun: 90 },
 };
@@ -68,6 +71,9 @@ export const BOT_ZONES = {
   cafe: { x: 0, z: 2, r: 4 },
   club: { x: 0, z: 2, r: 4.5 },
   lounge: { x: 0, z: 2, r: 4 },
+  // the loft's open middle, between the two duel tables and north of the
+  // stairwell mouth (z 3.8): plain planks, no rug edge, no collider
+  loft: { x: 0, z: 0.6, r: 2.6 },
   // south of the Prop Hunt lobby deck: the old (0, 3, 4) circle covered the
   // deck's northern half, so blind bots wandered onto the join pads and read
   // as capys who had signed up for a hunt they were not in

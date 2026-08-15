@@ -169,11 +169,16 @@ export class NetClient {
           try { this._addRemote(p); } catch (e) { console.warn('[net] bad player record', p?.id, e); }
         }
         game.events.emit('population', m.players.length);
-        // the lounge builds ~220ms after this frame; replay the cached table
-        // boards once it exists so the station chips start correct
-        if (m.room === 'lounge' && this.lastTables.size) {
+        // A den room builds ~220ms after this frame; replay the cached table
+        // boards once it exists so the station chips start correct. Not keyed
+        // to 'lounge' any more: the den is two rooms (the floor and the Trophy
+        // Loft over it), and which games stand in which is shared/constants.js's
+        // business, not this file's. Rooms with no tables have no 'table'
+        // listener, so a stray replay anywhere else is a no-op.
+        if (this.lastTables.size) {
+          const room = m.room;
           setTimeout(() => {
-            if (game.roomId !== 'lounge') return;
+            if (game.roomId !== room) return;
             for (const t of this.lastTables.values()) game.events.emit('table', t);
           }, 1200);
         }

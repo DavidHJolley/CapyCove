@@ -8,6 +8,7 @@ export const ROOMS = {
   cafe: () => import('./rooms/cafe.js').then((m) => m.CafeRoom),
   club: () => import('./rooms/club.js').then((m) => m.ClubRoom),
   lounge: () => import('./rooms/lounge.js').then((m) => m.LoungeRoom),
+  loft: () => import('./rooms/loft.js').then((m) => m.LoftRoom),
   mine: () => import('./rooms/mine.js').then((m) => m.MineRoom),
   jungle: () => import('./rooms/jungle.js').then((m) => m.JungleRoom),
   drift: () => import('./rooms/drift.js').then((m) => m.DriftRoom),

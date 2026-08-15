@@ -35,7 +35,10 @@ const RACE_STATE_MS = 200; // ghost relay cadence (~5Hz)
 const RACE_MAX_MS = 150_000; // hard stop, so one rage-quit cannot hang a race
 const RACE_WIN_COINS = 30;
 
-const LOUNGE_ROOM = 'lounge';
+// The den is two rooms now: the loud floor ('lounge') and the Trophy Loft
+// upstairs ('loft', chess + Capy Clash). Nothing here hard-codes which is
+// which: a game's table belongs to whatever room shared/constants.js gives it,
+// and DEN_ROOMS is only the set of rooms that own at least one table.
 const TABLE_SEATS = 2; // every den game is a duel
 const MATCH_START_MS = 1_000; // table fills -> both seats read the roster -> go
 const MATCH_MOVE_LIMIT = 25; // relayed moves per second, per player
@@ -319,8 +322,10 @@ function joinRoom(p, roomId) {
   // forfeits a run in progress); the lobby must never list someone who left
   if (p.room === SLED_ROOM) exitSled(p);
   // same deal for the den: leaving the room stands you up from your table, and
-  // walking out mid-duel hands the win (and the coins) to whoever stayed
-  if (p.room === LOUNGE_ROOM) exitTable(p);
+  // walking out mid-duel hands the win (and the coins) to whoever stayed.
+  // Both den rooms count, so walking up the stairs from the floor gives up a
+  // shuffleboard seat exactly like walking out of the door does
+  if (DEN_ROOMS.includes(p.room)) exitTable(p);
   // and for the party games: the mine's hunt and the jungle's doodle are both
   // tied to their room, so walking out drops you from the board and the round
   if (p.room === MINE_ROOM) exitPropHunt(p);
@@ -336,8 +341,8 @@ function joinRoom(p, roomId) {
   // the lobby only broadcasts on change, so a late arrival would stare at an
   // empty sign-up board until someone else joined or left
   if (roomId === SLED_ROOM) sendTo(p, lobbyPayload());
-  // and the den's five boards, for the same reason
-  if (roomId === LOUNGE_ROOM) sendTables(p);
+  // and the den boards standing in THIS room, for the same reason
+  if (DEN_ROOMS.includes(roomId)) sendTables(p, roomId);
   // ...and the party boards in the mine and the jungle
   for (const lob of Object.values(partyLobbies)) if (roomId === lob.room) sendTo(p, partyPayload(lob));
   // wave 7: the room you just walked into has to arrive already running. The
@@ -743,8 +748,18 @@ function exitSled(p) {
 // opponent and nobody else. A table stays occupied for the whole match, so the
 // third capy in the queue waits for a seat that is really free.
 
-const TABLE_GAMES = Object.keys(MINIGAMES).filter((g) => MINIGAMES[g].room === LOUNGE_ROOM);
+// Which games are duels at a two-seat table, and which room each one stands in.
+// Both come from shared/constants.js: the den games are the ones whose room is
+// part of the den (the floor and the loft over it), so moving a table upstairs
+// is a one-line change there and nothing here needs to know.
+const DEN_ROOMS = ['lounge', 'loft'];
+const TABLE_GAMES = Object.keys(MINIGAMES).filter((g) => DEN_ROOMS.includes(MINIGAMES[g].room));
 const tables = new Map(TABLE_GAMES.map((g) => [g, { game: g, seats: [], timer: null }]));
+
+/** The room a game's table physically stands in: you must be in it to sit down. */
+function tableRoom(game) {
+  return Object.prototype.hasOwnProperty.call(MINIGAMES, game) ? MINIGAMES[game].room : null;
+}
 
 function tablePayload(game) {
   const table = tables.get(game);
@@ -757,12 +772,15 @@ function tablePayload(game) {
 }
 
 function broadcastTable(game) {
-  broadcastToRoom(LOUNGE_ROOM, tablePayload(game));
+  const room = tableRoom(game);
+  if (room) broadcastToRoom(room, tablePayload(game));
 }
 
-/** Every board at once, for someone who just walked into the den. */
-function sendTables(p) {
-  for (const game of TABLE_GAMES) sendTo(p, tablePayload(game));
+/** Every board in THIS room, for someone who just walked into it. */
+function sendTables(p, roomId = p.room) {
+  for (const game of TABLE_GAMES) {
+    if (tableRoom(game) === roomId) sendTo(p, tablePayload(game));
+  }
 }
 
 /** The player id in the other seat, or null once they are gone. */
@@ -773,8 +791,9 @@ function otherSeat(match, id) {
 function joinTable(p, game) {
   if (typeof game !== 'string' || !tables.has(game)) return;
   // the tables are furniture in the den: you cannot sign up for one from the
-  // beach, mid-sled-race, or while you are already playing a match
-  if (p.room !== LOUNGE_ROOM || p.race || p.match || p.table) return;
+  // beach, from the floor below the loft it stands on, mid-sled-race, or while
+  // you are already playing a match
+  if (p.room !== tableRoom(game) || p.race || p.match || p.table) return;
   const table = tables.get(game);
   if (table.seats.length >= TABLE_SEATS || table.seats.includes(p.id)) return;
   table.seats.push(p.id);
@@ -823,7 +842,7 @@ function startMatch(table) {
   table.timer = null;
   const members = table.seats
     .map((id) => world.players.get(id))
-    .filter((p) => p && p.room === LOUNGE_ROOM && p.table === table.game && !p.match && !p.race);
+    .filter((p) => p && p.room === tableRoom(table.game) && p.table === table.game && !p.match && !p.race);
   if (members.length < TABLE_SEATS) {
     // somebody blinked out between sitting down and the deal; drop every seat
     // that no longer resolves so a ghost cannot wedge a table at "full" for good

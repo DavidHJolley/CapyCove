@@ -65,7 +65,14 @@ Shipped wave 4 (den PvP): table-join/table-leave/table,
 match-start/match-move/match-done/match-end (2-seat tables per den game,
 agreed-winner +30 bonus, forfeit on leave/disconnect). The Game Den now lives
 inside the Frosty Peak ski lodge (peak 'exit-lounge' <-> lounge 'exit-peak');
-the plaza no longer references it. Known/accepted: two colluding accounts can
+the plaza no longer references it. The den is TWO rooms: the loud floor
+('lounge': pong, shuffle, connect4) and 'loft', The Trophy Loft above it
+(fireplace, Hall of Champions, chess + Capy Clash), joined by a real walk up
+the stair (lounge 'exit-loft' <-> loft 'exit-lounge', spawns from_loft /
+from_lounge). Nothing server-side names either room: a table belongs to
+whatever room `MINIGAMES[game].room` gives it, so the join requirement, the
+board broadcast and the join-time snapshot all follow shared/constants.js and
+moving a table between floors is a one-line change there. Known/accepted: two colluding accounts can
 farm the 30-coin match bonus (hourly backstop bounds it); a match-move relayed
 between match-start and the game chunk's mount is dropped (harmless for
 current games).
@@ -120,8 +127,10 @@ stamp album + milestone cosmetics, and The Drift (swimming, shaders, Big
 Blue). A wave-7.5 playtest-polish pass followed (doodle word sync, prop hunt
 arena rebuild + free prop movement + wall-clock timers, mine declutter,
 music beds for mine/jungle/drift, right-click snowballs, plaza tidy, Den
-floor decongestion, Drift swim-cam overhaul, click-to-move marker, loft
-stair routing via room.routeTo, background-tab movement, beach minWalkY
+floor decongestion, Drift swim-cam overhaul, click-to-move marker, the den's
+two-floor split into 'lounge' + 'loft' (the old in-room mezzanine and its
+floor-hop hotspots are GONE: a balcony is opaque from a camera 9.5 up, and
+one camera cannot frame two storeys), background-tab movement, beach minWalkY
 shoreline clamp, citizens: no sleeping + hash-scattered spots). PENDING (see
 the session task list): EST real-time world clock (America/New_York), lobby
 "Start now" chips, lobby walk-away un-queue. Wave 8 (Capy Clash Spectacle,
@@ -184,7 +193,8 @@ server bots, security hardening pass, wave 1 (3-player seeded sled racing with
 gate lobby, friends + profile cards with medals, game menu, chat history,
 walk-through exits, chairlift/bench/quit/ramp/fishing-lives fixes); wave 2
 Game Den ('lounge': pong, shuffle, chess, connect4, cards per
-docs/CARDGAME.md, all vs capybara AI with win payouts); wave 3 player houses
+docs/CARDGAME.md, all vs capybara AI with win payouts; chess and cards moved
+upstairs to 'loft' in the 7.5 polish pass); wave 3 player houses
 (dynamic 'house:<owner>' rooms, 20-item furniture catalog + placement editor
 in src/ui/houseEditor.js, open/friends/invite access, Furniture shop tab,
 visits via menu/profile/friends). Not yet done: public deployment.

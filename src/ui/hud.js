@@ -618,6 +618,10 @@ const ART = {
   peak: [0.500, 0.195],
   cafe: [0.795, 0.400],
   lounge: [0.362, 0.284],
+  // The Trophy Loft is the storey ABOVE the Game Den, so it has no landmark of
+  // its own: it is the same painted lodge, and the "you are here" pin just
+  // climbs to the upper window rather than the door.
+  loft: [0.352, 0.262],
   club: [0.690, 0.700],
   mine: [0.458, 0.252],
   jungle: [0.334, 0.582],
@@ -640,11 +644,21 @@ const ART = {
 // faces the landmark: the peak label hangs over the north water pointing down
 // at the summit, the Glimmer Mine sits below the mountain pointing up at its
 // mouth, and so on. Verified by pairwise getBoundingClientRect: zero overlaps
-// at 1600x900 and 1280x720 (closest pair 32px apart), 960x540 (18px), and,
-// with the phone font steps in styles.css, at 480x800 (18px) and 360x640 (7px).
+// at 1600x900, 1280x720, 960x540, and, with the phone font steps in
+// styles.css, at 480x800 and 360x640. Since the Trophy Loft joined, the
+// closest pair in the set is always it and the Game Den under it, because they
+// label two floors of one building: 23px apart at 1600x900 and 1280x720, 12px
+// at 960x540 and 480x800, 3.5px at 360x640 (where the card is 269x199 and the
+// peak and beach labels already overhang the island into the card's padding).
 const MAP_SPOTS = [
   { id: 'peak', bx: 50, by: 4.5, dir: 'down' },
-  { id: 'lounge', bx: 22, by: 18, dir: 'right' },
+  // The two den floors stack the way the building does: the Trophy Loft above
+  // the Game Den, both nubs pointing right at the one lodge they share. 11.5%
+  // of box height apart, and the den moved 1.5 down to buy it: at 9 apart the
+  // pair measured 2.9px of daylight on the 960x540 card, which reads as
+  // touching. Re-measured pairwise after the move (see the note above).
+  { id: 'loft', bx: 22, by: 8, dir: 'right' },
+  { id: 'lounge', bx: 22, by: 19.5, dir: 'right' },
   { id: 'cafe', bx: 81, by: 29.5, dir: 'down' },
   { id: 'mine', bx: 45, by: 32.5, dir: 'up' },
   { id: 'plaza', bx: 62, by: 46, dir: 'left' },

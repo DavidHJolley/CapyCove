@@ -6,39 +6,37 @@ import { BOT_ZONES } from '../../../shared/constants.js';
 import { getOverrides } from '../layout.js';
 
 // ---------------------------------------------------------------------------
-// The Game Den: the warm timber games room INSIDE the Frosty Peak ski lodge,
-// now on TWO floors. Floor plus three walls, the south side open to the camera;
-// the door leads back out onto the mountain, so every window looks at snow,
-// pines and the far ridges.
+// The Game Den: the warm timber games room INSIDE the Frosty Peak ski lodge.
+// Floor plus three walls, the south side open to the camera; the door leads
+// back out onto the mountain, so every window looks at snow, pines and the far
+// ridges.
 //
-//   GROUND FLOOR (loud): four corner territories around one open middle. The
+//   THE FLOOR (loud): four corner territories around one open middle. The
 //   arcade cabinet is hard against the west wall, the four-in-a-row stand is
 //   angled across the south-west, the shuffleboard runs down the east wall and
 //   the cocoa bar is tucked into the south-east behind the stair foot; the rug,
 //   the door and the walking lanes between them are everything else. See the
 //   STATIONS table for the plan and the rules it obeys.
-//   THE LOFT (quiet): a timber mezzanine across the north end at y = 3.2 on
-//   chunky posts, reached by a boxed stair up the east wall. The grand stone
-//   fireplace is up here on the gable wall, with chess and the card table
-//   either side of it and deep chairs in front of the fire.
+//   THE NORTH WALL: the room's landmark. A painted map of the whole cove on a
+//   hanging tapestry, the den crest over it, the long console under it, and
+//   the game-box shelves either side.
+//   THE STAIR, up the east wall, leads to a lit doorway and 'THE TROPHY LOFT':
+//   its own room ('loft', src/world/rooms/loft.js) with the fireplace, the
+//   trophies, the Hall of Champions, chess and Capy Clash in it. Walking up
+//   the flight crosses 'exit-loft' and travels; you come back out at the foot.
 //
-// The fireplace moved upstairs deliberately, and it is the whole reason the
-// layout works. A balcony is opaque from a 3/4 camera 14 units south and 9.5
-// up: anything standing on the ground under it is invisible from the room, so
-// the undercroft became an arcade of posts and shelves, and the star attraction
-// went UP where the ground floor can still see it glowing over the balcony rail.
+// It used to be one room on two floors: a timber mezzanine at y 3.2 with the
+// hearth and the two quiet tables on it. That is gone, and this is why. A
+// balcony is opaque from a 3/4 camera 14 south and 9.5 up, so the whole north
+// third of the ground floor was scenery under a deck nobody could see into;
+// the rail circles that stopped people falling off the deck also walled the
+// floor below off at the same line (obstacle circles are 2D); and the two
+// storeys had to share one camera, one static vantage and one set of prompts.
+// Splitting the loft into its own instance gave BOTH halves their whole room
+// back: the north end down here is walkable ground with a landmark on it, and
+// upstairs is composed for its own camera.
 //
-// Two-floor rules, all of them consequences of the shipped ground snap (walkers
-// take the HIGHEST surface within +1.2 of their feet):
-//   * the deck sits 3.2 up, so ground walkers under it never get lifted;
-//   * a walker who steps off a deck edge DOES drop (any surface below is in
-//     range), so every open edge carries railing obstacle circles;
-//   * obstacle circles are 2D and blind to height: a rail on the balcony edge
-//     also walls the ground floor off at that line. So the ground floor stops
-//     at the balcony, the undercroft is scenery, and the ONLY way up is the
-//     stair, whose treads are real ground meshes.
-//
-// Those chairs are the multiplayer half of the room (wave 4). Every station is
+// The chairs are the multiplayer half of the room (wave 4). Every station is
 // a two-seat table on the server (protocol in CLAUDE.md / src/net/client.js):
 //   out  {t:'table-join', game} {t:'table-leave'}
 //   in   'table' {game, players:[{id,name}]}
@@ -53,17 +51,15 @@ import { getOverrides } from '../layout.js';
 // props, which keeps the room at about 105 draw calls.
 //
 // Framing rules the layout obeys, all of them found by screenshot:
-//   * NOTHING overhead. The camera rides 9.5 above the player, so on the loft
-//     it sits at y ~12.7: a ceiling, a rafter or a roof at lodge height would
-//     put itself between the camera and anyone upstairs. The lodge is a
-//     cutaway: walls, eaves and snow on the OUTSIDE, open sky above;
-//   * the balcony rail is low (0.92) and mostly air, so the loft reads from the
-//     ground floor and from the static camera instead of hiding behind a board;
-//   * the loft's own signs stay under y = 5.05 (deck + 1.85), which is where the
-//     camera's line to a standing capybara's head passes one unit south of them;
+//   * NOTHING overhead. The camera rides 9.5 above the player: a ceiling, a
+//     rafter or a roof at lodge height would put itself between the two. The
+//     lodge is a cutaway: walls, eaves and snow on the OUTSIDE, open sky above;
 //   * the doorway has posts but NO lintel (the cafe's lesson): with the camera
 //     14 behind the player, a lintel at z 8.3 lands exactly on the head of
-//     anyone standing on the default spawn.
+//     anyone standing on the default spawn;
+//   * the stair is the one thing in the room that climbs, and it climbs up the
+//     east wall away from every sight line; its treads stay real ground meshes
+//     so you walk up them into the loft door rather than teleporting.
 // ---------------------------------------------------------------------------
 
 const PAL = {
@@ -112,59 +108,62 @@ const HW = 11;        // half width in x
 const ZN = -7;        // north wall (inner face)
 const ZS = 9;         // south edge of the floor
 const WALL_H = 6.4;   // side walls
-const WALL_N = 8.8;   // north gable: the loft fireplace is a two-storey stack
-const FZ = -6.5;      // centre plane of the fireplace stonework
+const WALL_N = 8.8;   // north gable: it carries the cove tapestry and the crest
 const DZ = 8.3;       // doorway posts
 const ZONE = BOT_ZONES.lounge; // { x: 0, z: 2, r: 4 }
 
-// --- the loft --------------------------------------------------------------
-// MZ_Y is 2.6x the 1.2 step-up range, so nothing on the ground floor is ever
-// snapped up onto the deck. MZ_BAY steps the middle of the balcony back to keep
-// the whole bot circle (0, 2, r 4: it reaches z = -2) out from under the deck.
-const MZ_Y = 3.2;          // deck walking surface
-const MZ_T = 0.44;         // slab thickness (the soffit reads from below)
-const MZ_S = -2.2;         // south edge of the two wings
-const MZ_BAY = -2.8;       // south edge of the middle bay
-const MZ_BAYX = 4.5;       // |x| where the balcony steps back
-const RAIL_Y = 0.92;       // rail height above the deck (low: sight lines)
-const RAIL_R = 0.6;        // railing collider radius
+// --- the stair to the Trophy Loft ------------------------------------------
+// It boxes up the east wall and climbs north to a landing and a lit doorway.
+// Rise 0.4 a step is well inside the 1.2 ground snap, so it walks as one
+// continuous ramp; the landing is the only walkable ground up here, and
+// 'exit-loft' fires on the way up it.
+const LOFT_Y = 3.2;              // landing / doorway threshold
+const ST_X0 = 8.7, ST_X1 = HW;   // west rail / east wall
+const ST_Z0 = 3.6;               // bottom tread, at the foot by the cocoa bar
+const ST_N = 8;
+const ST_RISE = LOFT_Y / ST_N;   // 0.4
+const ST_TOP_Z = -2.2;           // top tread
+const ST_GOING = (ST_Z0 - ST_TOP_Z) / ST_N; // 0.725
+const LAND_Z = -3.4;             // landing, between the top tread and the door
+const DOOR_Z = -4.15;            // the loft doorway itself
 // Collider spacing. "Just overlap them" is NOT enough to make a wall out of
 // circles: WalkController pushes you onto a circle's rim and then slides you
 // along it toward your target, so two circles 0.9 apart squeeze you onto their
 // centre line, where the rim normal is sideways and the slide tangent points
 // straight through the fence. At 0.45 every point of the line is deep inside
 // three or more circles and the push-out always has a component back the way
-// you came. Walked at 0.25 resolution across the whole edge, plus eight
-// diagonal approaches per side: 0 crossings either way (see the stair lane,
-// x >= 8.7, which is meant to be the only way between the floors).
+// you came.
 const RAIL_STEP = 0.45;
-// The stair boxes up the east wall and climbs north onto the east wing. Rise
-// 0.4 a step is well inside the 1.2 snap, so it walks as one continuous ramp.
-const ST_X0 = 8.7, ST_X1 = HW;   // west rail / east wall
-const ST_Z0 = 3.6;               // bottom tread, at the foot by the cocoa bar
-const ST_N = 8;
-const ST_RISE = MZ_Y / ST_N;     // 0.4
-const ST_GOING = (ST_Z0 - MZ_S) / ST_N; // 0.725
+const RAIL_Y = 0.92;
+const RAIL_R = 0.6;
 
-// window openings, given in WORLD z and mirrored onto both side walls
-const WINZ = [[-1.2, 2.0], [3.8, 7.0]];
-const WIN_LO = 2.2, WIN_HI = 4.5;
-// Upper runs: one either side of the loft's own floor, plus a clerestory over
-// the stair. The clerestory is not for the view, it is for the frame: climbing
-// the stair puts the camera a metre off the east wall, and 6.4 metres of blank
-// plaster filled a third of the shot until the daylight went through it.
-const WINZ_UP = [[-6.3, -3.4, 4.4, 6.0], [-1.7, 6.6, 4.75, 5.9]];
+// How far a painted sign face stands proud of its own post (radius 0.09).
+const SIGN_OUT = 0.13;
+
+// Window openings, given in WORLD z and mirrored onto both side walls. Tall:
+// with the mezzanine gone the side walls are 6.4 of plaster from the wainscot
+// up, and the room's whole reason to be inside a ski lodge is the mountain
+// past the glass, so the openings run from just over the chair rail to the
+// eaves and the north end got a run of its own.
+const WINZ = [[-6.3, -3.4], [-1.2, 2.0], [3.8, 7.0]];
+const WIN_LO = 1.85, WIN_HI = 4.75;
+// A clerestory over the whole run, above the tall glass. Not for the view, for
+// the frame: at the top of the stair the camera sits a metre off the east wall,
+// and blank plaster up there filled a third of the shot until the daylight went
+// through it.
+const WINZ_UP = [[-6.0, 6.6, 5.25, 6.05]];
 
 const FONT = '"Trebuchet MS", "Segoe UI", system-ui, sans-serif';
 const OUTLINE = '#2d2417';
 
-// Every station in one table so the floor plan is auditable at a glance: which
-// floor it is on, where the prop stands, where each of its two prompts fires,
-// where its sign post goes, and where its two chairs sit.
+// Every station in one table so the floor plan is auditable at a glance: where
+// the prop stands, where each of its two prompts fires, where its sign post
+// goes, and where its two chairs sit. Chess and Capy Clash are NOT here any
+// more: they are upstairs in src/world/rooms/loft.js, with the same table.
 //
-// GROUND FLOOR PLAN (playtest note: "the games are too close and it is hard to
-// tell what game is what"). The ground floor is now four corner territories
-// around the open rug, with a walking lane between every pair:
+// FLOOR PLAN (playtest note: "the games are too close and it is hard to tell
+// what game is what"). Four corner territories around the open rug, with a
+// walking lane between every pair:
 //
 //        x -11 ..................... 0 ..................... x +11
 //   z -2  [ PADDLE PANIC ]        (open rug / bot circle)   [ SHUFFLE ]
@@ -189,11 +188,8 @@ const OUTLINE = '#2d2417';
 //     a station's whole cluster keeps its own |x| / depth band;
 //   * nothing a player needs to read sits south of z ~6.8: the planted half
 //     wall by the door cuts the camera's line to the floor beyond that;
-//   * the loft's prompts run tighter radii (1.5 / 1.2) and stay north of
-//     z = -2.9. Hotspot proximity is measured in 2D, so a generous radius up
-//     here would pop a chess prompt for somebody leaning on the rail below;
-//   * every ground station keeps its whole collider footprint outside the bot
-//     circle (0, 2, r 4), which stays plain open floor.
+//   * every station keeps its whole collider footprint outside the bot circle
+//     (0, 2, r 4), which stays plain open floor.
 // `ai` is the opponent each minigame actually names in its own code.
 const STATIONS = [
   {
@@ -201,7 +197,7 @@ const STATIONS = [
     // -10.8) and as far north as the balcony rail allows, so the whole
     // south-west quarter belongs to the four-in-a-row stand instead.
     id: 'pong', label: 'Play Paddle Panic', name: 'PADDLE PANIC',
-    sub: 'out-volley the house bot', ai: 'Blip', y: 0, yaw: 0.95,
+    sub: 'out-volley the house bot', ai: 'Blip', yaw: 0.95,
     // The sign stands at the MOUTH of the corner, not back by the wall beside
     // the cabinet: from the follow camera the four-in-a-row stand fills the
     // left edge of the frame out to about a sixth of the screen width, and a
@@ -218,7 +214,7 @@ const STATIONS = [
     // the cocoa counter are 1.4 apart, which is the lane everyone walks to get
     // upstairs. Shorter than it was (5.4, see _shuffle) for exactly that.
     id: 'shuffle', label: 'Play Shuffle Showdown', name: 'SHUFFLE SHOWDOWN',
-    sub: 'slide it, do not shove it', ai: 'Waxwell', y: 0,
+    sub: 'slide it, do not shove it', ai: 'Waxwell',
     at: [5.63, 1.04], hs: [3.58, 0.69], aiAt: [3.48, 2.09], sign: [7.47, -0.36],
     seats: [[4.03, -0.41], [4.03, 3.04]],
   },
@@ -238,21 +234,9 @@ const STATIONS = [
     // three metres behind it (the camera trades height against depth), which is
     // the exact "signs reading over each other" the playtest called out.
     id: 'connect4', label: 'Play Four in a Row', name: 'FOUR IN A ROW',
-    sub: 'drop, stack, gloat', ai: 'Dizzy', y: 0, yaw: 1.15, signH: 1.5,
+    sub: 'drop, stack, gloat', ai: 'Dizzy', yaw: 1.15, signH: 1.5,
     at: [-9.48, 4.15], hs: [-8.29, 4.68], aiAt: [-8.19, 6.08], sign: [-10.06, 6.44],
     seats: [[-7.73, 3.67], [-8.67, 5.77]],
-  },
-  {
-    id: 'chess', label: 'Play Grand Capy Chess', name: 'GRAND CAPY CHESS',
-    sub: 'think before you nibble', ai: 'Grandmaster Pebble', y: MZ_Y,
-    at: [6.40, -5.60], hs: [6.40, -4.15], aiAt: [6.40, -2.95], sign: [8.99, -5.86],
-    seats: [[4.75, -5.60], [8.05, -5.60]],
-  },
-  {
-    id: 'cards', label: 'Play Capy Clash', name: 'CAPY CLASH',
-    sub: 'elements at dawn', ai: 'Grandmaster Pebble', y: MZ_Y,
-    at: [-6.60, -5.60], hs: [-6.60, -4.15], aiAt: [-6.60, -2.95], sign: [-9.47, -3.80],
-    seats: [[-8.25, -5.60], [-4.95, -5.60]],
   },
 ];
 const STATION_BY_ID = new Map(STATIONS.map((s) => [s.id, s]));
@@ -300,15 +284,6 @@ function shortName(n) {
   const t = String(n || 'Someone');
   return t.length > 14 ? `${t.slice(0, 13)}…` : t;
 }
-
-const CHAMPIONS = [
-  { name: 'Nutmeg', color: 0xb08a5a, hat: 'crown', expr: 'beam' },
-  { name: 'Biscuit', color: 0xc9a06b, hat: 'cap', expr: 'idle' },
-  { name: 'Pudding', color: 0x8a6642, hat: 'none', expr: 'smug' },
-  { name: 'Tugboat', color: 0xe8657a, hat: 'visor', expr: 'idle' },
-  { name: 'Marzipan', color: 0x9b6bd4, hat: 'crown', expr: 'beam' },
-  { name: 'Old Bramble', color: 0x6b4f35, hat: 'none', expr: 'smug' },
-];
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -851,236 +826,6 @@ function texShuffleTop() {
   });
 }
 
-function texChessBoard() {
-  const S = 512;
-  return canvasTexture(S, S, (g) => {
-    const c = S / 8;
-    for (let y = 0; y < 8; y++) {
-      for (let x = 0; x < 8; x++) {
-        g.fillStyle = (x + y) % 2 ? '#8a5a30' : '#f0dcae';
-        g.fillRect(x * c, y * c, c, c);
-      }
-    }
-    g.strokeStyle = 'rgba(60,36,14,0.35)';
-    g.lineWidth = 3;
-    g.strokeRect(1.5, 1.5, S - 3, S - 3);
-    g.fillStyle = 'rgba(255,255,255,0.08)';
-    for (let i = 0; i < 700; i++) g.fillRect((i * 173) % S, (i * 97) % S, 3, 2);
-  });
-}
-
-function texFelt() {
-  const S = 256;
-  return canvasTexture(S, S, (g) => {
-    g.fillStyle = '#2f8f52';
-    g.fillRect(0, 0, S, S);
-    g.fillStyle = 'rgba(0,0,0,0.06)';
-    for (let i = 0; i < 900; i++) g.fillRect((i * 149) % S, (i * 101) % S, 2, 2);
-    g.strokeStyle = 'rgba(242,182,74,0.6)';
-    g.lineWidth = 5;
-    g.beginPath();
-    g.arc(S / 2, S / 2, 92, 0, 7);
-    g.stroke();
-    g.setLineDash([8, 10]);
-    g.lineWidth = 3;
-    g.beginPath();
-    g.arc(S / 2, S / 2, 74, 0, 7);
-    g.stroke();
-    g.setLineDash([]);
-    ['#e8657a', '#4fb3e8', '#f2b64a', '#9b6bd4'].forEach((col, i) => {
-      const a = (i / 4) * Math.PI * 2 + 0.78;
-      const x = S / 2 + Math.cos(a) * 92, y = S / 2 + Math.sin(a) * 92;
-      g.fillStyle = col;
-      g.beginPath();
-      g.arc(x, y, 17, 0, 7);
-      g.fill();
-      g.fillStyle = 'rgba(255,246,227,0.85)';
-      g.beginPath();
-      g.arc(x, y, 8, 0, 7);
-      g.fill();
-    });
-    g.fillStyle = 'rgba(242,182,74,0.75)';
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.font = `900 34px ${FONT}`;
-    g.fillText('CAPY CLASH', S / 2, S / 2);
-  });
-}
-
-function texCard() {
-  const w = 128, h = 180;
-  return canvasTexture(w, h, (g) => {
-    g.fillStyle = '#fffaf0';
-    rrect(g, 3, 3, w - 6, h - 6, 12);
-    g.fill();
-    ink(g, 4);
-    g.fillStyle = '#e8657a';
-    rrect(g, 12, 12, w - 24, 40, 8);
-    g.fill();
-    g.fillStyle = '#fff6e3';
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.font = `900 26px ${FONT}`;
-    g.fillText('7', w / 2, 33);
-    g.fillStyle = '#4fb3e8';
-    g.beginPath();
-    g.arc(w / 2, h * 0.6, 26, 0, 7);
-    g.fill();
-    ink(g, 4);
-    g.fillStyle = '#f2b64a';
-    for (let i = 0; i < 3; i++) {
-      g.beginPath();
-      g.arc(30 + i * 34, h - 26, 9, 0, 7);
-      g.fill();
-    }
-  });
-}
-
-function texCardBack() {
-  const w = 128, h = 180;
-  return canvasTexture(w, h, (g) => {
-    g.fillStyle = '#8e4f9e';
-    rrect(g, 3, 3, w - 6, h - 6, 12);
-    g.fill();
-    ink(g, 4);
-    g.save();
-    rrect(g, 6, 6, w - 12, h - 12, 10);
-    g.clip();
-    g.strokeStyle = 'rgba(255,246,227,0.55)';
-    g.lineWidth = 3;
-    for (let i = -3; i < 8; i++) {
-      g.beginPath();
-      g.moveTo(i * 24, 0);
-      g.lineTo(i * 24 + h, h);
-      g.stroke();
-      g.beginPath();
-      g.moveTo(i * 24, h);
-      g.lineTo(i * 24 + h, 0);
-      g.stroke();
-    }
-    g.restore();
-    g.fillStyle = '#f2b64a';
-    g.beginPath();
-    g.arc(w / 2, h / 2, 24, 0, 7);
-    g.fill();
-    ink(g, 4);
-  });
-}
-
-/** Champion portrait, in the art language of the smoothie customers. */
-function texPortrait(cfg) {
-  const w = 224, h = 264;
-  return canvasTexture(w, h, (g) => {
-    const bg = g.createLinearGradient(0, 0, 0, h);
-    bg.addColorStop(0, '#fff3d8');
-    bg.addColorStop(1, '#eccf9e');
-    g.fillStyle = bg;
-    g.fillRect(0, 0, w, h);
-    g.save();
-    g.translate(w / 2, h * 0.46);
-    g.scale(w / 215, w / 215);
-    g.translate(-100, -100);
-    g.lineJoin = 'round';
-    g.lineCap = 'round';
-
-    const body = cfg.color;
-    const dark = tint(body, -0.24);
-    const muzzle = tint(body, 0.22);
-
-    rrect(g, 46, 152, 108, 66, 30);
-    g.fillStyle = dark; g.fill(); ink(g, 5);
-
-    for (const ex of [46, 154]) {
-      g.beginPath();
-      g.ellipse(ex, 48, 20, 17, ex < 100 ? 0.3 : -0.3, 0, 7);
-      g.fillStyle = dark; g.fill(); ink(g, 5);
-      g.beginPath();
-      g.ellipse(ex, 50, 9, 7, 0, 0, 7);
-      g.fillStyle = '#e2a3a8'; g.fill();
-    }
-
-    rrect(g, 38, 36, 124, 104, 42);
-    g.fillStyle = tint(body, 0.06); g.fill(); ink(g, 5.5);
-
-    rrect(g, 58, 96, 84, 58, 26);
-    g.fillStyle = muzzle; g.fill(); ink(g, 4.5);
-
-    g.fillStyle = OUTLINE;
-    for (const nx of [86, 114]) {
-      g.save(); g.translate(nx, 116); g.rotate(nx < 100 ? 0.5 : -0.5);
-      g.beginPath(); g.ellipse(0, 0, 3.2, 6, 0, 0, 7); g.fill();
-      g.restore();
-    }
-
-    g.lineWidth = 4.5; g.strokeStyle = OUTLINE;
-    if (cfg.expr === 'beam') {
-      g.beginPath();
-      g.moveTo(84, 130); g.quadraticCurveTo(100, 148, 116, 130); g.closePath();
-      g.fillStyle = '#5c3327'; g.fill(); ink(g, 4);
-    } else if (cfg.expr === 'smug') {
-      g.beginPath(); g.moveTo(86, 132); g.quadraticCurveTo(100, 142, 116, 126); g.stroke();
-    } else {
-      g.beginPath(); g.moveTo(88, 130); g.quadraticCurveTo(100, 140, 112, 130); g.stroke();
-    }
-
-    for (const ex of [70, 130]) {
-      if (cfg.expr === 'beam') {
-        g.lineWidth = 5; g.strokeStyle = OUTLINE;
-        g.beginPath();
-        g.moveTo(ex - 11, 78); g.quadraticCurveTo(ex, 62, ex + 11, 78);
-        g.stroke();
-      } else if (cfg.expr === 'smug') {
-        g.lineWidth = 5; g.strokeStyle = OUTLINE;
-        g.beginPath();
-        g.moveTo(ex - 12, 70); g.lineTo(ex + 12, 72);
-        g.stroke();
-        g.beginPath(); g.ellipse(ex, 80, 7, 6, 0, 0, 7);
-        g.fillStyle = OUTLINE; g.fill();
-      } else {
-        g.beginPath(); g.ellipse(ex, 76, 10, 11.5, 0, 0, 7);
-        g.fillStyle = OUTLINE; g.fill();
-        g.beginPath(); g.arc(ex - 3.4, 72, 3.4, 0, 7);
-        g.fillStyle = '#fff'; g.fill();
-      }
-    }
-
-    g.fillStyle = 'rgba(232,101,122,0.3)';
-    g.beginPath(); g.ellipse(52, 104, 13, 8, 0, 0, 7); g.fill();
-    g.beginPath(); g.ellipse(148, 104, 13, 8, 0, 0, 7); g.fill();
-
-    if (cfg.hat === 'crown') {
-      g.beginPath();
-      g.moveTo(64, 40); g.lineTo(72, 14); g.lineTo(86, 32); g.lineTo(100, 8);
-      g.lineTo(114, 32); g.lineTo(128, 14); g.lineTo(136, 40);
-      g.closePath();
-      g.fillStyle = '#f2b64a'; g.fill(); ink(g, 5);
-    } else if (cfg.hat === 'cap') {
-      g.beginPath(); g.ellipse(100, 40, 52, 30, 0, Math.PI, 7); g.closePath();
-      g.fillStyle = '#4fb3e8'; g.fill(); ink(g, 5);
-      g.beginPath(); g.ellipse(132, 42, 34, 10, 0, 0, 7);
-      g.fillStyle = tint(0x4fb3e8, -0.2); g.fill(); ink(g, 4);
-    } else if (cfg.hat === 'visor') {
-      g.beginPath(); g.arc(100, 46, 50, Math.PI * 1.12, Math.PI * 1.88);
-      g.lineWidth = 16; g.strokeStyle = '#e8657a'; g.stroke();
-      g.beginPath(); g.ellipse(100, 32, 62, 16, 0, Math.PI, 7); g.closePath();
-      g.fillStyle = tint(0xe8657a, 0.3); g.fill(); ink(g, 5);
-    }
-    g.restore();
-
-    g.fillStyle = '#d7a44b';
-    rrect(g, w * 0.16, h - 42, w * 0.68, 30, 8);
-    g.fill();
-    g.strokeStyle = '#8a6320';
-    g.lineWidth = 3;
-    g.stroke();
-    g.fillStyle = '#3a2a12';
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    fitFont(g, cfg.name, w * 0.6, 21, '900');
-    g.fillText(cfg.name, w / 2, h - 27);
-  });
-}
-
 function texBanner(text) {
   const w = 512, h = 128;
   return canvasTexture(w, h, (g) => {
@@ -1143,26 +888,151 @@ function texCrest() {
   });
 }
 
-/** The brass band across the mantel front, naming each trophy. */
-function texMantelBand() {
-  const w = 1024, h = 64;
+/**
+ * THE COVE TAPESTRY: the den's new landmark, hung on the north gable where the
+ * fireplace used to stand before it went upstairs. A hand-painted map of the
+ * whole island on a strip of linen, with a big red X on the lodge, because the
+ * one thing a games room wall should say is "here is everywhere you could be
+ * instead, and you chose to be here".
+ */
+function texCoveMap() {
+  const w = 768, h = 460;
   return canvasTexture(w, h, (g) => {
-    g.fillStyle = '#7a4e2a';
+    // linen, then the sea
+    g.fillStyle = '#f3e3bc';
     g.fillRect(0, 0, w, h);
-    g.fillStyle = '#d7a44b';
-    rrect(g, 6, 8, w - 12, h - 16, 10);
+    g.fillStyle = 'rgba(120,86,40,0.07)';
+    for (let i = 0; i < 900; i++) g.fillRect((i * 149) % w, (i * 233) % h, 3, 2);
+    g.fillStyle = '#bfe0f2';
+    rrect(g, 26, 26, w - 52, h - 52, 10);
     g.fill();
-    g.strokeStyle = '#8a6320';
+    g.strokeStyle = '#a06a30';
+    g.lineWidth = 9;
+    g.stroke();
+    // swell lines
+    g.strokeStyle = 'rgba(90,150,190,0.45)';
+    g.lineWidth = 3;
+    for (let i = 0; i < 9; i++) {
+      const y = 52 + i * 44;
+      g.beginPath();
+      g.moveTo(40, y);
+      for (let x = 40; x < w - 40; x += 40) g.quadraticCurveTo(x + 20, y - 7, x + 40, y);
+      g.stroke();
+    }
+
+    // the island: sand ring, then grass
+    const cx = w * 0.5, cy = h * 0.54;
+    const blob = (rx, ry, fill, wob) => {
+      g.beginPath();
+      for (let a = 0; a <= 64; a++) {
+        const th = (a / 64) * Math.PI * 2;
+        const r = 1 + Math.sin(th * 3 + 0.6) * wob + Math.sin(th * 5 + 2.1) * (wob * 0.6);
+        const px = cx + Math.cos(th) * rx * r;
+        const py = cy + Math.sin(th) * ry * r;
+        if (a === 0) g.moveTo(px, py); else g.lineTo(px, py);
+      }
+      g.closePath();
+      g.fillStyle = fill;
+      g.fill();
+    };
+    blob(268, 168, '#efd9a4', 0.05);
+    blob(246, 150, '#8fc866', 0.05);
+    g.strokeStyle = 'rgba(70,110,50,0.4)';
     g.lineWidth = 3;
     g.stroke();
-    const names = ['PADDLE PANIC', 'SHUFFLE SHOWDOWN', 'GRAND CAPY CHESS', 'FOUR IN A ROW', 'CAPY CLASH'];
-    g.fillStyle = '#3a2a12';
+
+    // the peak, with the lodge on its shoulder
+    g.fillStyle = '#dbe7f4';
+    g.beginPath();
+    g.moveTo(cx - 92, cy - 52);
+    g.lineTo(cx - 6, cy - 158);
+    g.lineTo(cx + 84, cy - 52);
+    g.closePath();
+    g.fill();
+    g.strokeStyle = '#8fa4bd';
+    g.lineWidth = 4;
+    g.stroke();
+    g.fillStyle = '#fff';
+    g.beginPath();
+    g.moveTo(cx - 6, cy - 158);
+    g.lineTo(cx + 34, cy - 108);
+    g.lineTo(cx - 40, cy - 108);
+    g.closePath();
+    g.fill();
+
+    // landmark pins, in the same order the map card in the HUD paints them
+    const pins = [
+      ['Sunny Plaza', cx + 8, cy + 6, '#f2b64a'],
+      ['Driftwood Beach', cx - 176, cy + 52, '#4fb3e8'],
+      ['Frosty Peak', cx - 4, cy - 96, '#dff0fb'],
+      ['Smoothie Shack', cx + 170, cy - 12, '#e8657a'],
+      ['Groove Grotto', cx + 118, cy + 108, '#9b6bd4'],
+      ['Tangle Jungle', cx - 96, cy + 96, '#7ac74f'],
+    ];
+    for (const [name, px, py, col] of pins) {
+      g.beginPath();
+      g.arc(px, py, 10, 0, 7);
+      g.fillStyle = col;
+      g.fill();
+      ink(g, 4);
+      g.fillStyle = '#3a2a12';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      fitFont(g, name, 150, 19, '900');
+      g.fillText(name, px, py + 24);
+    }
+
+    // the lodge, with the X on it
+    const lx = cx - 96, ly = cy - 74;
+    g.strokeStyle = '#c03a3a';
+    g.lineWidth = 9;
+    g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(lx - 18, ly - 18); g.lineTo(lx + 18, ly + 18);
+    g.moveTo(lx + 18, ly - 18); g.lineTo(lx - 18, ly + 18);
+    g.stroke();
+    // The caption reads back WEST off the X, into open water. To its east is
+    // the Frosty Peak pin, whose own label is drawn 24 under it and 92 to the
+    // right of the lodge: "YOU ARE HERE" set left-aligned from the X ran
+    // straight through the words "Frosty Peak" (found in a wall capture, not in
+    // the code). Everything west of the lodge is sea, so the caption gets it.
+    g.fillStyle = '#c03a3a';
+    g.textAlign = 'right';
+    fitFont(g, 'YOU ARE HERE', 190, 24, '900');
+    g.fillText('YOU ARE HERE', lx - 30, ly - 6);
+    g.fillStyle = 'rgba(90,58,30,0.75)';
+    fitFont(g, 'the game den, upstairs and down', 210, 18, 'normal');
+    g.fillText('the game den, upstairs and down', lx - 30, ly + 18);
+
+    // compass rose and title
+    const rx = w - 96, ry = h - 96;
+    g.strokeStyle = '#8a5a2c';
+    g.lineWidth = 5;
+    g.beginPath();
+    g.arc(rx, ry, 40, 0, 7);
+    g.stroke();
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 - Math.PI / 2;
+      g.beginPath();
+      g.moveTo(rx + Math.cos(a) * 40, ry + Math.sin(a) * 40);
+      g.lineTo(rx + Math.cos(a + 0.35) * 12, ry + Math.sin(a + 0.35) * 12);
+      g.lineTo(rx + Math.cos(a - 0.35) * 12, ry + Math.sin(a - 0.35) * 12);
+      g.closePath();
+      g.fillStyle = i % 2 ? '#e8657a' : '#f2b64a';
+      g.fill();
+      ink(g, 3);
+    }
+    g.fillStyle = '#5b3a1e';
     g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    names.forEach((n, i) => {
-      fitFont(g, n, 180, 23, '900');
-      g.fillText(n, (i + 0.5) * (w / 5), h / 2);
-    });
+    fitFont(g, 'N', 24, 24, '900');
+    g.fillText('N', rx, ry - 54);
+
+    g.fillStyle = '#5b3a1e';
+    fitFont(g, 'CAPY COVE', 300, 46, '900');
+    g.fillText('CAPY COVE', 190, 62);
+    g.fillStyle = 'rgba(90,58,30,0.7)';
+    fitFont(g, 'every last inch of it, more or less', 300, 20, 'normal');
+    g.fillText('every last inch of it, more or less', 190, 92);
   });
 }
 
@@ -1283,8 +1153,9 @@ export class LoungeRoom extends Room {
 
     this._buildShell(scene, B);
     this._buildLights(scene);
-    this._buildLoft(scene, B);
-    this._buildFireplace(scene, B, rand);
+    this._buildStair(scene, B);
+    this._buildNorthWall(scene, B);
+    this._buildFestoon(scene, B);
     this._buildStations(scene, B);
     this._buildSeating(scene, B, rand);
     this._buildBar(scene, B);
@@ -1300,55 +1171,49 @@ export class LoungeRoom extends Room {
     B.cone.build(scene, true, true);
 
     // --- navigation ---------------------------------------------------------
-    // The den is a room inside the peak's ski lodge, so the only door leads back
-    // out onto the mountain. Both spawns sit 3.0 / 2.0 short of that door,
-    // outside its 1.9 prompt radius, so arriving does not pop "back outside"
-    // over your head; both look straight up the room at the fireplace.
+    // Two ways out: the door back onto the mountain, and the stair up to the
+    // Trophy Loft. The peak spawns sit 3.0 / 2.0 short of the door, outside its
+    // 1.9 prompt radius, so arriving does not pop "back outside" over your head;
+    // both look straight up the room at the cove tapestry. `from_loft` puts you
+    // at the foot of the stair, facing back into the room.
     this.spawnPoints = {
       default: new THREE.Vector3(0, 0, 5),
       from_peak: new THREE.Vector3(0, 0, 6),
+      from_loft: new THREE.Vector3(9.85, 0, 4.6),
     };
-    // Flatter than the den used to be (was 10.5/13.5, a 38 degree pitch): with
-    // the hearth up on the loft the old angle put the whole fireplace above the
-    // top of the frame from the arrival spawn, which is exactly the shot the
-    // room is composed for. 9.5/14 keeps the same camera distance and the same
-    // 3/4 read as the rest of the world, and brings the fire back into it.
+    // 9.5/14: the same camera distance and 3/4 read as the rest of the world.
+    // The room's landmark is the north wall now, and at this pitch the whole
+    // tapestry sits in the top third of the frame from the arrival spawn.
     this.cameraHint = { offset: new THREE.Vector3(0, 9.5, 14.0), lookHeight: 1.5 };
-    // Whole-room vantage: high enough south that the loft deck is not edge-on
-    // and the rail does not eat the chess table, close enough that the arcade
-    // downstairs still reads. Everything from the gable top (8.8) to the porch
-    // (z 9) sits inside the 16:9 frustum with ~14% margin.
-    // Re-framed by eye at 960x540: the dollhouse angle was right, it was just
-    // standing too far off. The look point moved south to z=1.5 (the peak-door
-    // prompt was sitting at the 429px HUD line) and the vantage in to
-    // 18.5/24, which trades a strip of dead snow at the top for ~2px of capy
-    // (34.6 -> 36.7). Worst hotspot/spawn NDC 0.55; both floors still read.
+    // Whole-room vantage: far enough south that the gable (8.8) and the porch
+    // (z 9) both sit inside the 16:9 frustum, close enough that the four
+    // territories read as four. Re-framed by eye at 960x540 after the loft
+    // moved out: with nothing above 5 in the middle of the room any more, the
+    // old 18.5/24 wasted the top fifth of the frame on snow.
     this.staticCamera = {
-      position: new THREE.Vector3(0, 18.5, 24),
-      lookAt: new THREE.Vector3(0, 3.0, 1.5),
+      position: new THREE.Vector3(0, 17.0, 22.0),
+      lookAt: new THREE.Vector3(0, 2.4, 1.0),
     };
 
     // Two prompts per station: sit down at the real table, or play the house.
     // Solo runs always clear __matchCtx first, so a match that never started
     // can never turn a later solo run into a phantom duel.
     for (const s of STATIONS) {
-      const up = s.y > 0;
       const sit = {
         id: `sit-${s.id}`,
-        position: new THREE.Vector3(s.hs[0], s.y, s.hs[1]),
-        radius: up ? 1.5 : 1.9,
+        position: new THREE.Vector3(s.hs[0], 0, s.hs[1]),
+        radius: 1.9,
         label: this._sitLabel(s),
-        action: (g) => { if (this._onFloor(g, s)) this._onSit(g, s); },
+        action: (g) => this._onSit(g, s),
       };
       this.hotspots.push(sit);
       this._sitSpots.set(s.id, sit);
       this.hotspots.push({
         id: `play-${s.id}`,
-        position: new THREE.Vector3(s.aiAt[0], s.y, s.aiAt[1]),
-        radius: up ? 1.2 : 1.6,
+        position: new THREE.Vector3(s.aiAt[0], 0, s.aiAt[1]),
+        radius: 1.6,
         label: `Play vs ${s.ai}`,
         action: (g) => {
-          if (!this._onFloor(g, s)) return;
           g.__matchCtx = null;
           g.startMinigame(s.id);
         },
@@ -1362,50 +1227,19 @@ export class LoungeRoom extends Room {
       action: (g) => g.goToRoom('peak', 'lounge'),
     });
 
-    // Instant floor hops (playtester call, 2026-08-07: walking the stairs
-    // every time was a chore). Step onto the BOTTOM tread and you pop up to
-    // the loft; step onto the TOP tread and you pop down. They ride the same
-    // walk-through intent logic as room exits ('exit-' prefix), the treads are
-    // out of every normal walking lane, and the stairs stay for the look.
-    {
-      const cx = (ST_X0 + HW) / 2;
-      const upSpot = new THREE.Vector3(cx, 0.25, ST_Z0 + 0.1);
-      const downSpot = new THREE.Vector3(cx, MZ_Y - 0.3, MZ_S + 0.55);
-      const hop = (g, to, other) => {
-        const eng = g.engine;
-        const a = eng.playerAvatar;
-        a.group.position.copy(to);
-        eng.snapY(a.group.position, this);
-        eng.controller.stop();
-        eng.camTarget.copy(a.group.position);
-        g.audio?.play?.('pop');
-        // both zones re-arm: unlike room exits, we are still in the room
-        for (const h of this.hotspots) {
-          if (h.id === 'exit-loft-up' || h.id === 'exit-loft-down') {
-            h.__fired = false;
-            h.__intent = 0;
-          }
-        }
-      };
-      this.hotspots.push(
-        {
-          id: 'exit-loft-up',
-          position: upSpot,
-          radius: 1.25,
-          floorY: 0,
-          label: 'Up to the loft',
-          action: (g) => hop(g, new THREE.Vector3(cx, MZ_Y, MZ_S - 1.2)),
-        },
-        {
-          id: 'exit-loft-down',
-          position: downSpot,
-          radius: 1.25,
-          floorY: MZ_Y,
-          label: 'Down to the floor',
-          action: (g) => hop(g, new THREE.Vector3(cx, 0, ST_Z0 + 1.8)),
-        },
-      );
-    }
+    // The way upstairs. It fires near the TOP of the flight, so climbing is a
+    // real walk rather than a hop off the bottom tread, and it is tagged with
+    // the height of the landing: hotspot proximity is 2D, and without floorY
+    // anyone crossing the floor below the stair (the shuffleboard's north end
+    // is 2 metres away) would be dragged upstairs mid-shuffle.
+    this.hotspots.push({
+      id: 'exit-loft',
+      position: new THREE.Vector3((ST_X0 + HW) / 2, LOFT_Y, ST_TOP_Z + 0.5),
+      radius: 1.7,
+      floorY: LOFT_Y,
+      label: 'Up to the Trophy Loft',
+      action: (g) => g.goToRoom('loft', 'lounge'),
+    });
 
     // Live only while this room is: both handles are dropped in dispose().
     if (game?.events?.on) {
@@ -1413,26 +1247,14 @@ export class LoungeRoom extends Room {
       this._offMatchStart = game.events.on('match-start', (m) => this._onMatchStart(m));
     }
     for (const s of STATIONS) this._paintChip(s.id);
+    // The server sends this room's boards the moment we join, which is ~220ms
+    // before this room exists to hear them. The net client keeps the last frame
+    // of each table, so read them straight off it rather than starting blank.
+    const cached = this._game?.net?.lastTables;
+    if (cached?.values) for (const row of cached.values()) this._applyTable(row);
   }
 
   /* --- tables: prompts ----------------------------------------------------- */
-
-  /**
-   * Hotspot proximity is measured in 2D, so a capybara on the ground floor can
-   * be "at" a loft prompt (and the reverse) just by standing under it. Every
-   * station action goes through this first: same storey, or a nudge toward the
-   * stair. Without it a click down here would seat you at a chair you cannot
-   * walk to, and _updateTables would stand you straight back up.
-   */
-  _onFloor(g, s) {
-    const py = this._game?.engine?.playerAvatar?.group?.position?.y ?? 0;
-    if (Math.abs(py - s.y) <= 1.2) return true;
-    g?.audio?.play?.('pop');
-    g?.toast?.(s.y > 0
-      ? `${s.name.toLowerCase()} is up on the loft: the stairs are by the cocoa bar!`
-      : `${s.name.toLowerCase()} is down on the floor below.`);
-    return false;
-  }
 
   /** The sit-down prompt reads the table it belongs to. */
   _sitLabel(s) {
@@ -1536,7 +1358,7 @@ export class LoungeRoom extends Room {
       hat: remote?.p?.hat ?? 'none',
     });
     avatar.setAnim('sit');
-    avatar.group.position.set(seat[0], SEAT_Y + s.y, seat[1]);
+    avatar.group.position.set(seat[0], SEAT_Y, seat[1]);
     avatar.group.rotation.y = seatYaw(s, slot);
     this._seatGroup.add(avatar.group);
 
@@ -1600,7 +1422,7 @@ export class LoungeRoom extends Room {
     this._localTable = id;
     this._localSeat = slot;
     if (seat) {
-      engine?.controller?.setTarget(this._v.set(seat[0], s.y, seat[1]));
+      engine?.controller?.setTarget(this._v.set(seat[0], 0, seat[1]));
       game?.audio?.play?.('whoosh');
       game?.toast?.(`You take a chair at ${s.name.toLowerCase()}. Waiting for a rival!`);
     } else if (avatar) {
@@ -1700,31 +1522,18 @@ export class LoungeRoom extends Room {
     snowfield.position.y = -0.06;
     scene.add(snowfield);
 
-    // The plank floor comes in two pieces. The south piece is the walkable one;
-    // the strip under the balcony is scenery, and leaving it OUT of
-    // groundMeshes is what stops a click landing a capybara in a space the
-    // camera cannot see into (and stops anyone who slips off the deck edge from
-    // ending up wedged under it).
-    const UNDER_Z = -3.2;
+    // ONE plank floor, wall to wall. It used to stop at z -3.2 because the
+    // north third lived under the balcony and a click back there put a capybara
+    // somewhere the camera could not see; with the loft gone that whole strip is
+    // real room again, and it is where the cove tapestry and its console live.
     const walkTex = texPlanks();
-    walkTex.repeat.set(6, (ZS - UNDER_Z) * 0.3125);
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW, ZS - UNDER_Z), this._toonMap(walkTex));
+    walkTex.repeat.set(6, (ZS - ZN) * 0.3125);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(2 * HW, ZS - ZN), this._toonMap(walkTex));
     floor.rotation.x = -Math.PI / 2;
-    floor.position.z = (UNDER_Z + ZS) / 2;
+    floor.position.z = (ZN + ZS) / 2;
     floor.receiveShadow = true;
     scene.add(floor);
     this.groundMeshes = [floor];
-
-    const underTex = texPlanks();
-    underTex.repeat.set(6, (UNDER_Z - ZN) * 0.3125); // same plank size across the seam
-    const under = new THREE.Mesh(
-      new THREE.PlaneGeometry(2 * HW, UNDER_Z - ZN),
-      this._toonMap(underTex, 0xcbb595),
-    );
-    under.rotation.x = -Math.PI / 2;
-    under.position.set(0, 0.002, (ZN + UNDER_Z) / 2);
-    under.receiveShadow = true;
-    scene.add(under);
 
     // Decking beyond the door: the lodge's swept porch, snow banked up either
     // side of it. Not walkable, but it fills the bottom third of the frame
@@ -1756,9 +1565,9 @@ export class LoungeRoom extends Room {
     }
 
     // --- walls, with the window openings punched clean through -------------
-    // The north wall is a gable end: it carries a two-storey fireplace, so it
-    // runs to WALL_N while the side walls stop at WALL_H. Nothing bridges them
-    // overhead — see the header note about the loft camera.
+    // The north wall is a gable end: it carries the cove tapestry, the crest
+    // and the banner over them, so it runs to WALL_N while the side walls stop
+    // at WALL_H. Nothing bridges them overhead — see the header note.
     const wallMat = makeToon(PAL.wall);
     const mkWall = (width, height, holes) => {
       const s = new THREE.Shape();
@@ -1786,9 +1595,8 @@ export class LoungeRoom extends Room {
 
     const north = mkWall(2 * HW + 1, WALL_N, []);
     north.position.z = ZN;
-    // Side walls carry the same world-z openings on both storeys. Wall-local +x
-    // maps to world -z on the west and +z on the east, so the west holes are
-    // mirrored.
+    // Wall-local +x maps to world -z on the west and +z on the east, so the
+    // west holes are mirrored.
     const holesE = [...WINZ.map(([a, b]) => [a, b, WIN_LO, WIN_HI]), ...WINZ_UP];
     const holesW = holesE.map(([a, b, c, d]) => [-b, -a, c, d]);
     const west = mkWall(ZS - ZN + 0.8, WALL_H, holesW);
@@ -1799,7 +1607,7 @@ export class LoungeRoom extends Room {
     east.position.set(HW, 0, 0);
 
     // the painted mountainside, hung just outside each run of glass: tall and
-    // long enough to fill the loft windows as well as the ones downstairs
+    // long enough to fill the clerestory as well as the tall windows
     this._views = [];
     for (const s of [-1, 1]) {
       const v = new THREE.Mesh(new THREE.PlaneGeometry(17.6, 6.8), this._flat(texAlps(s > 0)));
@@ -1810,7 +1618,7 @@ export class LoungeRoom extends Room {
       this._views.push([v.material, (p) => texAlps(s > 0, p)]);
     }
 
-    // frames, sills, mullions, sill plants: every storey off one loop
+    // frames, sills, mullions, sill plants: every run off one loop
     const winRuns = [
       ...WINZ.map(([a, b]) => [a, b, WIN_LO, WIN_HI, true]),
       ...WINZ_UP.map(([a, b, c, d]) => [a, b, c, d, false]),
@@ -1835,8 +1643,8 @@ export class LoungeRoom extends Room {
       }
     }
 
-    // wainscot, chair rail, top plate. The coral band rides low at 1.55 now:
-    // at its old 5.05 it cut straight across the loft's windows.
+    // wainscot, chair rail, top plate. The coral band rides at 1.55, just
+    // under the sills of the tall glass.
     const runs = [
       [0, ZN + 0.1, 2 * HW, 0.2, WALL_N],
       [-HW + 0.1, 0, 0.2, ZS - ZN, WALL_H],
@@ -1848,17 +1656,15 @@ export class LoungeRoom extends Room {
       boxFlat.add(PAL.wood, x, top - 0.22, z, sx + 0.08, 0.34, sz + 0.08);
       boxFlat.add(PAL.coral, x, 1.55, z, sx, 0.1, sz);
     }
-    // the loft's own chair rail, on the gable wall above the deck
-    boxFlat.add(PAL.woodLight, 0, MZ_Y + 1.34, ZN + 0.1, 2 * HW, 0.14, 0.2);
     for (const sx of [-1, 1]) {
       box.add(PAL.wood, sx * (HW - 0.2), WALL_N / 2, ZN + 0.2, 0.4, WALL_N, 0.4);
       box.add(PAL.wood, sx * (HW - 0.2), WALL_H / 2, ZS - 0.24, 0.4, WALL_H, 0.4);
     }
 
     // Eaves and snow, all of it OUTSIDE the walls. The den is a cutaway: with
-    // the camera 9.5 above a player (12.7 when they are upstairs) any roof
-    // over the room would render between the two, so the roofline is sold from
-    // the outside edge in and the room stays open to the sky.
+    // the camera 9.5 above a player, any roof over the room would render
+    // between the two, so the roofline is sold from the outside edge in and
+    // the room stays open to the sky.
     for (const sx of [-1, 1]) {
       box.add(PAL.woodMid, sx * (HW + 0.42), WALL_H + 0.08, 1.0, 1.1, 0.22, ZS - ZN + 1.2, 0, 0, sx * 0.12);
       box.add(PAL.snow, sx * (HW + 0.52), WALL_H + 0.28, 1.0, 1.15, 0.22, ZS - ZN + 1.0, 0, 0, sx * 0.12);
@@ -1908,18 +1714,18 @@ export class LoungeRoom extends Room {
     scene.add(this._amb);
 
     this._lamps = [];
-    // Two storeys, six fills: one per ground station cluster, one per loft
-    // table, and a dim one under the balcony so the undercroft is shadow with
-    // something in it rather than a black band. The hearth light upstairs (in
-    // _buildFireplace) covers the middle of the loft; no fill by the door,
-    // where daylight through the opening does the job.
+    // Five fills: one per station cluster, one over the middle of the rug, and
+    // a pair washing the north wall so the cove tapestry is the brightest thing
+    // in the room from the door. No fill at the door itself, where daylight
+    // through the opening does the job. (The loft door has its own, next to it
+    // in _buildStair, and it does not fade with the clock: the room beyond is
+    // lit whatever time it is.)
     for (const [x, y, z, col, i, dist] of [
       [0, 4.2, 2.2, 0xffd8a4, 15, 15],
       [-8.4, 3.4, 2.2, 0xffcf9a, 13, 14],
       [8.5, 3.4, 4.4, 0xffd6a8, 13, 14],
-      [0, 2.3, -4.6, 0xffb877, 7, 9],
-      [-6.6, MZ_Y + 2.0, -4.4, 0xffc890, 12, 11],
-      [6.6, MZ_Y + 2.0, -4.4, 0xffc890, 12, 11],
+      [-3.4, 4.3, -5.6, 0xffc890, 11, 10],
+      [3.4, 4.3, -5.6, 0xffc890, 11, 10],
     ]) {
       const p = new THREE.PointLight(col, i, dist, 2);
       p.position.set(x, y, z);
@@ -1936,7 +1742,7 @@ export class LoungeRoom extends Room {
     sun.shadow.mapSize.set(1024, 1024);
     sun.shadow.camera.left = -16;
     sun.shadow.camera.right = 16;
-    sun.shadow.camera.top = 18;   // the loft deck and the gable live up here now
+    sun.shadow.camera.top = 16;   // the gable (8.8) plus room for the shadow cast
     sun.shadow.camera.bottom = -14;
     sun.shadow.camera.near = 1;
     sun.shadow.camera.far = 62;
@@ -1948,143 +1754,21 @@ export class LoungeRoom extends Room {
   }
 
   // -------------------------------------------------------------------------
-  /** World clock (wave 7). The lodge never changes shape: the mountainside
-   *  past the glass goes from afternoon to alpenglow to moonlit snow, the
-   *  daylight raking in through the west windows fades with it, and the hearth,
-   *  the lamps and the string lights carry the room after dusk. */
-  onClock(dayT) {
-    const lit = daylight(dayT);
-    const phase = clockPhase(dayT);
-    if (phase !== this._phase) {
-      this._phase = phase;
-      for (const [mat, paint] of this._views) {
-        mat.map?.dispose();      // the engine only ever disposes the current one
-        mat.map = paint(phase);
-        mat.needsUpdate = true;
-      }
-      const sky = phase === 'night' ? 0x1d2748 : phase === 'dusk' ? 0xe6a074 : 0xc3dcf1;
-      this._skyMat.color.setHex(sky);
-      if (this._fog) this._fog.color.setHex(phase === 'night' ? 0x2b3a5e : phase === 'dusk' ? 0xe0ae8c : 0xd8e8f6);
-    }
-    // the window glow reverses: daylight out, lamplight in
-    this._sun.intensity = 0.08 + 0.67 * lit;
-    this._sun.color.setHex(
-      phase === 'night' ? 0xa8bcea : phase === 'dusk' ? 0xffb279 : 0xffe2b4,
-    );
-    this._hemi.intensity = 0.2 + 0.3 * lit;
-    this._amb.intensity = 0.12 + 0.12 * lit;
-    for (const p of this._lamps) p.intensity = p.userData.base * (1.55 - 0.55 * lit);
-    this._glowK = 1.3 - 0.5 * lit;
-  }
-
-  // -------------------------------------------------------------------------
-  // THE LOFT: deck, posts, railings, and the boxed stair up the east wall.
-  //
-  // Nothing here reaches above the deck except the rails, because the camera
-  // rides 9.5 above whoever it is following: on this floor that is y ~12.7,
-  // so a ceiling, a rafter or a roof would simply erase the player. The
-  // undercroft below is scenery for the same reason in reverse (a balcony is
-  // opaque from a low 3/4 camera), which is why its floor is not walkable.
-  //
-  // Edges: north, east and west are the walls, and the walkable floor stops
-  // there, so stepping off that way just stops the walker. The south edge has
-  // real ground 3.2 below it, and the snap takes any surface below without ado,
-  // so that edge is fenced with obstacle circles the whole way. They are 2D and
-  // so they fence the ground floor off at the same line: that is the deal, and
-  // the ground floor is laid out south of it.
-  // -------------------------------------------------------------------------
-  _buildLoft(scene, B) {
-    const { box, boxFlat, bead } = B;
-
-    // --- the deck ----------------------------------------------------------
-    // Shape space is (x, -z); extruding MZ_T and laying it flat puts the
-    // walking surface exactly on MZ_Y. The middle steps back to MZ_BAY so the
-    // whole bot circle stays out from under the balcony.
-    const sh = new THREE.Shape();
-    sh.moveTo(-HW, -ZN);
-    sh.lineTo(HW, -ZN);
-    sh.lineTo(HW, -MZ_S);
-    sh.lineTo(MZ_BAYX, -MZ_S);
-    sh.lineTo(MZ_BAYX, -MZ_BAY);
-    sh.lineTo(-MZ_BAYX, -MZ_BAY);
-    sh.lineTo(-MZ_BAYX, -MZ_S);
-    sh.lineTo(-HW, -MZ_S);
-    sh.closePath();
-    const deckTex = texPlanks();
-    deckTex.wrapS = deckTex.wrapT = THREE.RepeatWrapping;
-    deckTex.repeat.set(0.273, 0.3125); // extrude UVs are world units: match the floor
-    const deckGeo = new THREE.ExtrudeGeometry(sh, { depth: MZ_T, bevelEnabled: false });
-    const deck = new THREE.Mesh(deckGeo, this._toonMap(deckTex));
-    deck.rotation.x = -Math.PI / 2;
-    deck.position.y = MZ_Y - MZ_T;
-    deck.castShadow = true;
-    deck.receiveShadow = true;
-    scene.add(deck);
-    this.groundMeshes.push(deck);
-
-    // the edge segments, south side only: [x0, z0, x1, z1]
-    const EDGES = [
-      [-HW, MZ_S, -MZ_BAYX, MZ_S],
-      [-MZ_BAYX, MZ_S, -MZ_BAYX, MZ_BAY],
-      [-MZ_BAYX, MZ_BAY, MZ_BAYX, MZ_BAY],
-      [MZ_BAYX, MZ_BAY, MZ_BAYX, MZ_S],
-      [MZ_BAYX, MZ_S, ST_X0, MZ_S], // stops at the stair head: that gap is the way down
-    ];
-
-    // fascia board + soffit trim, and the railing above it
-    for (const [x0, z0, x1, z1] of EDGES) {
-      const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
-      const len = Math.hypot(x1 - x0, z1 - z0);
-      const alongX = Math.abs(x1 - x0) > Math.abs(z1 - z0);
-      const sx = alongX ? len : 0.3, sz = alongX ? 0.3 : len;
-      boxFlat.add(PAL.wood, cx, MZ_Y - MZ_T / 2, cz, sx + 0.02, MZ_T + 0.18, sz + 0.02);
-      boxFlat.add(PAL.woodLight, cx, MZ_Y - MZ_T - 0.16, cz, sx + 0.1, 0.14, sz + 0.1);
-      // top and mid rails: chunky but mostly air, so the loft still reads from
-      // the ground floor and from the static camera
-      box.add(PAL.woodMid, cx, MZ_Y + RAIL_Y, cz, alongX ? len : 0.14, 0.16, alongX ? 0.14 : len);
-      box.add(PAL.wood, cx, MZ_Y + RAIL_Y * 0.55, cz, alongX ? len : 0.09, 0.1, alongX ? 0.09 : len);
-
-      const n = Math.max(2, Math.round(len / 1.7));
-      for (let i = 0; i <= n; i++) {
-        const u = i / n;
-        const px = x0 + (x1 - x0) * u, pz = z0 + (z1 - z0) * u;
-        box.add(PAL.wood, px, MZ_Y + RAIL_Y / 2, pz, 0.15, RAIL_Y, 0.15);
-        bead.add(PAL.gold, px, MZ_Y + RAIL_Y + 0.12, pz, 0.17, 0.17, 0.17);
-      }
-      // the fence itself: circles tight enough to overlap into a solid line
-      const steps = Math.max(1, Math.round(len / RAIL_STEP));
-      for (let i = 0; i <= steps; i++) {
-        const u = i / steps;
-        this.obstacles.push({ x: x0 + (x1 - x0) * u, z: z0 + (z1 - z0) * u, r: RAIL_R });
-      }
-    }
-
-    // --- the posts that hold it up -----------------------------------------
-    for (const [px, pz] of [
-      [-10.3, MZ_S], [-7.2, MZ_S], [-MZ_BAYX, MZ_BAY], [0, MZ_BAY], [MZ_BAYX, MZ_BAY],
-      [7.2, MZ_S], [ST_X0 - 0.1, MZ_S], [-8.0, -6.4], [8.0, -6.4],
-    ]) {
-      box.add(PAL.wood, px, MZ_Y / 2, pz, 0.36, MZ_Y, 0.36);
-      box.add(PAL.woodMid, px, MZ_Y - 0.42, pz, 0.62, 0.22, 0.62);
-      for (const sx of [-1, 1]) {
-        box.add(PAL.woodMid, px + sx * 0.3, MZ_Y - 0.72, pz, 0.42, 0.42, 0.3, 0, 0, sx * 0.78);
-      }
-    }
-    // beams under the deck, all of them below 3.2 and north of the edge, so
-    // they can never land between the camera and anybody
-    for (const z of [-6.2, -4.6, -3.0]) {
-      boxFlat.add(PAL.wood, 0, MZ_Y - MZ_T - 0.14, z, 2 * HW, 0.26, 0.34);
-    }
-
-    // --- the stair ---------------------------------------------------------
-    this._buildStair(scene, B);
-
-    // --- festoon along the balcony edge, plus the run over the door ---------
+  /**
+   * String lights: two runs down the side walls and one across the doorway.
+   * They used to hang off the balcony fascia, which is the one place they can
+   * no longer go. Everything is above 4.5 and inside a metre of the plaster,
+   * except the door run, which is south of everybody: nothing here can land
+   * between the camera and a capybara.
+   */
+  _buildFestoon(scene, B) {
+    const { bead } = B;
     const bulbs = [], cord = [];
     for (const [x0, z0, x1, z1, by] of [
-      [-10.5, MZ_S - 0.18, -4.7, MZ_S - 0.18, MZ_Y - 0.72],
-      [-4.3, MZ_BAY - 0.18, 4.3, MZ_BAY - 0.18, MZ_Y - 0.72],
-      [4.7, MZ_S - 0.18, 8.5, MZ_S - 0.18, MZ_Y - 0.72],
+      [-HW + 0.7, -6.2, -HW + 0.7, 7.4, 4.9],
+      // the east run stops short of the stair: the landing is 3.2 up, and a
+      // bulb at 4.9 would be level with the ears of anyone standing on it
+      [HW - 0.7, 1.5, HW - 0.7, 7.4, 4.9],
       [-10.4, 8.2, 10.4, 8.2, 4.6],
     ]) {
       const n = 16;
@@ -2120,15 +1804,51 @@ export class LoungeRoom extends Room {
     this._bulbs = bulbMesh;
   }
 
-  /**
-   * The stair: eight boxed treads up the east wall, climbing north onto the
-   * east wing. Every tread is a solid block from the floor up, so the ground
-   * snap sees one continuous rising surface (0.4 a step, a third of the 1.2
-   * step-up range) and walks a capybara up it without a single special case.
-   * One InstancedMesh, and it goes straight into groundMeshes.
-   */
+  // -------------------------------------------------------------------------
+  /** World clock (wave 7). The lodge never changes shape: the mountainside
+   *  past the glass goes from afternoon to alpenglow to moonlit snow, the
+   *  daylight raking in through the west windows fades with it, and the lamps
+   *  and the string lights carry the room after dusk. */
+  onClock(dayT) {
+    const lit = daylight(dayT);
+    const phase = clockPhase(dayT);
+    if (phase !== this._phase) {
+      this._phase = phase;
+      for (const [mat, paint] of this._views) {
+        mat.map?.dispose();      // the engine only ever disposes the current one
+        mat.map = paint(phase);
+        mat.needsUpdate = true;
+      }
+      const sky = phase === 'night' ? 0x1d2748 : phase === 'dusk' ? 0xe6a074 : 0xc3dcf1;
+      this._skyMat.color.setHex(sky);
+      if (this._fog) this._fog.color.setHex(phase === 'night' ? 0x2b3a5e : phase === 'dusk' ? 0xe0ae8c : 0xd8e8f6);
+    }
+    // the window glow reverses: daylight out, lamplight in
+    this._sun.intensity = 0.08 + 0.67 * lit;
+    this._sun.color.setHex(
+      phase === 'night' ? 0xa8bcea : phase === 'dusk' ? 0xffb279 : 0xffe2b4,
+    );
+    this._hemi.intensity = 0.2 + 0.3 * lit;
+    this._amb.intensity = 0.12 + 0.12 * lit;
+    for (const p of this._lamps) p.intensity = p.userData.base * (1.55 - 0.55 * lit);
+    this._glowK = 1.3 - 0.5 * lit;
+  }
+
+  // -------------------------------------------------------------------------
+  // THE STAIR TO THE TROPHY LOFT: eight boxed treads up the east wall, a
+  // landing at the top and a lit doorway off it. Every tread is a solid block
+  // from the floor up, so the ground snap sees one continuous rising surface
+  // (0.4 a step, a third of the 1.2 step-up range) and walks a capybara up it
+  // without a single special case. The treads and the landing are real ground
+  // meshes; 'exit-loft' fires up near the head of the flight.
+  //
+  // Everything up here stays east of x 8.7 and north of z -2.2, and the strip
+  // of floor UNDER the landing is fenced off (it is the log store now): from
+  // the arrival spawn the camera's line to a capybara standing back there
+  // would pass straight through the landing slab.
+  // -------------------------------------------------------------------------
   _buildStair(scene, B) {
-    const { box, boxFlat, bead } = B;
+    const { box, boxFlat, cyl, ball, bead } = B;
     const W = ST_X1 - ST_X0, cx = (ST_X0 + ST_X1) / 2;
 
     const steps = new THREE.InstancedMesh(
@@ -2151,32 +1871,95 @@ export class LoungeRoom extends Room {
     scene.add(steps);
     this.groundMeshes.push(steps);
 
+    // the landing: the last flat stretch before the door
+    const land = new THREE.Mesh(new THREE.PlaneGeometry(W, ST_TOP_Z - LAND_Z), makeToon(PAL.woodMid));
+    land.rotation.x = -Math.PI / 2;
+    land.position.set(cx, LOFT_Y, (ST_TOP_Z + LAND_Z) / 2);
+    land.receiveShadow = true;
+    scene.add(land);
+    this.groundMeshes.push(land);
+    box.add(PAL.wood, cx, LOFT_Y - 0.34, (ST_TOP_Z + LAND_Z) / 2 - 0.2, W, 0.6, ST_TOP_Z - LAND_Z + 0.8);
+
     // skirt board down the open side, and the raked handrail above it
-    const run = ST_Z0 - MZ_S, rise = MZ_Y;
+    const run = ST_Z0 - ST_TOP_Z, rise = LOFT_Y;
     const len = Math.hypot(run, rise), rake = Math.atan2(rise, run);
-    box.add(PAL.wood, ST_X0 - 0.06, (ST_RISE + MZ_Y) / 2 - 0.32, (ST_Z0 + MZ_S) / 2,
+    box.add(PAL.wood, ST_X0 - 0.06, (ST_RISE + LOFT_Y) / 2 - 0.32, (ST_Z0 + ST_TOP_Z) / 2,
       0.2, 0.72, len + 0.3, rake, 0, 0);
-    box.add(PAL.woodMid, ST_X0 - 0.06, (ST_RISE + MZ_Y) / 2 + RAIL_Y - 0.1, (ST_Z0 + MZ_S) / 2,
+    box.add(PAL.woodMid, ST_X0 - 0.06, (ST_RISE + LOFT_Y) / 2 + RAIL_Y - 0.1, (ST_Z0 + ST_TOP_Z) / 2,
       0.16, 0.16, len, rake, 0, 0);
     for (let i = 0; i <= ST_N; i++) {
       const pz = ST_Z0 - i * ST_GOING;
       const py = i * ST_RISE;
       box.add(PAL.wood, ST_X0 - 0.06, py + RAIL_Y / 2 + 0.1, pz, 0.14, RAIL_Y + 0.2, 0.14);
-      // The fence: same overlapping circles as the balcony edge, but NOT over
-      // the bottom two treads. Those sit 0.4 and 0.8 up, which the ground snap
-      // treats as a step, so their open sides are a way on rather than a fall
-      // — and a fenced bottom step would have shut the only lane to the stair
-      // between the rail and the cocoa bar (found by walking it).
+      // The fence, as overlapping circles, but NOT over the bottom two treads.
+      // Those sit 0.4 and 0.8 up, which the ground snap treats as a step, so
+      // their open sides are the way ON rather than a fall — and a fenced
+      // bottom step would shut the only lane to the stair between the rail and
+      // the cocoa bar (found by walking it).
       if (i >= 2) this.obstacles.push({ x: ST_X0, z: pz, r: RAIL_R });
     }
+    // the same fence along the landing, then on north to close the strip under
+    // it: that floor is scenery for the camera's sake (see the note above)
+    for (let z = ST_TOP_Z; z >= ZN + 0.5; z -= RAIL_STEP) {
+      this.obstacles.push({ x: ST_X0, z, r: RAIL_R });
+    }
+    for (let i = 0; i <= 3; i++) {
+      const pz = ST_TOP_Z - i * ((ST_TOP_Z - LAND_Z) / 3);
+      box.add(PAL.wood, ST_X0 - 0.06, LOFT_Y + RAIL_Y / 2 + 0.1, pz, 0.14, RAIL_Y + 0.2, 0.14);
+    }
+    box.add(PAL.woodMid, ST_X0 - 0.06, LOFT_Y + RAIL_Y, (ST_TOP_Z + LAND_Z) / 2,
+      0.16, 0.16, ST_TOP_Z - LAND_Z, 0, 0, 0);
     // newels: a chunky one at the foot, a taller one at the head
-    for (const [px, py, pz, h] of [[ST_X0 - 0.06, 0, ST_Z0 + 0.2, 1.5], [ST_X0 - 0.06, MZ_Y, MZ_S - 0.1, 1.3]]) {
+    for (const [px, py, pz, h] of [[ST_X0 - 0.06, 0, ST_Z0 + 0.2, 1.5], [ST_X0 - 0.06, LOFT_Y, LAND_Z + 0.1, 1.3]]) {
       box.add(PAL.wood, px, py + h / 2, pz, 0.3, h, 0.3);
       bead.add(PAL.gold, px, py + h + 0.12, pz, 0.3, 0.32, 0.3);
     }
 
-    // the invitation upstairs, hung on the skirt where the foot of the flight
-    // meets the cocoa bar
+    // --- the doorway at the head -------------------------------------------
+    // Posts, lintel and a warm panel of lamplight from the room beyond, which
+    // is a whole other instance now. It faces SOUTH, at the camera: a board
+    // turned back into the wall only ever shows the camera its back.
+    for (const sx of [-1, 1]) {
+      box.add(PAL.wood, cx + sx * (W / 2 - 0.18), LOFT_Y + 1.15, DOOR_Z, 0.34, 2.3, 0.42);
+    }
+    box.add(PAL.wood, cx, LOFT_Y + 2.42, DOOR_Z, W + 0.3, 0.36, 0.5);
+    box.add(PAL.woodLight, cx, LOFT_Y + 2.66, DOOR_Z, W + 0.5, 0.14, 0.62);
+    const glow = new THREE.Mesh(
+      new THREE.PlaneGeometry(W - 0.5, 2.2),
+      new THREE.MeshBasicMaterial({ color: 0xffc477, transparent: true, opacity: 0.5, depthWrite: false }),
+    );
+    // Order matters and the first pass had it backwards: the camera is SOUTH of
+    // this door (it trails the climber), so larger z is nearer. The dark panel
+    // is the room beyond and has to sit BEHIND the lamplight, or it is simply a
+    // black slab with the glow hidden behind it, which is what a capture of the
+    // stair head showed.
+    glow.position.set(cx, LOFT_Y + 1.15, DOOR_Z - 0.10);
+    scene.add(glow);
+    this._loftGlow = glow;
+    boxFlat.add(0x2a1a0e, cx, LOFT_Y + 1.15, DOOR_Z - 0.32, W - 0.45, 2.2, 0.2);
+    const pool = new THREE.Mesh(
+      new THREE.CircleGeometry(1.3, 22),
+      new THREE.MeshBasicMaterial({ color: 0xffd08a, transparent: true, opacity: 0.22, depthWrite: false }),
+    );
+    pool.rotation.x = -Math.PI / 2;
+    pool.position.set(cx, LOFT_Y + 0.02, DOOR_Z + 0.9);
+    scene.add(pool);
+    this._loftPool = pool;
+    const lamp = new THREE.PointLight(0xffb968, 9, 8, 2);
+    lamp.position.set(cx, LOFT_Y + 1.5, DOOR_Z + 0.4);
+    scene.add(lamp);
+
+    // the sign over the door, and its twin down at the foot of the flight
+    const top = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.1, 0.74),
+      this._flat(texSign('THE TROPHY LOFT', 'fireside, chess & cards')),
+    );
+    // 0.28 SOUTH of the doorway plane, not north of it: the lintel is 0.5 deep
+    // about DOOR_Z, so a board tucked behind it is a board nobody ever sees.
+    top.position.set(cx, LOFT_Y + 2.42, DOOR_Z + 0.28);
+    scene.add(top);
+    for (const sx of [-1, 1]) bead.add(0xffe0a8, cx + sx * 1.0, LOFT_Y + 2.0, DOOR_Z + 0.24, 0.26, 0.26, 0.26);
+
     const sign = new THREE.Mesh(
       new THREE.PlaneGeometry(1.9, 0.72),
       this._flat(texSign('UP TO THE LOFT', 'fireside, chess & cards')),
@@ -2186,207 +1969,84 @@ export class LoungeRoom extends Room {
     scene.add(sign);
     box.add(PAL.woodMid, ST_X0 - 0.24, 1.85, ST_Z0 + 1.0, 1.98, 0.8, 0.1, 0, -0.62, 0);
     boxFlat.add(PAL.brass, ST_X0 - 0.3, 2.32, ST_Z0 + 1.0, 0.9, 0.12, 0.12, 0, -0.62, 0);
+
+    // the log store in the fenced strip under the landing: scenery, built to be
+    // looked at from the side rather than walked into
+    box.add(PAL.wood, cx, 0.9, LAND_Z - 1.4, W - 0.2, 1.8, 1.6);
+    boxFlat.add(0x4a2f18, cx, 0.95, LAND_Z - 1.3, W - 0.5, 1.5, 1.5);
+    for (let i = 0; i < 8; i++) {
+      cyl.add(i % 2 ? PAL.wood : PAL.woodMid, cx - 0.66 + (i % 4) * 0.44, 0.55 + ((i / 4) | 0) * 0.42,
+        LAND_Z - 1.25, 0.36, 1.3, 0.36, 0, Math.PI / 2, 0);
+    }
+    ball.add(PAL.leafDark, cx - 0.5, 2.05, LAND_Z - 1.4, 0.9, 0.55, 0.8);
+    for (let i = 0; i < 3; i++) {
+      cyl.add(PAL.brass, cx - 0.6 + i * 0.6, 2.5, ZN + 0.5, 0.12, 0.5, 0.12, 0.4, 0, 0);
+    }
   }
 
   // -------------------------------------------------------------------------
-  // THE STAR: grand stone fireplace, live flames, trophy shelf on the mantel,
-  // and since the loft went in it stands on the LOFT, on the gable wall.
+  // THE NORTH WALL: the room's landmark since the hearth went upstairs.
   //
-  // That is the whole trick of the two-floor room. A balcony reads as opaque
-  // from a 3/4 camera 9.5 up: put the fire under it and the room's landmark is
-  // a rumour. Up here the hearth floor sits at 3.2 and the camera's line from
-  // the arrival spawn clears the balcony rail at 4.45, so the fire is the first
-  // thing you see through the door, glowing over the heads of the crowd.
+  // A fireplace two storeys tall used to fill this gable; taking it away left
+  // the biggest, best-lit surface in the room blank, and a room with no focal
+  // point opposite its door reads as a corridor. So the wall got the one thing
+  // a games den should hang: a painted map of the whole cove with a red X on
+  // the lodge you are standing in, the den crest over it, the banner over that
+  // and the long console under it. It sits dead ahead from both door spawns.
   // -------------------------------------------------------------------------
-  _buildFireplace(scene, B, rand) {
-    const { box, boxFlat, cyl, cyl8, ball, bead, cone } = B;
-    const Y = MZ_Y;                       // hearth floor = the loft deck
-    const OPEN_HW = 1.6, OPEN_TOP = Y + 1.75;
-    this._fireY = Y;
+  _buildNorthWall(scene, B) {
+    const { box, boxFlat, cyl, ball, bead } = B;
+    const WZ = ZN + 0.22;
 
-    // chunky coursed stonework, opening left hollow
-    for (let row = 0; row < 6; row++) {
-      const y = Y + 0.3 + row * 0.58;
-      let x = -3.2;
-      while (x < 3.2) {
-        const w = 0.66 + rand() * 0.5;
-        const inOpening = y < OPEN_TOP && x + w > -OPEN_HW && x < OPEN_HW;
-        if (!inOpening) {
-          const tone = [PAL.stone, PAL.stoneMid, PAL.stoneDark][(row + ((x * 3) | 0) + 9) % 3];
-          box.add(tone, x + w / 2, y, FZ, w, 0.54, 1.2);
-        }
-        x += w + 0.04;
-      }
-    }
-    // arch across the opening
-    for (let i = 0; i < 11; i++) {
-      const a = Math.PI * (0.06 + (i / 10) * 0.88);
-      box.add(i % 2 ? PAL.stone : PAL.stoneMid,
-        Math.cos(a) * 1.85, Y + 1.62 + Math.sin(a) * 0.6, FZ,
-        0.42, 0.5, 1.24, 0, 0, -(a - Math.PI / 2) * 0.55);
-    }
-    // dark firebox behind, so the opening reads as depth not a painted panel
-    boxFlat.add(0x21150c, 0, Y + 0.95, -6.9, 3.3, 2.0, 0.9);
-    box.add(PAL.stoneDark, 0, Y + 0.09, -6.4, 3.4, 0.18, 1.0);
-
-    // logs and ash, sitting proud of the dark so the firelight catches them
-    cyl8.add(PAL.wood, -0.45, Y + 0.3, -6.3, 0.34, 1.5, 0.34, Math.PI / 2, 0.28, 0);
-    cyl8.add(PAL.wood, 0.45, Y + 0.3, -6.32, 0.34, 1.5, 0.34, Math.PI / 2, -0.3, 0);
-    cyl8.add(PAL.woodMid, 0, Y + 0.5, -6.2, 0.3, 1.3, 0.3, Math.PI / 2, 0.1, 0);
-    bead.add(0x54483a, 0, Y + 0.16, -6.24, 2.6, 0.24, 0.8);
-
-    // nine flame tongues, driven per frame
-    const flames = new THREE.InstancedMesh(
-      new THREE.ConeGeometry(0.5, 1, 8), makeGlow(0xffffff, { unique: true }), 9,
-    );
-    const fc = new THREE.Color(PAL.flame);
-    const d = new THREE.Object3D();
-    this._flameData = [];
-    for (let i = 0; i < 9; i++) {
-      this._flameData.push({
-        x: -0.85 + (i % 5) * 0.42 + (rand() - 0.5) * 0.16,
-        z: -6.35 + ((i / 5) | 0) * 0.26,
-        s: 0.5 + rand() * 0.6, ph: rand() * 6.28, sp: 2.4 + rand() * 2.6,
-      });
-      d.position.set(0, -9, 0);
-      d.updateMatrix();
-      flames.setMatrixAt(i, d.matrix);
-      flames.setColorAt(i, fc);
-    }
-    flames.instanceColor.setUsage(THREE.DynamicDrawUsage);
-    flames.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    // every instance starts parked at (0,-9,0); the bounds three caches from
-    // that would cull the whole batch once the flames move up into the firebox
-    flames.frustumCulled = false;
-    scene.add(flames);
-    this._flames = flames;
-
-    const emberMesh = new THREE.InstancedMesh(
-      new THREE.SphereGeometry(0.055, 6, 4), makeGlow(0xffb057, { unique: true }), 14,
-    );
-    this._emberData = [];
-    for (let i = 0; i < 14; i++) {
-      this._emberData.push({ t: rand(), sp: 0.35 + rand() * 0.4, x: (rand() - 0.5) * 1.6, ph: rand() * 6.28 });
-      d.position.set(0, -9, 0);
-      d.updateMatrix();
-      emberMesh.setMatrixAt(i, d.matrix);
-    }
-    emberMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    emberMesh.frustumCulled = false;
-    scene.add(emberMesh);
-    this._embers = emberMesh;
-
-    const fireLight = new THREE.PointLight(PAL.ember, 24, 17, 2);
-    fireLight.position.set(0, Y + 1.0, -6.0);
-    scene.add(fireLight);
-    this._fireLight = fireLight;
-    const glow = new THREE.Mesh(
-      new THREE.PlaneGeometry(3.1, 1.9),
-      new THREE.MeshBasicMaterial({ color: 0xff9c46, transparent: true, opacity: 0.28, depthWrite: false }),
-    );
-    glow.position.set(0, Y + 0.95, -6.42);
-    scene.add(glow);
-    this._fireGlow = glow;
-
-    // hearth apron, fire irons, log basket
-    box.add(PAL.stoneDark, 0, Y + 0.09, -5.5, 5.6, 0.18, 1.3);
-    box.add(PAL.stone, 0, Y + 0.2, -5.5, 5.3, 0.1, 1.1);
-    for (const [ix, lean] of [[-2.4, 0.12], [-2.22, -0.1]]) {
-      cyl8.add(PAL.steel, ix, Y + 0.6, -5.4, 0.07, 1.2, 0.07, 0, 0, lean);
-      bead.add(PAL.brass, ix, Y + 1.24, -5.4, 0.16, 0.16, 0.16);
-    }
-    cyl.add(PAL.woodMid, 2.5, Y + 0.34, -5.4, 1.1, 0.66, 1.1);
-    for (let i = 0; i < 5; i++) {
-      cyl8.add(PAL.wood, 2.5 + (i % 2 ? 0.16 : -0.16), Y + 0.62 + i * 0.1, -5.4 + ((i % 3) - 1) * 0.14,
-        0.2, 0.9, 0.2, Math.PI / 2, i * 0.5, 0);
+    // the hanging itself, on a batten top and bottom
+    const map = new THREE.Mesh(new THREE.PlaneGeometry(6.0, 3.6), this._flat(texCoveMap()));
+    map.position.set(0, 3.4, WZ);
+    scene.add(map);
+    box.add(PAL.wood, 0, 5.3, WZ - 0.06, 6.5, 0.18, 0.22);
+    box.add(PAL.wood, 0, 1.56, WZ - 0.06, 6.4, 0.14, 0.2);
+    for (const sx of [-1, 1]) {
+      bead.add(PAL.gold, sx * 3.2, 5.3, WZ - 0.06, 0.26, 0.26, 0.26);
+      cyl.add(PAL.brass, sx * 2.9, 1.4, WZ - 0.04, 0.1, 0.3, 0.1);
     }
 
-    // --- mantel + trophy shelf ---------------------------------------------
-    box.add(PAL.wood, 0, Y + 2.35, -6.1, 7.0, 0.4, 1.9);
-    box.add(PAL.woodLight, 0, Y + 2.6, -6.1, 7.2, 0.1, 2.0);
-    const band = new THREE.Mesh(new THREE.PlaneGeometry(6.6, 0.28), this._flat(texMantelBand()));
-    band.position.set(0, Y + 2.35, -5.14);
-    scene.add(band);
-
-    // One little gold capy per minigame, echoing the avatar's proportions in
-    // miniature. Five trophies of nine parts each would be 45 draw calls, so
-    // the parts are instanced across all five and their matrices recomposed
-    // per frame from the parent trophy transform: four draw calls instead.
-    const gold = makeToon(PAL.gold);
-    const goldD = makeToon(PAL.brass);
-    const trophyKinds = [
-      { geo: new THREE.BoxGeometry(1, 1, 1), mat: goldD, parts: [[0, 0.05, 0, 0.44, 0.1, 0.36, 0]] },
-      { geo: new THREE.CylinderGeometry(0.5, 0.7, 1, 10), mat: goldD, parts: [[0, 0.18, 0, 0.28, 0.18, 0.28, 0]] },
-      {
-        geo: new THREE.SphereGeometry(0.5, 10, 8),
-        mat: gold,
-        parts: [
-          [0, 0.42, 0, 0.42, 0.34, 0.38, 0],      // barrel
-          [0, 0.6, 0.1, 0.3, 0.28, 0.28, 0],      // head
-          [0, 0.56, 0.22, 0.17, 0.14, 0.16, 0],   // snout
-          [-0.11, 0.72, 0.07, 0.11, 0.11, 0.11, 0],
-          [0.11, 0.72, 0.07, 0.11, 0.11, 0.11, 0],
-        ],
-      },
-      {
-        geo: new THREE.TorusGeometry(0.08, 0.022, 5, 10),
-        mat: goldD,
-        parts: [[-0.16, 0.3, 0, 1, 1, 1, Math.PI / 2], [0.16, 0.3, 0, 1, 1, 1, Math.PI / 2]],
-      },
-    ];
-    this._trophyAt = [];
-    for (let i = 0; i < 5; i++) this._trophyAt.push([-2.6 + i * 1.3, Y + 2.65, -5.8]);
-    this._trophy = [];
-    for (const k of trophyKinds) {
-      const locals = k.parts.map((p) => {
-        const o = new THREE.Object3D();
-        o.position.set(p[0], p[1], p[2]);
-        o.scale.set(p[3], p[4], p[5]);
-        o.rotation.y = p[6];
-        o.updateMatrix();
-        return o.matrix.clone();
-      });
-      const im = new THREE.InstancedMesh(k.geo, k.mat, locals.length * 5);
-      im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      im.castShadow = true;
-      im.frustumCulled = false;
-      scene.add(im);
-      this._trophy.push({ mesh: im, locals });
-    }
-
-    // chimney breast + crest, running up the gable to just under the eaves
-    box.add(PAL.stoneMid, 0, Y + 3.65, -6.6, 2.6, 2.2, 1.0);
-    box.add(PAL.stone, 0, Y + 4.85, -6.6, 2.9, 0.3, 1.2);
-    const crest = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 1.4), this._flat(texCrest()));
-    crest.position.set(0, Y + 3.7, -6.08);
+    // the crest above it, and the banner above that
+    const crest = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), this._flat(texCrest()));
+    crest.position.set(0, 6.0, WZ);
     scene.add(crest);
-    for (const s of [-1, 1]) {
-      cone.add(PAL.brass, s * 1.55, Y + 3.3, -6.05, 0.28, 0.42, 0.28, Math.PI, 0, 0);
-      bead.add(0xffe0a8, s * 1.55, Y + 3.06, -6.05, 0.24, 0.24, 0.24);
+    const banner = new THREE.Mesh(new THREE.PlaneGeometry(4.4, 1.1),
+      this._flat(texBanner('TONIGHT\u2019S CHALLENGERS')));
+    banner.position.set(0, 7.5, WZ);
+    scene.add(banner);
+
+    // two brass sconces, one either side of the map
+    for (const sx of [-1, 1]) {
+      box.add(PAL.wood, sx * 3.6, 4.3, ZN + 0.45, 0.09, 0.09, 0.7);
+      cyl.add(PAL.brass, sx * 3.6, 4.45, ZN + 0.72, 0.34, 0.3, 0.34, Math.PI, 0, 0);
+      bead.add(0xffe0a8, sx * 3.6, 4.28, ZN + 0.72, 0.3, 0.3, 0.3);
     }
 
-    // The hearth's footprint on the loft. Leaves a 1.1-wide walkway across the
-    // middle of the balcony (z -4.5 to -3.4) so the two wings connect.
-    //
-    // The flanks are 0.85, not 1.25, and that is load-bearing. At 1.25 they
-    // reached far enough south to bite deep into the armchair circle at
-    // (3.0, -5.2), and the lens where two obstacle circles overlap is a trap:
-    // WalkController pushes you onto one rim, the other pushes you back, and you
-    // stand there walking on the spot. From a chair at the cards table, "go to
-    // the stairs" jammed there every time, still holding the seat. 0.85 is the
-    // smallest circle that still covers the stonework corners
-    // (hypot(0.6, 0.6) = 0.849), and the whole 0.80-0.88 band walks clean;
-    // at 0.90 the jam comes back.
+    // the console under the map: the den's lost-property shelf
+    const CZ = ZN + 0.85;
+    box.add(PAL.wainscot, 0, 0.5, CZ, 5.4, 1.0, 0.9);
+    box.add(PAL.woodLight, 0, 1.06, CZ, 5.7, 0.14, 1.1);
+    box.add(PAL.coral, 0, 0.62, CZ - 0.48, 5.0, 0.24, 0.06);
+    for (let i = 0; i < 4; i++) {
+      box.add([PAL.coral, PAL.sky, PAL.gold, PAL.leaf][i], -2.0 + i * 0.42, 1.22, CZ,
+        0.66, 0.12, 0.5, 0, i * 0.3, 0);
+    }
+    cyl.add(PAL.cream, 1.5, 1.26, CZ, 0.34, 0.3, 0.34);
+    cyl.add(PAL.cocoa, 1.5, 1.41, CZ, 0.28, 0.02, 0.28);
+    cyl.add(PAL.terracotta, 2.3, 1.2, CZ, 0.5, 0.3, 0.5);
+    ball.add(PAL.leafDark, 2.3, 1.44, CZ, 0.7, 0.5, 0.6);
+    boxFlat.add(PAL.brass, -2.4, 1.2, CZ, 0.5, 0.14, 0.4);
     this.obstacles.push(
-      { x: 0, z: -6.5, r: 2.0 },
-      { x: -2.6, z: -6.5, r: 0.85 },
-      { x: 2.6, z: -6.5, r: 0.85 },
-      { x: 0, z: -5.5, r: 1.05 },
+      { x: -1.8, z: CZ, r: 1.0 }, { x: 0, z: CZ, r: 1.0 }, { x: 1.8, z: CZ, r: 1.0 },
     );
   }
 
+
   // -------------------------------------------------------------------------
-  // the five game stations
+  // the three game stations (chess and Capy Clash are upstairs in loft.js)
   // -------------------------------------------------------------------------
   _buildStations(scene, B) {
     this._rings = [];
@@ -2403,8 +2063,6 @@ export class LoungeRoom extends Room {
     reg('pong', () => this._pong(scene, B, STATION_BY_ID.get('pong')));
     reg('shuffle', () => this._shuffle(scene, B, STATION_BY_ID.get('shuffle')));
     reg('connect4', () => this._connect4(scene, B, STATION_BY_ID.get('connect4')));
-    reg('cards', () => this._cards(scene, B, STATION_BY_ID.get('cards')));
-    reg('chess', () => this._chess(scene, B, STATION_BY_ID.get('chess')));
 
     // Seated challengers get their own group so dispose() can empty it without
     // hunting through the scene graph.
@@ -2413,67 +2071,66 @@ export class LoungeRoom extends Room {
 
     const { box, cyl, bead } = B;
     for (const s of STATIONS) {
-      const y = s.y;
       // two chairs per station, both looking at the game they belong to
       for (let i = 0; i < s.seats.length; i++) {
-        this._chair(B, s.seats[i][0], s.seats[i][1], y, seatYaw(s, i), i ? PAL.leather : PAL.coral);
+        this._chair(B, s.seats[i][0], s.seats[i][1], seatYaw(s, i), i ? PAL.leather : PAL.coral);
       }
 
       // Sign post, turned to face the room camera rather than its own wall.
       // Post, backer and finial ride the shared batches; only the painted face
       // and the live status chip need meshes of their own, because only they
-      // carry a canvas nobody else shares.
-      //
-      // The loft's posts are stubby (board top 4.88, i.e. deck + 1.68). The
-      // camera's line to a standing capybara's head passes deck + 1.7 about a
-      // metre south of them, so a full-height post up here would blot out
-      // whoever was walking behind it. A station may also name its own height
-      // (`signH`): the ground floor's southernmost board is a low one, because
-      // this camera trades height against depth and a full-height post that
-      // close to the lens rides up into the frame belonging to the station
-      // three metres behind it.
+      // carry a canvas nobody else shares. A station may name its own height
+      // (`signH`): the southernmost board is a low one, because this camera
+      // trades height against depth and a full-height post that close to the
+      // lens rides up into the frame belonging to the station three metres
+      // behind it.
       const [sx, sz] = s.sign;
-      const h = s.signH ?? (y ? 1.35 : 2.42);
+      const h = s.signH ?? 2.42;
       const yaw = Math.atan2(-sx, 12 - sz);
       const nx = Math.sin(yaw), nz = Math.cos(yaw);
-      cyl.add(PAL.wood, sx, y + (h + 0.35) / 2, sz, 0.18, h + 0.35, 0.18);
-      box.add(PAL.woodMid, sx, y + h, sz, 1.86, 0.74, 0.1, 0, yaw, 0);
-      bead.add(PAL.gold, sx, y + h + 0.46, sz, 0.22, 0.22, 0.22);
+      cyl.add(PAL.wood, sx, (h + 0.35) / 2, sz, 0.18, h + 0.35, 0.18);
+      box.add(PAL.woodMid, sx, h, sz, 1.86, 0.74, 0.1, 0, yaw, 0);
+      bead.add(PAL.gold, sx, h + 0.46, sz, 0.22, 0.22, 0.22);
+      // SIGN_OUT, not the 0.07 this used to be: the post is 0.09 of radius
+      // about the board's own centre line, so a face standing 0.07 proud of it
+      // had the post's front growing straight through the middle of the
+      // lettering (every board read "PADDL|PANIC" from the play camera). 0.13
+      // puts the canvas in front of the post it hangs on.
       const face = new THREE.Mesh(new THREE.PlaneGeometry(1.76, 0.66), this._flat(texSign(s.name, s.sub)));
-      face.position.set(sx + nx * 0.07, y + h, sz + nz * 0.07);
+      face.position.set(sx + nx * SIGN_OUT, h, sz + nz * SIGN_OUT);
       face.rotation.y = yaw;
       scene.add(face);
 
       // the chip hangs off the bottom of the board on two little brass hooks
-      box.add(PAL.woodMid, sx, y + h - 0.56, sz, 1.6, 0.44, 0.09, 0, yaw, 0);
+      box.add(PAL.woodMid, sx, h - 0.56, sz, 1.6, 0.44, 0.09, 0, yaw, 0);
       for (const hx of [-0.62, 0.62]) {
-        bead.add(PAL.brass, sx + Math.cos(yaw) * hx, y + h - 0.37, sz - Math.sin(yaw) * hx, 0.1, 0.16, 0.1);
+        bead.add(PAL.brass, sx + Math.cos(yaw) * hx, h - 0.37, sz - Math.sin(yaw) * hx, 0.1, 0.16, 0.1);
       }
       const tex = texChip();
       const chip = new THREE.Mesh(
         new THREE.PlaneGeometry(1.5, 0.375),
         this._flat(tex, { transparent: true, depthWrite: false }),
       );
-      chip.position.set(sx + nx * 0.075, y + h - 0.56, sz + nz * 0.075);
+      chip.position.set(sx + nx * (SIGN_OUT + 0.005), h - 0.56, sz + nz * (SIGN_OUT + 0.005));
       chip.rotation.y = yaw;
       scene.add(chip);
       this._chips.set(s.id, { tex, mesh: chip, state: 'open' });
 
       // glowing rings on the floor where each prompt fires: gold for the table
       // you can sit at, a smaller cool one for the house opponent
-      this._rings.push(this._ring(scene, s.hs, y, 0.9, 1.24, 0xffd489, 0.42));
-      this._rings.push(this._ring(scene, s.aiAt, y, 0.5, 0.76, 0x8fd8ff, 0.3));
+      this._rings.push(this._ring(scene, s.hs, 0.9, 1.24, 0xffd489, 0.42));
+      this._rings.push(this._ring(scene, s.aiAt, 0.5, 0.76, 0x8fd8ff, 0.3));
     }
   }
 
   /** Pulsing prompt marker on the boards. */
-  _ring(scene, at, y, r0, r1, color, opacity) {
+  _ring(scene, at, r0, r1, color, opacity) {
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(r0, r1, 24),
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false }),
     );
     ring.rotation.x = -Math.PI / 2;
-    ring.position.set(at[0], y + 0.018, at[1]);
+    ring.position.set(at[0], 0.018, at[1]);
     scene.add(ring);
     return ring;
   }
@@ -2484,11 +2141,11 @@ export class LoungeRoom extends Room {
    * so `yaw` is the direction the sitter looks. No obstacle circle: a collider
    * here would shove the local player straight back out of their own seat.
    */
-  _chair(B, x, z, y, yaw, cushion) {
+  _chair(B, x, z, yaw, cushion) {
     const { box, cyl, ball } = B;
     const c = Math.cos(yaw), s = Math.sin(yaw);
     const at = (lx, lz) => [x + lx * c + lz * s, z - lx * s + lz * c];
-    const pad = y + 0.5;
+    const pad = 0.5;
 
     const [px, pz] = at(0, 0);
     box.add(PAL.woodLight, px, pad + 0.05, pz, 0.78, 0.1, 0.74, 0, yaw, 0);
@@ -2498,7 +2155,7 @@ export class LoungeRoom extends Room {
     for (const lx of [-0.28, 0.28]) {
       for (const lz of [-0.26, 0.26]) {
         const [gx, gz] = at(lx, lz);
-        cyl.add(PAL.wood, gx, y + 0.25, gz, 0.1, 0.5, 0.1);
+        cyl.add(PAL.wood, gx, 0.25, gz, 0.1, 0.5, 0.1);
       }
     }
     // back: two posts and two slats, high enough to frame a seated capy
@@ -2515,7 +2172,7 @@ export class LoungeRoom extends Room {
   /** PONG: upright arcade cabinet, glowing marquee, joystick. */
   _pong(scene, B, s) {
     const g = new THREE.Group();
-    g.position.set(s.at[0], s.y, s.at[1]);
+    g.position.set(s.at[0], 0, s.at[1]);
     // Turned toward the approach AND the camera. Facing the prompt alone put
     // the marquee and the screen nearly edge-on: the camera always looks due
     // north, so a face with no +z in its normal is a sliver.
@@ -2622,125 +2279,12 @@ export class LoungeRoom extends Room {
     for (let i = -3; i <= 3; i++) this.obstacles.push({ x, z: z + i * 0.59, r: 1.05 });
   }
 
-  /** CARDS: round green felt, a fanned hand, element tokens, wall lantern. */
-  _cards(scene, B, s) {
-    const { box, cyl, bead } = B;
-    const [x, z] = s.at;
-    const y = s.y;
-    const TOP = y + 0.8;
-    cyl.add(PAL.wood, x, TOP - 0.06, z, 2.4, 0.14, 2.4);
-    cyl.add(PAL.woodMid, x, y + 0.4, z, 0.5, 0.8, 0.5);
-    cyl.add(PAL.wood, x, y + 0.07, z, 1.4, 0.14, 1.4);
-    const felt = new THREE.Mesh(new THREE.CircleGeometry(1.1, 30), this._toonMap(texFelt()));
-    felt.rotation.x = -Math.PI / 2;
-    felt.position.set(x, TOP + 0.02, z);
-    felt.receiveShadow = true;
-    scene.add(felt);
-
-    // a hand fanned out on the near edge, plus a face-down deck: two instanced
-    // meshes rather than nine little planes
-    const cardGeo = new THREE.PlaneGeometry(0.34, 0.48);
-    const o = new THREE.Object3D();
-    const lay = (mat, rows) => {
-      const im = new THREE.InstancedMesh(cardGeo, mat, rows.length);
-      rows.forEach((r, i) => {
-        o.position.set(r[0], r[1], r[2]);
-        o.rotation.set(-Math.PI / 2, 0, r[3]);
-        o.updateMatrix();
-        im.setMatrixAt(i, o.matrix);
-      });
-      im.instanceMatrix.needsUpdate = true;
-      scene.add(im);
-    };
-    const fan = [], deck = [];
-    for (let i = 0; i < 5; i++) {
-      const a = -0.5 + i * 0.25;
-      fan.push([x + Math.sin(a) * 0.6, TOP + 0.03 + i * 0.003, z + 0.66 - Math.cos(a) * 0.12, -a]);
-    }
-    for (let i = 0; i < 4; i++) deck.push([x - 0.56, TOP + 0.03 + i * 0.012, z - 0.44, 0.3 + i * 0.04]);
-    lay(this._flat(texCard(), { side: THREE.DoubleSide }), fan);
-    lay(this._flat(texCardBack(), { side: THREE.DoubleSide }), deck);
-    for (const [col, dx, dz] of [[PAL.coral, -0.3, 0], [PAL.sky, 0.1, -0.24], [PAL.gold, 0.3, 0.16], [PAL.plum, -0.1, 0.3]]) {
-      cyl.add(col, x + dx, TOP + 0.06, z + dz, 0.3, 0.1, 0.3);
-      bead.add(0xfff6e3, x + dx, TOP + 0.12, z + dz, 0.14, 0.04, 0.14);
-    }
-    // A lantern on a bracket off the gable wall, not a pendant: there is no
-    // ceiling over the loft to hang one from, and anything tall enough to see
-    // over the table would stand between the camera and whoever walks past it.
-    this._wallLamp(scene, B, x, y + 2.05, PAL.coral);
-
-    this.obstacles.push({ x, z, r: 1.3 });
-  }
-
-  /** Bracket lantern on the gable wall, for the loft's two tables. */
-  _wallLamp(scene, B, x, y, col) {
-    const { box, bead } = B;
-    box.add(PAL.wood, x, y + 0.34, ZN + 0.5, 0.09, 0.09, 1.0);
-    box.add(PAL.wood, x, y + 0.62, ZN + 0.16, 0.09, 0.56, 0.09);
-    const shade = new THREE.Mesh(
-      new THREE.ConeGeometry(0.46, 0.4, 12, 1, true),
-      makeToon(col, { side: THREE.DoubleSide }),
-    );
-    shade.position.set(x, y + 0.2, ZN + 0.95);
-    scene.add(shade);
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), makeGlow(0xffe2ac));
-    bulb.position.set(x, y + 0.06, ZN + 0.95);
-    scene.add(bulb);
-    bead.add(PAL.brass, x, y + 0.42, ZN + 0.95, 0.14, 0.14, 0.14);
-  }
-
-  /** CHESS: heavy table, oversized pieces caught mid-game. */
-  _chess(scene, B, s) {
-    const { box, cyl, cone, ball, bead } = B;
-    const [x, z] = s.at;
-    const y = s.y;
-    const TOP = y + 0.72;
-    box.add(PAL.wood, x, TOP - 0.08, z, 2.2, 0.18, 2.2);
-    for (const dx of [-1, 1]) {
-      for (const dz of [-1, 1]) {
-        box.add(PAL.woodMid, x + dx * 0.82, y + (0.72 - 0.16) / 2, z + dz * 0.82, 0.22, 0.72 - 0.16, 0.22);
-      }
-    }
-    box.add(PAL.woodMid, x, y + 0.24, z, 1.7, 0.12, 0.16);
-    const board = new THREE.Mesh(new THREE.PlaneGeometry(1.86, 1.86), this._toonMap(texChessBoard()));
-    board.rotation.x = -Math.PI / 2;
-    board.position.set(x, TOP + 0.02, z);
-    board.receiveShadow = true;
-    scene.add(board);
-    this._wallLamp(scene, B, x, y + 2.05, PAL.sky);
-
-    const cell = 1.86 / 8;
-    const light = 0xf4e2bb, dark = 0x53331d;
-    const piece = (cx, cz, col, kind) => {
-      const px = x - 0.93 + (cx + 0.5) * cell;
-      const pz = z - 0.93 + (cz + 0.5) * cell;
-      cyl.add(col, px, TOP + 0.05, pz, 0.2, 0.1, 0.2);
-      cyl.add(col, px, TOP + 0.16, pz, 0.12, 0.22, 0.12);
-      if (kind === 'pawn') ball.add(col, px, TOP + 0.32, pz, 0.16, 0.16, 0.16);
-      else if (kind === 'rook') box.add(col, px, TOP + 0.34, pz, 0.2, 0.2, 0.2);
-      else if (kind === 'bishop') cone.add(col, px, TOP + 0.36, pz, 0.2, 0.32, 0.2);
-      else {
-        cone.add(col, px, TOP + 0.34, pz, 0.24, 0.3, 0.24);
-        bead.add(PAL.gold, px, TOP + 0.52, pz, 0.1, 0.1, 0.1);
-      }
-    };
-    piece(2, 6, light, 'pawn'); piece(4, 5, light, 'pawn'); piece(0, 7, light, 'rook');
-    piece(3, 7, light, 'king'); piece(5, 6, light, 'bishop');
-    piece(3, 1, dark, 'pawn'); piece(5, 2, dark, 'pawn'); piece(7, 0, dark, 'rook');
-    piece(4, 0, dark, 'king'); piece(2, 1, dark, 'bishop');
-    // two captured pieces lying on the rim
-    cyl.add(light, x + 1.24, TOP + 0.06, z + 0.4, 0.2, 0.12, 0.2, 0.3, 0, 1.3);
-    cyl.add(dark, x + 1.24, TOP + 0.06, z - 0.3, 0.2, 0.12, 0.2, 0.2, 0, 1.4);
-
-    this.obstacles.push({ x, z, r: 1.3 });
-  }
-
   /** CONNECT 4: big standing blue grid with red and yellow discs. */
   _connect4(scene, B, s) {
     const [x, z] = s.at;
     const g = new THREE.Group();
     const yaw = s.yaw ?? Math.PI / 2;
-    g.position.set(x, s.y, z);
+    g.position.set(x, 0, z);
     g.rotation.y = yaw; // into the room AND toward the camera: see _pong
     scene.add(g);
 
@@ -2838,7 +2382,8 @@ export class LoungeRoom extends Room {
   }
 
   // -------------------------------------------------------------------------
-  // rugs, armchairs, cushions, low table, the sleeping regular
+  // rugs, the reading nook under the cove map, cushions, low table, the
+  // sleeping regular
   // -------------------------------------------------------------------------
   _buildSeating(scene, B, rand) {
     const { box, cyl, ball, bead } = B;
@@ -2852,22 +2397,21 @@ export class LoungeRoom extends Room {
     rug.position.set(ZONE.x, 0.012, ZONE.z - 0.1);
     rug.receiveShadow = true;
     scene.add(rug);
-    // the hearth rug came upstairs with the fire
-    const hearthRug = new THREE.Mesh(new THREE.CircleGeometry(2.3, 32), this._toonMap(texRug(1)));
-    hearthRug.rotation.x = -Math.PI / 2;
-    hearthRug.position.set(0, MZ_Y + 0.012, -4.7);
-    hearthRug.receiveShadow = true;
-    scene.add(hearthRug);
-    const cardRug = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 4.2), this._toonMap(texRug(1)));
-    cardRug.rotation.set(-Math.PI / 2, 0, 0.4);
-    cardRug.position.set(-6.6, MZ_Y + 0.01, -5.5);
-    scene.add(cardRug);
+    // The reading nook's round rug, under the cove map. This end of the room
+    // was the undercroft until the loft moved out; a rug and two armchairs are
+    // what turn a strip of newly walkable floor into somewhere to be.
+    const nookRug = new THREE.Mesh(new THREE.CircleGeometry(2.5, 32), this._toonMap(texRug(1)));
+    nookRug.rotation.x = -Math.PI / 2;
+    nookRug.position.set(0, 0.012, -4.1);
+    nookRug.receiveShadow = true;
+    scene.add(nookRug);
 
-    // two leather-look armchairs pulled up to the fire, up on the loft
+    // two leather-look armchairs, angled in at the map like a fire that is not
+    // there any more
     for (const sx of [-1, 1]) {
-      const x = sx * 3.0, z = -5.2;
+      const x = sx * 2.9, z = -3.6;
       const g = new THREE.Group();
-      g.position.set(x, MZ_Y, z);
+      g.position.set(x, 0, z);
       g.rotation.y = Math.atan2(0 - x, -6.6 - z);
       scene.add(g);
       const hide = makeToon(PAL.leather);
@@ -2896,8 +2440,8 @@ export class LoungeRoom extends Room {
     }
 
     // low table with a leaning stack of games, down in the south-east corner
-    // where the room's own hangout spot is: the loft's middle has to stay a
-    // through route between the two wings.
+    // where the room's other hangout spot is: the middle of the floor has to
+    // stay a through route between the four territories.
     const [tx, tz] = [2.6, 6.4];
     cyl.add(PAL.woodMid, tx, 0.44, tz, 1.7, 0.12, 1.7);
     cyl.add(PAL.wood, tx, 0.22, tz, 0.34, 0.44, 0.34);
@@ -2909,13 +2453,13 @@ export class LoungeRoom extends Room {
     cyl.add(PAL.cream, tx + 0.42, 0.6, tz - 0.12, 0.24, 0.2, 0.24);
     this.obstacles.push({ x: tx, z: tz, r: 0.9 });
 
-    // floor cushions: two round the low table, two on the hearth rug upstairs
-    for (const [cx, cy, cz, col] of [
-      [1.3, 0, 5.5, PAL.coral], [3.9, 0, 7.1, PAL.sky],
-      [-1.5, MZ_Y, -5.1, PAL.gold], [1.5, MZ_Y, -5.1, PAL.plum],
+    // floor cushions: two round the low table, two on the nook rug
+    for (const [cx, cz, col] of [
+      [1.3, 5.5, PAL.coral], [3.9, 7.1, PAL.sky],
+      [-1.2, -4.4, PAL.gold], [1.2, -4.4, PAL.plum],
     ]) {
-      ball.add(col, cx, cy + 0.19, cz, 0.98, 0.38, 0.98, 0, rand() * 3, 0);
-      bead.add(0xfff6e3, cx, cy + 0.34, cz, 0.12, 0.06, 0.12);
+      ball.add(col, cx, 0.19, cz, 0.98, 0.38, 0.98, 0, rand() * 3, 0);
+      bead.add(0xfff6e3, cx, 0.34, cz, 0.12, 0.06, 0.12);
     }
 
     // The regular: a capybara fast asleep on a beanbag, parked between the
@@ -3039,17 +2583,23 @@ export class LoungeRoom extends Room {
   }
 
   // -------------------------------------------------------------------------
-  // bookshelves, champion portraits, plants
+  // bookshelves, plants, the trophy plaque
   // -------------------------------------------------------------------------
   _buildDecor(scene, B, rand) {
     const { box, boxFlat, cyl, bead, cone } = B;
 
-    // --- game-box shelves in the undercroft ---------------------------------
-    // Low and pulled forward to z -3.5. Under a balcony the camera only sees
-    // what is below the line from its eye through the deck lip: at this depth
-    // that is y 1.8, so a full-height bookcase back at the wall would be a
-    // rumour and these read fully.
-    for (const [x, z] of [[-8.6, -3.5], [-4.4, -3.5], [4.4, -3.5], [8.0, -3.5]]) {
+    // --- game-box shelves, flanking the cove map on the gable ---------------
+    // They used to stand in the middle of the room at z -3.5, pulled forward
+    // out of the balcony's shadow. With the deck gone they can go where a
+    // bookcase belongs: back against the wall, flanking the map, low enough
+    // (1.74) that the map, the crest and the banner above it own the whole
+    // upper wall.
+    //
+    // Two west, one east, on purpose: the fourth would stand at x 8.2, whose
+    // collider circles (7.58 / 8.82) would cross the stair fence's at x 8.7 and
+    // make an overlap lens a walker can stand in and shuffle on the spot. The
+    // log store already fills that corner for the camera.
+    for (const [x, z] of [[-8.2, ZN + 0.55], [-5.0, ZN + 0.55], [5.0, ZN + 0.55]]) {
       box.add(PAL.wood, x, 0.85, z, 2.4, 1.7, 0.7);
       boxFlat.add(0x5d3a1e, x, 0.9, z + 0.02, 2.1, 1.5, 0.66);
       for (let s = 0; s < 2; s++) {
@@ -3067,55 +2617,31 @@ export class LoungeRoom extends Room {
       box.add(PAL.woodLight, x, 1.74, z, 2.6, 0.14, 0.86);
       cyl.add(PAL.terracotta, x - 0.8, 1.92, z, 0.4, 0.28, 0.4);
       cone.add(PAL.leafDark, x - 0.8, 2.22, z, 0.5, 0.54, 0.5);
+      // two circles down the carcass rather than one fat bubble: a single
+      // circle wide enough to cover 2.4 of shelf would reach a metre into the
+      // room at its ends and nothing at all in the middle
+      for (const ox of [-0.62, 0.62]) this.obstacles.push({ x: x + ox, z: z + 0.1, r: 0.8 });
     }
 
-    // --- the wall of framed champions, up on the gable over the loft --------
-    for (const side of [0, 1]) {
-      const sx = side ? 1 : -1;
-      for (let i = 0; i < 3; i++) {
-        const x = sx * (7.9 + i * 1.2);
-        const cfg = CHAMPIONS[side * 3 + i];
-        boxFlat.add(0x6b4a2c, x, 5.4, ZN + 0.2, 1.16, 1.34, 0.1);   // frame
-        boxFlat.add(PAL.brass, x, 5.4, ZN + 0.26, 1.02, 1.2, 0.08); // mat
-        const p = new THREE.Mesh(new THREE.PlaneGeometry(0.92, 1.08), this._flat(texPortrait(cfg)));
-        p.position.set(x, 5.4, ZN + 0.32);
-        scene.add(p);
-        if (i < 2) {
-          cyl.add(PAL.brass, sx * (8.5 + i * 1.2), 6.18, ZN + 0.42, 0.16, 0.34, 0.16, 0.9, 0, 0);
-          bead.add(0xffe0a8, sx * (8.5 + i * 1.2), 6.06, ZN + 0.54, 0.16, 0.16, 0.16);
-        }
-      }
-    }
-
-    // --- the banners, hung off the balcony fascia where the camera lives ----
-    const banners = ['HALL OF CHAMPIONS', "TONIGHT'S CHALLENGERS"];
-    [[-7.4, MZ_S], [7.0, MZ_S]].forEach(([x, z], i) => {
-      const b = new THREE.Mesh(new THREE.PlaneGeometry(3.6, 0.9), this._flat(texBanner(banners[i])));
-      b.position.set(x, MZ_Y - 0.98, z - 0.2);
-      scene.add(b);
-    });
-
-    // --- potted plants in the corners, both storeys -------------------------
-    for (const [x, y, z] of [
-      [-10.3, MZ_Y, -6.2], [10.3, MZ_Y, -6.2], [-10.3, 0, 7.9], [10.3, 0, 7.9],
-    ]) {
-      cyl.add(PAL.terracotta, x, y + 0.32, z, 0.86, 0.64, 0.86);
-      cyl.add(0x6b4b32, x, y + 0.62, z, 0.74, 0.06, 0.74);
+    // --- potted plants in the two south corners -----------------------------
+    for (const [x, z] of [[-10.3, 7.9], [10.3, 7.9]]) {
+      cyl.add(PAL.terracotta, x, 0.32, z, 0.86, 0.64, 0.86);
+      cyl.add(0x6b4b32, x, 0.62, z, 0.74, 0.06, 0.74);
       for (let i = 0; i < 7; i++) {
         const a = (i / 7) * Math.PI * 2 + rand();
         const lean = 0.4 + rand() * 0.3;
         cone.add(i % 2 ? PAL.leaf : PAL.leafDark,
-          x + Math.cos(a) * 0.34, y + 1.05 + rand() * 0.4, z + Math.sin(a) * 0.34,
+          x + Math.cos(a) * 0.34, 1.05 + rand() * 0.4, z + Math.sin(a) * 0.34,
           0.34, 1.3, 0.34, Math.sin(a) * lean, 0, -Math.cos(a) * lean);
       }
       this.obstacles.push({ x, z, r: 0.7 });
     }
 
-    // a trophy plaque on the solid stretch of the loft's west wall
-    boxFlat.add(PAL.wood, -HW + 0.24, 4.5, -2.95, 0.14, 1.3, 1.3);
-    cyl.add(PAL.cream, -HW + 0.34, 4.5, -2.95, 0.9, 0.06, 0.9, 0, 0, Math.PI / 2);
-    cyl.add(PAL.coral, -HW + 0.38, 4.5, -2.95, 0.5, 0.04, 0.5, 0, 0, Math.PI / 2);
-    bead.add(PAL.gold, -HW + 0.42, 4.5, -2.95, 0.14, 0.14, 0.14);
+    // a trophy plaque on the solid stretch of the west wall, over the arcade
+    boxFlat.add(PAL.wood, -HW + 0.24, 3.4, -2.95, 0.14, 1.3, 1.3);
+    cyl.add(PAL.cream, -HW + 0.34, 3.4, -2.95, 0.9, 0.06, 0.9, 0, 0, Math.PI / 2);
+    cyl.add(PAL.coral, -HW + 0.38, 3.4, -2.95, 0.5, 0.04, 0.5, 0, 0, Math.PI / 2);
+    bead.add(PAL.gold, -HW + 0.42, 3.4, -2.95, 0.14, 0.14, 0.14);
   }
 
   // -------------------------------------------------------------------------
@@ -3192,21 +2718,6 @@ export class LoungeRoom extends Room {
   }
 
   /**
-   * Multi-storey routing (engine hook): a click on the other floor walks via
-   * the stair instead of pressing into the balcony rail. Returns the
-   * intermediate waypoints, or null for a same-floor direct walk. The stair
-   * lane is x in [ST_X0, HW], base at z ~ ST_Z0, top on the east wing at MZ_S.
-   */
-  routeTo(from, to) {
-    const floorOf = (p) => (p.y > 1.6 ? 1 : 0);
-    if (floorOf(from) === floorOf(to)) return null;
-    const cx = (ST_X0 + HW) / 2; // stair centreline
-    const base = new THREE.Vector3(cx, 0, ST_Z0 + 0.7);
-    const top = new THREE.Vector3(cx, MZ_Y, MZ_S - 0.5);
-    return floorOf(from) === 0 ? [base, top] : [top, base];
-  }
-
-  /**
    * Dev layout editor: every number of a station that may be dragged, as a
    * labelled handle. Each one is a real coordinate in the STATIONS table, so
    * moving a handle and rebuilding puts the sign post, chair, prompt zone or
@@ -3226,7 +2737,7 @@ export class LoungeRoom extends Room {
     s.seats.forEach((q, i) => out.push({
       key: `seats.${i}`, label: `${id}: chair ${i + 1}`, xz: q, color: 0x7ac74f,
     }));
-    return out.map((h) => ({ ...h, y: s.y || 0 }));
+    return out.map((h) => ({ ...h, y: 0 }));
   }
 
   /** Turn one dragged handle into a patch for src/world/layout.js. */
@@ -3265,55 +2776,11 @@ export class LoungeRoom extends Room {
     const t = (this.t += dt);
     const d = this._d;
 
-    // fire
-    for (let i = 0; i < this._flameData.length; i++) {
-      const f = this._flameData[i];
-      const k = 0.62 + 0.32 * Math.sin(t * f.sp + f.ph) + 0.12 * Math.sin(t * f.sp * 2.7 + f.ph);
-      const hgt = f.s * (0.7 + k * 0.75);
-      d.position.set(f.x + Math.sin(t * 1.7 + f.ph) * 0.05, this._fireY + 0.3 + hgt / 2, f.z);
-      d.rotation.set(0, t * 0.6 + f.ph, Math.sin(t * 2.1 + f.ph) * 0.12);
-      d.scale.set(f.s * (0.42 + k * 0.16), hgt, f.s * (0.42 + k * 0.16));
-      d.updateMatrix();
-      this._flames.setMatrixAt(i, d.matrix);
-      this._col.setRGB(1, 0.42 + k * 0.34, 0.06 + k * 0.22);
-      this._flames.setColorAt(i, this._col);
-    }
-    this._flames.instanceMatrix.needsUpdate = true;
-    this._flames.instanceColor.needsUpdate = true;
-
-    for (let i = 0; i < this._emberData.length; i++) {
-      const e = this._emberData[i];
-      e.t += dt * e.sp;
-      if (e.t > 1) e.t -= 1;
-      const f = e.t;
-      // the old cut launched these at z -8.3, a unit and a half behind the wall
-      // where nobody has ever seen one: they belong in the mouth of the firebox
-      d.position.set(e.x + Math.sin(f * 6 + e.ph) * 0.3, this._fireY + 0.5 + f * 2.2,
-        -6.35 + Math.cos(f * 4 + e.ph) * 0.14);
-      d.rotation.set(0, 0, 0);
-      d.scale.setScalar(Math.max(0, 1 - f) * (0.7 + Math.sin(f * 12 + e.ph) * 0.3));
-      d.updateMatrix();
-      this._embers.setMatrixAt(i, d.matrix);
-    }
-    this._embers.instanceMatrix.needsUpdate = true;
-
-    this._fireLight.intensity = 22 + Math.sin(t * 7.3) * 4 + Math.sin(t * 2.9) * 3;
-    this._fireGlow.material.opacity = 0.22 + Math.sin(t * 5.1) * 0.07;
-
-    // trophies catch the light as they turn
-    const mA = this._mA, mB = this._mB;
-    for (let i = 0; i < 5; i++) {
-      const at = this._trophyAt[i];
-      mA.makeRotationY(Math.sin(t * 0.5 + i * 1.1) * 0.35);
-      mA.setPosition(at[0], at[1] + Math.sin(t * 1.3 + i * 0.8) * 0.012, at[2]);
-      for (const k of this._trophy) {
-        for (let p = 0; p < k.locals.length; p++) {
-          mB.multiplyMatrices(mA, k.locals[p]);
-          k.mesh.setMatrixAt(i * k.locals.length + p, mB);
-        }
-      }
-    }
-    for (const k of this._trophy) k.mesh.instanceMatrix.needsUpdate = true;
+    // the lamplight of the loft, spilling down the stair
+    const w = Math.sin(t * 1.9);
+    this._loftGlow.material.opacity = 0.46 + w * 0.07;
+    this._loftPool.material.opacity = 0.2 + w * 0.05;
+    this._loftPool.scale.setScalar(1 + w * 0.04);
 
     // string lights twinkle (harder after dusk: see onClock)
     for (let i = 0; i < this._bulbSeed.length; i++) {
@@ -3420,7 +2887,7 @@ export class LoungeRoom extends Room {
         this._leaveSeat('walk');
       } else if (!tgt && away < 0.6) {
         if (avatar.state.anim !== 'sit') avatar.setAnim('sit');
-        g.position.y = SEAT_Y + st.y;
+        g.position.y = SEAT_Y;
         const yaw = seatYaw(st, this._localSeat);
         const d = ((((yaw - g.rotation.y) % TAU) + Math.PI * 3) % TAU) - Math.PI;
         g.rotation.y += d * Math.min(1, dt * 6);
@@ -3457,13 +2924,8 @@ export class LoungeRoom extends Room {
     this._tables = null;
     this._chips = null; // chip materials are unique; disposeObject frees them
     this._game = null;
-    this._flames = null;
-    this._flameData = null;
-    this._embers = null;
-    this._emberData = null;
-    this._fireLight = null;
-    this._fireGlow = null;
-    this._trophies = null;
+    this._loftGlow = null;
+    this._loftPool = null;
     this._bulbs = null;
     this._bulbSeed = null;
     this._views = null;
