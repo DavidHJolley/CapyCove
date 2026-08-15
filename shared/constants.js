@@ -131,7 +131,7 @@ export const NAME_MAX_LEN = 16;
 // against it, server/admin.js maps roles to capabilities, the client only ever
 // echoes what the wire said.
 export const ROLES = ['player', 'mod', 'admin'];
-export const CAPS = ['who', 'inspect', 'mute', 'kick', 'ban', 'ban-perm', 'unban', 'tp', 'announce', 'editor', 'role', 'staffchat'];
+export const CAPS = ['who', 'inspect', 'mute', 'kick', 'ban', 'ban-perm', 'unban', 'tp', 'announce', 'editor', 'events', 'role', 'staffchat'];
 export const ANNOUNCE_MAX_LEN = 160;
 
 export const NET_TICK_MS = 100; // server broadcast + send cadence

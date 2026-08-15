@@ -182,6 +182,27 @@ and speed-hack guard in one rule); standings rank VALIDATED laps, never raw
 line crossings. kart-resume restores a reconnecting racer (speedway.js parks
 it on game.__kartCtx.resume; kart.js applies it on mount; `lap` = laps
 COMPLETED, `laps` = race total).
+Shipped wave 13 (the cadence engine): `events` (server->all on hello, on
+EVERY room join and on any change) {now, tz, rev, active:[{id,name,blurb,
+icon,badge,rooms,startedAt,endsAt,endsIn,effects}], next:{...}|null, flags};
+active: [] is said out loud so a stale pill clears. Client->server: `events`
+(budgeted board read), `event-start`/`event-stop` (capability 'events',
+ADMIN only, answered on a-ok/a-err). All in server/events.js (dispatch after
+kart); the calendar is data/calendar.json (TRACKED - the one file under
+data/ in git and docker), hot-reloaded shadow-parse-and-swap; grantCoins
+multiplies by events.coinMult(p, reason), which is >= 1 ALWAYS and never
+touches the AFK earners (mine dig, bonfire, bottle). Consignment: `shop-rot`
+(read -> {ids,pool,secret,dye:{price},until}) and `buy-dye` {color} ->
+`dye` {ok,color,coins,delta,colors}; rec.dyes on the ACCOUNT is the paid-
+colour authority (never localStorage). Charm hunt (server/charms.js):
+`charm` (read; also pushed on hello), `charm-claim` (server validates room +
+proximity + one per account per week), `charm-found` broadcast ({name} is
+the FINDER, {charmName} the charm, {n} finds this week); `a-charm` admin op;
+charms/charmCount ride publicProfile via charms.profileBits. The client
+renders the glint via src/world/charm.js attachCharm (engine calls it beside
+attachOverlay). Stats (server/stats.js) tee off signal/grantCoins/sessions/
+buy sinks into data/stats/ NDJSON; npm run report prints the twelve numbers;
+aggregates only, never content, never per-player rows.
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.

@@ -174,7 +174,7 @@ export const RANK = Object.freeze({ player: 0, mod: 1, admin: 2 });
  *             moderators is a moderator working alone at 2am.
  */
 export const CAPS = Object.freeze([
-  'who', 'inspect', 'mute', 'kick', 'ban', 'ban-perm', 'unban', 'tp', 'announce', 'editor',
+  'who', 'inspect', 'mute', 'kick', 'ban', 'ban-perm', 'unban', 'tp', 'announce', 'editor', 'events',
   'role', 'staffchat',
 ]);
 

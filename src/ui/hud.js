@@ -1006,6 +1006,17 @@ export function initHud(game) {
   });
   game.events.on('minigame', (id) => { if (id) hideChip(); });
 
+  // ---- BEGIN 13D: the cadence engine's mount (owner: src/ui/events.js) -----
+  // One call, and nothing else in this file. The event pill (it inserts itself
+  // after .room-chip above), the lead-in and fanfare toasts and the charm-found
+  // celebration all live in that module, styles included. Loaded on demand like
+  // the shop and the menu so it stays out of the entry chunk; it asks the server
+  // for the calendar itself, so a frame that lands mid-load is never missed.
+  import('./events.js')
+    .then((m) => m.mountEvents(game))
+    .catch((e) => { console.error('[hud] events failed to load:', e); });
+  // ---- END 13D -------------------------------------------------------------
+
   // map
   buildMap(game, $('map-overlay'));
   $('btn-map').onclick = () => { $('map-overlay').classList.toggle('hidden'); game.audio.play('click'); };

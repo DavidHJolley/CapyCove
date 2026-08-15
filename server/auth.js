@@ -6,6 +6,7 @@ import {
 } from './db.js';
 import { NAME_MAX_LEN, NAME_MIN_LEN } from '../shared/constants.js';
 import { profileBits } from './admin.js';
+import { profileBits as charmBits } from './charms.js';
 import { checkName as filterCheckName } from './filter.js';
 
 // Accounts: password hashing, session tokens, and the recovery codes that
@@ -361,6 +362,7 @@ export function publicProfile(rec) {
     // through "choose a new password" before it lets them do anything else.
     mustReset: !!rec.mustReset,
     ...profileBits(rec), // { role, caps, muteUntil } from admin.js, always fresh
+    ...charmBits(rec), // { charms, charmCount } - the weekly hunt trophies
   };
 }
 

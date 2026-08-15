@@ -6,13 +6,48 @@ import { makeToon, makeGlow, disposeObject } from '../core/materials.js';
 /**
  * Wardrobe & Shop modal.
  *
- * A live 3D capybara turntable on the left, Colors / Hats / Furniture tabs on
- * the right. Hovering a hat (or a color) tries it on instantly without
- * committing; clicking equips or buys. Purchases that go to the server show a
- * pending spinner and resolve on the next 'profile' / 'coins' / 'furn' event.
+ * A live 3D capybara turntable on the left, Colors / Hats / Furniture (and,
+ * when the stall has stock, Consignment) tabs on the right. Hovering a hat (or
+ * a color) tries it on instantly without committing; clicking equips or buys.
+ * Purchases that go to the server show a pending spinner and resolve on the
+ * next 'profile' / 'coins' / 'furn' event.
  *
  * Furniture is bought for the player's den (see the house rooms). It stacks:
  * every copy you own can be placed, so the cards count instead of locking.
+ *
+ * ---------------------------------------------------------------------------
+ * The Cove Consignment (wave 13, N-29)
+ * ---------------------------------------------------------------------------
+ * The catalog is split into a STAPLES RACK (always on sale, which is every
+ * existing item) and a ROTATING STALL, driven entirely by one optional server
+ * frame:
+ *
+ *   server -> client   {t:'shop-rot', ids:[…], pool:[…]?, secret:[…]?,
+ *                       dye:{price}?, until:<epoch ms>, endsIn:<seconds>?}
+ *   client -> server   {t:'shop-rot'}            // a read, like {t:'quests'}
+ *
+ * EVERY part of it degrades to today's behaviour when the frame never arrives:
+ * no frame means no stall tab, the full catalog on the rack, and free dyes.
+ * That is deliberate. This file must ship green whether or not the server side
+ * lands in the same wave.
+ *
+ *  - `ids`    : what is on the stall this fortnight. Ids that are not in
+ *               HATS/FURNITURE are ignored; milestone cosmetics are ignored
+ *               too (hide-not-show stays: coins must never reach them).
+ *  - `pool`   : the authored rotating pool. Anything in the pool that is NOT
+ *               in `ids` is hidden from the rack until its turn comes round.
+ *               Defaults to the items flagged `stall: true` in the catalogs,
+ *               so an empty/absent pool hides nothing. GUARDRAIL: an item you
+ *               already own is never hidden from you, whatever the pool says.
+ *  - `secret` : unannounced stock, revealed one item per hidden find on the
+ *               turntable diorama. Never listed, never counted, never hinted.
+ *  - `dye`    : {price} for a coat colour you have not worn before. Colours
+ *               you have already worn, the four natural browns, and every
+ *               milestone dye are free forever. There is no charge at all
+ *               until the server names a price.
+ *
+ * Prices always come from the shared catalogs, never from the frame: a shop
+ * frame can decide WHAT is on sale, never what it costs.
  *
  * Exported API is exactly: openShop(game)  (the HUD button toggles it).
  */
@@ -73,6 +108,25 @@ const FURN_BLURBS = {
   cocoa_station: 'Marshmallows are strictly non negotiable.',
 };
 
+/**
+ * A capybara's own coat is free. The four natural browns at the head of
+ * BODY_COLORS (see the comment on it in shared/constants.js) are what a capy
+ * grows, not what the dye tub sells, so going back to one never costs a coin.
+ * Listed by value rather than by index so a reordered palette cannot silently
+ * start charging for brown.
+ */
+const NATURAL_COLORS = [0xb08a5a, 0x8a6642, 0xc9a06b, 0x6b4f35];
+
+/** Cozy lines for the hidden finds on the turntable. Nothing signposts these. */
+const FIND_LINES = [
+  'A smooth little pebble, warm from the lamp. The stallholder nods.',
+  'A striped shell somebody left on the stand. Finders keepers.',
+  'A stray brass key. It opens nothing, which is somehow better.',
+];
+
+const FINDS_KEY = 'cove.stall.finds';
+const DYES_KEY = 'cove.dyes';
+
 const TIERS = [
   { max: 0, label: 'Starter' },
   { max: 119, label: 'Common' },
@@ -104,6 +158,148 @@ function hexCss(c) {
 
 function colorName(c) {
   return COLOR_NAMES[c] || 'Custom';
+}
+
+// ---------------------------------------------------------------------------
+// consignment rotation: normalising whatever the wire says
+// ---------------------------------------------------------------------------
+
+/** Own-property lookup for an id in one of the shared catalogs. */
+function catalogItem(id) {
+  if (typeof id !== 'string') return null;
+  if (Object.prototype.hasOwnProperty.call(HATS, id)) return { kind: 'hat', item: HATS[id] };
+  if (Object.prototype.hasOwnProperty.call(FURNITURE, id)) return { kind: 'furn', item: FURNITURE[id] };
+  return null;
+}
+
+/** Ids the catalogs themselves mark as rotating stock, when nothing else says. */
+function defaultPool() {
+  const out = [];
+  for (const [id, item] of Object.entries(HATS)) if (item.stall) out.push(id);
+  for (const [id, item] of Object.entries(FURNITURE)) if (item.stall) out.push(id);
+  return out;
+}
+
+/**
+ * Turn a raw 'shop-rot' frame into the shape the UI trusts. Every field is
+ * optional and every bad value falls back to "no stall at all", because a
+ * malformed frame must leave the wardrobe exactly as it was rather than empty
+ * the shelves. Sellable ids only: milestone cosmetics are dropped here so the
+ * hide-not-show rule survives an operator typo in the calendar.
+ */
+function normalizeRotation(msg) {
+  const m = msg && typeof msg === 'object' ? msg : null;
+  if (!m) return null;
+  const sellable = (id) => {
+    const hit = catalogItem(id);
+    return !!hit && !hit.item.milestone;
+  };
+  const list = (v) => (Array.isArray(v) ? [...new Set(v.filter(sellable))] : []);
+  const ids = list(m.ids);
+  const secret = list(m.secret).filter((id) => !ids.includes(id));
+  const pool = Array.isArray(m.pool) ? list(m.pool) : defaultPool();
+  // absolute first (it survives a paused tab), the countdown second
+  let until = Number(m.until);
+  if (!Number.isFinite(until) || until <= 0) until = 0;
+  const endsIn = Number(m.endsIn);
+  if (!until && Number.isFinite(endsIn) && endsIn > 0) until = Date.now() + endsIn * 1000;
+  const dyePrice = Math.max(0, Math.min(500, Math.floor(Number(m.dye?.price) || 0)));
+  return { ids, secret, pool: [...new Set([...pool, ...ids, ...secret])], until, dyePrice };
+}
+
+/**
+ * The no-new-server-code path. Wave 13A's `events` frame already carries every
+ * active event's `effects` verbatim (server/events.js publicEvent) plus the
+ * merged `flags` map, so the stall can be driven straight from
+ * data/calendar.json with nothing shop-specific on the server at all:
+ *
+ *   "effects": { "shop": { "featured": "pirate" } }      -> onto the stall
+ *   "effects": { "flag": { "stall": "tophat,aquarium",   -> the fortnight's rack
+ *                          "stall-pool": "…",            -> what waits its turn
+ *                          "stall-secret": "…",          -> the hidden finds
+ *                          "stall-dye": "20" } }         -> the re-dye charge
+ *
+ * `until` is the end of the active events that supplied the stock, which is
+ * exactly when the stall changes. A real 'shop-rot' frame always outranks this.
+ * DELIBERATELY IGNORED: `shop.discount`. The server is the price authority, so
+ * a discount the buy handler does not apply must never be printed on a card.
+ */
+function rotationFromEvents(msg) {
+  const m = msg && typeof msg === 'object' ? msg : null;
+  if (!m) return null;
+  const active = Array.isArray(m.active) ? m.active : [];
+  const flags = m.flags && typeof m.flags === 'object' ? m.flags : {};
+  const csv = (v) => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : []);
+  const featured = [];
+  for (const a of active) {
+    const id = a?.effects?.shop?.featured;
+    if (typeof id === 'string') featured.push(id);
+  }
+  const listed = csv(flags.stall);
+  const pool = csv(flags['stall-pool']);
+  const secret = csv(flags['stall-secret']);
+  const dye = Math.max(0, Math.floor(Number(flags['stall-dye']) || 0));
+  if (!featured.length && !listed.length && !pool.length && !secret.length && dye <= 0) return null;
+  let until = 0;
+  for (const a of active) until = Math.max(until, Number(a?.endsAt) || 0);
+  return { t: 'shop-rot', ids: [...featured, ...listed], pool, secret, dye: { price: dye }, until };
+}
+
+/**
+ * "Rotates in about four days." Coarse on purpose: this is a calendar, not a
+ * countdown timer. Scarcity by calendar is charming, scarcity by pressure is
+ * not (docs/research/liveops.md section 3.6).
+ */
+function rotateLine(until) {
+  if (!until) return 'Fresh crates come in when the boat comes in.';
+  const ms = until - Date.now();
+  if (ms <= 0) return 'A new crate is being unpacked right now.';
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) return `New crates in about ${Math.max(1, mins)} minute${mins === 1 ? '' : 's'}.`;
+  const hours = Math.round(mins / 60);
+  if (hours < 36) return `New crates in about ${hours} hour${hours === 1 ? '' : 's'}.`;
+  const days = Math.round(hours / 24);
+  return `New crates in about ${days} day${days === 1 ? '' : 's'}.`;
+}
+
+/**
+ * Which hidden finds this browser has already picked up, for the current
+ * rotation window. Local only: a find reveals stock that the server has
+ * already told us about, so it can never mint anything, and losing it to a
+ * cleared cache costs one click.
+ */
+function loadFinds(until) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FINDS_KEY) || 'null');
+    if (!raw || typeof raw !== 'object' || raw.u !== until) return [];
+    return Array.isArray(raw.k) ? raw.k.filter((k) => typeof k === 'string').slice(0, 8) : [];
+  } catch {
+    return []; // private mode, quota, corrupt value: the finds are just fresh again
+  }
+}
+
+function saveFinds(until, keys) {
+  try { localStorage.setItem(FINDS_KEY, JSON.stringify({ u: until, k: keys.slice(0, 8) })); } catch { /* not worth a word to the player */ }
+}
+
+/**
+ * Coat colours this player has already paid the dye charge for. The SERVER is
+ * the authority the moment it starts echoing `colors` on the dye reply; this
+ * local copy exists so that, until then, a player is never charged twice for a
+ * shade they are visibly already wearing. It can only ever make a dye cheaper,
+ * never dearer, and it grants nothing a player could not buy anyway.
+ */
+function loadDyes() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DYES_KEY) || 'null');
+    return Array.isArray(raw) ? raw.map((v) => Math.floor(Number(v))).filter((v) => Number.isFinite(v)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDyes(colors) {
+  try { localStorage.setItem(DYES_KEY, JSON.stringify([...colors].slice(0, 64))); } catch { /* private mode: pay once more, one time */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +531,36 @@ const CSS = `
 @media (prefers-reduced-motion: reduce) {
   .shop-furn { animation: none; }
 }
+
+/* ---- consignment stall ---- */
+.shop-tab.is-stall.is-on { background: #b58bd8; box-shadow: 0 3px 10px rgba(181,139,216,.4); }
+.shop-stall-note {
+  margin: 0 0 10px; padding: 9px 13px; border-radius: 14px;
+  background: #f8f1ff; border: 2px solid #e8dbf6; color: #7c6b8f;
+  font-size: 12px; font-weight: 700; line-height: 1.4;
+}
+.shop-stall-note b { color: var(--ink); }
+.shop-stall-when { color: #9b8ab0; }
+.shop-stall-empty {
+  padding: 26px 18px; text-align: center; font-size: 12.5px; font-weight: 700;
+  color: #a3906c; line-height: 1.5;
+}
+.shop-hat.is-secret, .shop-furn.is-secret { border-color: #b58bd8; background: #fbf6ff; }
+.shop-found {
+  position: absolute; top: 9px; right: 9px; font-size: 8.5px; font-weight: 900; letter-spacing: .09em;
+  text-transform: uppercase; padding: 3px 7px; border-radius: 999px; background: #ecdcff; color: #7d5aa8;
+}
+.shop-hat.is-secret .shop-tier, .shop-furn.is-secret .shop-tier { display: none; }
+
+/* ---- dye charge ---- */
+.shop-swatch.is-pending { cursor: progress; }
+.shop-swatch-cost {
+  position: absolute; left: 50%; bottom: 4px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 3px; padding: 1px 6px; border-radius: 999px;
+  background: rgba(255,255,255,.92); color: #6b5a3a; font-size: 9.5px; font-weight: 900;
+  box-shadow: 0 1px 3px rgba(45,36,23,.25); pointer-events: none;
+}
+.shop-swatch.is-on .shop-swatch-cost { display: none; }
 `;
 
 function ensureStyles() {
@@ -407,6 +633,34 @@ function buildPreview(canvas, game) {
     });
   }
 
+  // Hidden finds (N-29). Three small props tucked into the diorama, no glow, no
+  // cursor change, no tooltip: a secret that announces itself is a button. Two
+  // ride the turntable so they drift in and out of view, one sits still on the
+  // pedestal rim where it reads as scenery.
+  const hotMeshes = [];
+  function addHot(key, mesh, parent) {
+    mesh.userData.hotKey = key;
+    parent.add(mesh);
+    hotMeshes.push(mesh);
+  }
+  const pebble = new THREE.Mesh(new THREE.IcosahedronGeometry(0.078, 0), makeToon(0xa79273));
+  pebble.position.set(0.66, 0.05, 0.46);
+  pebble.rotation.set(0.6, 0.9, 0.2);
+  addHot('pebble', pebble, scene);
+
+  const shell = new THREE.Mesh(new THREE.ConeGeometry(0.075, 0.15, 7), makeToon(0xf2cfae));
+  shell.position.set(-0.52, 0.08, 0.34);
+  shell.rotation.set(Math.PI * 0.52, 0, 0.35);
+  addHot('shell', shell, turntable);
+
+  const keyProp = new THREE.Mesh(new THREE.TorusGeometry(0.055, 0.018, 6, 10), makeToon(0xd8a94b));
+  keyProp.position.set(-0.18, 0.03, -0.66);
+  keyProp.rotation.x = -Math.PI / 2;
+  addHot('key', keyProp, turntable);
+
+  const ray = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+
   let raf = 0;
   let last = 0;
   let t = 0;
@@ -467,6 +721,18 @@ function buildPreview(canvas, game) {
       punch = Math.max(punch, 0.85 * power);
       boost = Math.max(boost, 7 * power);
       burst = Math.max(burst, power);
+    },
+    /** nx/ny are normalised device coords over the canvas. Returns a find key or null. */
+    pick(nx, ny) {
+      const live = hotMeshes.filter((m) => m.visible);
+      if (!live.length) return null;
+      ray.setFromCamera(ndc.set(nx, ny), camera);
+      const hit = ray.intersectObjects(live, false)[0];
+      return hit ? hit.object.userData.hotKey : null;
+    },
+    /** A find is picked up: the prop leaves the diorama for good. */
+    takeFind(key) {
+      for (const m of hotMeshes) if (m.userData.hotKey === key) m.visible = false;
     },
     dispose() {
       cancelAnimationFrame(raf);
@@ -604,6 +870,29 @@ function paintCrate(ctx, w, h) {
 let openInstance = null;
 let lastTab = 'colors';
 
+/**
+ * The last rotation the server sent, cached across opens. The frame arrives on
+ * hello and on room joins, long before anybody walks into the shop, so without
+ * this the stall would look empty until the read came back. Wired lazily on the
+ * first openShop() call: this module must have no import-time side effects.
+ */
+let lastRot = null;
+let lastRotWire = false; // a real 'shop-rot' frame outranks the calendar fallback
+let rotWired = false;
+
+function wireRotation(game) {
+  if (rotWired || !game?.events?.on) return;
+  rotWired = true;
+  game.events.on('shop-rot', (m) => {
+    const r = normalizeRotation(m);
+    if (r) { lastRot = r; lastRotWire = true; }
+  });
+  game.events.on('events', (m) => {
+    if (lastRotWire) return;
+    lastRot = normalizeRotation(rotationFromEvents(m));
+  });
+}
+
 function elm(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -649,6 +938,7 @@ export function openShop(game) {
             <button class="shop-tab" role="tab" data-tab="colors">Colors</button>
             <button class="shop-tab" role="tab" data-tab="hats">Hats</button>
             <button class="shop-tab" role="tab" data-tab="furniture">Furniture</button>
+            <button class="shop-tab is-stall" role="tab" data-tab="stall" hidden>Consignment</button>
           </div>
           <div class="shop-pane" data-pane="colors">
             <div class="shop-swatches"></div>
@@ -660,6 +950,10 @@ export function openShop(game) {
           <div class="shop-pane" data-pane="furniture">
             <div class="shop-furn-note"></div>
             <div class="shop-fgrid"></div>
+          </div>
+          <div class="shop-pane" data-pane="stall">
+            <div class="shop-stall-note"></div>
+            <div class="shop-grid shop-sgrid"></div>
           </div>
           <div class="shop-foot"><span class="shop-coin shop-coin-sm"></span><span class="shop-foot-text"></span></div>
         </div>
@@ -680,13 +974,18 @@ export function openShop(game) {
   const swatchWrap = q('.shop-swatches');
   const colorNameEl = q('.shop-color-name');
   const colorHintEl = q('.shop-color-hint');
-  const grid = q('.shop-grid');
+  // pane-scoped: the stall rack reuses .shop-grid for its scroll and layout
+  const grid = q('[data-pane="hats"] .shop-grid');
   const subEl = q('.shop-sub');
   const furnNote = q('.shop-furn-note');
   const fgrid = q('.shop-fgrid');
+  const stallTab = q('.shop-tab.is-stall');
+  const stallNote = q('.shop-stall-note');
+  const sgrid = q('.shop-sgrid');
 
   const SUB_WEAR = subEl.textContent;
   const SUB_FURN = 'Everything you buy is delivered to your den, ready to place.';
+  const SUB_STALL = 'The consignment stall. Whatever came in on the boat this fortnight.';
 
   stageName.textContent = game.state.name || 'Capybara';
   q('.shop-foot-text').textContent =
@@ -701,6 +1000,38 @@ export function openShop(game) {
     canvas.remove();
     const fb = elm('div', 'shop-stage-fallback', 'The mirror is foggy today, but everything still works.');
     stageFrame.appendChild(fb);
+  }
+
+  // ---- consignment rotation state -----------------------------------------
+  // `rot` is null until (and unless) the server says otherwise, and null means
+  // "one rack, everything on it", which is exactly the pre-wave-13 shop.
+  wireRotation(game);
+  let rot = lastRot;
+  let rotFromWire = lastRotWire;
+  let finds = loadFinds(rot?.until || 0);
+
+  function owns(id) {
+    return Object.prototype.hasOwnProperty.call(HATS, id)
+      ? game.state.ownedHats.includes(id)
+      : ownedCount(id) > 0;
+  }
+
+  /** Secret stock is revealed one item per find, in the order the server sent. */
+  function revealed() {
+    if (!rot) return [];
+    return rot.secret.slice(0, finds.length);
+  }
+
+  function stallList() {
+    if (!rot) return [];
+    return [...rot.ids, ...revealed().filter((id) => !rot.ids.includes(id))];
+  }
+
+  /** Pool stock waiting its turn. Never hides something you already own. */
+  function hiddenSet() {
+    if (!rot) return new Set();
+    const onStall = new Set(stallList());
+    return new Set(rot.pool.filter((id) => !onStall.has(id) && !owns(id)));
   }
 
   let hoverColor = null;
@@ -739,6 +1070,29 @@ export function openShop(game) {
     .filter((v) => Number.isFinite(v) && v >= 0 && v <= 0xffffff && !BODY_COLORS.includes(v));
   const paletteColors = [...BODY_COLORS, ...new Set(bonusColors)];
 
+  // The dye tub (N-29). A colour costs the stall's dye price the FIRST time you
+  // wear it and is free for ever after, so the charge is a one-off sink and
+  // never a tax on changing your mind. Trying colours on stays free: you pay
+  // for the change, not for the look. Natural browns are your own coat and
+  // milestone dyes are proof of play, so neither is ever charged. And there is
+  // no charge at all until the server names a price, which means an unwired
+  // server is the old free wardrobe, exactly.
+  const paidColors = new Set([game.state.color, ...loadDyes()]);
+  for (const v of (Array.isArray(game.state.paidColors) ? game.state.paidColors : [])) {
+    const n = Math.floor(Number(v));
+    if (Number.isFinite(n)) paidColors.add(n);
+  }
+  let dyePendingColor = null;
+  let dyeTimer = 0;
+
+  function dyePrice(c) {
+    if (!rot || !rot.dyePrice) return 0;
+    if (c === game.state.color || paidColors.has(c)) return 0;
+    if (NATURAL_COLORS.includes(c)) return 0;
+    if (bonusColors.includes(c)) return 0;
+    return rot.dyePrice;
+  }
+
   const swatchRefs = [];
   paletteColors.forEach((c, i) => {
     const b = elm('button', 'shop-swatch');
@@ -747,6 +1101,11 @@ export function openShop(game) {
     b.style.setProperty('--i', String(i));
     b.title = colorName(c);
     b.setAttribute('aria-label', `${colorName(c)} coat`);
+    const cost = elm('span', 'shop-swatch-cost');
+    const costN = elm('span', null, '0');
+    cost.append(elm('span', 'shop-coin shop-coin-sm'), costN);
+    cost.hidden = true;
+    b.appendChild(cost);
     b.addEventListener('pointerenter', () => { hoverColor = c; syncPreview(); });
     b.addEventListener('pointerleave', () => { hoverColor = null; syncPreview(); });
     b.addEventListener('focus', () => { hoverColor = c; syncPreview(); });
@@ -754,29 +1113,121 @@ export function openShop(game) {
     b.addEventListener('click', () => {
       hoverColor = null;
       if (game.state.color === c) { game.audio?.play?.('click'); return; }
-      game.setColor(c);
-      game.audio?.play?.('pop');
-      preview?.celebrate(0.55);
-      syncPreview();
-      refreshSwatches();
+      onDyePick(c, b);
     });
     swatchWrap.appendChild(b);
-    swatchRefs.push({ el: b, color: c });
+    swatchRefs.push({ el: b, color: c, cost, costN });
   });
 
+  function applyColor(c) {
+    paidColors.add(c);
+    saveDyes(paidColors);
+    game.setColor(c);
+    game.audio?.play?.('pop');
+    preview?.celebrate(0.55);
+    syncPreview();
+    refreshSwatches();
+  }
+
+  function clearDyePending() {
+    dyePendingColor = null;
+    if (dyeTimer) { clearTimeout(dyeTimer); dyeTimer = 0; }
+  }
+
+  function onDyePick(c, el) {
+    if (dyePendingColor !== null) return;
+    const price = dyePrice(c);
+    if (price <= 0) { applyColor(c); return; }
+    if (game.state.coins < price) {
+      game.audio?.play?.('fail');
+      game.toast(`${colorName(c)} dye costs ${price}. You need ${price - game.state.coins} more.`);
+      shake(el);
+      return;
+    }
+    if (!game.net?.connected) {
+      // offline / guest: the purse is local anyway, same road as buyHat's offline path
+      game.grantCoins(-price, 'shop');
+      applyColor(c);
+      return;
+    }
+    dyePendingColor = c;
+    game.audio?.play?.('click');
+    game.net.send({ t: 'buy-dye', color: c });
+    refreshSwatches();
+    dyeTimer = setTimeout(() => {
+      if (dyePendingColor !== c) return;
+      clearDyePending();
+      refreshSwatches();
+      game.toast('The dye tub is still swirling. Try again.');
+    }, 8000);
+  }
+
+  // Server reply: {t:'dye', ok, color, coins, delta, colors?}. Same shape of
+  // guard as onFurn: correct whether or not the net layer folded it into state.
+  function onDye(msg) {
+    const m = msg && typeof msg === 'object' ? msg : {};
+    if (m.ok === false) {
+      clearDyePending();
+      game.audio?.play?.('fail');
+      game.toast(m.msg || 'That dye is not in the tub today.');
+      refreshSwatches();
+      return;
+    }
+    for (const v of (Array.isArray(m.colors) ? m.colors : [])) {
+      const n = Math.floor(Number(v));
+      if (Number.isFinite(n)) paidColors.add(n);
+    }
+    const echoed = Math.floor(Number(m.color));
+    const c = Number.isFinite(echoed) ? echoed : dyePendingColor;
+    clearDyePending();
+    if (typeof m.coins === 'number' && m.coins !== game.state.coins) {
+      game.syncCoins(m.coins, Number(m.delta) || 0, 'shop');
+    }
+    purseN.textContent = String(game.state.coins);
+    if (c === null || c === undefined) { refreshSwatches(); return; }
+    applyColor(c);
+    game.toast(`A fresh coat of ${colorName(c)}. It suits you.`);
+  }
+
+  // one quiet line under the swatches, and only while a price is actually set
+  const dyeNote = elm('div', 'shop-note shop-dye-note');
+  dyeNote.hidden = true;
+  swatchWrap.parentElement.appendChild(dyeNote);
+
+  function refreshDyeNote() {
+    const price = rot?.dyePrice || 0;
+    dyeNote.hidden = price <= 0;
+    if (price > 0) {
+      dyeNote.textContent = `The dye tub charges ${price} coins for a shade you have not worn before. `
+        + 'Your own browns, anything you have worn already, and every dye you earned are free. Trying colours on costs nothing.';
+    }
+  }
+
   function refreshSwatches() {
-    for (const s of swatchRefs) s.el.classList.toggle('is-on', s.color === game.state.color);
+    for (const s of swatchRefs) {
+      const on = s.color === game.state.color;
+      const price = dyePrice(s.color);
+      s.el.classList.toggle('is-on', on);
+      s.el.classList.toggle('is-pending', dyePendingColor === s.color);
+      s.cost.hidden = on || price <= 0;
+      s.costN.textContent = String(price);
+      s.el.setAttribute('aria-label', price > 0 && !on
+        ? `${colorName(s.color)} coat, ${price} coins`
+        : `${colorName(s.color)} coat`);
+    }
   }
 
   // ---- hats ----------------------------------------------------------------
-  const hatEntries = shopEntries(HATS, (id) => game.state.ownedHats.includes(id));
   const hatRefs = new Map();
   let pendingId = null;
   let pendingTimer = 0;
 
-  hatEntries.forEach(([id, hat], i) => {
+  /** One hat card, appended to whichever rack asked for it (staples or stall). */
+  function makeHatCard(id, i, target, secret) {
+    const hat = HATS[id];
     const cardEl = elm('div', 'shop-hat');
     cardEl.style.setProperty('--i', String(i));
+    if (secret) cardEl.classList.add('is-secret');
 
     const ribbon = elm('div', 'shop-ribbon', 'EQUIPPED');
     const tier = elm('div', 'shop-tier', tierLabel(hat.price));
@@ -799,7 +1250,8 @@ export function openShop(game) {
     btn.type = 'button';
     foot.append(price, btn);
     cardEl.append(ribbon, tier, name, blurb, foot);
-    grid.appendChild(cardEl);
+    if (secret) cardEl.appendChild(elm('div', 'shop-found', 'Found'));
+    target.appendChild(cardEl);
 
     const act = () => onHatAction(id, cardEl);
     btn.addEventListener('click', (e) => { e.stopPropagation(); act(); });
@@ -810,7 +1262,7 @@ export function openShop(game) {
     btn.addEventListener('blur', () => { hoverHat = null; syncPreview(); });
 
     hatRefs.set(id, { el: cardEl, btn, price });
-  });
+  }
 
   function refreshHats() {
     const { ownedHats, hat: worn, coins } = game.state;
@@ -911,7 +1363,6 @@ export function openShop(game) {
   }
 
   // ---- furniture -----------------------------------------------------------
-  const furnEntries = shopEntries(FURNITURE, (id) => ownedCount(id) > 0);
   const furnRefs = new Map();
   const thumbJobs = [];
   let furnPendingId = null;
@@ -927,9 +1378,12 @@ export function openShop(game) {
     el.classList.add('shop-shake');
   }
 
-  furnEntries.forEach(([id, item], i) => {
+  /** One furniture card, appended to whichever rack asked for it. */
+  function makeFurnCard(id, i, target, secret) {
+    const item = FURNITURE[id];
     const cardEl = elm('div', 'shop-furn');
     cardEl.style.setProperty('--i', String(i));
+    if (secret) cardEl.classList.add('is-secret');
 
     const thumb = elm('div', 'shop-furn-thumb');
     const tcanvas = document.createElement('canvas');
@@ -951,14 +1405,102 @@ export function openShop(game) {
     foot.append(price, btn);
 
     cardEl.append(thumb, name, blurb, foot);
-    fgrid.appendChild(cardEl);
+    if (secret) cardEl.appendChild(elm('div', 'shop-found', 'Found'));
+    target.appendChild(cardEl);
 
     // button-only: repeat buys are allowed, so a stray card click must not spend
     btn.addEventListener('click', (e) => { e.stopPropagation(); onFurnBuy(id, cardEl); });
 
     furnRefs.set(id, { el: cardEl, btn, price, count });
     thumbJobs.push({ id, canvas: tcanvas });
-  });
+  }
+
+  // ---- racks ---------------------------------------------------------------
+  /**
+   * Paint the three grids from the current rotation. Called on open and again
+   * whenever a 'shop-rot' frame lands, so a rotation that changes mid-browse
+   * redraws instead of going stale. Cheap: at most a few dozen small cards.
+   */
+  function buildRacks() {
+    grid.textContent = '';
+    fgrid.textContent = '';
+    sgrid.textContent = '';
+    hatRefs.clear();
+    furnRefs.clear();
+    thumbJobs.length = 0;
+
+    const stall = stallList();
+    const onStall = new Set(stall);
+    const hidden = hiddenSet();
+    const secretSet = new Set(revealed());
+
+    let i = 0;
+    for (const [id] of shopEntries(HATS, (id2) => game.state.ownedHats.includes(id2))) {
+      if (onStall.has(id) || hidden.has(id)) continue;
+      makeHatCard(id, i++, grid, false);
+    }
+    i = 0;
+    for (const [id] of shopEntries(FURNITURE, (id2) => ownedCount(id2) > 0)) {
+      if (onStall.has(id) || hidden.has(id)) continue;
+      makeFurnCard(id, i++, fgrid, false);
+    }
+    i = 0;
+    for (const id of stall) {
+      const hit = catalogItem(id);
+      if (!hit) continue;
+      const secret = secretSet.has(id);
+      if (hit.kind === 'hat') makeHatCard(id, i++, sgrid, secret);
+      else makeFurnCard(id, i++, sgrid, secret);
+    }
+
+    refreshStall();
+    refreshHats();
+    refreshFurniture();
+    startThumbs();
+  }
+
+  /** The stall's tab, its header line, and the empty case. */
+  function refreshStall() {
+    const stall = stallList();
+    const show = !!rot && (stall.length > 0 || rot.pool.length > 0);
+    stallTab.hidden = !show;
+    if (!show && lastTab === 'stall') selectTab('hats');
+    const found = revealed().length;
+    stallNote.textContent = '';
+    stallNote.append(
+      elm('b', null, 'The Cove Consignment. '),
+      elm('span', null, stall.length
+        ? 'Whatever came in on the boat this fortnight. When a crate goes back, everything you already bought stays yours.'
+        : 'The shelves are between crates just now. Nothing here is going away for good.'),
+      elm('span', 'shop-stall-when', ` ${rotateLine(rot?.until || 0)}`),
+    );
+    if (found > 0) {
+      stallNote.append(elm('span', 'shop-stall-when',
+        found === 1 ? ' One tucked-away find is on the shelf.' : ` ${found} tucked-away finds are on the shelf.`));
+    }
+    if (!stall.length && show && !sgrid.firstChild) {
+      sgrid.appendChild(elm('div', 'shop-stall-empty',
+        'Empty shelves, swept floor, one very patient stallholder. Come back when the boat is in.'));
+    }
+  }
+
+  /** Swap in a rotation that arrived while the wardrobe was open. */
+  function applyRotation(msg) {
+    const next = normalizeRotation(msg);
+    if (!next) return;
+    const windowChanged = (rot?.until || 0) !== next.until;
+    rot = next;
+    if (windowChanged) {
+      // a prop already picked up cannot be put back on the stand, so what this
+      // browser found this session is kept rather than quietly taken away
+      finds = [...new Set([...loadFinds(next.until), ...finds])];
+      saveFinds(next.until, finds);
+    }
+    for (const key of finds) preview?.takeFind(key);
+    refreshDyeNote();
+    buildRacks();
+    refreshSwatches();
+  }
 
   function ownedCount(id) {
     const owned = game.state.ownedFurniture;
@@ -1092,51 +1634,70 @@ export function openShop(game) {
   }
 
   // Thumbnails: build each catalog mesh once, blit it, throw the mesh away.
+  // A rotation can repaint the racks, so the queue is restartable: `furnBuild`
+  // is null until the chunk lands, false if there is none, and the builder
+  // after that. The shooter's GL context is created on demand and disposed the
+  // moment the queue drains, so the wardrobe never sits on two live contexts.
   let thumbRaf = 0;
   let shooter = null;
+  let furnBuild = null;
+  let thumbLoading = false;
 
   function paintFallbacks() {
     for (const job of thumbJobs) paintThumb(job.canvas, paintCrate);
     thumbJobs.length = 0;
   }
 
+  function stepThumbs() {
+    thumbRaf = 0;
+    if (closed) return;
+    const t0 = performance.now();
+    // a few per frame: 20 little renders in one go would hitch the modal
+    while (thumbJobs.length && performance.now() - t0 < 7) {
+      const job = thumbJobs.shift();
+      let obj = null;
+      try { obj = furnBuild(job.id); } catch { obj = null; }
+      let shot = false;
+      if (obj && obj.isObject3D) {
+        try { shot = shooter.shoot(obj); } catch { shot = false; }
+        disposeObject(obj);
+      }
+      paintThumb(job.canvas, shot
+        ? (ctx, w, h) => ctx.drawImage(shooter.canvas, 0, 0, w, h)
+        : paintCrate);
+    }
+    if (thumbJobs.length) { thumbRaf = requestAnimationFrame(stepThumbs); return; }
+    try { shooter?.dispose(); } catch { /* context may already be lost */ }
+    shooter = null;
+  }
+
   function startThumbs() {
-    if (!thumbJobs.length) return;
-    import('../world/furniture.js').then((mod) => {
-      if (closed) return;
-      const build = typeof mod.buildFurniture === 'function' ? mod.buildFurniture
-        : typeof mod.default === 'function' ? mod.default : null;
-      if (!build) { paintFallbacks(); return; }
+    if (closed || !thumbJobs.length || thumbRaf) return;
+    if (thumbLoading) return; // the import will call back in here when it lands
+    if (furnBuild === null) {
+      thumbLoading = true;
+      import('../world/furniture.js').then((mod) => {
+        thumbLoading = false;
+        furnBuild = typeof mod.buildFurniture === 'function' ? mod.buildFurniture
+          : typeof mod.default === 'function' ? mod.default : false;
+        if (!closed) startThumbs();
+      }).catch(() => {
+        thumbLoading = false;
+        furnBuild = false;
+        if (!closed) paintFallbacks();
+      });
+      return;
+    }
+    if (furnBuild === false) { paintFallbacks(); return; }
+    if (!shooter) {
       try {
         shooter = makeThumbShooter(thumbPW, thumbPH);
       } catch {
         paintFallbacks(); // no WebGL context to spare: crates it is
         return;
       }
-      const step = () => {
-        thumbRaf = 0;
-        if (closed) return;
-        const t0 = performance.now();
-        // a few per frame: 20 little renders in one go would hitch the modal
-        while (thumbJobs.length && performance.now() - t0 < 7) {
-          const job = thumbJobs.shift();
-          let obj = null;
-          try { obj = build(job.id); } catch { obj = null; }
-          let shot = false;
-          if (obj && obj.isObject3D) {
-            try { shot = shooter.shoot(obj); } catch { shot = false; }
-            disposeObject(obj);
-          }
-          paintThumb(job.canvas, shot
-            ? (ctx, w, h) => ctx.drawImage(shooter.canvas, 0, 0, w, h)
-            : paintCrate);
-        }
-        if (thumbJobs.length) { thumbRaf = requestAnimationFrame(step); return; }
-        try { shooter?.dispose(); } catch { /* context may already be lost */ }
-        shooter = null;
-      };
-      step();
-    }).catch(() => { if (!closed) paintFallbacks(); });
+    }
+    stepThumbs();
   }
 
   // ---- tabs ----------------------------------------------------------------
@@ -1150,7 +1711,7 @@ export function openShop(game) {
       t.setAttribute('aria-selected', on ? 'true' : 'false');
     }
     for (const p of panes) p.classList.toggle('is-on', p.dataset.pane === name);
-    subEl.textContent = name === 'furniture' ? SUB_FURN : SUB_WEAR;
+    subEl.textContent = name === 'furniture' ? SUB_FURN : name === 'stall' ? SUB_STALL : SUB_WEAR;
   }
   for (const t of tabs) {
     t.addEventListener('click', () => {
@@ -1159,7 +1720,7 @@ export function openShop(game) {
       game.audio?.play?.('click');
     });
   }
-  selectTab(lastTab === 'hats' || lastTab === 'furniture' ? lastTab : 'colors');
+  selectTab(['hats', 'furniture', 'stall'].includes(lastTab) ? lastTab : 'colors');
 
   // ---- live state ----------------------------------------------------------
   function setCoins(total) {
@@ -1182,13 +1743,36 @@ export function openShop(game) {
       syncPreview();
     }),
     game.events.on('furn', onFurn),
-    // reconnecting mid-browse turns the furniture buttons back on
-    game.events.on('net', () => refreshFurniture()),
+    game.events.on('dye', onDye),
+    // a rotation that lands mid-browse repaints the racks instead of going stale
+    game.events.on('shop-rot', (m) => { rotFromWire = true; applyRotation(m); }),
+    // and the calendar fallback, which also has to CLEAR the stall when the
+    // event that stocked it ends while somebody is stood in front of it
+    game.events.on('events', (m) => {
+      if (rotFromWire) return;
+      const synth = rotationFromEvents(m);
+      if (synth) { applyRotation(synth); return; }
+      if (!rot) return;
+      rot = null;
+      refreshDyeNote();
+      buildRacks();
+      refreshSwatches();
+    }),
+    // reconnecting mid-browse turns the furniture buttons back on, and is the
+    // moment to ask the stall what is on the shelves today
+    game.events.on('net', () => { refreshFurniture(); askRotation(); }),
   ];
 
+  /** One read, answered with a 'shop-rot' frame. Silent when nothing answers. */
+  function askRotation() {
+    if (!game.net?.connected) return;
+    try { game.net.send({ t: 'shop-rot' }); } catch { /* the cached rotation still stands */ }
+  }
+
+  // the countdown line is coarse (hours, days), so once a minute is plenty
+  const rotTick = setInterval(() => { if (!closed && rot) refreshStall(); }, 60000);
+
   refreshSwatches();
-  refreshHats();
-  refreshFurniture();
   syncPreview();
 
   // ---- close ---------------------------------------------------------------
@@ -1199,9 +1783,12 @@ export function openShop(game) {
     openInstance = null;
     clearPending();
     clearFurnPending();
+    clearDyePending();
+    clearInterval(rotTick);
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
     root.removeEventListener('pointerdown', onBackdrop);
+    canvas.removeEventListener('pointerdown', onStagePick);
     if (thumbRaf) { cancelAnimationFrame(thumbRaf); thumbRaf = 0; }
     thumbJobs.length = 0;
     try { shooter?.dispose(); } catch { /* context may already be lost */ }
@@ -1223,12 +1810,51 @@ export function openShop(game) {
     if (e.key === 'Escape') { e.preventDefault(); close(); }
   }
 
+  // ---- the hidden finds ----------------------------------------------------
+  /**
+   * A click on the diorama, raycast against the three tucked-away props. There
+   * is no cursor change and no tooltip on purpose: a secret that signposts
+   * itself is just a button, and the point of these is that one player tells
+   * another. Finding one reveals a piece of unannounced stall stock (the server
+   * already sent the ids, so a find can never mint anything a player could not
+   * otherwise buy); with no secret stock in this rotation it is a small warm
+   * moment and nothing more.
+   */
+  function onStagePick(e) {
+    if (!preview || closed) return;
+    if (e.button > 0) return; // right-drag orbits the world camera, it does not rummage
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const nx = ((e.clientX - r.left) / r.width) * 2 - 1;
+    const ny = -((e.clientY - r.top) / r.height) * 2 + 1;
+    let key = null;
+    try { key = preview.pick(nx, ny); } catch { key = null; }
+    if (!key || finds.includes(key)) return;
+    const before = revealed().length;
+    finds = [...finds, key];
+    saveFinds(rot?.until || 0, finds);
+    preview.takeFind(key);
+    preview.celebrate(1);
+    game.audio?.play?.('success');
+    const gained = revealed().length > before;
+    game.toast(FIND_LINES[(finds.length - 1) % FIND_LINES.length]
+      + (gained ? ' Something new is on the consignment shelf.' : ''), gained ? 4200 : 3000);
+    if (gained) { buildRacks(); selectTab('stall'); } else { refreshStall(); }
+  }
+
   root.addEventListener('pointerdown', onBackdrop);
+  canvas.addEventListener('pointerdown', onStagePick);
   q('.shop-x').addEventListener('click', close);
   addEventListener('keydown', onKey, true);
   card.focus({ preventScroll: true });
   game.audio?.play?.('whoosh');
-  startThumbs(); // after `closed` exists: the queue bails if the modal is gone
+
+  // after `closed` exists: buildRacks starts the thumbnail queue, which bails
+  // if the modal is already gone
+  for (const key of finds) preview?.takeFind(key);
+  refreshDyeNote();
+  buildRacks();
+  askRotation();
 
   openInstance = { close };
 }

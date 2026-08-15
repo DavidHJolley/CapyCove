@@ -302,6 +302,9 @@ export class NetClient {
         game.events.emit('a-role', m);
         break;
       case 'a-ok': case 'a-err': case 'announce': case 'report': case 'dd-vote': case 'a-schat':
+      // wave 13: the calendar bus, the consignment stall, the dye receipt,
+      // and the weekly charm hunt (src/world/charm.js + src/ui/events.js)
+      case 'events': case 'shop-rot': case 'dye': case 'charm': case 'charm-found':
       // wave 12 co-presence: room populations + friends' whereabouts
       case 'pop': case 'fpresence':
       // Capy Karts: the whole kart-* family rides through raw; the speedway

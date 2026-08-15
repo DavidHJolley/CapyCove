@@ -19,13 +19,16 @@ import * as chatlog from './chatlog.js';
 import * as reports from './reports.js';
 import * as econ from './econ.js';
 import * as kart from './kart.js';
+import * as events from './events.js';
+import * as charms from './charms.js';
+import * as stats from './stats.js';
 import * as log from './log.js';
 import { flush, markSeen, adminSeed, renameAccount, banActive } from './db.js';
 import { writeJsonAtomic } from './store.js';
 import {
   ROOM_IDS, ROOM_INFO, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
   NAME_MAX_LEN, NAME_MIN_LEN, clampCoinsForGame, MINIGAMES,
-  FURNITURE, HOUSE_MAX_ITEMS, HOUSE_ACCESS_MODES,
+  FURNITURE, HOUSE_MAX_ITEMS, HOUSE_ACCESS_MODES, BODY_COLORS,
 } from '../shared/constants.js';
 
 // Client-supplied strings must never reach a catalog through the prototype
@@ -240,7 +243,7 @@ app.get('/api/me', (req, res) => {
 // `rooms` counts the live room sets: the fixed ROOM_IDS plus however many dens
 // currently have someone standing in them. Handy for spotting a den that failed
 // to get reaped when its last visitor left.
-app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, sockets: wss.clients.size, audit: audit.stats(), econ: econ.stats(), ...log.health() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, sockets: wss.clients.size, audit: audit.stats(), econ: econ.stats(), events: events.eventStats(), charms: charms.stats(), stats: stats.stats(), ...log.health() }));
 app.get('/api/layout/:room', (req, res) => layouts.httpGet(req, res));
 
 // dev-only: lets automated playtests save canvas captures to disk
@@ -391,6 +394,7 @@ function joinRoom(p, roomId) {
   sendTo(p, clockFrame());
   // always, even with nothing running: it is also how a stale beacon clears
   sendTo(p, partiesFrame());
+  sendTo(p, events.frame()); // same reason: a stale event pill must clear
   if (roomId === BALL_ROOM) sendBall(p);
   if (roomId === MURAL_ROOM) sendMuralGrid(p);
   if (roomId === DRIFT_ROOM) sendBottle(p);
@@ -445,7 +449,12 @@ const cleanName = (s) => String(s || '').replace(/[^\w \-]/g, '').trim().slice(0
  */
 function grantCoins(p, amount, reason) {
   const now = Date.now();
-  const payout = Math.max(0, Math.floor(Number(amount) || 0));
+  const base = Math.max(0, Math.floor(Number(amount) || 0));
+  // wave 13A: the calendar multiplier rides on top of the ALREADY-CLAMPED
+  // honest payout and under the hourly backstop below. events.coinMult() is
+  // >= 1 always; Math.max is belt and braces on the owner's law that nothing
+  // may ever pay less.
+  const payout = Math.max(base, Math.floor(base * events.coinMult(p, reason)));
   if (payout <= 0) return 0;
   p.earned = p.earned.filter((e) => now - e.t < 3_600_000);
   if (p.earned.reduce((a, e) => a + e.n, 0) + payout > MAX_COINS_PER_HOUR) {
@@ -461,6 +470,7 @@ function grantCoins(p, amount, reason) {
   if (rec) rec.coins = next;
   p.coins = next;
   persist(p);
+  stats.grant(p, payout, reason); // the paid path only: a refused grant mints nothing
   sendTo(p, { t: 'coins', coins: p.coins, delta: payout, reason });
   return payout;
 }
@@ -486,6 +496,9 @@ reports.install({ audit: audit.log, sendTo, recordFor, findEntity, chatlog });
 layouts.install({ sendTo, broadcastAll, recordFor, audit: audit.log });
 econ.install({ sendTo, audit: audit.log, recordFor });
 kart.install({ sendTo, broadcastToRoom, world, has, log, audit: audit.log });
+events.install({ sendTo, broadcastAll, recordFor, audit: audit.log });
+charms.install({ users, saveSoon, grantCoins, sendTo, broadcastAll, broadcastToRoom, recordFor, audit: audit.log, requireCap: admin.requireCap });
+stats.install({ recordFor }); // wave 13B: the aggregate tee (data/stats/, npm run report)
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -498,6 +511,7 @@ function signal(name, p, data) {
   try { progress.signal(name, p, data); } catch (e) {
     console.error(`[progress] signal '${name}' failed:`, e?.message || e);
   }
+  stats.signal(name, p, data); // never throws; see server/stats.js
 }
 
 /**
@@ -581,6 +595,21 @@ function popFrame() {
   return {
     t: 'pop', rooms,
     lobbies: [{ game: 'sled', room: SLED_ROOM, n: sledLobby.length, need: SLED_LOBBY_MAX, ...(lobbyStartAt ? { countdownAt: lobbyStartAt } : {}) }],
+  };
+}
+
+/** The consignment stall: a thin read of the calendar's rotation block. */
+function shopRotFrame() {
+  const r = (typeof events.rotation === 'function' ? events.rotation() : null) || {};
+  const fx = typeof events.shopEffect === 'function' ? events.shopEffect() : null;
+  const ids = Array.isArray(r.ids) ? r.ids.slice(0, 24) : [];
+  if (fx && fx.featured && !ids.includes(fx.featured)) ids.unshift(fx.featured);
+  return {
+    t: 'shop-rot', ids,
+    pool: Array.isArray(r.pool) ? r.pool.slice(0, 96) : [],
+    secret: Array.isArray(r.secret) ? r.secret.slice(0, 4) : [],
+    dye: { price: Math.max(0, Math.min(200, Math.floor(Number(r.dyePrice) || 0))) },
+    until: Number(r.until) || 0,
   };
 }
 
@@ -2324,6 +2353,7 @@ wss.on('connection', (ws) => {
       // order is load-bearing: a muted player's line died above and must never
       // be logged as something they said; observe never consumes
       if (p) chatlog.observe(p, m);
+      if (p) stats.observe(p, m); // counts mgstart + report; never consumes
       if (p && reports.handleMessage(p, m)) return;
       if (p && layouts.handleMessage(p, m)) return;
       if (p && progress.handleMessage(p, m)) return;
@@ -2338,6 +2368,11 @@ wss.on('connection', (ws) => {
       // 'kart' (placement rewritten to the one the server assigned) without
       // consuming either.
       if (p && kart.handleMessage(p, m)) return;
+      // wave 13A: the calendar bus owns 'events' (a board read) plus the two
+      // admin one-off ops; it consumes nothing else.
+      if (p && events.handleMessage(p, m)) return;
+      // wave 13E: the weekly charm hunt owns 'charm', 'charm-claim', 'a-charm'
+      if (p && charms.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
           if (p) return;
@@ -2408,6 +2443,7 @@ wss.on('connection', (ws) => {
             title: typeof profile.title === 'string' ? profile.title : '',
           };
           world.players.set(p.id, p);
+          stats.sessionOpen(p);
           sendTo(p, { t: 'welcome', id: p.id, profile: { ...profile, registered: p.registered } });
           // the sky and any party in progress travel with the welcome: a client
           // that joins mid-evening must not open at noon and snap
@@ -2416,6 +2452,9 @@ wss.on('connection', (ws) => {
           // wave 12: the island's pulse and your friends' whereabouts arrive
           // with the welcome, and your friends hear that you are on
           sendTo(p, popFrame());
+          sendTo(p, events.frame());
+          sendTo(p, shopRotFrame());
+          sendTo(p, charms.frameFor(p));
           {
             const rec0 = recordFor(p);
             if (rec0) sendTo(p, fpresenceFrame(rec0));
@@ -2565,6 +2604,35 @@ wss.on('connection', (ws) => {
           p.ownedHats.push(m.hat);
           persist(p);
           sendTo(p, { t: 'shop', ok: true, coins: p.coins, delta: -hat.price, ownedHats: p.ownedHats, bought: m.hat });
+          stats.spend(p, hat.price, 'hat');
+          break;
+        }
+        case 'shop-rot':
+          if (socialLimited(p, t0)) break;
+          sendTo(p, shopRotFrame());
+          break;
+        case 'buy-dye': {
+          if (socialLimited(p, t0)) break;
+          const c = Math.floor(Number(m.color));
+          if (!Number.isFinite(c) || c < 0 || c > 0xffffff) return sendTo(p, { t: 'dye', ok: false, msg: 'That is not a colour.' });
+          const price = shopRotFrame().dye.price;
+          const rec = recordFor(p);
+          const paid = rec && Array.isArray(rec.dyes) ? rec.dyes : [];
+          const earned = rec && Array.isArray(rec.unlockedColors) ? rec.unlockedColors : [];
+          // free: no charge set, already paid for, a natural brown, or earned.
+          // rec.dyes is THE authority: a second browser or a cleared cache can
+          // never be charged again for a colour this account already bought.
+          if (price <= 0 || paid.includes(c) || BODY_COLORS.slice(0, 4).includes(c) || earned.includes(c)) {
+            return sendTo(p, { t: 'dye', ok: true, color: c, coins: p.coins, delta: 0, colors: paid });
+          }
+          const stored = rec ? rec.coins : p.coins;
+          const bal = Number.isFinite(stored) ? stored : 0;
+          if (bal < price) return sendTo(p, { t: 'dye', ok: false, msg: 'Not enough coins' });
+          if (rec) { rec.coins = bal - price; rec.dyes = [...paid, c].slice(-64); }
+          p.coins = bal - price;
+          persist(p);
+          stats.spend(p, price, 'dye');
+          sendTo(p, { t: 'dye', ok: true, color: c, coins: p.coins, delta: -price, colors: rec ? rec.dyes : [c] });
           break;
         }
 
@@ -2589,6 +2657,7 @@ wss.on('connection', (ws) => {
             // the 40-stamp milestone title, so the card shows what the name tag
             // shows (src/ui/profile.js prefers it over its own flavour line)
             title: (!target.bot && typeof rec?.title === 'string' && rec.title) || '',
+            ...charms.profileBits(rec),
           });
           break;
         }
@@ -2738,6 +2807,7 @@ wss.on('connection', (ws) => {
             t: 'furn', ok: true, coins: p.coins, delta: -item.price,
             ownedFurniture: { ...owned }, bought: m.id,
           });
+          stats.spend(p, item.price, 'furniture');
           break;
         }
 
@@ -3023,6 +3093,7 @@ wss.on('connection', (ws) => {
       persist(p);
       leaveWorld(p);
       log.info('ws.disconnect', { id: p.id, name: p.name, room: p.room, online: world.players.size });
+      stats.sessionClose(p);
     }
   });
   ws.on('error', () => {});
@@ -3045,6 +3116,7 @@ process.on('uncaughtException', (e) => {
     audit.log({ actor: null, via: 'system', op: audit.OPS.SERVER_UNCAUGHT, args: { name: e?.name || 'Error', at: String(e?.stack || e).slice(0, 800) }, ok: false });
     audit.flush();
     layouts.flush();
+    stats.flush();
     flush();
   } catch {}
 });
@@ -3109,6 +3181,9 @@ setInterval(() => {
   }
   try { progress.tick(CLOCK_MS / 1000, clockFrame()); } catch (e) {
     console.error('[progress] tick failed:', e?.message || e);
+  }
+  try { events.tick(Date.now()); } catch (e) {
+    console.error('[events] tick failed:', e?.message || e);
   }
 }, CLOCK_MS);
 

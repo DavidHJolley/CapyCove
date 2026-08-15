@@ -4,6 +4,7 @@ import { disposeObject } from './materials.js';
 import { createAvatar } from '../player/avatar.js';
 import { WalkController } from '../player/controller.js';
 import { attachOverlay, preloadLayout } from '../world/overlay.js';
+import { attachCharm } from '../world/charm.js';
 
 const DOWN = new THREE.Vector3(0, -1, 0);
 const _rayOrigin = new THREE.Vector3(); // snapY runs per remote per frame; don't allocate
@@ -214,6 +215,7 @@ export class Engine {
       this.scene = new THREE.Scene();
       this.room.build(this.scene, this.game);
       attachOverlay(this.room, this.scene, this.game, id);
+      attachCharm(this.room, this.scene, this.game, id);
       if (!this.room.groundMeshes?.length) console.warn(`[engine] room '${id}' has no groundMeshes`);
       this.scene.add(this.remoteGroup);
       postfx.setScene(this.scene, this.camera);
@@ -355,6 +357,7 @@ export class Engine {
     this.scene = new THREE.Scene();
     this.room.build(this.scene, this.game);
     attachOverlay(this.room, this.scene, this.game, this.room.id);
+    attachCharm(this.room, this.scene, this.game, this.room.id);
     this.scene.add(this.remoteGroup);
     postfx.setScene(this.scene, this.camera);
 

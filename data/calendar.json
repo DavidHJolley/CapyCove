@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "tz": "America/New_York",
+  "_note": "The Capy Cove live-ops calendar. Edit it and save: the server hot-reloads within a second and NEVER goes down for a broken edit (it keeps serving the last good calendar and shouts in the log). All times are America/New_York, always, on purpose. Effect verbs: coins {mult>=1, reasons|games}, decorate {room: theme}, spotlight <game>, doubleStamps, flag {name: value}, notice {headline, body}, sky {aurora, weather}, shop {featured, discount}, mural {cooldownMs}, bots {route, share}, quest {extra}, goal {id}. A coins mult below 1.0 is REFUSED at load: nothing here may ever make a payout smaller.",
+  "events": [
+    {
+      "id": "friday-fete",
+      "name": "Friday Fete",
+      "blurb": "Bunting in the plaza and every game pays one and a half until nine.",
+      "icon": "coin",
+      "when": { "rrule": "FRI", "start": "20:00", "durMin": 60 },
+      "rooms": ["*"],
+      "effects": {
+        "coins": { "mult": 1.5, "games": "*" },
+        "decorate": { "plaza": "bunting" },
+        "notice": {
+          "headline": "Friday Fete, 8pm ET.",
+          "body": "The plaza puts the bunting up and every game pays one and a half for an hour. Nothing to sign up for: just play."
+        }
+      },
+      "announce": {
+        "leadMin": 10,
+        "startMsg": "Friday Fete! The bunting is up and every game pays one and a half for an hour.",
+        "endMsg": "The Fete is over and the bunting stays up till morning. Nicely played, everyone."
+      }
+    },
+    {
+      "id": "sunday-splash",
+      "name": "Sunday Splash",
+      "blurb": "An afternoon in the water: buoys on the Drift, flags on the beach, and the fishing rods are out.",
+      "icon": "wave",
+      "when": { "rrule": "SUN", "start": "15:00", "durMin": 120 },
+      "rooms": ["drift", "beach"],
+      "effects": {
+        "decorate": { "drift": "splash-buoys", "beach": "splash-flags" },
+        "spotlight": "fishing",
+        "doubleStamps": true,
+        "flag": { "drift.bigblue.surface": "often" },
+        "notice": {
+          "headline": "Sunday Splash, 3pm ET.",
+          "body": "Two hours on the water. Big Blue surfaces more often, the beach flies its flags, and Reel Rush is in the spotlight."
+        }
+      },
+      "announce": {
+        "leadMin": 15,
+        "startMsg": "Sunday Splash! Buoys on the Drift, flags on the beach, and Big Blue is about."
+      }
+    }
+  ],
+  "oneoffs": []
+}
