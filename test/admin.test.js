@@ -76,7 +76,9 @@ const MIN = 60_000;
 
 test('capsFor is the whole matrix, and hands back a fresh array every time', () => {
   assert.deepEqual(capsFor('player'), []);
-  assert.deepEqual(capsFor('mod'), ['who', 'inspect', 'mute', 'kick', 'ban', 'tp', 'announce']);
+  // wave 12 added 'staffchat' to the mod rung (the roster + the staff channel).
+  // 'role' stayed admin-only: see test/staff.test.js.
+  assert.deepEqual(capsFor('mod'), ['who', 'inspect', 'mute', 'kick', 'ban', 'tp', 'announce', 'staffchat']);
   assert.deepEqual(capsFor('admin'), [...CAPS]);
   // an unknown or missing role is a player, never a crash and never an upgrade
   for (const junk of ['wizard', '', null, undefined, 42]) {

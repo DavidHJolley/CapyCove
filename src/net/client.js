@@ -290,7 +290,16 @@ export class NetClient {
       // ---- wave 9 (the spine): operator ops + the island banner ------------
       // Re-emitted raw; src/ui/admin.js owns the a-* shapes and the HUD owns
       // the banner. a-ok/a-err carry `op` = the full frame name they answer.
-      case 'a-ok': case 'a-err': case 'announce': case 'report': case 'dd-vote':
+      // staff suite: a-role is the SUBJECT's own new capability triple
+      // (profileBits verbatim), so it goes through game.applyModeration BEFORE
+      // the panel hears about it - that is what makes a freshly granted mod's
+      // open session gain the panel with no relog. a-schat is one line of the
+      // staff channel.
+      case 'a-role':
+        game.applyModeration(m);
+        game.events.emit('a-role', m);
+        break;
+      case 'a-ok': case 'a-err': case 'announce': case 'report': case 'dd-vote': case 'a-schat':
         game.events.emit(m.t, m);
         break;
       // ---- den tables / PvP matches (wave 4) -------------------------------

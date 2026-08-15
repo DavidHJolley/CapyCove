@@ -63,7 +63,9 @@
  *     {t:'a-resolve', id, state?, note?}        close one report
  *   server -> the SUBJECT of a role change (their open sessions, so a fresh
  *     mod gets the panel without relogging)
- *     {t:'a-role', role, caps, by, at}          + the usual {t:'toast'}
+ *     {t:'a-role', role, caps, muteUntil, by, at}   + the usual {t:'toast'}
+ *     (that is profileBits() verbatim, so the client handler is one line:
+ *      `game.applyModeration(m)` — src/core/game.js:222 already says so)
  *   server -> every ONLINE session holding any capability
  *     {t:'a-schat', from, role, text, at}       ephemeral, never stored
  * Both subject frames need ONE line each in src/net/client.js (re-emit onto
@@ -96,6 +98,16 @@
  * the den's own toast. Forced entry is an admin op with its own audit line and
  * it is not in this wave's scope.
  *
+ * DECISION (wave 12) - `role` is admin-only and can never be delegated. A mod
+ * who could make mods is an admin with extra steps, and the first thing a
+ * compromised mod account would do is mint three more.
+ *
+ * DECISION (wave 12) - staff chat is EPHEMERAL and FILTERED. Not stored, not
+ * replayed, audited as a count and never as content; and it goes through
+ * server/filter.js like every other line of player-authored text, because a
+ * slur typed by a moderator is the worst version of that message, not the
+ * excused one. What IS logged is that a line was sent and to how many people.
+ *
  * NO EARNING CAPS ANYWHERE. Nothing in this file touches grantCoins, the hourly
  * backstop, or any payout. The rate limits here bound OPERATOR actions only.
  *
@@ -108,6 +120,21 @@ import {
   muteActive, muteRemaining, banActive,
 } from './db.js';
 import { NAME_MAX_LEN } from '../shared/constants.js';
+// filter.js is a PURE module with zero imports (see its header), so this costs
+// nothing at boot and cannot be part of any cycle. Staff chat runs through it
+// for the same reason player chat does: the no-slurs tier has no staff door.
+import { check as filterCheck } from './filter.js';
+// The report queue. This IS a cycle (reports.js imports requireCap/actorFrom
+// from here) and it is safe in exactly one direction: everything reports.js
+// takes from this file is a hoisted `function` declaration, so it is defined
+// before either module's body runs. The rule that keeps it safe in the other
+// direction: NOTHING here may read a reports.js `const` at module-evaluation
+// time — if reports.js is the module that loaded first, its consts are still
+// in their TDZ while this file's body executes. So the OPS table below spells
+// its two capabilities ('inspect', 'mute') literally rather than importing
+// reports.READ_CAP / reports.ACT_CAP, and every other use is inside a function
+// body, which runs long after both modules are live.
+import * as reportsModule from './reports.js';
 
 // ---------------------------------------------------------------------------
 // roles and capabilities
@@ -139,9 +166,16 @@ export const RANK = Object.freeze({ player: 0, mod: 1, admin: 2 });
  *   editor    NOT an op: the Ctrl+E layout editor gate in src/main.js. This is
  *             the cap that closes the CLAUDE.md:141 deployment blocker, which
  *             is today a /^david/i test on a DISPLAY NAME.
+ *   role      a-role       grant/revoke a staff role. ADMIN ONLY, forever:
+ *             the cap that hands out capabilities cannot itself be handed to
+ *             the people it creates, or `mod` is admin with extra steps.
+ *   staffchat a-staff / a-schat   the roster and the staff channel. The one
+ *             new cap a mod DOES hold: a moderator who cannot reach the other
+ *             moderators is a moderator working alone at 2am.
  */
 export const CAPS = Object.freeze([
   'who', 'inspect', 'mute', 'kick', 'ban', 'ban-perm', 'unban', 'tp', 'announce', 'editor',
+  'role', 'staffchat',
 ]);
 
 const CAPS_BY_ROLE = {
@@ -152,7 +186,7 @@ const CAPS_BY_ROLE = {
   // Destructive-but-reversible, plus time-boxed bans. This is what makes
   // "trusted community member" a thing you can hand out. The role may go
   // unused at launch; carrying it costs nothing.
-  mod: Object.freeze(['who', 'inspect', 'mute', 'kick', 'ban', 'tp', 'announce']),
+  mod: Object.freeze(['who', 'inspect', 'mute', 'kick', 'ban', 'tp', 'announce', 'staffchat']),
   // Everything, including the editor gate.
   admin: Object.freeze([...CAPS]),
 };
@@ -213,8 +247,12 @@ function actorRole(x) {
  * here and it is muted everywhere, with no other edit anywhere in the server.
  * `emote` is deliberately absent: a muted player may still wave and dance.
  * They still play, still earn, still walk. Mute is not a jail.
+ *
+ * `a-schat` is here on purpose. An admin CAN mute a mod (the rank guard is
+ * strictly greater), and a mute that stops you talking to players but not to
+ * staff is not a mute, it is a change of audience.
  */
-export const MUTED_FRAMES = Object.freeze(['chat', 'whisper', 'mural', 'dd-guess', 'ph-msg']);
+export const MUTED_FRAMES = Object.freeze(['chat', 'whisper', 'mural', 'dd-guess', 'ph-msg', 'a-schat']);
 const MUTED_SET = new Set(MUTED_FRAMES);
 
 /** How long a mute may run, by the actor's role. Admin's ceiling is a year. */
@@ -234,6 +272,19 @@ const OP_BURST = 5;
 const OP_WINDOW_MS = 1000;
 /** a-who is a scan and gets its own, tighter budget (spec 3.3). */
 const WHO_EVERY_MS = 2000;
+/**
+ * Staff chat is a CONVERSATION, not an operator action, so it gets its own
+ * budget on top of the 5-ops-a-second one: about a line a second, which is
+ * faster than anyone types and slow enough that a compromised mod account
+ * cannot paper the staff channel.
+ */
+const SCHAT_EVERY_MS = 1000;
+/** One staff line. Longer than a chat line (staff paste ids and reasons). */
+const SCHAT_MAX_LEN = 300;
+/** Rows a single a-staff returns. The roster is people, not accounts. */
+const STAFF_MAX_ROWS = 100;
+/** Reports a single a-reports page may carry. */
+const REPORTS_MAX_ROWS = 50;
 /** A muted player is told once a minute, not once a keystroke. */
 const MUTE_TOAST_EVERY_MS = 60_000;
 /** How often a still-connected banned session is re-checked and closed. */
@@ -251,6 +302,7 @@ const offlineBudget = new Map();
 
 const stats = {
   ops: 0, refused: 0, probes: 0, mutedFrames: 0, bannedFrames: 0, errors: 0,
+  roleChanges: 0, staffLines: 0,
 };
 
 const own = (o, k) => typeof k === 'string' && Object.prototype.hasOwnProperty.call(o, k);
@@ -297,7 +349,7 @@ function humanMs(ms) {
 
 function sched(p) {
   let s = scratch.get(p);
-  if (!s) { s = { w: 0, n: 0, whoAt: 0, muteToastAt: 0, banAt: 0, seen: Date.now() }; scratch.set(p, s); }
+  if (!s) { s = { w: 0, n: 0, whoAt: 0, schatAt: 0, muteToastAt: 0, banAt: 0, seen: Date.now() }; scratch.set(p, s); }
   return s;
 }
 
@@ -316,18 +368,26 @@ function budget(actor, now) {
   return ++b.n > OP_BURST;
 }
 
-function whoBudget(actor, now) {
+/**
+ * A minimum GAP between two calls of one op by one actor, on the same two
+ * stores the burst budget uses. `field` names the last-call stamp, so a-who's
+ * scan budget and a-schat's typing budget cannot spend each other.
+ * Returns true when the call is too soon.
+ */
+function gapBudget(actor, now, field, everyMs) {
   let b;
   if (actor.p) b = sched(actor.p);
   else {
     const key = actor.uid || actor.key || '?';
     b = offlineBudget.get(key);
-    if (!b) { b = { w: 0, n: 0, whoAt: 0 }; offlineBudget.set(key, b); }
+    if (!b) { b = { w: 0, n: 0, whoAt: 0, schatAt: 0 }; offlineBudget.set(key, b); }
   }
-  if (now - b.whoAt < WHO_EVERY_MS) return true;
-  b.whoAt = now;
+  if (now - (b[field] || 0) < everyMs) return true;
+  b[field] = now;
   return false;
 }
+
+const whoBudget = (actor, now) => gapBudget(actor, now, 'whoAt', WHO_EVERY_MS);
 
 function send(actor, msg) {
   if (actor.p && ctx?.sendTo) { try { ctx.sendTo(actor.p, msg); } catch { /* socket died */ } }
@@ -493,12 +553,32 @@ const OPS = {
   kick: { cap: 'kick', target: true, mutates: true, run: opKick },
   tp: { cap: 'tp', target: true, mutates: false, run: opTp },
   announce: { cap: 'announce', target: false, mutates: false, run: opAnnounce },
+  // --- wave 12: the staff surface ------------------------------------------
+  // `role` mutates a record but declares `mutates: false`, which is the ONE
+  // deliberate exception in this table and needs saying out loud: the shared
+  // guard is "strictly greater rank", and a role op has to be able to demote a
+  // PEER admin (that is the whole point of having more than one). Its own
+  // guards live in opRole and are stricter in every other direction — admin
+  // only, never yourself, never above your own rank, never the last admin —
+  // and every refusal is audited with its own deny code.
+  role: { cap: 'role', target: true, mutates: false, run: opRole },
+  staff: { cap: 'staffchat', target: false, mutates: false, run: opStaff },
+  schat: { cap: 'staffchat', target: false, mutates: false, run: opSchat },
+  // Spelled literally, NOT read from reports.READ_CAP / reports.ACT_CAP: see
+  // the import header for why this table may not touch a reports.js const.
+  reports: { cap: 'inspect', target: false, mutates: false, run: opReports },
+  resolve: { cap: 'mute', target: false, mutates: false, run: opResolve },
 };
 
 /** Audit op names (accounts-admin.md 7.2 vocabulary). */
 const AUDIT_NAME = {
   who: 'mod.who', inspect: 'mod.inspect', mute: 'mod.mute', unmute: 'mod.unmute',
   ban: 'mod.ban', unban: 'mod.unban', kick: 'mod.kick', tp: 'mod.tp', announce: 'mod.say',
+  // A successful role change overrides this with audit.js's own role.grant /
+  // role.revoke (see opRole's _audit.op); `role.set` is what a REFUSAL logs as,
+  // because a refusal granted and revoked nothing.
+  role: 'role.set', staff: 'mod.staff', schat: 'mod.staffchat',
+  reports: 'mod.reports', resolve: 'mod.report.resolve',
 };
 
 // ---------- reads ----------
@@ -737,6 +817,281 @@ function opAnnounce(actor, _t, args) {
   return { ok: true, msg: 'Announced to the whole island', text, _audit: { args: { note: text } } };
 }
 
+// ---------- staff: roles, the roster, the staff channel ----------
+
+/**
+ * Every live session that holds ANY capability — the staff channel's audience,
+ * and the definition of "on duty". Read from the record every single time: a
+ * role granted ten seconds ago is in the fan-out of the next line, and a role
+ * revoked ten seconds ago is out of it, with nothing cached anywhere to go
+ * stale. Guests and bots have no record and can never be in this list.
+ */
+function staffSessions() {
+  const out = [];
+  const players = ctx?.world?.players;
+  if (!players || typeof players.values !== 'function' || typeof ctx.recordFor !== 'function') return out;
+  for (const p of players.values()) {
+    if (!p || p.bot || !p.registered) continue;
+    const rec = ctx.recordFor(p);
+    if (!rec) continue;
+    if (!capsFor(roleOf(rec)).length) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+/** Admins on the island other than `rec`. The island must never reach zero. */
+function adminsBesides(rec) {
+  let n = 0;
+  for (const [, other] of store.allUsers()) {
+    if (other === rec) continue;
+    if (roleOf(other) === 'admin') n++;
+  }
+  return n;
+}
+
+/** The report queue module. ctx may inject one (tests, a future split). */
+function reportsApi() {
+  const injected = ctx?.reports;
+  if (injected && typeof injected.queue === 'function') return injected;
+  return reportsModule;
+}
+
+/**
+ * Grant or revoke a staff role. The rules, in the order they are checked:
+ *
+ *   1. ADMIN ONLY. The `role` capability is admin-only in CAPS_BY_ROLE and
+ *      this re-checks the rank anyway, because the day someone widens that
+ *      table by accident must not be the day mods can mint mods.
+ *   2. Never a role above your own rank. An admin granting `admin` is the one
+ *      case where equal is allowed, and it is deliberate: the owner has to be
+ *      able to hand the island to a second person without editing users.json.
+ *   3. Never yourself. Not a promotion, not a demotion, not a no-op. The way
+ *      an operator account gets its role is the COVE_ADMIN seed or another
+ *      admin, and that is what makes the audit line worth reading.
+ *   4. Never the LAST admin. See adminsBesides: with rules 1 and 3 in force
+ *      the actor is themselves a stored admin, so this cannot fire on the
+ *      in-game path — it is the backstop for every other caller (the panel,
+ *      a script, a future service actor whose authority is not a stored
+ *      record). An island with no admin cannot appoint one from inside the
+ *      game, and that is a restore-from-backup afternoon.
+ *
+ * The change persists (setRole -> saveSoon), revokes every issued token
+ * (setRole bumps tokenV, the same revocation bumpTokenV performs for a ban),
+ * and reaches the target's OPEN sessions immediately: the server re-reads the
+ * record on every capability check, so their new powers are live before the
+ * frame is even sent, and the `a-role` frame is only there so their CLIENT
+ * catches up without relogging.
+ */
+function opRole(actor, t, args) {
+  if (t.bot) return err('The cove citizens do not hold office', 'bot');
+  if (!t.rec) return err('Guests have no account to hold a role', 'guest');
+
+  const want = String(args.role ?? '').trim().toLowerCase();
+  if (!isRole(want)) return err(`Role must be one of: ${ROLES.join(', ')}`, 'args');
+  if (rankOf(actor.role) < RANK.admin) return err('Only an admin may change roles', 'cap');
+  if ((RANK[want] ?? 0) > rankOf(actor.role)) return err('You cannot grant a role above your own', 'rank');
+
+  const isSelf = (actor.rec && t.rec === actor.rec)
+    || (actor.uid && t.uid && actor.uid === t.uid)
+    || t.sessions.some((s) => actor.p && s.id === actor.p.id);
+  if (isSelf) return err('You cannot change your own role', 'self');
+
+  const before = roleOf(t.rec);
+  if (before === want) return err(`${t.name} is already ${before}`, 'noop');
+  if (before === 'admin' && want !== 'admin' && adminsBesides(t.rec) < 1) {
+    return err(`${t.name} is the last admin on the island: promote someone else first`, 'lastadmin');
+  }
+
+  // setRole validates the role, writes it, bumps tokenV (the same revocation a
+  // ban performs with bumpTokenV) and calls saveSoon itself: db.js:245.
+  if (!setRole(t.rec, want)) return err('That role did not stick', 'error');
+  stats.roleChanges++;
+
+  const caps = capsFor(want);
+  const at = Date.now();
+  // The subject's own sessions: the capability triple first (the panel repaints
+  // off this), then the sentence a human reads.
+  //
+  // The payload is profileBits() verbatim — {role, caps, muteUntil} — because
+  // the client seam this lands on is `game.applyModeration(bits)`
+  // (src/core/game.js:222), and that function re-derives ALL THREE from what it
+  // is handed: "absent fields mean not privileged, never keep". Sending role
+  // and caps alone would quietly un-mute a muted mod's client the moment they
+  // were promoted, and the client would then let them type into a chat box the
+  // server still refuses.
+  for (const s of t.sessions) {
+    try { ctx.sendTo(s, { t: 'a-role', ...profileBits(t.rec), by: actor.name, at }); } catch { /* socket died */ }
+  }
+  toastAll(t.sessions, want === 'player'
+    ? `${actor.name} has ended your staff role. Thank you for looking after the cove.`
+    : `${actor.name} made you ${want === 'admin' ? 'an admin' : 'a mod'} of the cove. Ctrl+Shift+A opens the staff panel.`);
+
+  const up = (RANK[want] ?? 0) > (RANK[before] ?? 0);
+  return {
+    ok: true,
+    msg: `${t.name}: ${before} -> ${want}${t.sessions.length ? ' (live now)' : ''}`,
+    uid: t.uid, name: t.name, role: want, was: before, caps, sessions: t.sessions.length,
+    _audit: {
+      op: up ? 'role.grant' : 'role.revoke',
+      before: { role: before },
+      after: { role: want, tokenV: t.rec.tokenV | 0 },
+      args: { role: want, was: before, sessions: t.sessions.length },
+    },
+  };
+}
+
+/**
+ * The staff roster: who holds a role, who is on duty right now, and when the
+ * rest were last seen. Gated on `staffchat` rather than `who` on purpose —
+ * this is the list of people you can talk to in the staff channel, and every
+ * staff member can see their own colleagues. No player ever sees it.
+ */
+function opStaff(actor, _t, _args) {
+  const now = Date.now();
+  const rows = [];
+  for (const [key, rec] of store.allUsers()) {
+    const role = roleOf(rec);
+    if (role === 'player') continue;
+    const sessions = typeof ctx?.sessionsFor === 'function' ? ctx.sessionsFor(key) : [];
+    const online = sessions.length > 0;
+    rows.push({
+      uid: rec.uid || '',
+      name: rec.username || key,
+      role,
+      online,
+      room: online ? (sessions[0].room || '') : '',
+      sessions: sessions.length,
+      lastSeen: online ? now : (rec.lastSeen || 0),
+      muted: muteRemaining(rec, now) > 0,
+    });
+    if (rows.length >= STAFF_MAX_ROWS) break;
+  }
+  // On duty first, then seniority, then alphabetical: the useful half on top.
+  rows.sort((a, b) => (Number(b.online) - Number(a.online))
+    || (rankOf(b.role) - rankOf(a.role))
+    || a.name.localeCompare(b.name));
+  const on = rows.filter((r) => r.online).length;
+  return {
+    ok: true,
+    msg: `${rows.length} staff, ${on} on duty`,
+    staff: rows,
+    online: on,
+    // The panel builds its role dropdown from THIS, never from a hard-coded
+    // list, so adding a rung to the ladder is still a one-file change.
+    roles: [...ROLES],
+    canRole: requireCap(actor, 'role'),
+  };
+}
+
+/**
+ * One line to every staff member who is online. EPHEMERAL: not stored, not
+ * logged, not replayed on join — the same deal room chat gets, for the same
+ * reason (a channel that is quietly archived forever is a channel nobody says
+ * anything real in).
+ *
+ * Staff are NOT exempt from the filter. The mask tier is masked and the block
+ * tier is refused, exactly as it is for a nine-year-old in the plaza: a slur
+ * typed by a moderator is the worst version of that message, not the excused
+ * one. Mild profanity passes here as it passes everywhere else.
+ *
+ * The audit line records that a line WAS SENT and to how many people. Never
+ * the words: 9D's redactor would strip a `text` key anyway, and a staff
+ * channel whose contents land in a 90-day operator log is a staff channel that
+ * gets used for nothing.
+ */
+function opSchat(actor, _t, args) {
+  const raw = String(args.text ?? '').replace(/\s+/g, ' ').trim().slice(0, SCHAT_MAX_LEN);
+  if (!raw) return err('Nothing to say', 'args');
+  // The gap is spent BEFORE the filter runs, so a refused line costs the same
+  // second a delivered one does: otherwise the wordlist can be mapped out at
+  // whatever rate the socket allows, one candidate word per frame.
+  if (gapBudget(actor, Date.now(), 'schatAt', SCHAT_EVERY_MS)) return err('One line a second, please', 'slow');
+
+  const verdict = filterCheck(raw);
+  if (!verdict.ok) return err(verdict.msg || 'That one stays out of the cove.', 'filtered');
+  const text = typeof verdict.cleaned === 'string' && verdict.cleaned ? verdict.cleaned : raw;
+
+  const at = Date.now();
+  const frame = { t: 'a-schat', from: actor.name, role: actor.role, text, at };
+  const audience = staffSessions();
+  let to = 0;
+  for (const s of audience) { try { ctx.sendTo(s, frame); to++; } catch { /* socket died */ } }
+  stats.staffLines++;
+  return {
+    ok: true,
+    // The sender is in the fan-out too (they hold a capability by definition),
+    // so their own line arrives the same way everyone else's does and the panel
+    // needs no local echo that could disagree with what was actually sent.
+    msg: `Sent to ${to} on duty`,
+    to, at, masked: verdict.changed === true,
+    _audit: { args: { to, chars: text.length, masked: verdict.changed === true } },
+  };
+}
+
+/**
+ * The open report queue, straight off server/reports.js's own seam. Nothing is
+ * re-implemented here: `queue()` already folds the append-only store, counts
+ * the states and pages. This op exists so the in-game panel can read the queue
+ * through the ONE road every other operator action takes.
+ */
+function opReports(_actor, _t, args) {
+  const api = reportsApi();
+  if (!api || typeof api.queue !== 'function') return err('The report queue is not wired', 'unavailable');
+  const asked = String(args.state ?? '').trim().toLowerCase();
+  // Default to the unanswered ones: an operator opening the queue wants the
+  // inbox, not the archive. 'all' is how the panel asks for everything.
+  const state = asked === 'all' ? '' : (asked || 'open');
+  const limit = Math.min(REPORTS_MAX_ROWS, Math.max(1, Math.floor(Number(args.limit)) || 25));
+  const out = api.queue({
+    state,
+    kind: typeof args.kind === 'string' ? args.kind.slice(0, 24) : '',
+    room: typeof args.room === 'string' ? args.room.slice(0, 32) : '',
+    q: typeof args.q === 'string' ? args.q.slice(0, 40) : '',
+    limit,
+    offset: args.offset,
+  }) || {};
+  const rows = Array.isArray(out.reports) ? out.reports : [];
+  return {
+    ok: true,
+    msg: `${rows.length} report${rows.length === 1 ? '' : 's'}${state ? ` (${state})` : ''}`,
+    state,
+    reports: rows,
+    counts: out.counts || {},
+    total: out.total | 0,
+    offset: out.offset | 0,
+    done: out.done !== false,
+    _audit: { args: { state, n: rows.length } },
+  };
+}
+
+/**
+ * Close one report. reports.setState does its own capability check (its
+ * ACT_CAP) and writes its own `report.state` audit line; this adds the
+ * operator-side line, so "who closed what, from where" is answerable from the
+ * admin log alone. Two gates, one road — reports.js's own words.
+ */
+function opResolve(actor, _t, args) {
+  const api = reportsApi();
+  if (!api || typeof api.setState !== 'function') return err('The report queue is not wired', 'unavailable');
+  const id = String(args.id ?? '').trim().slice(0, 64);
+  if (!id) return err('Which report?', 'args');
+  const want = String(args.state ?? 'actioned').trim().toLowerCase();
+  if (!['reviewed', 'actioned', 'dismissed'].includes(want)) {
+    return err("A report moves to 'reviewed', 'actioned' or 'dismissed'", 'args');
+  }
+  const note = cleanReason(args.note);
+  const res = api.setState(actor, id, want, { note, via: actor.via });
+  if (!res || !res.ok) return err(res?.msg || 'That report did not move', res?.code || 'refused');
+  return {
+    ok: true,
+    msg: res.msg || `Report ${want}`,
+    id: res.id || id,
+    state: res.state || want,
+    _audit: { args: { report: res.id || id, state: res.state || want }, after: { state: res.state || want } },
+  };
+}
+
 /** The line a banned player sees, everywhere a ban is enforced. */
 export function banMessage(rec) {
   const b = banActive(rec);
@@ -816,7 +1171,10 @@ export function performOp(actor, op, args = {}) {
     delete res._audit;
     stats.ops++;
     if (!res.ok) stats.refused++;
-    audit(AUDIT_NAME[name] || `mod.${name}`, a, target, extra.args || pickArgs(name, args), {
+    // `extra.op` lets ONE op log under two names when the difference is what
+    // an auditor is reading for: a role change is `role.grant` or
+    // `role.revoke`, never a flat `role.set` (audit.js OPS §7.2).
+    audit(extra.op || AUDIT_NAME[name] || `mod.${name}`, a, target, extra.args || pickArgs(name, args), {
       ok: res.ok !== false,
       ...(extra.before ? { before: extra.before } : {}),
       ...(extra.after ? { after: extra.after } : {}),
@@ -835,6 +1193,11 @@ export function performOp(actor, op, args = {}) {
 function pickArgs(name, args) {
   if (name === 'who') return { room: args.room || '', q: args.q || '' };
   if (name === 'inspect') return { uid: args.uid || '', name: args.name || '', id: args.id || '' };
+  if (name === 'role') return { role: String(args.role ?? '').slice(0, 16), uid: args.uid || '', name: args.name || '', id: args.id || '' };
+  // NEVER the words. A refused staff line logs its length, not its content.
+  if (name === 'schat') return { chars: String(args.text ?? '').length };
+  if (name === 'reports') return { state: String(args.state ?? '').slice(0, 16) };
+  if (name === 'resolve') return { report: String(args.id ?? '').slice(0, 64), state: String(args.state ?? '').slice(0, 16) };
   return {};
 }
 

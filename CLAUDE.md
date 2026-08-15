@@ -131,6 +131,19 @@ first, COVE_LOG_LEVEL/COVE_LOG_PRETTY), /api/health carries econ + log + frame
 counters. Tests: npm test runs test/**/*.test.js + tests/**/*.test.mjs; CI in
 .github/workflows/ci.yml builds with COVE_STRICT_BUILD=1 (a surviving
 window.__x debug handle fails the build; clearing `= null` writes are fine).
+Shipped staff suite: `a-role` {target, role} / `a-staff` / `a-schat` {text} /
+`a-reports` {state?,kind?,limit?,offset?} / `a-resolve` {id, state?, note?},
+all handled inside server/admin.js performOp (NO index.js change: index.js
+already routes every a-* frame to admin.handleMessage first). New caps:
+'role' (ADMIN ONLY) and 'staffchat' (mod + admin). Role rules: admin only,
+never your own role, never above your own rank (admin->admin allowed), never
+the last admin; the change bumps tokenV, persists, and re-caps open sessions
+live. Two new server->client frames: `a-role` {role, caps, muteUntil, by, at}
+to the SUBJECT (profileBits verbatim -> game.applyModeration) and `a-schat`
+{from, role, text, at} to every online session holding any capability. Staff
+chat is EPHEMERAL, passes server/filter.js, ~1 line/s per sender, audited as
+a COUNT never content, and 'a-schat' is in MUTED_FRAMES (a muted mod is muted
+there too). a-reports/a-resolve ride server/reports.js's existing queue().
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.
