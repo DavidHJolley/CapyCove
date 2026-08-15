@@ -1720,7 +1720,13 @@ function openEditor(game) {
     lastPick = { x: e.clientX, y: e.clientY, index };
     const h = list[index];
     const chain = topChain(h.object);
-    selectEntries([entryFromLevel({ chain, levels: levelsFor(chain, h.instanceId ?? null, h.faceIndex ?? null), depth: 0 })]);
+    const levels = levelsFor(chain, h.instanceId ?? null, h.faceIndex ?? null);
+    // An InstancedMesh's "whole prop" is the room's ENTIRE batch (every bench
+    // at once), so a click starts at the single instance that was hit; Tab
+    // still wraps up to the batch. Authored groups and welded pieces keep the
+    // whole-prop-first order, where depth 0 really is one prop.
+    const depth = levels[levels.length - 1]?.kind === 'instance' ? levels.length - 1 : 0;
+    selectEntries([entryFromLevel({ chain, levels, depth })]);
     startInspectDrag(e);
   }
 
@@ -1833,11 +1839,35 @@ function openEditor(game) {
       game.toast(sel.size ? `${sel.size} selected` : 'Nothing in the box');
       return;
     }
+    // Never grab a batch whole from a marquee: rooms keep ALL their benches in
+    // one InstancedMesh (or one merged mesh), usually with its origin at 0,0,
+    // so the old whole-object origin test swept every bench in the room into
+    // the selection and a drag moved all of them at once.
     const picked = [];
+    const CAP = 400;
     for (const child of engine.scene.children) {
       if (!isPickable(child)) continue;
-      if (inBand(child.getWorldPosition(v))) picked.push(makeEntry(child));
+      if (child.isInstancedMesh) {
+        for (let i = 0; i < child.count && picked.length <= CAP; i++) {
+          child.getMatrixAt(i, _m);
+          if (inBand(child.localToWorld(v.setFromMatrixPosition(_m)))) picked.push(makeEntry(child, i));
+        }
+        continue;
+      }
+      const pk = child.isMesh && child.geometry ? piecesOf(child.geometry) : null;
+      if (pk && pk.pieces.length > 1) {
+        for (let i = 0; i < pk.pieces.length && picked.length <= CAP; i++) {
+          const p = pk.pieces[i];
+          if (inBand(v.copy(p.center).applyMatrix4(child.matrixWorld))) picked.push(makeEntry(child, null, p, i, pk.pieces.length));
+        }
+        continue;
+      }
+      // plain prop: test the centre of its bounds, not its origin, so a group
+      // authored about the room origin is only caught where it actually sits
+      const b = new THREE.Box3().setFromObject(child);
+      if (!b.isEmpty() && inBand(b.getCenter(v))) picked.push(makeEntry(child));
     }
+    if (picked.length > CAP) { game.toast('Box too big, grabbed nothing'); return; }
     selectEntries(picked);
     game.toast(picked.length ? `${picked.length} selected` : 'Nothing in the box');
   }
