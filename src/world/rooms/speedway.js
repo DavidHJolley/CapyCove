@@ -978,19 +978,12 @@ export class SpeedwayRoom extends Room {
       label: this._joinLabel(),
       action: (g) => {
         if (g.net?.connected) {
-          // grand prix: the sign-on carries this capy's kart pick and track
-          // vote (kart.js's own localStorage keys, §A4/§A5); the server
-          // coerces unknown ids to coco/sunny, so this is safe standalone
-          if (this._signedOn) {
-            g.net.send({ t: 'kart-leave' });
-          } else {
-            let kart = 'coco'; let track = 'sunny';
-            try {
-              kart = localStorage.getItem('cove.kart.pick') || kart;
-              track = localStorage.getItem('cove.kart.track') || track;
-            } catch { /* storage off: race the defaults */ }
-            g.net.send({ t: 'kart-join', kart, track });
-          }
+          // Grand prix, owner's request: the kart pick and the track VOTE
+          // happen right here at the gate, on a little race card, not off in
+          // the practice screen. Signing on (and re-picking while signed on)
+          // sends kart-join {kart, track}; the server coerces unknown ids to
+          // coco/sunny, so the card can never send something harmful.
+          this._openRaceCard(g);
         } else {
           // offline: no sheet to sign, so the pit wall just starts a solo race
           g.__kartCtx = null;
@@ -1089,6 +1082,172 @@ export class SpeedwayRoom extends Room {
     if (el) el.textContent = label;
   }
 
+  // ==========================================================================
+  // The race card: kart pick + track vote AT THE GATE (owner's request).
+  // Ids are the frozen §A1/§A4 contract set; blurbs are the paddock's own.
+  // The server coerces unknown ids, and dart/fern's unlock is the same
+  // client-side races-run ceremony kart.js uses (cove.kart.runs).
+  // ==========================================================================
+
+  static KARTS = [
+    { id: 'coco', name: 'Coco', blurb: 'the all-rounder' },
+    { id: 'reef', name: 'Reef', blurb: 'corners like a dream' },
+    { id: 'biscuit', name: 'Biscuit', blurb: 'heavy and unbothered' },
+    { id: 'dart', name: 'Dart', blurb: 'all gas', unlockRuns: 10 },
+    { id: 'fern', name: 'Fern', blurb: 'featherweight', unlockRuns: 25 },
+  ];
+
+  static TRACKS = [
+    { id: 'sunny', name: 'Sunny Circuit', blurb: 'the beachside classic' },
+    { id: 'summit', name: 'Summit', blurb: 'climbs, ice, one big hairpin' },
+    { id: 'tangle', name: 'Tangle', blurb: 'vines and rolling boulders' },
+    { id: 'glimmer', name: 'Glimmer Deep', blurb: 'banked curves and a leap' },
+  ];
+
+  _openRaceCard(g) {
+    if (this._raceCard) { this._closeRaceCard(); return; }
+    let runs = 0; let pick = 'coco'; let vote = 'sunny';
+    try {
+      runs = Math.max(0, Math.floor(Number(localStorage.getItem('cove.kart.runs')) || 0));
+      pick = localStorage.getItem('cove.kart.pick') || pick;
+      vote = localStorage.getItem('cove.kart.track') || vote;
+    } catch { /* storage off: defaults race fine */ }
+    if (!SpeedwayRoom.KARTS.some((k) => k.id === pick)) pick = 'coco';
+    if (!SpeedwayRoom.TRACKS.some((t) => t.id === vote)) vote = 'sunny';
+
+    const card = document.createElement('div');
+    card.className = 'kkc-card';
+    this._ensureCardStyles();
+    const kartRow = (k) => {
+      const locked = k.unlockRuns && runs < k.unlockRuns;
+      return `<button class="kkc-chip${k.id === pick ? ' is-on' : ''}${locked ? ' is-locked' : ''}"
+        data-kart="${k.id}" ${locked ? 'disabled' : ''}
+        title="${locked ? `${k.unlockRuns - runs} more races to unlock` : k.blurb}">
+        ${k.name}${locked ? ` <span class="kkc-lock">${k.unlockRuns} races</span>` : ''}</button>`;
+    };
+    const trackRow = (t) => `<button class="kkc-track${t.id === vote ? ' is-on' : ''}" data-track="${t.id}">
+      <b>${t.name}</b><span>${t.blurb}</span><i class="kkc-votes" data-votes="${t.id}"></i></button>`;
+    card.innerHTML = `
+      <div class="kkc-head">Race day!<span>pick your ride, vote the track</span></div>
+      <div class="kkc-sec">Your kart</div>
+      <div class="kkc-karts">${SpeedwayRoom.KARTS.map(kartRow).join('')}</div>
+      <div class="kkc-sec">The track (most votes wins, ties take turns)</div>
+      <div class="kkc-tracks">${SpeedwayRoom.TRACKS.map(trackRow).join('')}</div>
+      <div class="kkc-row">
+        <button class="kkc-go"></button>
+        <button class="kkc-leave" hidden>Leave the sheet</button>
+        <button class="kkc-x">Close</button>
+      </div>`;
+    document.body.appendChild(card);
+    this._raceCard = card;
+    this._cardPick = pick;
+    this._cardVote = vote;
+
+    const go = card.querySelector('.kkc-go');
+    const leave = card.querySelector('.kkc-leave');
+    const syncButtons = () => {
+      go.textContent = this._signedOn ? 'Update my pick' : 'Sign on!';
+      leave.hidden = !this._signedOn;
+    };
+    syncButtons();
+    this._cardSync = syncButtons;
+
+    card.addEventListener('click', (e) => {
+      const chip = e.target.closest('[data-kart]');
+      const trk = e.target.closest('[data-track]');
+      if (chip && !chip.disabled) {
+        this._cardPick = chip.dataset.kart;
+        for (const el of card.querySelectorAll('[data-kart]')) el.classList.toggle('is-on', el === chip);
+        g.audio?.play?.('click');
+        return;
+      }
+      if (trk) {
+        this._cardVote = trk.dataset.track;
+        for (const el of card.querySelectorAll('[data-track]')) el.classList.toggle('is-on', el === trk);
+        g.audio?.play?.('click');
+        return;
+      }
+      if (e.target === go) {
+        try {
+          localStorage.setItem('cove.kart.pick', this._cardPick);
+          localStorage.setItem('cove.kart.track', this._cardVote);
+        } catch { /* the send below still carries them */ }
+        // a repeat kart-join UPDATES the existing signature (§A5), so this one
+        // button is both "sign on" and "change my vote"
+        g.net.send({ t: 'kart-join', kart: this._cardPick, track: this._cardVote });
+        if (this._signedOn) g.toast?.('Pick updated!');
+        this._closeRaceCard();
+        return;
+      }
+      if (e.target === leave) {
+        g.net.send({ t: 'kart-leave' });
+        this._closeRaceCard();
+        return;
+      }
+      if (e.target === card.querySelector('.kkc-x')) this._closeRaceCard();
+    });
+    this._paintVotes();
+  }
+
+  _closeRaceCard() {
+    this._raceCard?.remove();
+    this._raceCard = null;
+    this._cardSync = null;
+  }
+
+  /** Live tally onto the open card, from the last kart-lobby echo. */
+  _paintVotes() {
+    if (!this._raceCard) return;
+    const votes = this._votes || {};
+    for (const el of this._raceCard.querySelectorAll('[data-votes]')) {
+      const n = Number(votes[el.dataset.votes]) || 0;
+      el.textContent = n ? `${n} vote${n === 1 ? '' : 's'}` : '';
+      el.classList.toggle('is-winning', !!n && el.dataset.votes === this._winning);
+    }
+  }
+
+  _ensureCardStyles() {
+    if (document.getElementById('kkc-styles')) return;
+    const s = document.createElement('style');
+    s.id = 'kkc-styles';
+    s.textContent = `
+.kkc-card { position: fixed; left: 50%; bottom: 86px; transform: translateX(-50%);
+  z-index: 46; width: min(430px, 94vw); padding: 14px 16px 12px;
+  background: var(--cream, #fdf3dd); border: 4px solid #fff; border-radius: 22px;
+  box-shadow: 0 12px 34px rgba(20,32,44,.35); font-family: inherit; }
+.kkc-head { font-weight: 900; font-size: 17px; color: var(--accent, #e8657a); }
+.kkc-head span { font-size: 11.5px; font-weight: 700; color: #a3906c; margin-left: 8px; }
+.kkc-sec { font-size: 10px; font-weight: 900; letter-spacing: .09em; text-transform: uppercase;
+  color: #8a6a1f; margin: 9px 0 5px; }
+.kkc-karts { display: flex; flex-wrap: wrap; gap: 6px; }
+.kkc-chip { border: 0; cursor: pointer; font: inherit; font-weight: 900; font-size: 12px;
+  padding: 6px 12px; border-radius: 999px; background: #f2e7cd; color: #6b5b3c;
+  box-shadow: inset 0 0 0 2px rgba(45,36,23,.08); }
+.kkc-chip.is-on { background: linear-gradient(180deg,#ffd98a,var(--gold,#f2b64a));
+  color: #4a3413; box-shadow: 0 3px 0 rgba(158,111,20,.3); }
+.kkc-chip.is-locked { opacity: .55; cursor: default; }
+.kkc-lock { font-size: 9px; font-weight: 900; opacity: .8; }
+.kkc-tracks { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.kkc-track { border: 0; cursor: pointer; font: inherit; text-align: left; padding: 8px 10px;
+  border-radius: 14px; background: #fff; box-shadow: inset 0 0 0 2px rgba(45,36,23,.08);
+  display: flex; flex-direction: column; gap: 1px; position: relative; }
+.kkc-track b { font-size: 12.5px; font-weight: 900; color: #4a3413; }
+.kkc-track span { font-size: 10px; font-weight: 700; color: #a3906c; }
+.kkc-track.is-on { box-shadow: inset 0 0 0 3px var(--gold,#f2b64a); background: #fff8ea; }
+.kkc-votes { position: absolute; top: 6px; right: 8px; font-size: 9px; font-weight: 900;
+  font-style: normal; color: #8a6a1f; }
+.kkc-votes.is-winning { color: #5a9b3f; }
+.kkc-row { display: flex; gap: 8px; margin-top: 10px; }
+.kkc-go { flex: 1; border: 0; cursor: pointer; font: inherit; font-weight: 900; font-size: 13.5px;
+  padding: 9px 0; border-radius: 999px; color: #4a3413;
+  background: linear-gradient(180deg,#ffd98a,var(--gold,#f2b64a));
+  box-shadow: 0 4px 0 rgba(158,111,20,.3); }
+.kkc-leave, .kkc-x { border: 0; cursor: pointer; font: inherit; font-weight: 900; font-size: 12px;
+  padding: 9px 14px; border-radius: 999px; background: #ece0c4; color: #93815f; }
+@media (max-width: 480px) { .kkc-tracks { grid-template-columns: 1fr; } }`;
+    document.head.appendChild(s);
+  }
+
   /** Server -> room: 'kart-lobby' {players, starting, startsAt, max}. */
   _onLobby(m) {
     const players = Array.isArray(m?.players) ? m.players.slice(0, 6) : [];
@@ -1102,6 +1261,12 @@ export class SpeedwayRoom extends Room {
     }));
     this._signedOn = selfId !== null && this._roster.some((p) => p.id === selfId);
     this._starting = !!m?.starting;
+    // the tally for the race card: votes is zero-filled per track, track is
+    // the plurality winner as the server resolves it right now
+    this._votes = (m && typeof m.votes === 'object') ? m.votes : {};
+    this._winning = typeof m?.track === 'string' ? m.track : null;
+    this._paintVotes();
+    this._cardSync?.();
 
     if (this._signedOn && !was) {
       this._game?.audio?.play?.('whoosh');
@@ -1125,6 +1290,7 @@ export class SpeedwayRoom extends Room {
   _onGrid(m) {
     const game = this._game;
     if (!game || !m) return;
+    this._closeRaceCard(); // the grid outranks an open picker
     this._boardLive = true;
     // Already inside a minigame (a practice lap started while the sheet
     // filled): startMinigame would no-op and the ctx would sit there waiting to
@@ -2601,6 +2767,7 @@ export class SpeedwayRoom extends Room {
       this._game.net.send({ t: 'kart-leave' });
     }
     this._signedOn = false;
+    this._closeRaceCard();
 
     this._offLobby?.();
     this._offGrid?.();
