@@ -168,21 +168,24 @@ game.events.on('minigame', async (id) => {
 });
 
 /**
- * TEMPORARY DEV ACCESS: anyone whose name starts with "david" gets the layout
- * editor. This is a convenience gate, NOT security: the editor is entirely
- * client-side (it drags local meshes and prints coordinates, it cannot change
- * anyone else's world or touch the server), and any player could open devtools
- * and call the same module. It exists so the owner can art-direct rooms in
- * place during development.
+ * OPERATOR HOTKEYS (wave 9E). The name-prefix backdoor that used to live here
+ * is gone: access is now the server's `caps` list, minted from `rec.role` in
+ * server/admin.js, carried on the welcome profile and re-derived on every
+ * applyProfile (src/core/game.js). A guest is rank 0 and holds nothing, so
+ * `caps` is empty and neither hotkey exists for them.
  *
- * !!! REMOVE BEFORE THE GAME GOES PUBLIC !!!
- * Replace with a real check (an `admin: true` flag on the server record,
- * verified in the welcome profile) or delete the editor hotkey entirely.
- * Tracked in the session task list and in CLAUDE.md's roadmap.
+ * Both gates are cosmetic, and deliberately so:
+ *   Ctrl+E       the layout editor is client-side only (it drags local meshes
+ *                and prints coordinates; it writes nothing to the server), so
+ *                'editor' is a UX gate on a tool, not a privilege.
+ *   Ctrl+Shift+A the mod panel only ever SENDS `a-*` frames, and every one of
+ *                them is re-authorised by server/admin.js's performOp. The
+ *                chunk existing on the CDN is harmless: a player who loads it
+ *                by hand gets a panel whose every button is answered with
+ *                silence, and a log line.
+ * The panel module is imported ONLY when caps is non-empty, so an ordinary
+ * player never fetches, parses or pays for a byte of it.
  */
-function isAdmin() {
-  return /^david/i.test(game.state?.name || '');
-}
 
 // keyboard shortcuts (skipped while typing in inputs, and while a minigame owns
 // the screen: Enter used to focus the chat box hidden underneath it, which left
@@ -190,10 +193,21 @@ function isAdmin() {
 addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
   // Ctrl+E: dev layout editor. Allowed before the minigame guard so it can be
-  // closed from anywhere. See isAdmin() for the temporary access rule.
-  if (e.key === 'e' && (e.ctrlKey || e.metaKey) && isAdmin()) {
+  // closed from anywhere.
+  if (e.key === 'e' && (e.ctrlKey || e.metaKey) && game.can('editor')) {
     e.preventDefault();
     import('./ui/editor.js').then((m) => m.toggleEditor(game));
+    return;
+  }
+  // Ctrl+Shift+A: the mod/admin panel. Any capability at all opens it; the
+  // panel itself shows only the buttons this role holds. Also before the
+  // minigame guard, so it can be closed from anywhere.
+  if ((e.key === 'a' || e.key === 'A') && e.shiftKey && (e.ctrlKey || e.metaKey)
+    && game.state.caps?.length) {
+    e.preventDefault();
+    import('./ui/admin.js')
+      .then((m) => m.toggleAdmin(game))
+      .catch((err) => { console.error('[main] admin panel failed to load:', err); game.toast('The mod panel is not answering, try again'); });
     return;
   }
   if (game.activeMinigame) return;

@@ -116,7 +116,14 @@ export const CHAT_MAX_LEN = 120;
 export const NAME_MIN_LEN = 3;
 export const NAME_MAX_LEN = 16;
 
-export const NET_TICK_MS = 100; // server broadcast + client send cadence
+// Wave 9: the role ladder as contract data. server/db.js validates storage
+// against it, server/admin.js maps roles to capabilities, the client only ever
+// echoes what the wire said.
+export const ROLES = ['player', 'mod', 'admin'];
+export const CAPS = ['who', 'inspect', 'mute', 'kick', 'ban', 'ban-perm', 'unban', 'tp', 'announce', 'editor'];
+export const ANNOUNCE_MAX_LEN = 160;
+
+export const NET_TICK_MS = 100; // server broadcast + send cadence
 export const WALK_SPEED = 5.2; // units/sec, shared so server bots match players
 
 // ---------------------------------------------------------------------------

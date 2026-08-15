@@ -286,6 +286,12 @@ export class NetClient {
       case 'house-guests':
         game.events.emit('house-guests', m);
         break;
+      // ---- wave 9 (the spine): operator ops + the island banner ------------
+      // Re-emitted raw; src/ui/admin.js owns the a-* shapes and the HUD owns
+      // the banner. a-ok/a-err carry `op` = the full frame name they answer.
+      case 'a-ok': case 'a-err': case 'announce':
+        game.events.emit(m.t, m);
+        break;
       // ---- den tables / PvP matches (wave 4) -------------------------------
       case 'table':
         // cache the latest board per game: the join-time snapshot lands ~200ms

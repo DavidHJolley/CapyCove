@@ -11,6 +11,10 @@ import {
 import { signup, login, verifyToken, publicProfile } from './auth.js';
 import { BotManager } from './bots.js';
 import * as progress from './progress.js';
+import * as admin from './admin.js';
+import * as audit from './audit.js';
+import { flush, markSeen, adminSeed, renameAccount, banActive } from './db.js';
+import { writeJsonAtomic } from './store.js';
 import {
   ROOM_IDS, ROOM_INFO, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
   NAME_MAX_LEN, NAME_MIN_LEN, clampCoinsForGame, MINIGAMES,
@@ -189,13 +193,17 @@ function authLimited(ip) {
   return hits.length > 12;
 }
 
-app.post('/api/signup', (req, res) => {
+// signup/login went async in wave 9 (async scrypt): Express 4 does not catch a
+// rejected promise from an async handler, so the try/catch is load-bearing
+app.post('/api/signup', async (req, res) => {
   if (authLimited(req.ip)) return res.json({ ok: false, msg: 'Slow down a moment' });
-  res.json(signup(req.body || {}));
+  try { res.json(await signup(req.body || {})); }
+  catch (e) { console.error('[auth] signup failed:', e.message); res.json({ ok: false, msg: 'Something went wrong, try again' }); }
 });
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   if (authLimited(req.ip)) return res.json({ ok: false, msg: 'Slow down a moment' });
-  res.json(login(req.body || {}));
+  try { res.json(await login(req.body || {})); }
+  catch (e) { console.error('[auth] login failed:', e.message); res.json({ ok: false, msg: 'Something went wrong, try again' }); }
 });
 app.get('/api/me', (req, res) => {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -206,7 +214,7 @@ app.get('/api/me', (req, res) => {
 // `rooms` counts the live room sets: the fixed ROOM_IDS plus however many dens
 // currently have someone standing in them. Handy for spotting a den that failed
 // to get reaped when its last visitor left.
-app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, audit: audit.stats() }));
 
 // dev-only: lets automated playtests save canvas captures to disk
 if (process.env.NODE_ENV !== 'production') {
@@ -416,6 +424,17 @@ function grantCoins(p, amount, reason) {
 
 // progression module boot (quests/stamps/milestones live in server/progress.js)
 progress.install({ users, saveSoon, grantCoins, sendTo, broadcastToRoom, has });
+// wave 9, the spine: audit first (so admin ops log from the start), then the
+// operator module: it takes first refusal on every frame (see :2178 area)
+audit.install({ meta: { pid: process.pid } });
+if (adminSeed.name) {
+  audit.log({ actor: null, via: 'system', op: audit.OPS.ROLE_SEED, target: { uid: adminSeed.uid, name: adminSeed.name }, args: { role: 'admin', applied: adminSeed.applied, missing: adminSeed.missing } });
+  if (adminSeed.missing) console.warn(`[admin] COVE_ADMIN=${adminSeed.name} has no account yet`);
+}
+admin.install({
+  users, saveSoon, sendTo, broadcastToRoom, broadcastAll, sessionsFor, recordFor,
+  findEntity, world, grantCoins, joinRoom, has, audit,
+});
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -2175,6 +2194,9 @@ wss.on('connection', (ws) => {
     try {
       // progression module (server/progress.js) gets first refusal on frames
       // it owns (quest-*, stamp-* etc.); everything else falls through
+      // admin gets FIRST refusal: mute/ban pre-emption and every a-* op happen
+      // here, before any feature handler can see the frame
+      if (p && admin.handleMessage(p, m)) return;
       if (p && progress.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
@@ -2185,6 +2207,11 @@ wss.on('connection', (ws) => {
             username = verifyToken(m.token);
             if (!username) return sendTo({ ws }, { t: 'denied', msg: 'Session expired, log in again' });
             const rec = users.get(username.toLowerCase());
+            if (rec) {
+              markSeen(rec);
+              const banned = admin.banMessage?.(rec) || (banActive(rec) ? 'This account is banned' : null);
+              if (banned) return sendTo({ ws }, { t: 'denied', msg: banned });
+            }
             profile = publicProfile(rec);
             // the den editor needs the inventory from the first frame; a copy,
             // never the live record object (two tabs would share one map)
@@ -2802,7 +2829,14 @@ setInterval(() => {
 }, HEARTBEAT_MS);
 
 // last resort: the game should never die from one unexpected throw
-process.on('uncaughtException', (e) => console.error('[fatal]', e));
+process.on('uncaughtException', (e) => {
+  console.error('[fatal]', e);
+  try {
+    audit.log({ actor: null, via: 'system', op: audit.OPS.SERVER_UNCAUGHT, args: { name: e?.name || 'Error', at: String(e?.stack || e).slice(0, 800) }, ok: false });
+    audit.flush();
+    flush();
+  } catch {}
+});
 process.on('unhandledRejection', (e) => console.error('[fatal] unhandled rejection:', e));
 
 // ---------- tick: broadcast positions + run bots ----------
