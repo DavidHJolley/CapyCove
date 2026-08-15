@@ -37,7 +37,10 @@ function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 // ---------------------------------------------------------------------------
 // ingredients
 // ---------------------------------------------------------------------------
-const ING_IDS = ['mango', 'strawberry', 'banana', 'kiwi', 'blueberry', 'coconut', 'ice'];
+const ING_IDS = [
+  'mango', 'strawberry', 'banana', 'kiwi', 'blueberry', 'coconut', 'ice',
+  'pineapple', 'dragonfruit', 'honey',
+];
 const ING = {
   mango: { name: 'Mango', c1: '#ffc14d', c2: '#e8622a', key: '1' },
   strawberry: { name: 'Strawberry', c1: '#ff6b7f', c2: '#c2274a', key: '2' },
@@ -46,7 +49,35 @@ const ING = {
   blueberry: { name: 'Blueberry', c1: '#8a92e8', c2: '#3a3d8f', key: '5' },
   coconut: { name: 'Coconut', c1: '#fdf3e2', c2: '#a97b4f', key: '6' },
   ice: { name: 'Ice', c1: '#e4f7ff', c2: '#79c4e8', key: '7' },
+  pineapple: { name: 'Pineapple', c1: '#ffd45c', c2: '#c9861a', key: '8' },
+  dragonfruit: { name: 'Dragon', c1: '#ff7fc4', c2: '#b32e70', key: '9' },
+  honey: { name: 'Honey', c1: '#ffcf4d', c2: '#c07c0d', key: '0' },
 };
+/** The first seven are the whole shack in minute one; the rest arrive later. */
+const BASE_ING = 7;
+const UNLOCKS = [
+  { at: 6, id: 'pineapple' },
+  { at: 11, id: 'dragonfruit' },
+  { at: 16, id: 'honey' },
+];
+
+/**
+ * Combo ladder. `at` is the flawless-serve streak that lights the tier; `mult`
+ * multiplies the order's pay; `glow` drives the screen heat. Escalating juice,
+ * bounded: see MAX_MULT for the stacked ceiling.
+ */
+const TIERS = [
+  { at: 0, mult: 1, name: '', col: '#f2b64a', glow: 0 },
+  { at: 3, mult: 1.2, name: 'WARMED UP', col: '#f2b64a', glow: 0.26 },
+  { at: 6, mult: 1.35, name: 'IN THE ZONE', col: '#ff9040', glow: 0.44 },
+  { at: 9, mult: 1.5, name: 'ON FIRE', col: '#e8657a', glow: 0.62 },
+  { at: 12, mult: 1.7, name: 'BLENDMASTER', col: '#b45ce8', glow: 0.82 },
+];
+/** Combo and rush stack but only so far, so a golden order still lands as THE
+ *  moment of the shift rather than disappearing into a ceiling already hit. */
+const MAX_MULT = 2.2;
+const RUSH_MULT = 1.4;
+const GOLD_MULT = 2;
 
 const CAPY_NAMES = [
   'Pip', 'Nubbin', 'Waffles', 'Muffin', 'Sprout', 'Tofu', 'Biscuit', 'Pebble',
@@ -202,6 +233,88 @@ function drawIngredient(ctx, id, size) {
     ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(255,255,255,0.85)';
     ctx.beginPath(); ctx.moveTo(32, 52); ctx.lineTo(32, 68); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(40, 50); ctx.lineTo(40, 58); ctx.stroke();
+  } else if (id === 'pineapple') {
+    // spiky crown first so the blades tuck behind the barrel
+    for (let i = 0; i < 5; i++) {
+      ctx.save();
+      ctx.translate(50, 44); ctx.rotate((i - 2) * 0.36);
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.quadraticCurveTo(-8, -22, 0, -42);
+      ctx.quadraticCurveTo(8, -22, 0, 0); ctx.closePath();
+      ctx.fillStyle = i % 2 ? '#4e8f2c' : '#6db83e'; ctx.fill(); ink(ctx, 3.6);
+      ctx.restore();
+    }
+    ctx.beginPath(); ctx.ellipse(50, 62, 25, 32, 0, 0, Math.PI * 2);
+    ctx.fillStyle = grad(ctx, 26, 32, 76, 94, d.c1, d.c2); ctx.fill(); ink(ctx);
+    ctx.save();
+    ctx.beginPath(); ctx.ellipse(50, 62, 22, 29, 0, 0, Math.PI * 2); ctx.clip();
+    ctx.lineWidth = 2.6; ctx.strokeStyle = 'rgba(120,74,10,0.55)';
+    for (let i = -4; i <= 4; i++) {
+      ctx.beginPath(); ctx.moveTo(20 + i * 13, 26); ctx.lineTo(20 + i * 13 + 44, 100); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(80 - i * 13, 26); ctx.lineTo(80 - i * 13 - 44, 100); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.beginPath(); ctx.ellipse(40, 48, 6, 9, -0.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.42)'; ctx.fill();
+  } else if (id === 'dragonfruit') {
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 + 0.42;
+      ctx.save();
+      ctx.translate(50 + Math.cos(a) * 21, 56 + Math.sin(a) * 21); ctx.rotate(a);
+      ctx.beginPath();
+      ctx.moveTo(-12, -9); ctx.quadraticCurveTo(20, -7, 27, 0);
+      ctx.quadraticCurveTo(20, 7, -12, 9); ctx.closePath();
+      ctx.fillStyle = i % 2 ? '#7ec84a' : '#a7de62'; ctx.fill(); ink(ctx, 3.4);
+      ctx.restore();
+    }
+    ctx.beginPath(); ctx.ellipse(50, 56, 27, 29, 0, 0, Math.PI * 2);
+    ctx.fillStyle = grad(ctx, 24, 28, 78, 86, d.c1, d.c2); ctx.fill(); ink(ctx);
+    ctx.beginPath(); ctx.ellipse(50, 56, 18, 20, 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff4f8'; ctx.fill();
+    ctx.fillStyle = '#2b1a20';
+    for (let i = 0; i < 11; i++) {
+      const a = (i / 11) * Math.PI * 2 + 0.7;
+      const rr = i % 2 ? 7 : 13;
+      ctx.beginPath();
+      ctx.ellipse(50 + Math.cos(a) * rr, 56 + Math.sin(a) * rr * 1.1, 2.4, 2.9, a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.beginPath(); ctx.ellipse(41, 46, 5, 7, -0.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fill();
+  } else if (id === 'honey') {
+    // dipper leaning out of the pot: the stick is half the silhouette
+    ctx.save();
+    ctx.translate(70, 30); ctx.rotate(0.62);
+    rrect(ctx, -4.5, -30, 9, 46, 4.5);
+    ctx.fillStyle = '#c98f52'; ctx.fill(); ink(ctx, 3.4);
+    ctx.fillStyle = '#e0a92a';
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath(); ctx.ellipse(0, 4 + i * 9, 9 - i * 0.6, 4.4, 0, 0, Math.PI * 2);
+      ctx.fill(); ink(ctx, 3);
+    }
+    ctx.restore();
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = -Math.PI / 2 + (i / 6) * Math.PI * 2;
+      const x = 48 + Math.cos(a) * 29, y = 62 + Math.sin(a) * 29;
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = grad(ctx, 20, 34, 76, 92, d.c1, d.c2); ctx.fill(); ink(ctx);
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(120,74,10,0.45)';
+    for (const [hx, hy] of [[40, 54], [58, 54], [49, 72]]) {
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = -Math.PI / 2 + (i / 6) * Math.PI * 2;
+        const x = hx + Math.cos(a) * 8, y = hy + Math.sin(a) * 8;
+        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      ctx.closePath(); ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(24, 68); ctx.quadraticCurveTo(16, 82, 24, 90);
+    ctx.quadraticCurveTo(32, 82, 24, 68); ctx.closePath();
+    ctx.fillStyle = '#ffd76b'; ctx.fill(); ink(ctx, 3.4);
   }
   ctx.restore();
 }
@@ -403,6 +516,23 @@ function drawCapy(ctx, size, cfg, expr) {
   ctx.restore();
 }
 
+/** The chef, in a toque, framed so the hat is not cropped. For the end card. */
+function chefCanvas(cssSize, cfg) {
+  const dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+  const c = document.createElement('canvas');
+  c.width = Math.round(cssSize * dpr);
+  c.height = Math.round(cssSize * dpr);
+  c.style.width = `${cssSize}px`;
+  c.style.height = `${cssSize}px`;
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.translate(cssSize * 0.5, cssSize * 0.2);
+  ctx.scale(0.74, 0.74);
+  ctx.translate(-cssSize * 0.5, 0);
+  drawCapy(ctx, cssSize, cfg, 'beam');
+  return c;
+}
+
 function paintCapy(canvas, cssSize, cfg, expr) {
   const dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
   const px = Math.round(cssSize * dpr);
@@ -467,9 +597,22 @@ const STYLE = `
 .mg-smoothie-score b{color:#e8657a;font-size:19px;min-width:34px;display:inline-block;text-align:right;}
 .mg-smoothie-score.mg-smoothie-bump{animation:mg-smoothie-bump .3s ease;}
 @keyframes mg-smoothie-bump{50%{transform:scale(1.16) rotate(-2deg)}}
-.mg-smoothie-streak b{color:#f2b64a;}
-.mg-smoothie-streak.mg-smoothie-hot{background:#f2b64a;color:#fff;}
-.mg-smoothie-streak.mg-smoothie-hot b,.mg-smoothie-streak.mg-smoothie-hot small{color:#fff;opacity:.9;}
+.mg-smoothie-streak{flex-direction:column;align-items:stretch;gap:4px;padding:6px 14px 7px;min-width:150px;
+  transition:background .3s,box-shadow .3s;}
+.mg-smoothie-streak .mg-smoothie-crow{display:flex;align-items:center;gap:8px;line-height:1;}
+.mg-smoothie-streak b{color:#f2b64a;font-size:17px;transition:color .3s;}
+.mg-smoothie-streak em{font-style:normal;font-size:10px;font-weight:900;letter-spacing:.12em;margin-left:auto;
+  opacity:.85;white-space:nowrap;}
+.mg-smoothie-cbar{height:7px;border-radius:999px;background:rgba(58,42,28,.2);overflow:hidden;
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.22);}
+.mg-smoothie-cbar i{display:block;height:100%;width:0;border-radius:999px;background:#f2b64a;
+  transition:width .28s cubic-bezier(.2,1.35,.4,1),background .3s;}
+.mg-smoothie-streak.mg-smoothie-hot{color:#fff;}
+.mg-smoothie-streak.mg-smoothie-hot b,.mg-smoothie-streak.mg-smoothie-hot small,
+.mg-smoothie-streak.mg-smoothie-hot em{color:#fff;opacity:.95;}
+.mg-smoothie-streak.mg-smoothie-hot .mg-smoothie-cbar{background:rgba(255,255,255,.3);}
+.mg-smoothie-streak.mg-smoothie-tierup{animation:mg-smoothie-tierup .5s cubic-bezier(.2,1.6,.4,1);}
+@keyframes mg-smoothie-tierup{40%{transform:scale(1.14) rotate(-1.5deg)}}
 .mg-smoothie-lives{display:flex;gap:6px;align-items:center;}
 .mg-smoothie-life{width:19px;height:23px;background:#e8657a;
   clip-path:polygon(14% 0,86% 0,72% 100%,28% 100%);transition:.25s;}
@@ -477,6 +620,7 @@ const STYLE = `
 .mg-smoothie-rush{background:linear-gradient(90deg,#e8657a,#f2b64a);color:#fff;letter-spacing:.1em;
   opacity:0;transform:translateY(-8px) scale(.9);transition:.22s;}
 .mg-smoothie-rush.mg-smoothie-on{opacity:1;transform:none;animation:mg-smoothie-pulse .7s ease-in-out infinite;}
+.mg-smoothie-rush.mg-smoothie-calm{background:linear-gradient(90deg,#4fb3e8,#9fdcc2);animation:none;}
 @keyframes mg-smoothie-pulse{50%{transform:scale(1.07)}}
 .mg-smoothie-spacer{flex:1;}
 .mg-smoothie-quit{border:0;background:rgba(58,42,28,.72);color:#fff6e3;font-family:inherit;font-weight:900;
@@ -522,6 +666,17 @@ const STYLE = `
   border:11px solid transparent;border-top-color:#fffdf6;border-bottom:0;}
 .mg-smoothie-bubble.mg-smoothie-pop{animation:mg-smoothie-bpop .34s cubic-bezier(.2,1.6,.4,1);}
 @keyframes mg-smoothie-bpop{from{transform:scale(.4);opacity:0}}
+.mg-smoothie-bubble.mg-smoothie-gold{background:linear-gradient(180deg,#fffbe8,#ffe6a4);
+  box-shadow:0 8px 20px rgba(150,100,10,.4),0 0 0 4px rgba(242,182,74,.6),0 0 26px rgba(242,182,74,.55);}
+.mg-smoothie-bubble.mg-smoothie-gold::after{border-top-color:#ffe6a4;}
+.mg-smoothie-bubble.mg-smoothie-gold .mg-smoothie-slot{background:#fff1c6;}
+.mg-smoothie-goldtag{position:absolute;top:-14px;left:50%;transform:translateX(-50%);white-space:nowrap;
+  background:linear-gradient(90deg,#e0982a,#ffe9a8,#e0982a);background-size:220% 100%;color:#6b4a08;
+  font-size:10.5px;font-weight:900;letter-spacing:.16em;padding:4px 14px;border-radius:999px;
+  box-shadow:0 3px 9px rgba(120,74,32,.45);animation:mg-smoothie-shim 1.7s linear infinite;}
+@keyframes mg-smoothie-shim{to{background-position:220% 0}}
+.mg-smoothie-cust.mg-smoothie-goldc .mg-smoothie-face{filter:drop-shadow(0 0 15px rgba(242,182,74,.95));}
+.mg-smoothie-cust.mg-smoothie-goldc .mg-smoothie-nametag{background:linear-gradient(180deg,#fff6d8,#ffdc8e);}
 .mg-smoothie-order{display:flex;gap:7px;justify-content:center;}
 .mg-smoothie-slot{position:relative;width:50px;height:50px;
   border-radius:14px;background:#fff2d8;display:flex;align-items:center;justify-content:center;
@@ -596,6 +751,30 @@ const STYLE = `
 .mg-smoothie-cuplid{position:absolute;top:-8px;left:-4px;right:-4px;height:11px;border-radius:6px;
   border:4px solid #3a2a1c;background:#fff6e3;}
 
+/* ---- plating flourish (perfect serves only) ---- */
+.mg-smoothie-cream{position:absolute;top:-24px;left:6px;width:30px;height:24px;opacity:0;
+  transform:scale(.3) translateY(10px);transition:opacity .18s;}
+.mg-smoothie-cream i{position:absolute;left:50%;border-radius:50%;background:#fffdf6;
+  border:3px solid #3a2a1c;transform:translateX(-50%);}
+.mg-smoothie-cream i:nth-child(1){width:30px;height:17px;bottom:0;}
+.mg-smoothie-cream i:nth-child(2){width:21px;height:14px;bottom:8px;}
+.mg-smoothie-cream i:nth-child(3){width:12px;height:11px;bottom:15px;}
+.mg-smoothie-cup.mg-smoothie-plated .mg-smoothie-cream{opacity:1;
+  animation:mg-smoothie-plate .5s cubic-bezier(.2,1.7,.4,1) forwards;}
+@keyframes mg-smoothie-plate{from{transform:scale(.3) translateY(12px)}to{transform:none}}
+.mg-smoothie-garnish{position:absolute;top:-14px;right:-16px;opacity:0;transform:rotate(-40deg) scale(.3);}
+.mg-smoothie-cup.mg-smoothie-plated .mg-smoothie-garnish{opacity:1;
+  animation:mg-smoothie-garn .5s .1s cubic-bezier(.2,1.7,.4,1) forwards;}
+@keyframes mg-smoothie-garn{to{transform:rotate(22deg) scale(1)}}
+.mg-smoothie-crown{position:absolute;top:-48px;left:50%;margin-left:-17px;width:34px;height:20px;opacity:0;
+  background:linear-gradient(180deg,#ffe08a,#e0982a);
+  clip-path:polygon(0 100%,100% 100%,100% 22%,78% 46%,50% 0,22% 46%,0 22%);
+  filter:drop-shadow(0 2px 3px rgba(120,74,32,.5));}
+.mg-smoothie-cup.mg-smoothie-royal .mg-smoothie-crown{opacity:1;
+  animation:mg-smoothie-crown .6s cubic-bezier(.2,1.7,.4,1) forwards;}
+@keyframes mg-smoothie-crown{from{transform:translateY(16px) scale(.4) rotate(-20deg)}to{transform:none}}
+.mg-smoothie-cup.mg-smoothie-royal .mg-smoothie-cupbody{box-shadow:0 0 18px rgba(242,182,74,.9);}
+
 /* ---- rack ---- */
 .mg-smoothie-rack{position:relative;z-index:6;display:flex;align-items:center;justify-content:center;
   gap:clamp(6px,1.1vw,16px);padding:clamp(10px,1.6vh,18px);
@@ -615,6 +794,18 @@ const STYLE = `
 .mg-smoothie-ing:hover{transform:translateY(-3px);}
 .mg-smoothie-ing.mg-smoothie-press{transform:translateY(7px);box-shadow:0 0 0 #a5702f,0 4px 8px rgba(30,16,4,.4);}
 .mg-smoothie-ing:disabled{filter:grayscale(.6) brightness(.9);cursor:default;}
+.mg-smoothie-ing.mg-smoothie-locked{display:none;}
+.mg-smoothie-ing.mg-smoothie-fresh{animation:mg-smoothie-fresh .7s cubic-bezier(.2,1.6,.4,1);}
+@keyframes mg-smoothie-fresh{from{transform:translateY(60px) scale(.4) rotate(-18deg);opacity:0}
+  60%{transform:translateY(-8px) scale(1.12)}}
+.mg-smoothie-rack.mg-smoothie-wide{gap:clamp(4px,.7vw,10px);}
+.mg-smoothie-rack.mg-smoothie-wide .mg-smoothie-ing{width:clamp(56px,7.4vw,96px);border-radius:16px;}
+/* ten bottles on a narrow shelf: drop the words, keep the fruit and the key */
+@media (max-width:830px){
+  .mg-smoothie-rack.mg-smoothie-wide{gap:3px;padding:8px 4px;}
+  .mg-smoothie-rack.mg-smoothie-wide .mg-smoothie-ing{width:clamp(32px,8.4vw,72px);border-radius:12px;}
+  .mg-smoothie-rack.mg-smoothie-wide .mg-smoothie-ing span{display:none;}
+}
 
 /* ---- fx ---- */
 .mg-smoothie-fx{position:absolute;inset:0;z-index:8;pointer-events:none;overflow:hidden;}
@@ -633,6 +824,29 @@ const STYLE = `
 .mg-smoothie-tint{position:absolute;inset:0;z-index:7;pointer-events:none;opacity:0;transition:opacity .3s;
   background:radial-gradient(ellipse 80% 70% at 50% 60%,rgba(242,182,74,0) 40%,rgba(232,101,122,.42) 100%);}
 .mg-smoothie-tint.mg-smoothie-on{opacity:1;}
+/* combo heat: a coloured rim that climbs with the tier. Colour + strength from JS. */
+.mg-smoothie-heat{position:absolute;inset:0;z-index:7;pointer-events:none;opacity:0;
+  transition:opacity .5s ease,box-shadow .5s ease;}
+.mg-smoothie-heat.mg-smoothie-max{animation:mg-smoothie-heatbeat 1.5s ease-in-out infinite;}
+@keyframes mg-smoothie-heatbeat{50%{opacity:.7}}
+.mg-smoothie-star{position:absolute;transform:translate(-50%,-50%);pointer-events:none;
+  background:#ffe9a8;clip-path:polygon(50% 0,61% 35%,98% 35%,68% 57%,79% 100%,50% 73%,21% 100%,32% 57%,2% 35%,39% 35%);
+  animation:mg-smoothie-star .9s ease-out forwards;}
+@keyframes mg-smoothie-star{0%{opacity:0;transform:translate(-50%,-50%) scale(.2) rotate(0)}
+  25%{opacity:1}
+  100%{opacity:0;transform:translate(-50%,-50%) translate(var(--dx),var(--dy)) scale(.5) rotate(220deg)}}
+.mg-smoothie-banner{position:absolute;left:50%;top:34%;transform:translate(-50%,-50%);z-index:9;
+  padding:12px 30px;border-radius:999px;font-weight:900;letter-spacing:.16em;white-space:nowrap;
+  font-size:clamp(15px,2.1vw,25px);color:#fff;text-shadow:0 3px 0 rgba(60,34,10,.4);
+  box-shadow:0 10px 26px rgba(60,34,10,.4);animation:mg-smoothie-banner 1.5s ease-out forwards;}
+.mg-smoothie-banner span{display:block;font-size:.52em;letter-spacing:.1em;opacity:.9;margin-top:3px;}
+@keyframes mg-smoothie-banner{0%{opacity:0;transform:translate(-50%,-50%) scale(.5)}
+  16%{opacity:1;transform:translate(-50%,-50%) scale(1.08)}
+  26%{transform:translate(-50%,-50%) scale(1)}
+  78%{opacity:1;transform:translate(-50%,-50%) scale(1)}
+  100%{opacity:0;transform:translate(-50%,-90%) scale(.94)}}
+.mg-smoothie-float.mg-smoothie-gold{color:#ffe08a;font-size:clamp(20px,2.6vw,32px);letter-spacing:.08em;}
+.mg-smoothie-float.mg-smoothie-perfect{color:#b9f3a0;font-size:clamp(15px,1.8vw,22px);letter-spacing:.14em;}
 
 /* ---- overlays ---- */
 .mg-smoothie-over{position:absolute;inset:0;z-index:12;display:flex;align-items:center;justify-content:center;
@@ -675,9 +889,26 @@ const STYLE = `
 .mg-smoothie-count{font-size:clamp(80px,17vw,180px);font-weight:900;color:#fff6e3;
   text-shadow:0 8px 0 rgba(60,34,10,.35);animation:mg-smoothie-count .62s ease-out;}
 @keyframes mg-smoothie-count{from{transform:scale(2.2);opacity:0}40%{opacity:1}to{transform:scale(1)}}
+
+/* ---- the chef takes a bow ---- */
+.mg-smoothie-chef{display:flex;justify-content:center;align-items:flex-end;height:104px;margin:-6px 0 2px;}
+.mg-smoothie-chef span{display:inline-block;line-height:0;}
+.mg-smoothie-chef canvas{transform-origin:50% 96%;animation:mg-smoothie-bow 3s ease-in-out infinite;}
+@keyframes mg-smoothie-bow{0%,44%{transform:rotate(0) translateY(0)}
+  52%{transform:rotate(0) translateY(3px) scaleY(.96)}
+  62%,80%{transform:rotate(15deg) translateY(11px)}
+  90%{transform:rotate(-4deg) translateY(-2px)}
+  100%{transform:rotate(0) translateY(0)}}
+.mg-smoothie-chef i{align-self:center;font-style:normal;font-size:22px;opacity:0;
+  animation:mg-smoothie-clap 3s ease-in-out infinite;}
+.mg-smoothie-chef i:last-child{animation-delay:.16s;}
+@keyframes mg-smoothie-clap{0%,58%,100%{opacity:0;transform:translateY(6px) scale(.6)}
+  70%,84%{opacity:1;transform:translateY(-6px) scale(1)}}
+.mg-smoothie-stat.mg-smoothie-hotstat b{color:#b45ce8;}
 @media (max-height:660px){
   .mg-smoothie-board,.mg-smoothie-shelf{display:none;}
   .mg-smoothie-how div{padding:7px 12px;font-size:12px;}
+  .mg-smoothie-chef{height:76px;}
 }
 `;
 
@@ -717,6 +948,11 @@ export class SmoothieGame extends Minigame {
       scoreChip: q('[data-el="scoreChip"]'),
       streak: q('[data-el="streak"]'),
       streakChip: q('[data-el="streakChip"]'),
+      tierName: q('[data-el="tierName"]'),
+      cbar: q('[data-el="cbar"]'),
+      heat: q('[data-el="heat"]'),
+      goldtag: q('[data-el="goldtag"]'),
+      garnish: q('[data-el="garnish"]'),
       lives: [...wrap.querySelectorAll('[data-el="life"]')],
       rush: q('[data-el="rush"]'),
       tint: q('[data-el="tint"]'),
@@ -786,13 +1022,17 @@ export class SmoothieGame extends Minigame {
     return `
       <div class="mg-smoothie-wall" data-el="wall"></div>
       <div class="mg-smoothie-tint" data-el="tint"></div>
+      <div class="mg-smoothie-heat" data-el="heat"></div>
 
       <div class="mg-smoothie-hud">
         <div class="mg-smoothie-chip mg-smoothie-score" data-el="scoreChip">
           <small>PAID</small><b data-el="score">0</b>
         </div>
         <div class="mg-smoothie-chip mg-smoothie-streak" data-el="streakChip">
-          <small>STREAK</small><b data-el="streak">0</b>
+          <div class="mg-smoothie-crow">
+            <small>COMBO</small><b data-el="streak">0</b><em data-el="tierName"></em>
+          </div>
+          <div class="mg-smoothie-cbar"><i data-el="cbar"></i></div>
         </div>
         <div class="mg-smoothie-chip mg-smoothie-lives">
           <small>PATIENCE</small>
@@ -810,6 +1050,7 @@ export class SmoothieGame extends Minigame {
 
         <div class="mg-smoothie-cust" data-el="cust">
           <div class="mg-smoothie-bubble" data-el="bubble">
+            <div class="mg-smoothie-goldtag" data-el="goldtag">GOLDEN ORDER</div>
             <div class="mg-smoothie-order" data-el="order"></div>
           </div>
           <div class="mg-smoothie-pat" data-el="pat"><i data-el="patFill"></i></div>
@@ -818,6 +1059,9 @@ export class SmoothieGame extends Minigame {
         </div>
 
         <div class="mg-smoothie-cup" data-el="cup">
+          <div class="mg-smoothie-crown"></div>
+          <div class="mg-smoothie-cream"><i></i><i></i><i></i></div>
+          <div class="mg-smoothie-garnish" data-el="garnish"></div>
           <div class="mg-smoothie-straw"></div>
           <div class="mg-smoothie-cupbody"><div class="mg-smoothie-cupfill" data-el="cupFill"></div></div>
           <div class="mg-smoothie-cuplid"></div>
@@ -905,6 +1149,7 @@ export class SmoothieGame extends Minigame {
     this.el.btns = {};
     for (const id of ING_IDS) {
       const d = ING[id];
+      const locked = ING_IDS.indexOf(id) >= BASE_ING;
       const b = document.createElement('button');
       b.className = 'mg-smoothie-ing';
       b.type = 'button';
@@ -916,10 +1161,28 @@ export class SmoothieGame extends Minigame {
       b.appendChild(key);
       b.appendChild(iconCanvas(id, 52));
       b.appendChild(label);
+      if (locked) b.classList.add('mg-smoothie-locked');
       b.addEventListener('click', () => this._add(id));
       this.el.rack.appendChild(b);
       this.el.btns[id] = b;
     }
+  }
+
+  /** Reveal one shelf ingredient mid-shift, with a banner so it lands. */
+  _unlock(id) {
+    if (this.pool.includes(id)) return;
+    this.pool.push(id);
+    const b = this.el.btns?.[id];
+    if (b) {
+      b.classList.remove('mg-smoothie-locked');
+      void b.offsetWidth;
+      b.classList.add('mg-smoothie-fresh');
+      this._after(760, () => b.classList.remove('mg-smoothie-fresh'));
+    }
+    this.el.rack?.classList.toggle('mg-smoothie-wide', this.pool.length > 8);
+    this.game.audio?.play?.('success');
+    this._banner(`${ING[id].name.toUpperCase()} IS IN`,
+      `KEY ${ING[id].key} &middot; FRESH OFF THE BOAT`, 'linear-gradient(90deg,#7ac74f,#4fb3e8)');
   }
 
   // ---- screens ------------------------------------------------------------
@@ -935,10 +1198,12 @@ export class SmoothieGame extends Minigame {
         <div class="mg-smoothie-icons" data-el="splashIcons"></div>
         <div class="mg-smoothie-how">
           <div><i>1</i><span>Read the order bubble, then tap those fruits into the jar. Keys <b>1</b>&ndash;<b>7</b> work too.</span></div>
-          <div><i>2</i><span>A wrong fruit ruins the batch: the jar dumps itself and your streak breaks.</span></div>
+          <div><i>2</i><span>A wrong fruit ruins the batch: the jar dumps itself and your combo breaks.</span></div>
           <div><i>3</i><span>Order complete? Slam <b>BLEND</b> (or <b>Space</b>). The faster you serve, the fatter the tip.</span></div>
           <div><i>4</i><span>Three capybaras stomping off in a huff and the shack closes early.</span></div>
         </div>
+        <div class="mg-smoothie-sub" style="margin:-6px 0 12px">FLAWLESS SERVES STACK A COMBO
+          &middot; GOLDEN ORDERS PAY DOUBLE &middot; THREE MORE FRUITS ARRIVE AS THE RUSH BUILDS</div>
         <div class="mg-smoothie-stats">
           <div class="mg-smoothie-stat"><b>${best}</b><span>YOUR BEST</span></div>
           <div class="mg-smoothie-stat mg-smoothie-gold"><b>${this._payout(best)}</b><span>COINS THEN</span></div>
@@ -949,7 +1214,11 @@ export class SmoothieGame extends Minigame {
         </div>
       </div>`;
     const icons = over.querySelector('[data-el="splashIcons"]');
-    for (const id of ING_IDS) icons.appendChild(iconCanvas(id, 40));
+    ING_IDS.forEach((id, i) => {
+      const c = iconCanvas(id, 40);
+      if (i >= BASE_ING) c.style.opacity = '0.32'; // still on the boat
+      icons.appendChild(c);
+    });
     over.querySelector('[data-a="play"]').addEventListener('click', () => this._countdown());
     over.querySelector('[data-a="leave"]').addEventListener('click', () => {
       this.game.audio?.play?.('click');
@@ -994,6 +1263,7 @@ export class SmoothieGame extends Minigame {
     over.innerHTML = `
       <div class="mg-smoothie-card">
         ${isBest ? '<div class="mg-smoothie-ribbon">NEW SHACK RECORD</div>' : ''}
+        <div class="mg-smoothie-chef"><i>&#10024;</i><span data-el="chef"></span><i>&#10024;</i></div>
         <h2>Shift over!</h2>
         <div class="mg-smoothie-sub">${this._verdict(score)}</div>
         <div class="mg-smoothie-stats">
@@ -1002,14 +1272,21 @@ export class SmoothieGame extends Minigame {
           <div class="mg-smoothie-stat"><b>${shown}</b><span>BEST</span></div>
         </div>
         <div class="mg-smoothie-stats">
-          <div class="mg-smoothie-stat"><b>${this.served}</b><span>SERVED</span></div>
-          <div class="mg-smoothie-stat"><b>${this.bestStreak}</b><span>TOP STREAK</span></div>
+          <div class="mg-smoothie-stat"><b>${this.served}</b><span>ORDERS SERVED</span></div>
+          <div class="mg-smoothie-stat mg-smoothie-hotstat"><b>${this.bestStreak}</b><span>BEST COMBO</span></div>
+          <div class="mg-smoothie-stat mg-smoothie-gold"><b>${this.goldens}</b><span>GOLDEN</span></div>
         </div>
         <div class="mg-smoothie-btns">
           <button class="mg-smoothie-btn" data-a="again">Play again</button>
           <button class="mg-smoothie-btn mg-smoothie-alt" data-a="leave">Back to the shack</button>
         </div>
       </div>`;
+    const chefSlot = over.querySelector('[data-el="chef"]');
+    if (chefSlot) {
+      chefSlot.appendChild(chefCanvas(96, {
+        color: hexOf(pick(BODY_COLORS)), hat: 'toque', hatColor: '#fffaf0',
+      }));
+    }
     over.querySelector('[data-a="again"]').addEventListener('click', () => {
       this._done = false; // allow the next run to report its own score
       this._countdown();
@@ -1034,24 +1311,38 @@ export class SmoothieGame extends Minigame {
     this.bestStreak = 0;
     this.served = 0;
     this.strikes = 0;
-    this.rushUntil = 0;
     this.patience = 1;
+    this.flawless = true;
     this.filled = [];
     this.cust = null;
+    this.pool = ING_IDS.slice(0, BASE_ING);
+    this.rushLeft = 0;          // customers remaining in the current rush
+    this.calmLeft = 6;          // calm customers before the first rush can land
+    this.rushes = 0;            // rushes weathered, each a little longer
+    this.arc = 'calm';          // 'calm' | 'rush' | 'breathe'
+    this.goldens = 0;           // golden orders landed this shift
+    this.lastGolden = -9;       // served index of the last golden (no doubles)
+    this.tierAt = 0;            // combo tier currently lit, for the tier-up sting
     this.queue = [this._makeCapy(), this._makeCapy(), this._makeCapy()];
     this.blinkAt = 0;
     this.expr = 'idle';
     this.lastFrame = 0;
 
     this.el.score.textContent = '0';
-    this.el.streak.textContent = '0';
-    this.el.streakChip.classList.remove('mg-smoothie-hot');
     for (const l of this.el.lives) l.classList.remove('mg-smoothie-out');
-    this.el.rush.classList.remove('mg-smoothie-on');
+    this.el.rush.classList.remove('mg-smoothie-on', 'mg-smoothie-calm');
     this.el.tint.classList.remove('mg-smoothie-on');
-    this.el.cust.classList.remove('mg-smoothie-leave', 'mg-smoothie-storm');
+    this.el.cust.classList.remove('mg-smoothie-leave', 'mg-smoothie-storm', 'mg-smoothie-goldc');
     this.el.cust.style.visibility = 'hidden';
+    this.el.bubble.classList.remove('mg-smoothie-gold');
+    this.el.goldtag.style.display = 'none';
+    this.el.cup.classList.remove('mg-smoothie-show', 'mg-smoothie-plated', 'mg-smoothie-royal');
     this.el.fx.innerHTML = '';
+    this.el.rack.classList.remove('mg-smoothie-wide');
+    for (const id of ING_IDS) {
+      this.el.btns?.[id]?.classList.toggle('mg-smoothie-locked', !this.pool.includes(id));
+    }
+    this._syncStreak(true);
     this._clearJar();
   }
 
@@ -1071,25 +1362,76 @@ export class SmoothieGame extends Minigame {
   }
 
   _patienceMs() {
-    return Math.max(4000, 9800 - this.served * 420);
+    const base = Math.max(4000, 9800 - this.served * 420);
+    return this.arc === 'breathe' ? Math.round(base * 1.55) : base;
   }
 
-  get _rushing() { return performance.now() < this.rushUntil; }
+  get _rushing() { return this.arc === 'rush'; }
+
+  /**
+   * The shift breathes: a calm stretch, a rush of three-to-five, then one
+   * slow customer to let the player's shoulders drop. The first rush cannot
+   * arrive before the sixth order, so minute one is the shift it always was.
+   */
+  _advanceArc() {
+    const prev = this.arc;
+    if (this.rushLeft > 0) { this.rushLeft -= 1; this.arc = 'rush'; }
+    else if (prev === 'rush') { this.arc = 'breathe'; this.calmLeft = 5; }
+    else if (this.calmLeft > 0) { this.calmLeft -= 1; this.arc = 'calm'; }
+    else {
+      this.rushes += 1;
+      this.rushLeft = Math.min(4, 1 + this.rushes); // 2, 3, 4, 5 customers long
+      this.arc = 'rush';
+    }
+    if (this.arc !== prev) this._arcChanged();
+  }
+
+  _arcChanged() {
+    const chip = this.el.rush;
+    if (!chip) return;
+    if (this.arc === 'rush') {
+      chip.textContent = 'RUSH HOUR';
+      chip.classList.remove('mg-smoothie-calm');
+      chip.classList.add('mg-smoothie-on');
+      this.el.tint.classList.add('mg-smoothie-on');
+      this.game.audio?.play?.('ding');
+      this._banner('RUSH HOUR', `EVERY TIP &times;${RUSH_MULT}`, 'linear-gradient(90deg,#e8657a,#f2b64a)');
+    } else if (this.arc === 'breathe') {
+      chip.textContent = 'BREATHE';
+      chip.classList.add('mg-smoothie-on', 'mg-smoothie-calm');
+      this.el.tint.classList.remove('mg-smoothie-on');
+      this.game.audio?.play?.('pop');
+    } else {
+      chip.classList.remove('mg-smoothie-on', 'mg-smoothie-calm');
+      this.el.tint.classList.remove('mg-smoothie-on');
+    }
+  }
 
   // ---- customers ----------------------------------------------------------
   _nextCustomer(first = false) {
     if (this.phase !== 'play') return;
+    for (const u of UNLOCKS) if (this.served >= u.at) this._unlock(u.id);
+    this._advanceArc();
+
     this.cust = this.queue.shift();
     this.queue.push(this._makeCapy());
     const len = this._orderLength();
-    this.cust.order = Array.from({ length: len }, () => pick(ING_IDS));
+    this.cust.order = Array.from({ length: len }, () => pick(this.pool));
     this.cust.patMs = this._patienceMs();
+    // a golden order is pure upside, never a longer order, never back to back
+    this.cust.golden = this.served >= 4 && this.served - this.lastGolden >= 3
+      && this.arc !== 'breathe' && Math.random() < 0.2;
+    if (this.cust.golden) this.lastGolden = this.served;
     this.patience = 1;
+    this.flawless = true;
     this.filled = [];
     this.expr = 'idle';
 
     this.el.name.textContent = this.cust.name;
     this.el.cust.style.visibility = 'visible';
+    this.el.bubble.classList.toggle('mg-smoothie-gold', !!this.cust.golden);
+    this.el.goldtag.style.display = this.cust.golden ? '' : 'none';
+    this.el.cust.classList.toggle('mg-smoothie-goldc', !!this.cust.golden);
     this.el.cust.classList.remove('mg-smoothie-leave', 'mg-smoothie-storm', 'mg-smoothie-arrive');
     void this.el.cust.offsetWidth;
     this.el.cust.classList.add('mg-smoothie-arrive');
@@ -1102,7 +1444,10 @@ export class SmoothieGame extends Minigame {
     this._paintOrder();
     this._clearJar();
     this._updatePatience(true);
-    if (!first) this.game.audio?.play?.('pop');
+    if (this.cust.golden) {
+      this.game.audio?.play?.('ding');
+      this._sparkle(this._pointOf(this.el.bubble), 10, 1.1);
+    } else if (!first) this.game.audio?.play?.('pop');
     this.blinkAt = performance.now() + 1500 + Math.random() * 2500;
   }
 
@@ -1183,6 +1528,7 @@ export class SmoothieGame extends Minigame {
 
   _add(id) {
     if (this.phase !== 'play' || !this.cust) return;
+    if (!this.pool.includes(id)) return; // not on the shelf yet
     const btn = this.el.btns[id];
     btn.classList.remove('mg-smoothie-press');
     void btn.offsetWidth;
@@ -1208,8 +1554,14 @@ export class SmoothieGame extends Minigame {
 
   _wrong(id) {
     this.game.audio?.play?.('fail');
+    const hadCombo = this.streak;
     this.streak = 0;
+    this.flawless = false;
     this._syncStreak();
+    if (hadCombo >= 3) {
+      const s = this._pointOf(this.el.scene);
+      this._float(`COMBO x${hadCombo} LOST`, s.x, s.y - 70, 'mg-smoothie-bad');
+    }
     const b = this.el.blender;
     b.classList.remove('mg-smoothie-nope');
     void b.offsetWidth;
@@ -1267,10 +1619,12 @@ export class SmoothieGame extends Minigame {
     void cup.offsetWidth;
     cup.style.transition = 'left .38s cubic-bezier(.4,0,.3,1),opacity .18s';
     cup.classList.add('mg-smoothie-show');
+    cup.classList.remove('mg-smoothie-plated', 'mg-smoothie-royal');
     this.el.cupFill.style.background = color;
     this.el.cupFill.style.height = '0px';
     this.el.fill.style.height = '0px';
     this._after(40, () => { if (this.el.cupFill) this.el.cupFill.style.height = '54px'; });
+    if (this.flawless) this._after(210, () => this._plate());
     this._after(330, () => {
       if (!this.el.cup) return;
       cup.style.left = `${cRect.left - sceneRect.left + cRect.width / 2 - 26}px`;
@@ -1278,31 +1632,64 @@ export class SmoothieGame extends Minigame {
     this._after(760, () => this._paid());
   }
 
+  /** Garnish the cup: a fruit wedge on the rim, a swirl of cream, sparkles.
+   *  Only a flawless order earns it, so the flourish IS the feedback. */
+  _plate() {
+    const cup = this.el.cup;
+    if (!cup || !this.cust) return;
+    const g = this.el.garnish;
+    if (g) {
+      g.innerHTML = '';
+      g.appendChild(iconCanvas(this.cust.order[0], 26));
+    }
+    cup.classList.add('mg-smoothie-plated');
+    if (this.cust.golden) cup.classList.add('mg-smoothie-royal');
+    this.game.audio?.play?.('ding');
+    this._sparkle(this._pointOf(cup), this.cust.golden ? 12 : 6, this.cust.golden ? 1.2 : 0.8);
+  }
+
   _paid() {
     if (!this.cust) return;
     const rush = this._rushing;
-    const base = this.cust.order.length * 3;
-    const tip = Math.round(this.patience * 10);
-    const bonus = Math.min(this.streak, 8);
-    let pay = base + tip + bonus;
-    if (rush) pay *= 2;
+    const golden = !!this.cust.golden;
+    const perfect = this.flawless;
 
-    this.score += pay;
     this.served += 1;
-    this.streak += 1;
-    this.bestStreak = Math.max(this.bestStreak, this.streak);
+    if (perfect) {
+      this.streak += 1;
+      this.bestStreak = Math.max(this.bestStreak, this.streak);
+    }
+    if (golden) this.goldens += 1;
+
+    // base + tip, lifted by the combo ladder, the rush and the golden order.
+    // The stack is bounded (MAX_MULT) so no single order runs away with the run.
+    const tier = this._tier();
+    const base = this.cust.order.length * 3;
+    const tip = Math.round(this.patience * 12);
+    const stack = Math.min(MAX_MULT, tier.mult * (rush ? RUSH_MULT : 1));
+    const mult = stack * (golden ? GOLD_MULT : 1);
+    const pay = Math.max(1, Math.round((base + tip) * mult));
+    this.score += pay;
 
     this.expr = 'beam';
     this._paintCustomer();
     this.game.audio?.play?.('coin');
 
     const p = this._pointOf(this.el.cust);
-    this._float(`+${pay}`, p.x, p.y - 30, 'mg-smoothie-tip');
-    if (this.streak >= 3) {
-      this._float(`STREAK x${this.streak}`, p.x, p.y - 86, 'mg-smoothie-combo');
+    this._float(`+${pay}`, p.x, p.y - 30, golden ? 'mg-smoothie-gold' : 'mg-smoothie-tip');
+    let row = 86;
+    if (golden) {
+      this._float('GOLDEN ORDER!', p.x, p.y - row, 'mg-smoothie-gold');
+      row += 40;
+      this._sparkle(p, 16, 1.4);
+      this.game.audio?.play?.('success');
     }
-    if (rush) this._float('RUSH TIP x2', p.x + 90, p.y - 60, 'mg-smoothie-combo');
-    this._splatter(this.cust.color, p);
+    if (perfect && !golden) this._float('PERFECT', p.x, p.y - row, 'mg-smoothie-perfect');
+    if (mult > 1.01) {
+      this._float(`x${mult.toFixed(2).replace(/0$/, '').replace(/\.$/, '')}`,
+        p.x + 96, p.y - 54, 'mg-smoothie-combo');
+    }
+    this._splatter(golden ? '#f2b64a' : this.cust.color, p);
 
     this.el.score.textContent = String(Math.round(this.score));
     this.el.scoreChip.classList.remove('mg-smoothie-bump');
@@ -1314,10 +1701,9 @@ export class SmoothieGame extends Minigame {
     if (this.el.chunks) { this.el.chunks.style.opacity = ''; this.el.chunks.innerHTML = ''; }
     this.filled = [];
 
-    if (this.served % 5 === 0) this._startRush();
-
     this._after(520, () => {
       this.el.cust.classList.add('mg-smoothie-leave');
+      this.el.cup?.classList.remove('mg-smoothie-plated', 'mg-smoothie-royal');
       this.game.audio?.play?.('whoosh');
       this._after(420, () => {
         if (this.strikes >= 3) return;
@@ -1327,20 +1713,12 @@ export class SmoothieGame extends Minigame {
     });
   }
 
-  _startRush() {
-    this.rushUntil = performance.now() + 11000;
-    this.game.audio?.play?.('ding');
-    this.el.rush.classList.add('mg-smoothie-on');
-    this.el.tint.classList.add('mg-smoothie-on');
-    const p = this._pointOf(this.el.scene);
-    this._float('RUSH HOUR!', p.x, p.y - 40, 'mg-smoothie-tip');
-  }
-
   _stormOff() {
     if (!this.cust || this.phase !== 'play') return;
     this.phase = 'serve';
     this.strikes += 1;
     this.streak = 0;
+    this.flawless = false;
     this._syncStreak();
     this.game.audio?.play?.('fail');
     this.expr = 'cross';
@@ -1366,9 +1744,81 @@ export class SmoothieGame extends Minigame {
     });
   }
 
-  _syncStreak() {
-    this.el.streak.textContent = String(this.streak);
-    this.el.streakChip.classList.toggle('mg-smoothie-hot', this.streak >= 3);
+  /** Highest combo tier the current flawless streak has lit. */
+  _tier() {
+    let t = TIERS[0];
+    for (const x of TIERS) if (this.streak >= x.at) t = x;
+    return t;
+  }
+
+  _syncStreak(silent = false) {
+    const el = this.el;
+    if (!el.streak) return;
+    const tier = this._tier();
+    const idx = TIERS.indexOf(tier);
+    const next = TIERS[idx + 1] || null;
+    const frac = next ? (this.streak - tier.at) / (next.at - tier.at) : 1;
+
+    el.streak.textContent = String(this.streak);
+    el.tierName.textContent = tier.name || (this.streak ? '' : 'BUILD IT');
+    el.cbar.style.width = `${Math.max(0, Math.min(1, frac)) * 100}%`;
+    el.cbar.style.background = next ? tier.col : '#fff6e3';
+    el.streakChip.classList.toggle('mg-smoothie-hot', idx > 0);
+    el.streakChip.style.background = idx > 0
+      ? `linear-gradient(135deg,${tier.col},${shade(tier.col, -0.22)})`
+      : '';
+    el.streak.style.color = idx > 0 ? '#fff' : tier.col;
+
+    // the screen itself warms up as the ladder climbs
+    if (el.heat) {
+      el.heat.style.opacity = String(tier.glow);
+      el.heat.style.boxShadow = `inset 0 0 ${Math.round(70 + tier.glow * 150)}px `
+        + `${Math.round(6 + tier.glow * 34)}px ${tier.col}`;
+      el.heat.classList.toggle('mg-smoothie-max', idx === TIERS.length - 1);
+    }
+
+    if (silent) { this.tierAt = idx; return; }
+    if (idx > this.tierAt) {
+      el.streakChip.classList.remove('mg-smoothie-tierup');
+      void el.streakChip.offsetWidth;
+      el.streakChip.classList.add('mg-smoothie-tierup');
+      this.game.audio?.play?.('success');
+      this._banner(tier.name, `COMBO &times;${this.streak} &middot; TIPS &times;${tier.mult}`,
+        `linear-gradient(90deg,${tier.col},${shade(tier.col, 0.3)})`);
+      this._sparkle(this._pointOf(el.streakChip), 9, 0.9);
+    }
+    this.tierAt = idx;
+  }
+
+  /** One big centred call-out. Escalation you cannot miss. */
+  _banner(title, sub, background) {
+    if (!this.el.fx) return;
+    const d = document.createElement('div');
+    d.className = 'mg-smoothie-banner';
+    d.style.background = background;
+    d.innerHTML = sub ? `${title}<span>${sub}</span>` : title;
+    this.el.fx.appendChild(d);
+    this._after(1550, () => d.remove());
+  }
+
+  _sparkle(p, n = 8, scale = 1) {
+    if (!this.el.fx) return;
+    for (let i = 0; i < n; i++) {
+      const d = document.createElement('div');
+      d.className = 'mg-smoothie-star';
+      const a = (i / n) * Math.PI * 2 + Math.random() * 0.6;
+      const dist = (34 + Math.random() * 60) * scale;
+      d.style.setProperty('--dx', `${Math.cos(a) * dist}px`);
+      d.style.setProperty('--dy', `${Math.sin(a) * dist - 26}px`);
+      const s = (9 + Math.random() * 12) * scale;
+      d.style.width = `${s}px`;
+      d.style.height = `${s}px`;
+      d.style.left = `${p.x}px`;
+      d.style.top = `${p.y}px`;
+      d.style.animationDelay = `${(i * 0.03).toFixed(2)}s`;
+      this.el.fx.appendChild(d);
+      this._after(1150, () => d.remove());
+    }
   }
 
   // ---- fx -----------------------------------------------------------------
@@ -1424,7 +1874,7 @@ export class SmoothieGame extends Minigame {
       return;
     }
     if (this.phase !== 'play') return;
-    const idx = '1234567'.indexOf(k);
+    const idx = '1234567890'.indexOf(k);
     if (idx >= 0) { e.preventDefault(); this._add(ING_IDS[idx]); return; }
     if (k === ' ' || k === 'Enter') { e.preventDefault(); this._blend(); return; }
     if (k === 'Backspace') { e.preventDefault(); this._dump(); }
@@ -1460,14 +1910,9 @@ export class SmoothieGame extends Minigame {
     this.lastFrame = t;
     if (this.phase !== 'play' || !this.cust) return;
 
-    const mult = this._rushing ? 1.7 : 1;
+    const mult = this._rushing ? 1.45 : 1;
     this.patience -= (dt * 1000 / this.cust.patMs) * mult;
     this._updatePatience();
-
-    if (this.rushUntil && !this._rushing && this.el.rush.classList.contains('mg-smoothie-on')) {
-      this.el.rush.classList.remove('mg-smoothie-on');
-      this.el.tint.classList.remove('mg-smoothie-on');
-    }
 
     if (t > this.blinkAt && this.expr === 'idle') {
       this.blinkAt = t + 1800 + Math.random() * 2600;

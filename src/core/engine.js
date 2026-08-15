@@ -5,6 +5,7 @@ import { createAvatar } from '../player/avatar.js';
 import { WalkController } from '../player/controller.js';
 import { attachOverlay, preloadLayout } from '../world/overlay.js';
 import { attachCharm } from '../world/charm.js';
+import { attachAmbience } from '../world/ambience.js';
 
 const DOWN = new THREE.Vector3(0, -1, 0);
 const _rayOrigin = new THREE.Vector3(); // snapY runs per remote per frame; don't allocate
@@ -216,6 +217,9 @@ export class Engine {
       this.room.build(this.scene, this.game);
       attachOverlay(this.room, this.scene, this.game, id);
       attachCharm(this.room, this.scene, this.game, id);
+      // living air, outermost wrap: it hooks the room instance's own
+      // update/dispose/onClock, so the clock replay below must stay after it
+      attachAmbience(this.room, this.scene, this.game, id);
       if (!this.room.groundMeshes?.length) console.warn(`[engine] room '${id}' has no groundMeshes`);
       this.scene.add(this.remoteGroup);
       // {arrive:true}: the player is walking into this room behind a closed
@@ -362,6 +366,7 @@ export class Engine {
     this.room.build(this.scene, this.game);
     attachOverlay(this.room, this.scene, this.game, this.room.id);
     attachCharm(this.room, this.scene, this.game, this.room.id);
+    attachAmbience(this.room, this.scene, this.game, this.room.id);
     this.scene.add(this.remoteGroup);
     // in-place rebuild (the layout editor, after every dragged handle): nothing
     // covered the screen, so no arrival staging and no tinted wipe

@@ -29,7 +29,7 @@ import { writeJsonAtomic } from './store.js';
 import {
   ROOM_IDS, ROOM_INFO, DEFAULT_ROOM, HATS, CHAT_MAX_LEN, NET_TICK_MS,
   NAME_MAX_LEN, NAME_MIN_LEN, clampCoinsForGame, MINIGAMES,
-  FURNITURE, HOUSE_MAX_ITEMS, HOUSE_ACCESS_MODES, BODY_COLORS,
+  FURNITURE, HOUSE_MAX_ITEMS, HOUSE_ACCESS_MODES, BODY_COLORS, TRAILS,
 } from '../shared/constants.js';
 
 // Client-supplied strings must never reach a catalog through the prototype
@@ -292,6 +292,10 @@ function snapshotFor(p) {
   // this snapshot is on the hot path and bots never have either.
   if (p.room === DRIFT_ROOM || p.y) snap.y = +(p.y || 0).toFixed(2);
   if (p.ride) snap.ride = 1;
+  // The worn flourish (walk trail or idle aura). Present only when they have
+  // one on, so the hot path pays nothing for the many who do not;
+  // src/player/trails.js reads exactly this field off the remote's snapshot.
+  if (p.trail && p.trail !== 'none') snap.trail = p.trail;
   // The 40-stamp milestone title, for the second line on the world name tag
   // (src/net/client.js addTagTitle reads exactly this field). Only ever present
   // on the handful of accounts that earned it, so the hot path pays nothing.
@@ -1279,30 +1283,50 @@ function exitPropHunt(p) {
 // earn it, so there is nothing to read out of the DOM.
 
 // ~130 all-ages nouns, all of them things a capy could point at in the cove.
-const DOODLE_WORDS = [
-  'smoothie', 'chairlift', 'top hat', 'shark', 'pickaxe', 'minecart',
-  'lantern', 'crystal', 'mushroom', 'barrel', 'crate', 'sled',
-  'snowman', 'fountain', 'palm tree', 'seashell', 'crab', 'surfboard',
-  'beach ball', 'sandcastle', 'fishing rod', 'jellyfish', 'starfish', 'dolphin',
-  'iceberg', 'snowball', 'mitten', 'scarf', 'cocoa', 'marshmallow',
-  'blender', 'banana', 'mango', 'strawberry', 'pineapple', 'waffle',
-  'pancake', 'cupcake', 'cookie', 'donut', 'ice cream', 'popcorn',
-  'teapot', 'mug', 'apron', 'chef hat', 'disco ball', 'speaker',
-  'headphones', 'drum', 'guitar', 'piano', 'trumpet', 'microphone',
-  'neon sign', 'campfire', 'tent', 'lamp post', 'bridge', 'ladder',
-  'bucket', 'shovel', 'wheelbarrow', 'rope', 'anchor', 'sailboat',
-  'canoe', 'paddle', 'lighthouse', 'treasure chest', 'compass', 'telescope',
-  'balloon', 'kite', 'umbrella', 'sunglasses', 'backpack', 'wagon',
-  'bicycle', 'skateboard', 'rocket', 'robot', 'teddy bear', 'beanbag',
-  'sofa', 'bookshelf', 'aquarium', 'fireplace', 'pillow', 'blanket',
-  'alarm clock', 'mailbox', 'postcard', 'present', 'ribbon', 'birthday cake',
-  'candle', 'party hat', 'confetti', 'trophy', 'medal', 'crown',
-  'viking helm', 'pirate hat', 'propeller cap', 'flower pot', 'cactus', 'sunflower',
-  'acorn', 'pinecone', 'vine', 'waterfall', 'rainbow', 'snowflake',
-  'moon', 'star', 'butterfly', 'toucan', 'frog', 'turtle',
-  'snail', 'duckling', 'otter', 'bumblebee', 'firefly', 'owl',
-  'parrot', 'monkey', 'hammock', 'torch', 'statue', 'gemstone',
-];
+// Words grouped into themed packs (games wave B4): each round draws from ONE
+// pack, named on the wire, so the round has a flavour ("Snack Bar round!").
+// doodle.js reads `pack` off dd-words and dd-state and prefers this label.
+const DOODLE_PACKS = {
+  'Cove Life': [
+    'smoothie', 'chairlift', 'top hat', 'shark', 'pickaxe', 'minecart',
+    'lantern', 'crystal', 'mushroom', 'barrel', 'crate', 'sled',
+    'snowman', 'fountain', 'neon sign', 'disco ball', 'trophy', 'medal',
+    'crown', 'viking helm', 'pirate hat', 'propeller cap', 'statue', 'gemstone',
+  ],
+  'Beach Day': [
+    'palm tree', 'seashell', 'crab', 'surfboard', 'beach ball', 'sandcastle',
+    'fishing rod', 'jellyfish', 'starfish', 'dolphin', 'anchor', 'sailboat',
+    'canoe', 'paddle', 'lighthouse', 'treasure chest', 'compass', 'telescope',
+    'umbrella', 'sunglasses', 'hammock', 'kite',
+  ],
+  'Snack Bar': [
+    'blender', 'banana', 'mango', 'strawberry', 'pineapple', 'waffle',
+    'pancake', 'cupcake', 'cookie', 'donut', 'ice cream', 'popcorn',
+    'teapot', 'mug', 'apron', 'chef hat', 'cocoa', 'marshmallow',
+    'birthday cake', 'candle',
+  ],
+  'Band Night': [
+    'speaker', 'headphones', 'drum', 'guitar', 'piano', 'trumpet',
+    'microphone', 'balloon', 'present', 'ribbon', 'party hat', 'confetti',
+  ],
+  'Out Exploring': [
+    'iceberg', 'snowball', 'mitten', 'scarf', 'campfire', 'tent',
+    'lamp post', 'bridge', 'ladder', 'bucket', 'shovel', 'wheelbarrow',
+    'rope', 'backpack', 'wagon', 'bicycle', 'skateboard', 'rocket',
+    'torch', 'waterfall', 'rainbow', 'snowflake', 'moon', 'star',
+  ],
+  'Cozy Corner': [
+    'robot', 'teddy bear', 'beanbag', 'sofa', 'bookshelf', 'aquarium',
+    'fireplace', 'pillow', 'blanket', 'alarm clock', 'mailbox', 'postcard',
+    'flower pot', 'cactus', 'sunflower', 'acorn', 'pinecone', 'vine',
+  ],
+  'Little Friends': [
+    'butterfly', 'toucan', 'frog', 'turtle', 'snail', 'duckling',
+    'otter', 'bumblebee', 'firefly', 'owl', 'parrot', 'monkey',
+  ],
+};
+const DOODLE_PACK_NAMES = Object.keys(DOODLE_PACKS);
+const DOODLE_WORDS = Object.values(DOODLE_PACKS).flat();
 
 /** Case, spacing and punctuation all forgiven: "Top  Hat!" matches "top hat". */
 const normalizeWord = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1327,15 +1351,23 @@ function editDistance(a, b, max = 1) {
   return prev[b.length];
 }
 
-/** Three fresh choices; a word already drawn this game never comes back. */
-function pickWords(used) {
+/**
+ * Three fresh choices from ONE themed pack; a word already drawn this game
+ * never comes back. The pack rotates per round from a random start, so a
+ * five-round game tours five different flavours. Falls back to the full list
+ * if a pack somehow runs dry mid-game.
+ */
+function pickWords(used, packName = null) {
+  const pool = (packName && DOODLE_PACKS[packName]) || DOODLE_WORDS;
   const out = [];
   for (let guard = 0; out.length < 3 && guard < 400; guard++) {
-    const w = DOODLE_WORDS[Math.floor(Math.random() * DOODLE_WORDS.length)];
+    const w = pool[Math.floor(Math.random() * pool.length)];
     if (!out.includes(w) && !used.has(w)) out.push(w);
   }
-  // 130 words against 5 rounds means this never runs, but a repeat still beats
-  // a round that never starts
+  // the pack ran dry (tiny pack, long game): top up from everything
+  for (let i = 0; out.length < 3 && i < DOODLE_WORDS.length; i++) {
+    if (!out.includes(DOODLE_WORDS[i]) && !used.has(DOODLE_WORDS[i])) out.push(DOODLE_WORDS[i]);
+  }
   for (let i = 0; out.length < 3 && i < DOODLE_WORDS.length; i++) {
     if (!out.includes(DOODLE_WORDS[i])) out.push(DOODLE_WORDS[i]);
   }
@@ -1345,7 +1377,12 @@ function pickWords(used) {
 const maskOf = (word) => word.replace(/[a-z0-9]/gi, '_');
 
 const doodleStandings = (g) => [...g.players.values()]
-  .map(({ id, name, score }) => ({ id, name, score }))
+  .map(({ id, name, score, guessScore, drawScore }) => ({
+    id, name, score,
+    // additive halves for the end card's referee-backed awards; absent until
+    // the first point of that kind, and the client tolerates both states
+    ...(guessScore ? { guessScore } : {}), ...(drawScore ? { drawScore } : {}),
+  }))
   .sort((a, b) => b.score - a.score);
 
 /** Everyone still connected, still in this game. */
@@ -1366,6 +1403,7 @@ function broadcastDoodle(g, msg) {
 function sendDoodleState(g, extra = {}) {
   const base = {
     t: 'dd-state', phase: g.phase, round: g.round, rounds: g.rounds,
+    pack: g.pack || undefined,
     drawerId: g.drawerId, mask: g.mask, len: g.word ? g.word.length : 0,
     ms: Math.max(0, g.phaseEndsAt - Date.now()),
     scores: doodleStandings(g), guessed: [...g.guessed],
@@ -1387,9 +1425,14 @@ function clearDoodleTimers(g) {
   g.reveals = [];
 }
 
-function addDoodleScore(g, id, points) {
+function addDoodleScore(g, id, points, half = null) {
   const row = g.players.get(id);
-  if (row) row.score += points;
+  if (!row) return;
+  row.score += points;
+  // the two halves of a doodle score, so the end card's BEST GUESSER and
+  // BEST ARTIST awards come from the referee, not a client-side tally
+  if (half === 'guess') row.guessScore = (row.guessScore || 0) + points;
+  else if (half === 'draw') row.drawScore = (row.drawScore || 0) + points;
 }
 
 function startDoodle(members) {
@@ -1442,10 +1485,13 @@ function nextDoodleRound(g) {
   g.guessed.clear();
   g.skips.clear(); // every round starts unvoted
   g.correct = 0;
-  g.choices = pickWords(g.used);
+  // one themed pack per round, rotating from a random per-game start
+  if (!Number.isInteger(g.packStart)) g.packStart = Math.floor(Math.random() * DOODLE_PACK_NAMES.length);
+  g.pack = DOODLE_PACK_NAMES[(g.packStart + g.round - 1) % DOODLE_PACK_NAMES.length];
+  g.choices = pickWords(g.used, g.pack);
   g.phaseEndsAt = Date.now() + DD_PICK_MS;
   const drawer = world.players.get(drawerId);
-  if (drawer) sendTo(drawer, { t: 'dd-words', words: [...g.choices], round: g.round });
+  if (drawer) sendTo(drawer, { t: 'dd-words', words: [...g.choices], round: g.round, pack: g.pack });
   sendDoodleState(g);
   // a drawer who wanders off to make cocoa must not stall the whole jungle
   g.timer = setTimeout(() => {
@@ -1506,8 +1552,8 @@ function scoreDoodleGuess(g, p) {
   const points = guessPoints(g.correct, fracLeft);
   g.correct++;
   g.guessed.add(p.id);
-  addDoodleScore(g, p.id, points);
-  addDoodleScore(g, g.drawerId, DD_DRAWER_POINTS);
+  addDoodleScore(g, p.id, points, 'guess');
+  addDoodleScore(g, g.drawerId, DD_DRAWER_POINTS, 'draw');
   const base = {
     t: 'dd-correct', id: p.id, name: p.name, points,
     drawerId: g.drawerId, drawerPoints: DD_DRAWER_POINTS,
@@ -2438,6 +2484,8 @@ wss.on('connection', (ws) => {
             name: profile.name, username, registered: !!username,
             room: null, x: 0, y: 0, z: 4, rot: 0, anim: 'idle',
             coins: profile.coins, color: profile.color, hat: profile.hat,
+            trail: typeof profile.trail === 'string' ? profile.trail : 'none',
+            ownedTrails: Array.isArray(profile.ownedTrails) ? [...profile.ownedTrails] : ['none'],
             ownedHats: profile.ownedHats, bests: profile.bests,
             lastChat: 0, joinWindow: 0, joinCount: 0, run: null, earned: [],
             socialWindow: 0, socialCount: 0, race: null,
@@ -2552,8 +2600,27 @@ wss.on('connection', (ws) => {
         case 'custom': {
           p.color = Number(m.color) || p.color;
           if (has(HATS, m.hat) && (p.ownedHats.includes(m.hat) || !p.registered)) p.hat = m.hat;
+          if (has(TRAILS, m.trail) && (p.ownedTrails.includes(m.trail) || !p.registered)) p.trail = m.trail;
           persist(p);
-          broadcastToRoom(p.room, { t: 'custom', id: p.id, color: p.color, hat: p.hat }, p.id);
+          broadcastToRoom(p.room, { t: 'custom', id: p.id, color: p.color, hat: p.hat, trail: p.trail }, p.id);
+          break;
+        }
+        // The owner's stamp showcase (src/ui/profile.js). Guests have no record
+        // to write to, and a stamp they have not earned is never pinned.
+        case 'profile-set': {
+          if (socialLimited(p, t0)) break;
+          const rec = recordFor(p);
+          if (!rec || !Array.isArray(m.showcase)) break;
+          const earned = rec.progress?.stamps || {};
+          const ids = [];
+          for (const v of m.showcase) {
+            if (typeof v !== 'string' || !v || ids.includes(v)) continue;
+            if (!has(earned, v)) continue;
+            ids.push(v);
+            if (ids.length >= 3) break;
+          }
+          rec.showcase = ids;
+          persist(p);
           break;
         }
         // A run must be announced before it can be paid out, so 'score' can no
@@ -2617,6 +2684,32 @@ wss.on('connection', (ws) => {
           stats.spend(p, hat.price, 'hat');
           break;
         }
+        // The flourish slot: same shape as 'buy' above, same guards, same
+        // 'shop' frame family, so one client handler serves both counters.
+        case 'buy-trail': {
+          const tr = has(TRAILS, m.trail) ? TRAILS[m.trail] : null;
+          if (!tr || !Number.isFinite(tr.price)) return sendTo(p, { t: 'shop', ok: false, msg: 'Unknown trail' });
+          // milestone flourishes are earned, never sold: the same rule (and
+          // the same wire-level refusal) as the milestone hats
+          if (tr.milestone) {
+            return sendTo(p, { t: 'shop', ok: false, msg: 'That one is earned, not bought. Fill your stamp album!' });
+          }
+          // read the live record, not this connection's snapshot, so a second
+          // session cannot buy against a balance another one already spent
+          const rec = recordFor(p);
+          const owned = rec ? rec.ownedTrails || ['none'] : p.ownedTrails;
+          if (owned.includes(m.trail)) return sendTo(p, { t: 'shop', ok: false, msg: 'Already owned' });
+          const stored = rec ? rec.coins : p.coins;
+          const bal = Number.isFinite(stored) ? stored : 0;
+          if (bal < tr.price) return sendTo(p, { t: 'shop', ok: false, msg: 'Not enough coins' });
+          if (rec) { rec.coins = bal - tr.price; rec.ownedTrails = [...owned, m.trail]; }
+          p.coins = bal - tr.price;
+          if (!p.ownedTrails.includes(m.trail)) p.ownedTrails.push(m.trail);
+          persist(p);
+          sendTo(p, { t: 'shop', ok: true, coins: p.coins, delta: -tr.price, ownedTrails: p.ownedTrails, boughtTrail: m.trail });
+          stats.spend(p, tr.price, 'trail');
+          break;
+        }
         case 'shop-rot':
           if (socialLimited(p, t0)) break;
           sendTo(p, shopRotFrame());
@@ -2668,6 +2761,16 @@ wss.on('connection', (ws) => {
             // shows (src/ui/profile.js prefers it over its own flavour line)
             title: (!target.bot && typeof rec?.title === 'string' && rec.title) || '',
             ...charms.profileBits(rec),
+            // profile v2 (src/ui/profile.js). Every field is additive and the
+            // card degrades to not-drawn without it.
+            // `plays` is progress.c.byGame, which already counts scored runs.
+            since: !target.bot && Number.isFinite(rec?.created) ? rec.created : undefined,
+            plays: target.bot ? undefined : { ...(rec?.progress?.c?.byGame || {}) },
+            showcase: Array.isArray(rec?.showcase) ? [...rec.showcase] : undefined,
+            // STAFF ONLY. 'player' is never sent, so a normal capy leaks
+            // nothing, and caps are never sent to a third party at all.
+            role: (!target.bot && rec && admin.profileBits(rec).role !== 'player')
+              ? admin.profileBits(rec).role : undefined,
           });
           break;
         }
@@ -2988,8 +3091,11 @@ wss.on('connection', (ws) => {
             raw = JSON.stringify({
               t: 'dd-stroke', from: p.id, pts: m.pts,
               s: Math.floor(Number(m.s) || 0),
-              c: Math.floor(Number(m.c) || 0),
-              w: Math.floor(Number(m.w) || 0),
+              // clamped to the shipped palette (0..8, 8 = eraser) and width
+              // rack (0..2): every client clamps anyway, this keeps junk off
+              // the wire rather than closing any trust hole
+              c: Math.max(0, Math.min(8, Math.floor(Number(m.c) || 0))),
+              w: Math.max(0, Math.min(2, Math.floor(Number(m.w) || 0))),
               e: m.e ? 1 : 0,
             });
           }

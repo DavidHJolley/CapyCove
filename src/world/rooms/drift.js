@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
+import { makeWater, GLSL_CAUSTIC, waveFunctionGLSL, COVE_WAVES } from '../water.js';
 import { SwimController } from '../../player/swim.js';
 
 /* ---------------------------------------------------------------------------
@@ -53,6 +54,28 @@ const TAU = Math.PI * 2;
 const SURFACE_Y = 24;            // the underside of the sea, far overhead
 const SURFACE_GLSL = SURFACE_Y.toFixed(1); // same number, spelled for GLSL
 const FLOOR_R = 50;              // seabed plate radius (fog eats the rim)
+// The swell overhead, in the shared cove wave table's terms (src/world/water.js).
+// SCALE stretches the wavelength out to ~24 units, which is what an ocean swell
+// looks like from 24 metres under it; AMP then puts real slope back on the
+// faces so the toon ramp has something to band.
+const SWELL_SCALE = 0.42;
+const SWELL_AMP = 4.5;
+// WHERE THE SEA ACTUALLY IS. SURFACE_Y is the DEPTH REFERENCE - the number the
+// depth grade, the jelly reset and the swim volume are all tuned against, and
+// it does not move. The sea MESH is a different thing: it sits 1.6 above that
+// reference so the whole swell clears the reference plane, and it undulates
+// +/- SWELL_PEAK on top.
+//
+// Anything that is meant to touch, stop at, or disappear into the sea must be
+// built against SEA_MIN / SEA_MAX, never against SURFACE_Y. This is not
+// bookkeeping: the first pass raised the mesh and left the props behind, and
+// the dive-bell cable - the room's one piece of wayfinding, "the way home is
+// that way" - ended 0.9 to 2.2 units short and just stopped in open water.
+const SWELL_PEAK = SWELL_AMP * 0.28;   // 1.26, the wave table's amplitude sum
+const SEA_MESH_Y = SURFACE_Y + 1.6;    // 25.6, the mean height of the water mesh
+const SEA_MIN = SEA_MESH_Y - SWELL_PEAK; // 24.34, the lowest the sea ever gets
+const SEA_MAX = SEA_MESH_Y + SWELL_PEAK; // 26.86, the highest
+const SWELL_REFRACT = 7.0;       // how far that slope drags the caustics on the sand
 const DAY_SECONDS = 40 * 60;     // one cove day, from LIVING-COVE.md A
 
 // Swimmable volume. Pushing the edge eases you back: "the current". The floor
@@ -119,22 +142,10 @@ const C = {
 
 // ---------------------------------------------------------------- shaders ---
 
-// Domain-warped ridged sines: three cheap folds give the thin bright filaments
-// real caustics have, with no texture and no derivatives.
-const GLSL_CAUSTIC = `
-float caust(vec2 p, float t) {
-  vec2 q = p;
-  float acc = 0.0;
-  for (int i = 0; i < 3; i++) {
-    float k = float(i) * 0.7 + 1.0;
-    q += vec2(sin(q.y * 1.7 + t * 0.85 / k), cos(q.x * 1.55 - t * 0.62 / k)) * 0.62;
-    acc += 1.0 - abs(sin(q.x * 1.15 + q.y * 0.95 + t * 0.35));
-  }
-  // a cube, not a fifth power: any higher and the filaments thin out to
-  // nothing on a 100-unit seabed
-  return pow(clamp(acc * 0.3333, 0.0, 1.0), 3.0);
-}
-`;
+// The caustic net (GLSL_CAUSTIC) and the cove swell (waveFunctionGLSL) are both
+// imported from src/world/water.js so the sea overhead and the light it throws
+// on the sand are literally the same two functions. See _buildSurface.
+const GLSL_SWELL = waveFunctionGLSL(COVE_WAVES);
 
 // NOTE on the two #includes every fragment shader below ends with: three only
 // appends tone mapping and the output colour-space conversion to its OWN
@@ -168,12 +179,13 @@ void main() {
 
 const FS_SEABED = `
 uniform vec3 uSand, uDeep, uCaustCol, uBio, uWhale;
-uniform float uTime, uCaust, uNight;
+uniform float uTime, uCaust, uNight, uSwellScl, uRefract;
 varying vec3 vW;
 varying vec3 vN;
 varying float vDist;
 ${GLSL_FOG}
 ${GLSL_CAUSTIC}
+${GLSL_SWELL}
 void main() {
   // three-step toon ramp off a fixed "sun through the surface" direction
   float nl = dot(normalize(vN), normalize(vec3(0.22, 1.0, 0.12)));
@@ -187,10 +199,23 @@ void main() {
   // Big Blue's shadow sliding over the sand sells her size more than she does
   float sh = 0.55 * (1.0 - smoothstep(3.0, 13.0, length(vW.xz - uWhale.xz)));
 
+  // REFRACTION. The dapples on the sand are the sun bent by the swell twenty
+  // metres overhead, so sample the net at an offset given by the SLOPE of that
+  // swell (src/world/water.js, the same function the surface mesh is displaced
+  // by, at the same scale and the same clock). A flat sea would drop the net
+  // straight down; a crest sweeps it sideways, so the whole floor now crawls in
+  // lockstep with the sea instead of merely near it. Three cheap sines.
+  float sH, sDx, sDz;
+  coveWave(vW.xz * uSwellScl, uTime, sH, sDx, sDz);
+  vec2 refr = vec2(sDx, sDz) * uRefract;
+
   // two octaves so the caustic net never reads as a tiling pattern
-  float c = caust(vW.xz * 0.16, uTime * 0.6) * 0.95
-          + caust(vW.xz * 0.31 + 11.0, uTime * 0.42) * 0.5;
+  float c = caust(vW.xz * 0.16 + refr, uTime * 0.6) * 0.95
+          + caust(vW.xz * 0.31 + refr * 1.7 + 11.0, uTime * 0.42) * 0.5;
   c *= 0.6 + 0.4 * sin(vW.x * 0.06 + uTime * 0.11) * cos(vW.z * 0.05 - uTime * 0.08);
+  // crests spread the light and troughs focus it: a real caustic is brightest
+  // under a trough, and this one hard step keeps that legible without a gradient
+  c *= sH < 0.0 ? 1.18 : 0.86;
   col *= 1.0 - sh * 0.6;
   col += uCaustCol * c * uCaust * (1.0 - sh);
 
@@ -222,28 +247,8 @@ void main() {
 }
 `;
 
-// The underside of the sea, seen from below (BackSide): rippling silver with a
-// smeared sun glare. Never seen from above, so the camera can never break it.
-const FS_SURFACE = `
-uniform vec3 uBright, uDeep;
-uniform float uTime, uDay;
-varying vec3 vW;
-varying vec3 vN;
-varying float vDist;
-${GLSL_FOG}
-${GLSL_CAUSTIC}
-void main() {
-  vec2 p = vW.xz;
-  float c = caust(p * 0.085, uTime * 0.32);
-  float ripple = 0.5 + 0.5 * sin(p.x * 0.32 + uTime * 0.7) * cos(p.y * 0.29 - uTime * 0.55);
-  vec3 col = mix(uDeep, uBright, clamp(c * 0.95 + ripple * 0.18, 0.0, 1.0));
-  float glare = exp(-length(p - vec2(-6.0, -10.0)) * 0.045);
-  col += uBright * glare * 0.6 * uDay;
-  gl_FragColor = vec4(fogged(col, vDist), 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
-}
-`;
+// (The underside of the sea used to be a flat shader plane here. It is now the
+// shared cove water, built in _buildSurface with `underside: true`.)
 
 // God rays: tapered quads that billboard around their own vertical axis, which
 // is what a cone from the surface actually looks like from any angle, for one
@@ -412,6 +417,7 @@ const _seat = new THREE.Vector3();
 const _ndc = new THREE.Vector2();
 const _mat = new THREE.Matrix4();
 const _col = new THREE.Color();
+const _col2 = new THREE.Color();   // relight scratch: the clock runs every frame
 
 /** Shortest signed angle from a to b, in (-PI, PI]. */
 function angleDelta(a, b) {
@@ -837,6 +843,8 @@ export class DriftRoom extends Room {
         uTime: { value: 0 },
         uCaust: { value: 0.85 },
         uNight: { value: 0 },
+        uSwellScl: { value: SWELL_SCALE },
+        uRefract: { value: SWELL_REFRACT },
       },
     });
     this._shaders.push(mat);
@@ -866,30 +874,64 @@ export class DriftRoom extends Room {
     scene.add(mesh);
   }
 
+  /**
+   * The underside of the sea, seen from below, and the one place in the cove
+   * where the water is the CEILING. It is the shared cove water (src/world/
+   * water.js) with `underside: true`: same wave table as Driftwood Beach, same
+   * banded toon ramp, same one draw call - but stretched long, given real slope,
+   * and lit from the far side.
+   *
+   * Three things the shared module does for us here that the old flat plane
+   * could not:
+   *  - GEOMETRY. It actually undulates now, so the horizon of the sea rolls
+   *    instead of hanging there as a painted lid. That silhouette, where the
+   *    surface meets the fog, is most of what you actually read from down here.
+   *  - The glint is the sun seen THROUGH the water rather than reflected off it
+   *    (`underside` swaps the half-vector highlight for a view-toward-the-sun
+   *    blaze), so it slides across the ceiling as you swim under it.
+   *  - The toon bands. These fire off the surface's LEAN toward this room's
+   *    fixed sun rather than an absolute N.L, which is the only way they can
+   *    fire at all at 15 degrees of maximum tilt; see the note in water.js.
+   * The caustic net is the same FUNCTION the seabed samples but deliberately
+   * not the same parameters (ceiling 0.085/0.32, seabed 0.16/0.6): the ceiling
+   * is 24 metres away and the sand is under your nose, so they are scaled to
+   * where they are seen. Same water, not the same frame of it.
+   * Fog is three's own FogExp2 here rather than the hand-rolled uFog of the
+   * other shaders in this room; the formula and the colour are identical, so
+   * the far rim still meets the shell with no seam.
+   *
+   * The mesh sits at SEA_MESH_Y, NOT at SURFACE_Y - see the constant block at
+   * the top of this file before you move anything that is meant to reach it.
+   */
   _buildSurface(scene) {
-    const g = new THREE.PlaneGeometry(150, 150, 1, 1);
-    g.rotateX(-Math.PI / 2);
-    const mat = new THREE.ShaderMaterial({
-      vertexShader: VS_WORLD,
-      fragmentShader: FS_SURFACE,
-      side: THREE.BackSide, // only ever seen from below
-      uniforms: {
-        uBright: { value: new THREE.Color(0xcdeaf8) },
-        uDeep: { value: new THREE.Color(C.shallow) },
-        uFog: { value: this._fogColor },
-        uFogDensity: { value: FOG_DENSITY },
-        uTime: { value: 0 },
-        uDay: { value: 1 },
-      },
+    this._surface = makeWater({
+      width: 150,
+      segments: 64,
+      y: SEA_MESH_Y,
+      underside: true,
+      scale: SWELL_SCALE,
+      amplitude: SWELL_AMP,
+      shallow: C.shallow,
+      glint: 0xcdeaf8,
+      glintAmount: 0.55,
+      caustics: 0.75,
+      causticScale: 0.085,
+      // three's lights are all ABOVE this surface and it faces down, so it has
+      // to carry its own brightness or it reads as a dark lid
+      self: 0.92,
+      name: 'sea-surface',
     });
-    this._shaders.push(mat);
-    this._surfaceMat = mat;
-    const mesh = new THREE.Mesh(g, mat);
-    mesh.position.y = SURFACE_Y;
-    scene.add(mesh);
+    // the blaze you see when you look up: this room's key light never moves, so
+    // the direction is set once and only the amount rides the clock
+    this._surface.setSun(this._sun.position, 0xcdeaf8, 0.55);
+    scene.add(this._surface.mesh);
   }
 
+  /** Shafts of light coming down THROUGH the sea, so they start just under the
+   *  lowest the sea ever gets: pinned to SURFACE_Y they hung up to 3.3 units
+   *  below the water, which reads as light with nothing shining it. */
   _buildGodRays(scene, rng) {
+    const RAY_TOP = SEA_MIN - 0.4;
     const N = 11;
     const pos = new Float32Array(N * 4 * 3);
     const base = new Float32Array(N * 4 * 3);
@@ -905,10 +947,10 @@ export class DriftRoom extends Room {
       const corners = [[-1, 0], [1, 0], [1, 1], [-1, 1]];
       for (let c = 0; c < 4; c++) {
         const o = (i * 4 + c);
-        base[o * 3] = bx; base[o * 3 + 1] = SURFACE_Y - 0.4; base[o * 3 + 2] = bz;
+        base[o * 3] = bx; base[o * 3 + 1] = RAY_TOP; base[o * 3 + 2] = bz;
         param[o * 3] = hw; param[o * 3 + 1] = len; param[o * 3 + 2] = seed;
         corner[o * 2] = corners[c][0]; corner[o * 2 + 1] = corners[c][1];
-        pos[o * 3] = bx; pos[o * 3 + 1] = SURFACE_Y - 0.4; pos[o * 3 + 2] = bz;
+        pos[o * 3] = bx; pos[o * 3 + 1] = RAY_TOP; pos[o * 3 + 2] = bz;
       }
       const v = i * 4;
       idx.set([v, v + 1, v + 2, v, v + 2, v + 3], i * 6);
@@ -1235,10 +1277,16 @@ export class DriftRoom extends Room {
     this._geos.push(glassG);
     this._bellGlow = glow.material;
 
-    // the cable, running all the way up out of sight
-    const cableG = new THREE.CylinderGeometry(0.07, 0.07, SURFACE_Y - 4.4, 5);
+    // The cable, running all the way up and THROUGH the sea, out of sight. It
+    // has to clear SEA_MAX, not the mean height: the sea is opaque from below,
+    // so a cable that ends anywhere under the highest crest is a cable you can
+    // watch stop in mid-water every time a swell rolls over it. Overshooting
+    // costs nothing - the water clips it.
+    const cableTop = SEA_MAX + 0.7;
+    const cableH = cableTop - 5.1;
+    const cableG = new THREE.CylinderGeometry(0.07, 0.07, cableH, 5);
     const cable = new THREE.Mesh(cableG, makeToon(0x6b5a3a));
-    cable.position.y = 5.1 + (SURFACE_Y - 4.4) / 2;
+    cable.position.y = 5.1 + cableH / 2;
     grp.add(cable);
     this._geos.push(cableG);
 
@@ -2021,10 +2069,16 @@ export class DriftRoom extends Room {
     this._shellMat.uniforms.uShallow.value.copy(this._shallow);
     this._shellMat.uniforms.uDeep.value.copy(this._deep);
     this._shellMat.uniforms.uTime.value = t;
-    this._surfaceMat.uniforms.uDeep.value.copy(this._shallow);
-    this._surfaceMat.uniforms.uTime.value = t;
-    this._surfaceMat.uniforms.uDay.value = light;
-    this._surfaceMat.uniforms.uBright.value.setHex(0xcdeaf8).lerp(_col.setHex(0x8fadcc), night);
+    // the sea overhead: base colour follows the shallows, and the sun blaze and
+    // the caustic net both fade out with the day (at midnight the ceiling is a
+    // dim, cold, barely-rippling lid, which is exactly what it should be)
+    this._surface.update(t);
+    // lifted off the shallows toward silver: it is the lit side of the sea seen
+    // from underneath, and at the room's own shallow colour it read as a lid
+    this._surface.setTint(_col2.copy(this._shallow).lerp(_col.setHex(0xdff2ff), 0.35));
+    this._surface.setSun(null, _col2.setHex(0xcdeaf8).lerp(_col.setHex(0x8fadcc), night),
+      0.12 + 0.6 * light);
+    this._surface.setCaustics(0.18 + 0.62 * light);
     this._seabedMat.uniforms.uTime.value = t;
     this._seabedMat.uniforms.uCaust.value = 0.2 + 0.75 * light;
     this._seabedMat.uniforms.uNight.value = night;
@@ -2313,7 +2367,9 @@ export class DriftRoom extends Room {
       pos[i * 3 + 1] += b.vel[i] * dt;
       pos[i * 3] += Math.sin(this._t * 2.4 + b.seed[i]) * 0.35 * dt;
       pos[i * 3 + 2] += Math.cos(this._t * 2.1 + b.seed[i]) * 0.35 * dt;
-      if (pos[i * 3 + 1] > SURFACE_Y - 1) life[i] = 0;
+      // pop AT the sea, not at the old flat lid: SEA_MIN is the lowest the
+      // water ever is, so a bubble never dies in plain open water
+      if (pos[i * 3 + 1] > SEA_MIN - 1) life[i] = 0;
     }
     // emit: the local swimmer, every remote swimmer, two vents, her blowhole
     this._bubbleAt -= dt;
@@ -2398,6 +2454,9 @@ export class DriftRoom extends Room {
     this._shaders.length = 0;
     for (const g of this._geos) g.dispose();
     this._geos.length = 0;
+    // same story for the shared water: a unique (uncached) material + geometry
+    this._surface?.dispose();
+    this._surface = null;
 
     if (this._actx) {
       try { this._actx.close(); } catch { /* already closed */ }

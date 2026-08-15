@@ -626,6 +626,8 @@ export function openAdmin(game) {
   let repLoaded = false;
   let repNote = 'Nothing is waiting.';
 
+  let repRetry = 0;          // one-shot retry after a rate-limit refusal
+
   let staff = [];
   let staffLoaded = false;
   let staffRoles = ['player', 'mod', 'admin']; // replaced by a-staff's own list
@@ -768,6 +770,7 @@ export function openAdmin(game) {
 
   function requestReports() {
     if (!canReports) return;
+    if (repRetry) { clearTimeout(repRetry); repRetry = 0; }
     send({ t: 'a-reports', state: repState, limit: 40 });
   }
 
@@ -1388,11 +1391,15 @@ export function openAdmin(game) {
   function showTab(next) {
     if (next === tab) return;
     tab = next;
-    // A half-answered question does not follow you to another tab. `roleErr` is
-    // NOT cleared here: onErr sets it and THEN calls showTab('staff'), so the
-    // server's refusal has to survive the trip it triggered.
+    // A half-answered question does not follow you to another tab, and neither
+    // does an answered one: an open a-inspect card was staying pinned above the
+    // list on every tab, so a mod reading the report queue had a stranger's
+    // account record sitting over it. `roleErr` is NOT cleared here: onErr sets
+    // it and THEN calls showTab('staff'), so the server's refusal has to survive
+    // the trip it triggered.
     drawer = null;
     confirmAsk = null;
+    account = null;
     if (tab === 'chat') {
       bus.unread = 0;
       bus.onMessage = appendChat;
@@ -1473,9 +1480,26 @@ export function openAdmin(game) {
       return;
     }
     if (m.op === 'a-reports') {
+      // 'slow' is the server's rate limiter, not an answer. Leaving repLoaded
+      // true here was the bug: the queue's own poll is 20s, showTab only asks
+      // again when !repLoaded, and renderReports reads repLoaded as "the server
+      // spoke", so opening the panel and going straight to Reports could sit on
+      // "A quiet inbox" for twenty seconds with a full queue behind it. Stay
+      // unloaded, keep the reading-the-queue copy, keep any rows already on
+      // screen, and ask again: on the next showTab, and once by ourselves a
+      // beat later. The op budget is five a second, so a single retry is both
+      // inside it and enough - the panel opens asking for who, staff AND
+      // reports at once, which is the burst that trips this in the first place.
+      if (m.code === 'slow') {
+        repLoaded = false;
+        if (!repRetry) repRetry = setTimeout(() => { repRetry = 0; if (!repLoaded) requestReports(); }, 1200);
+        render();
+        return;
+      }
       repLoaded = true;
       repNote = m.msg || 'The cove would not open the queue.';
-      if (m.code !== 'slow') { reports = []; render(); }
+      reports = [];
+      render();
       return;
     }
     // a role refusal is shown WHERE IT WAS ASKED, in the server's own words:
@@ -1607,6 +1631,7 @@ export function openAdmin(game) {
     clearInterval(reportsPoll);
     if (whoTimer) clearTimeout(whoTimer);
     if (qTimer) clearTimeout(qTimer);
+    if (repRetry) clearTimeout(repRetry);
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
     root.classList.add('is-closing');

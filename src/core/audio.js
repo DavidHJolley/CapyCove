@@ -28,6 +28,13 @@
 //                           the 'minigame' event for itself, and the three
 //                           sources are OR'd, so a UI that calls this and one
 //                           that does not both behave.
+//   audio.duck(reason, db, ms)
+//                         - hold the music bed down by `db` (negative, default
+//                           -6) for as long as a moment lasts. `reason` is a
+//                           name so overlapping holds compose instead of
+//                           fighting; release with audio.duck(reason, 0), or
+//                           pass `ms` and it releases itself. Returns the total
+//                           attenuation in dB. See "named holds" below.
 //
 // Everything is synthesized. Music uses lookahead scheduling: a single interval
 // wakes up every ~90ms and schedules notes ~280ms ahead on the AudioContext
@@ -77,6 +84,8 @@ const TICK_MS = 90;        // scheduler wake-up
 const LOOKAHEAD = 0.28;    // seconds of notes queued ahead of the clock
 const CROSSFADE = 1.5;     // room-to-room music fade, seconds
 const AMB_STEP = 0.75;     // ambience decision slot, seconds
+const HOLD_IN = 0.25;      // a named duck leans in...
+const HOLD_OUT = 0.7;      // ...and comes back slower than it went
 
 // ------------------------------------------------------------ graph state ---
 
@@ -109,6 +118,7 @@ let dayLight = 1;
 let ambNext = null;     // next ambience slot on the audio clock, or null
 let focusSrc = null;    // Set of reasons the world is receded ('dom'|'mg'|'api')
 let focusOn = false;
+let holds = null;       // Map of reason -> {gain, timer}: sustained named ducks
 let attached = false;   // game.events + DOM watchers installed (post-gesture)
 let reduced = null;     // prefers-reduced-motion, resolved once, lazily
 
@@ -421,16 +431,64 @@ function setFocus(on, src) {
   applyFocus();
 }
 
+// ------------------------------------------------------------ named holds ---
+//
+// A sustained, NAMED duck: a kart countdown and a podium want the bed a fixed
+// few dB down for as long as the moment lasts, which is not what the sidechain
+// does (that is a one-beat dip under a sound, and a sound that lands during the
+// hold would end it). Rather than add a fifth music node with a second
+// automation of its own, a hold is folded into the same "world recedes" level
+// setOverlay already drives: they are the same statement (the world is a step
+// further away for a moment), they compose by multiplication, and the param
+// keeps exactly one writer, which is the rule the graph above is built on.
+//
+// A hold takes the LEVEL only and never the lowpass: a countdown wants the bed
+// quieter, not muffled. Depth is taken at face value (unlike the sidechain, it
+// is not halved for reduced motion): the caller asked for a number of dB and a
+// -6 that turns into -3 is a bug in a contract, not a kindness.
+
+/** Product of every live hold, as a gain. Floored so nothing can silence the
+ *  bed outright: this is a duck, and there is a mute button for the other. */
+function holdGain() {
+  if (!holds || !holds.size) return 1;
+  let g = 1;
+  for (const h of holds.values()) g *= h.gain;
+  return clamp(g, 0.06, 1);
+}
+
+/** Set (or clear) one named hold and land it. `gain` of 1 releases. */
+function setHold(reason, gain, ms) {
+  if (!holds) holds = new Map();
+  const prev = holds.get(reason);
+  if (prev?.timer) { try { clearTimeout(prev.timer); } catch { /* noop */ } }
+  if (gain >= 1) {
+    if (!prev) return;               // releasing something nobody was holding
+    holds.delete(reason);
+    applyFocus(HOLD_OUT);
+    return;
+  }
+  let timer = 0;
+  if (Number.isFinite(ms) && ms > 0) {
+    // Self-healing: a HUD torn down mid-countdown must never leave the cove
+    // playing under a duck forever.
+    timer = setTimeout(() => setHold(reason, 1), ms);
+    if (typeof timer === 'object' && timer?.unref) timer.unref();
+  }
+  holds.set(reason, { gain, timer });
+  applyFocus(HOLD_IN);
+}
+
 /** Land the current focus state on the graph. Separate from setFocus so a
  *  state taken before there was an AudioContext (setOverlay during boot) is
- *  applied by ensure() the moment the graph exists. */
-function applyFocus() {
+ *  applied by ensure() the moment the graph exists. `fade` overrides the ramp
+ *  (a named hold breathes in and out more slowly than a panel opening). */
+function applyFocus(fade) {
   if (!ctx || !musicLp || !musicFocus) return;
   const soft = reducedMotion();
   const t = ctx.currentTime;
   const cut = focusOn ? (soft ? 950 : 640) : 19000;
-  const lvl = focusOn ? (soft ? 0.82 : 0.72) : 1;
-  const len = focusOn ? (soft ? 0.5 : 0.3) : 0.45;
+  const lvl = (focusOn ? (soft ? 0.82 : 0.72) : 1) * holdGain();
+  const len = Number.isFinite(fade) && fade > 0 ? fade : (focusOn ? (soft ? 0.5 : 0.3) : 0.45);
   try {
     const f = musicLp.frequency;
     f.cancelScheduledValues(t);
@@ -2327,6 +2385,36 @@ export const audio = {
     // ensure() applies whatever state this left behind when audio really starts.
     setFocus(!!open, 'api');
     return focusOn;
+  },
+
+  /**
+   * Hold the music bed down while a moment lasts. The sibling of setOverlay:
+   * that one says "a panel is in front of the world", this one says "the world
+   * is a step back for a beat" without a panel to show for it. The kart
+   * countdown and the podium are the two the contract asks for
+   * (docs/KARTS.md A6/A7: -6 dB).
+   *
+   *   audio.duck('kart-countdown', -6, 3400)  // holds, then lets go by itself
+   *   audio.duck('kart-podium', -6)           // holds until released
+   *   audio.duck('kart-podium', 0)            // ...released
+   *
+   * `reason` names the hold so two of them compose instead of overwriting each
+   * other, and so a caller can only ever release its own. `db` is negative;
+   * 0 (or anything >= 0, or a nonsense value) releases. `ms` is optional: give
+   * it and the hold releases itself after that long, which is what makes a HUD
+   * that is disposed mid-countdown harmless. Safe before init() and while
+   * muted; never throws. Returns the TOTAL attenuation now held, in dB.
+   */
+  duck(reason, db = -6, ms = 0) {
+    const key = typeof reason === 'string' && reason.trim() ? reason.trim() : null;
+    if (!key) return 0;
+    const n = Number(db);
+    // a hold is bounded either side: -60 is silence in all but name, and a
+    // positive "duck" is a caller asking to be louder, which is a release
+    const gain = Number.isFinite(n) && n < 0 ? 10 ** (clamp(n, -60, 0) / 20) : 1;
+    setHold(key, gain, Number(ms));
+    const total = holdGain();
+    return total >= 1 ? 0 : 20 * Math.log10(total);
   },
 
   /**

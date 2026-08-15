@@ -342,6 +342,16 @@ export function publicProfile(rec) {
     // used to share a single ownedHats reference (free hats + coin rollback).
     ownedHats: [...(rec.ownedHats || ['none'])],
     bests: { ...(rec.bests || {}) },
+    // the flourish slot (walk trails + idle auras): `trail` is what is worn,
+    // `ownedTrails` the wardrobe the shop greys out against. Copies, never the
+    // live arrays, for the same reason ownedHats is copied above.
+    trail: typeof rec.trail === 'string' ? rec.trail : 'none',
+    ownedTrails: [...(rec.ownedTrails || ['none'])],
+    // profile v2: the owner's stamp showcase, their first day, and the run
+    // counts progress.js already keeps. All optional on the client.
+    showcase: [...(rec.showcase || [])],
+    since: Number.isFinite(rec.created) ? rec.created : 0,
+    plays: { ...(rec.progress?.c?.byGame || {}) },
     // wave 7 milestone rewards (server/progress.js writes both onto the record):
     // the "Legend of the Cove" title that rides under the name tag, and the
     // dye colours the stamp track has unlocked. Without them here the 12- and

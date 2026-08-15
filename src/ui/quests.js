@@ -11,8 +11,11 @@ import { stampById, paintStampCanvas } from './profile.js';
  * Wire protocol, tolerated loosely because the server owns the shapes:
  *   out  {t:'quests'}              ask for today's board
  *   out  {t:'quest-claim', id}     only sent for quests the server marks claimable
- *   in   {t:'quests', quests:[...], bonus:{...}, resetIn}   full board
+ *   in   {t:'quests', quests:[...], bonus:{...}, resetIn, streak:{...}}  full board
  *   in   {t:'quest-done', id, ...}                         one quest ticked over
+ * The login streak rides this frame rather than one of its own (wave 12B):
+ *   streak {days, show, plus, best, gift, next, claimed}
+ * See the chip below for what it is allowed to say about it.
  * A quest may arrive as {id, name|title, desc|blurb, progress|n, target|goal,
  * done, claimed, claimable, reward|coins}; anything missing gets a sane default
  * so a half-built server still paints a readable board.
@@ -53,6 +56,33 @@ const CSS = `
   display: inline-block; font-size: 10.5px; font-weight: 900; letter-spacing: 0.08em;
   text-transform: uppercase; color: #8a6a1f; background: rgba(242, 182, 74, 0.28);
   padding: 4px 11px; border-radius: 999px; margin-bottom: 10px;
+}
+
+.qb-streak {
+  display: flex; align-items: center; gap: 12px; margin: 2px 0 11px; padding: 10px 14px;
+  border-radius: 17px; background: rgba(242, 182, 74, 0.16);
+  box-shadow: inset 0 0 0 2px rgba(242, 182, 74, 0.3);
+  animation: qb-pop 0.36s backwards var(--spring);
+}
+.qb-streak[hidden] { display: none; }
+.qb-streak-ico { flex: none; width: 40px; height: 40px; }
+.qb-streak-ico canvas { display: block; }
+.qb-streak-txt { flex: 1; min-width: 0; }
+.qb-streak-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.qb-streak-days { font-weight: 900; font-size: 13.5px; }
+.qb-streak-best {
+  font-size: 9.5px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase;
+  color: #a4720f;
+}
+.qb-streak-sub { font-size: 11.5px; font-weight: 700; color: var(--muted); line-height: 1.35; }
+.qb-pips { display: flex; align-items: center; gap: 4px; margin-top: 5px; }
+.qb-pip {
+  width: 9px; height: 9px; border-radius: 50%; flex: none;
+  background: radial-gradient(circle at 34% 28%, #fff3bd 0%, var(--gold) 60%, #c98c1d 100%);
+}
+.qb-pip.next { background: none; box-shadow: inset 0 0 0 2px rgba(164, 114, 15, 0.35); }
+.qb-pip-more {
+  font-size: 10px; font-weight: 900; color: #a4720f; letter-spacing: 0.04em; margin-left: 1px;
 }
 
 .qb-list { display: flex; flex-direction: column; gap: 8px; }
@@ -143,7 +173,7 @@ const CSS = `
 @keyframes qb-rise { from { opacity: 0; transform: translateY(16px) scale(0.95); } }
 @keyframes qb-pop { from { opacity: 0; transform: translateY(9px) scale(0.93); } }
 @media (prefers-reduced-motion: reduce) {
-  .qb-card, .qb-q, .qb-q-tick { animation: none; }
+  .qb-card, .qb-q, .qb-q-tick, .qb-streak { animation: none; }
   .qb-bar i { transition: none; }
 }
 `;
@@ -173,7 +203,7 @@ function mountPoint() {
 // board state (cached so a re-open paints instantly instead of flashing empty)
 // ---------------------------------------------------------------------------
 
-let board = { quests: [], bonus: null, resetAt: 0, loaded: false };
+let board = { quests: [], bonus: null, streak: null, resetAt: 0, loaded: false };
 let listening = false;
 // wave 12: resetIn is a REAL-DAY number now; once the server has spoken the
 // 40-minute cove clock must never overwrite it again.
@@ -203,6 +233,38 @@ function parseQuest(raw, i) {
   };
 }
 
+/**
+ * The login streak block (wave 12B). Nothing here is allowed to be a stick:
+ * server-side a missed day simply starts the ramp again (see progress.js
+ * nextStreak), so this chip only ever says how long you have been around, what
+ * today's hello is worth and what tomorrow's would be. It never counts down, it
+ * never says what a gap cost, and it never asks you to come back.
+ *
+ * Returns null for anyone without a streak (a guest, or a record whose day has
+ * not been counted yet), which hides the chip entirely.
+ *
+ * The ladder's length is NOT hard-coded here: `plus` says you are past the top
+ * of it and `next === gift` says you are standing on it, so the pips can be
+ * drawn honestly against a server that lengthens the ramp later.
+ */
+function parseStreak(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const days = Math.max(0, Math.floor(num(raw.days, 0)));
+  if (days < 1) return null;
+  const show = Math.min(days, Math.max(1, Math.floor(num(raw.show, days))));
+  const gift = Math.max(0, Math.floor(num(raw.gift, 0)));
+  const next = Math.max(gift, Math.floor(num(raw.next, gift)));
+  return {
+    days,
+    show,
+    plus: raw.plus === true || days > show,
+    best: Math.max(days, Math.floor(num(raw.best, days))),
+    gift,
+    next,
+    claimed: raw.claimed === true,
+  };
+}
+
 function parseBoard(m) {
   const list = Array.isArray(m?.quests) ? m.quests
     : Array.isArray(m?.dailies) ? m.dailies
@@ -223,7 +285,10 @@ function parseBoard(m) {
     resetAt = Date.now() + resetIn * 1000;
     serverReset = true;
   }
-  return { quests, bonus, resetAt, loaded: true };
+  // a frame that carries no streak block (an older server) leaves the last one
+  // standing rather than blinking the chip out from under the player
+  const streak = parseStreak(m?.streak) || board.streak || null;
+  return { quests, bonus, streak, resetAt, loaded: true };
 }
 
 /**
@@ -299,6 +364,17 @@ export function openQuests(game) {
         <div class="qb-sub">Three jobs pinned up every day. Do them in any order.</div>
         <div class="qb-timer"></div>
       </div>
+      <div class="qb-streak" hidden>
+        <div class="qb-streak-ico"></div>
+        <div class="qb-streak-txt">
+          <div class="qb-streak-top">
+            <span class="qb-streak-days"></span>
+            <span class="qb-streak-best"></span>
+          </div>
+          <div class="qb-streak-sub"></div>
+          <div class="qb-pips"></div>
+        </div>
+      </div>
       <div class="qb-list"></div>
       <div class="qb-bonus" hidden>
         <div class="qb-bonus-ico"></div>
@@ -316,6 +392,7 @@ export function openQuests(game) {
   const card = q('.qb-card');
   const listEl = q('.qb-list');
   const timerEl = q('.qb-timer');
+  const streakEl = q('.qb-streak');
   const bonusEl = q('.qb-bonus');
   const footEl = q('.qb-foot');
 
@@ -395,6 +472,52 @@ export function openQuests(game) {
     return wrap;
   }
 
+  /**
+   * The login streak chip: how long you have been dropping in, what today's
+   * hello gift was worth, and what tomorrow's would be. A guest has no streak
+   * and gets no chip (the sign-up card below already makes that offer once).
+   */
+  function renderStreak() {
+    const s = guest ? null : board.streak;
+    if (!s) { streakEl.hidden = true; return; }
+    streakEl.hidden = false;
+
+    const ico = streakEl.querySelector('.qb-streak-ico');
+    ico.textContent = '';
+    const c = document.createElement('canvas');
+    // a new day over the cove, drawn by the same hand as the stamps
+    paintStampCanvas(c, { glyph: 'sun', hue: 0xf2b64a }, true, 40);
+    ico.appendChild(c);
+
+    streakEl.querySelector('.qb-streak-days').textContent = s.days === 1
+      ? 'Day one'
+      : `${s.days} days in a row`;
+    streakEl.querySelector('.qb-streak-best').textContent = s.best > s.days ? `best ${s.best}` : '';
+
+    // Every sentence here is good news. The gift is paid on the day's first
+    // hello, so the usual reading is the first line. Each part is skipped
+    // rather than printed empty, so a server that sends half a block says half
+    // a thing instead of offering nobody nothing.
+    const bits = [];
+    if (s.gift > 0) {
+      bits.push(s.claimed
+        ? `Today's hello gift of ${s.gift} coins is already in your purse.`
+        : `Today's hello gift is ${s.gift} coins.`);
+    }
+    if (s.next > s.gift) bits.push(`Tomorrow's is ${s.next}.`);
+    else if (s.gift > 0) bits.push('That is the top of the ladder, and it stays there.');
+    if (!bits.length) bits.push('Thank you for keeping the cove company.');
+    streakEl.querySelector('.qb-streak-sub').textContent = bits.join(' ');
+
+    // One filled pip per day of the ladder climbed, then either a hollow pip for
+    // the rung above or a "+N" for the days past the top of it.
+    const pips = streakEl.querySelector('.qb-pips');
+    pips.textContent = '';
+    for (let i = 0; i < s.show; i++) pips.appendChild(elm('span', 'qb-pip'));
+    if (s.plus) pips.appendChild(elm('span', 'qb-pip-more', `+${s.days - s.show}`));
+    else if (s.next > s.gift) pips.appendChild(elm('span', 'qb-pip next'));
+  }
+
   function renderBonus() {
     const b = board.bonus;
     if (!b || !board.quests.length) { bonusEl.hidden = true; return; }
@@ -427,6 +550,7 @@ export function openQuests(game) {
 
   function render() {
     listEl.textContent = '';
+    renderStreak();
     if (!board.quests.length) listEl.appendChild(emptyState());
     else board.quests.forEach((quest, i) => listEl.appendChild(questRow(quest, i)));
     renderBonus();

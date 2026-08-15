@@ -684,6 +684,15 @@ function grantReward(p, rec, reward) {
       // player's current look off their head
       ctx.sendTo(p, { t: 'shop', ok: true, coins: num(rec.coins), delta: 0, ownedHats: [...hats] });
     }
+  } else if (reward.type === 'trail' && typeof id === 'string') {
+    // the flourish slot mirrors the hat arm exactly: into the wardrobe, never
+    // auto-equipped, announced on the same 'shop' frame the client already has
+    const trails = Array.isArray(rec.ownedTrails) ? rec.ownedTrails : (rec.ownedTrails = ['none']);
+    if (!trails.includes(id)) trails.push(id);
+    if (p) {
+      p.ownedTrails = [...trails];
+      ctx.sendTo(p, { t: 'shop', ok: true, coins: num(rec.coins), delta: 0, ownedTrails: [...trails] });
+    }
   } else if (reward.type === 'furniture' && typeof id === 'string') {
     const inv = ensureOwnedFurniture(rec);
     inv[id] = Math.max(1, Math.floor(num(inv[id])) + 1);

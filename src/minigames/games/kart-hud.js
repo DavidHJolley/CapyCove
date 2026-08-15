@@ -32,6 +32,8 @@
  * best-lap chime); with no handler it simply stays quiet.
  */
 
+import { audio } from '../../core/audio.js';
+
 // =============================================================== constants ==
 /** Display names for §A4's roster. Duplicated from the contract by design. */
 const KART_NAMES = {
@@ -474,6 +476,11 @@ export class KartHud {
 
   /** 'splash' | 'count' | 'race' | 'done' | 'results'. */
   setPhase(phase) {
+    // the bed steps back for the two moments that have their own voice (the
+    // lights and the podium) and comes straight back up for the race. The `ms`
+    // is a self-release, so a HUD torn down mid-countdown cannot leave the cove
+    // playing under a duck forever.
+    audio.duck('kart-moment', phase === 'count' || phase === 'results' ? -6 : 0, 20000);
     this.phase = String(phase || 'splash');
     if (!this.mounted) return;
     const racing = this.phase === 'count' || this.phase === 'race' || this.phase === 'done';
@@ -753,6 +760,7 @@ export class KartHud {
 
   /** Leave `root` exactly as we found it: nodes, styles, timers, listeners. */
   dispose() {
+    audio.duck('kart-moment', 0); // whatever the phase was, the bed comes back
     if (this.disposed) return;
     this.disposed = true;
     for (const id of this.timers) clearTimeout(id);

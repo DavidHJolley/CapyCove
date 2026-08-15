@@ -1,4 +1,6 @@
 import { createAvatar } from '../player/avatar.js';
+import { WalkController } from '../player/controller.js';
+import { updateTrails } from '../player/trails.js';
 import { NET_TICK_MS } from '../../shared/constants.js';
 import { evictLayout } from '../world/overlay.js';
 
@@ -85,6 +87,9 @@ export class NetClient {
         coins: state.coins,
         ownedHats: state.ownedHats,
         bests: state.bests,
+        // deliberately NOT sent: the server's guest hello reads coins/hats/
+        // bests and nothing else, so a trail claimed here would be dropped on
+        // the floor. Add it here only when server/index.js starts clamping it.
       }, true);
     };
     this.ws.onmessage = (ev) => {
@@ -224,6 +229,9 @@ export class NetClient {
         if (!r) break;
         r.avatar.setColor(m.color);
         r.avatar.setHat(m.hat);
+        // the flourish slot lives on the snapshot, not on the avatar: the
+        // pooled field in src/player/trails.js reads r.p.trail every frame
+        if (typeof m.trail === 'string') r.p.trail = m.trail;
         break;
       }
       case 'coins':
@@ -231,10 +239,16 @@ export class NetClient {
         break;
       case 'shop':
         if (m.ok) {
-          game.state.ownedHats = m.ownedHats;
+          // one frame serves both counters (hats and the flourish slot), and a
+          // buy-trail answer carries no ownedHats: each list is taken only when
+          // the frame actually says something about it, or a trail purchase
+          // would wipe the hats it never mentioned
+          if (Array.isArray(m.ownedHats)) game.state.ownedHats = m.ownedHats;
+          if (Array.isArray(m.ownedTrails)) game.state.ownedTrails = m.ownedTrails;
           game.syncCoins(m.coins, m.delta ?? 0, 'shop');
           game.events.emit('profile', game.state);
           if (m.bought) game.equipHat(m.bought);
+          if (m.boughtTrail) game.equipTrail(m.boughtTrail);
         } else {
           game.toast(m.msg || 'Purchase failed');
         }
@@ -393,6 +407,10 @@ export class NetClient {
       p, avatar, tag, target: { x: p.x, z: p.z, rot: p.rot || 0 }, anim,
       // last position we raycast the ground for; Infinity so the first snap runs
       snapX: Infinity, snapZ: Infinity,
+      // Terrain oracle for THIS capy's footfall fx (see the note in update()).
+      // A controller with no target never walks anything: we only ever ask it
+      // what is under the paws.
+      terrain: new WalkController(avatar),
     });
   }
 
@@ -429,18 +447,41 @@ export class NetClient {
       }
       const dy = ((((r.target.rot - g.rotation.y) % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
       g.rotation.y += dy * k;
-      // snap remote to ground height of current room. Only when it actually
-      // moved: this is a full ground-mesh raycast (thousands of triangles in
-      // peak/beach) and idle bots would otherwise pay it every single frame.
+      // Snap remote to ground height of current room, and tell its avatar what
+      // it is standing on. Only when it actually moved: this is a full
+      // ground-mesh raycast (thousands of triangles in peak/beach) and idle
+      // bots would otherwise pay it every single frame.
+      //
+      // WHY A WalkController AND NOT engine.snapY: the avatar raises its own
+      // footfall dust off the distance it covers, so a walking remote has always
+      // puffed - but only ever in the default warm-cream, and never as a ripple,
+      // because setGroundTint/setWading were fed by the LOCAL player's
+      // controller and by nothing else. The controller is the one thing in the
+      // game that knows what is under a walker's paws (see its `_terrain` note),
+      // so each remote borrows one purely as a terrain oracle: its snapToGround
+      // is the same highest-surface-within-step rule engine.snapY mirrors, and
+      // it leaves behind the ground mesh and face normal that the tint and the
+      // shoreline test need. Both are edge-triggered inside the controller, so
+      // a walk across one floor costs one comparison a frame, and the wade test
+      // costs one comparison in every room that declares no shoreline.
       const room = this.engine.room;
       if (room?.groundMeshes?.length
         && Math.abs(g.position.x - r.snapX) + Math.abs(g.position.z - r.snapZ) > 0.01) {
-        this.engine.snapY(g.position, room);
+        // snapToGround refuses footing past a room's shoreline (minWalkY) and
+        // off the mesh entirely; the server knows about neither, so fall back to
+        // the engine's plainer snap rather than leaving a remote hanging.
+        if (!r.terrain.snapToGround(room, g.position)) this.engine.snapY(g.position, room);
+        r.terrain._terrain(room);
         r.snapX = g.position.x;
         r.snapZ = g.position.z;
       }
       r.avatar.update(dt);
     }
+
+    // The trail/aura field's one attach point, named in src/player/trails.js:
+    // this is the only place that holds the local avatar and every remote's
+    // snapshot at once. It reads both and writes to neither.
+    updateTrails(dt, this.engine, this.remotes);
 
     // throttled self position updates
     this.sendTimer += dt * 1000;

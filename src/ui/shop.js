@@ -1,6 +1,7 @@
 import * as THREE from 'three';
-import { HATS, BODY_COLORS, MINIGAMES, FURNITURE, HOUSE_MAX_ITEMS } from '../../shared/constants.js';
+import { HATS, BODY_COLORS, MINIGAMES, FURNITURE, HOUSE_MAX_ITEMS, TRAILS } from '../../shared/constants.js';
 import { createAvatar } from '../player/avatar.js';
+import { createTrailPreview } from '../player/trails.js';
 import { makeToon, makeGlow, disposeObject } from '../core/materials.js';
 
 /**
@@ -83,6 +84,25 @@ const HAT_BLURBS = {
   propeller: 'Spins nonstop. Lift not included.',
   chef: 'Smells permanently of mango smoothie.',
   pirate: 'Yarr, and excellent sun protection.',
+};
+
+const TRAIL_BLURBS = {
+  none: 'Just paws, and the ground you walked on.',
+  petals: 'The plaza blossom follows you home.',
+  sparkles: 'Every step lands with a little glint.',
+  glowring: 'Stand still and the warm light finds you.',
+  notes: 'A tune only your paws are playing.',
+  bubbles: 'Somehow never pops. Nobody asks how.',
+  snow: 'Peak weather, wherever you happen to be.',
+  stardrift: 'Five small stars, doing slow laps overhead.',
+  fireflies: 'They followed you back from the jungle.',
+  leaves: 'Autumn, personally, one capybara wide.',
+  embers: 'Cocoa warm, and it never once singes fur.',
+  butterflies: 'Three friends who insist on coming along.',
+  stars: 'Starfall, but gentle, and aimed at nobody.',
+  rainbow: 'A ribbon of every colour, in order, always.',
+  tidewake: 'The wake Big Blue leaves, in your size.',
+  goldpaw: 'Gold pawprints. They fade, which is the charm.',
 };
 
 const FURN_BLURBS = {
@@ -532,6 +552,19 @@ const CSS = `
   .shop-furn { animation: none; }
 }
 
+/* ---- trails grid: hat cards with a live little diorama on top ---- */
+.shop-trail-thumb {
+  position: relative; border-radius: 12px; overflow: hidden; margin-bottom: 3px;
+  background: radial-gradient(ellipse 78% 70% at 50% 38%, #fffaea 0%, #fbeed0 58%, #f1dcab 100%);
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,.7), 0 2px 6px rgba(45,36,23,.1);
+}
+.shop-trail-thumb canvas { display: block; width: 100%; height: auto; }
+.shop-aura {
+  display: inline-block; vertical-align: middle; margin-left: 6px;
+  font-size: 8.5px; font-weight: 900; letter-spacing: .09em; text-transform: uppercase;
+  padding: 3px 7px; border-radius: 999px; background: #d8f3ef; color: #2f8f83;
+}
+
 /* ---- consignment stall ---- */
 .shop-tab.is-stall.is-on { background: #b58bd8; box-shadow: 0 3px 10px rgba(181,139,216,.4); }
 .shop-stall-note {
@@ -813,6 +846,70 @@ function makeThumbShooter(pw, ph) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// trail art: ONE renderer, one little scene per card
+//
+// A flourish only reads when it moves, so these cards animate rather than take
+// a still. That is still exactly one GL context for the whole grid: each card
+// owns a `createTrailPreview` (its own private pools, so a preview can never
+// eat the world's particle budget), and every visible card is rendered into the
+// shared buffer and blitted into its own 2D canvas. Cards scrolled out of the
+// grid are skipped entirely, so the cost follows what the player can see.
+// ---------------------------------------------------------------------------
+
+const TRAIL_W = 132;
+const TRAIL_H = 94;
+const TRAIL_HZ = 24; // particles at 24fps read as film, and cost half of 60
+
+function makeTrailStage(pw, ph) {
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true, alpha: true, powerPreference: 'low-power',
+    preserveDrawingBuffer: true, // we drawImage() the buffer straight after render()
+  });
+  renderer.setPixelRatio(1);
+  renderer.setSize(pw, ph, false);
+  renderer.setClearAlpha(0);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+  // frames the pretend capybara's circle (radius 0.85) and everything the
+  // recipes throw, from ground pawprints to the drifting stars at y 1.95
+  const camera = new THREE.PerspectiveCamera(38, pw / ph, 0.1, 30);
+  camera.position.set(0, 1.5, 3.5);
+  camera.lookAt(0, 0.85, 0);
+
+  const cards = [];
+
+  return {
+    /** One card's art. `canvas` is the card's own 2D canvas. */
+    add(id, canvas) {
+      const pv = createTrailPreview(id);
+      const scene = new THREE.Scene();
+      scene.add(pv.group);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { pv.dispose(); return; }
+      cards.push({ pv, scene, ctx, canvas });
+    },
+    /** Advance and blit every card `visible` says is on screen. */
+    step(dt, visible) {
+      for (const c of cards) {
+        if (!visible(c.canvas)) continue;
+        c.pv.update(dt);
+        renderer.render(c.scene, camera);
+        c.ctx.clearRect(0, 0, c.canvas.width, c.canvas.height);
+        c.ctx.drawImage(renderer.domElement, 0, 0, c.canvas.width, c.canvas.height);
+      }
+    },
+    dispose() {
+      for (const c of cards) {
+        try { c.pv.dispose(); } catch { /* already gone */ }
+      }
+      cards.length = 0;
+      renderer.dispose();
+      try { renderer.forceContextLoss(); } catch { /* not all contexts support it */ }
+    },
+  };
+}
+
 function roundedPath(ctx, x, y, w, h, r) {
   const k = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
@@ -937,6 +1034,7 @@ export function openShop(game) {
           <div class="shop-tabs" role="tablist">
             <button class="shop-tab" role="tab" data-tab="colors">Colors</button>
             <button class="shop-tab" role="tab" data-tab="hats">Hats</button>
+            <button class="shop-tab" role="tab" data-tab="trails">Trails</button>
             <button class="shop-tab" role="tab" data-tab="furniture">Furniture</button>
             <button class="shop-tab is-stall" role="tab" data-tab="stall" hidden>Consignment</button>
           </div>
@@ -946,6 +1044,9 @@ export function openShop(game) {
           </div>
           <div class="shop-pane" data-pane="hats">
             <div class="shop-grid"></div>
+          </div>
+          <div class="shop-pane" data-pane="trails">
+            <div class="shop-grid shop-tgrid"></div>
           </div>
           <div class="shop-pane" data-pane="furniture">
             <div class="shop-furn-note"></div>
@@ -976,6 +1077,7 @@ export function openShop(game) {
   const colorHintEl = q('.shop-color-hint');
   // pane-scoped: the stall rack reuses .shop-grid for its scroll and layout
   const grid = q('[data-pane="hats"] .shop-grid');
+  const tgrid = q('.shop-tgrid');
   const subEl = q('.shop-sub');
   const furnNote = q('.shop-furn-note');
   const fgrid = q('.shop-fgrid');
@@ -984,6 +1086,7 @@ export function openShop(game) {
   const sgrid = q('.shop-sgrid');
 
   const SUB_WEAR = subEl.textContent;
+  const SUB_TRAIL = 'Walk trails and idle auras. Wear one and the whole cove sees it.';
   const SUB_FURN = 'Everything you buy is delivered to your den, ready to place.';
   const SUB_STALL = 'The consignment stall. Whatever came in on the boat this fortnight.';
 
@@ -1700,6 +1803,234 @@ export function openShop(game) {
     stepThumbs();
   }
 
+  // ---- trails --------------------------------------------------------------
+  // The flourish slot: one worn at a time, exactly like a hat, bought on the
+  // same 'shop' frame family (server/index.js 'buy-trail' answers with
+  // ownedTrails + boughtTrail). Milestone flourishes stay hidden until the
+  // stamp album grants one, which is the hat rack's hide-not-show rule again:
+  // coins must never be able to reach them.
+  const trailRefs = new Map();
+  let trailPendingId = null;
+  let trailPendingTimer = 0;
+  let trailStage = null; // null: not built yet. false: no WebGL, cards sit still.
+  let trailRaf = 0;
+  let trailLast = 0;
+  let trailAcc = 0;
+  let trailKey = '';
+
+  const trailPW = Math.round(TRAIL_W * thumbScale);
+  const trailPH = Math.round(TRAIL_H * thumbScale);
+
+  function ownedTrails() {
+    return Array.isArray(game.state.ownedTrails) ? game.state.ownedTrails : ['none'];
+  }
+  const ownsTrail = (id) => ownedTrails().includes(id);
+
+  /** One flourish card. Same furniture as a hat card, plus its live diorama. */
+  function makeTrailCard(id, i) {
+    const tr = TRAILS[id];
+    const cardEl = elm('div', 'shop-hat shop-trail');
+    cardEl.style.setProperty('--i', String(i));
+
+    const ribbon = elm('div', 'shop-ribbon', 'EQUIPPED');
+    const tier = elm('div', 'shop-tier', tierLabel(tr.price));
+    if (tr.price >= 500) tier.classList.add('is-legendary');
+    else if (tr.price >= 300) tier.classList.add('is-rare');
+
+    const thumb = elm('div', 'shop-trail-thumb');
+    const tcanvas = document.createElement('canvas');
+    tcanvas.width = trailPW;
+    tcanvas.height = trailPH;
+    tcanvas.setAttribute('aria-hidden', 'true');
+    thumb.appendChild(tcanvas);
+
+    const name = elm('div', 'shop-hat-name', tr.name);
+    // an aura is worn standing still, not walking: it is a different promise
+    // and the card says so rather than leaving the player to find out
+    if (tr.aura) name.appendChild(elm('span', 'shop-aura', 'Aura'));
+    const blurb = elm('div', 'shop-hat-blurb', TRAIL_BLURBS[id] || 'A flourish from the driftwood market.');
+
+    const foot = elm('div', 'shop-hat-foot');
+    const price = elm('div', 'shop-price');
+    if (tr.price > 0) {
+      price.appendChild(elm('span', 'shop-coin shop-coin-sm'));
+      price.appendChild(elm('span', null, String(tr.price)));
+    } else {
+      price.classList.add('is-free');
+      price.appendChild(elm('span', null, 'FREE'));
+    }
+    const btn = elm('button', 'shop-hat-btn');
+    btn.type = 'button';
+    foot.append(price, btn);
+    cardEl.append(ribbon, tier, thumb, name, blurb, foot);
+    tgrid.appendChild(cardEl);
+
+    const act = () => onTrailAction(id, cardEl);
+    btn.addEventListener('click', (e) => { e.stopPropagation(); act(); });
+    cardEl.addEventListener('click', act);
+
+    trailRefs.set(id, { el: cardEl, btn, price, canvas: tcanvas });
+  }
+
+  /** Rebuild the rack. Cheap, and the only thing that changes the card list is
+   *  a milestone flourish arriving, which is worth a redraw. */
+  function buildTrails() {
+    stopTrailArt();
+    try { trailStage?.dispose(); } catch { /* context may already be lost */ }
+    if (trailStage) trailStage = null; // false (no WebGL) stays false, it will not improve
+    tgrid.textContent = '';
+    trailRefs.clear();
+    const entries = shopEntries(TRAILS, ownsTrail);
+    trailKey = entries.map(([id]) => id).join(',');
+    let i = 0;
+    for (const [id] of entries) makeTrailCard(id, i++);
+    refreshTrails();
+    startTrailArt();
+  }
+
+  function startTrailArt() {
+    if (closed || trailRaf || !trailRefs.size || lastTab !== 'trails') return;
+    if (trailStage === false) return; // WebGL refused once: the gradients stand in
+    if (!trailStage) {
+      try {
+        trailStage = makeTrailStage(trailPW, trailPH);
+      } catch {
+        trailStage = false;
+        return;
+      }
+      for (const [id, ref] of trailRefs) trailStage.add(id, ref.canvas);
+    }
+    trailLast = 0;
+    trailAcc = 0;
+    trailRaf = requestAnimationFrame(stepTrailArt);
+  }
+
+  function stopTrailArt() {
+    if (trailRaf) { cancelAnimationFrame(trailRaf); trailRaf = 0; }
+  }
+
+  function stepTrailArt(now) {
+    trailRaf = 0;
+    if (closed || !trailStage || lastTab !== 'trails') return;
+    if (!trailLast) trailLast = now;
+    trailAcc += Math.min(0.1, (now - trailLast) / 1000);
+    trailLast = now;
+    if (trailAcc >= 1 / TRAIL_HZ) {
+      const box = tgrid.getBoundingClientRect();
+      const dt = trailAcc;
+      trailAcc = 0;
+      // only what the player can actually see: a rack scrolled past costs
+      // nothing at all until it comes back into the window
+      trailStage.step(dt, (canvas) => {
+        const r = canvas.getBoundingClientRect();
+        return r.width > 0 && r.bottom > box.top - 24 && r.top < box.bottom + 24;
+      });
+    }
+    trailRaf = requestAnimationFrame(stepTrailArt);
+  }
+
+  function refreshTrails() {
+    const worn = game.state.trail || 'none';
+    const owned = ownedTrails();
+    const { coins } = game.state;
+    for (const [id, ref] of trailRefs) {
+      const { price } = TRAILS[id];
+      const held = owned.includes(id);
+      const equipped = worn === id;
+      const pending = trailPendingId === id;
+      const short = !held && coins < price;
+
+      ref.el.classList.toggle('is-owned', held);
+      ref.el.classList.toggle('is-equipped', equipped);
+      ref.el.classList.toggle('is-locked', short && !pending);
+      ref.el.classList.toggle('is-pending', pending);
+      ref.price.classList.toggle('is-short', short);
+
+      ref.btn.disabled = equipped || pending || (trailPendingId !== null);
+      ref.btn.textContent = '';
+      if (pending) {
+        ref.btn.appendChild(elm('span', 'shop-spinner'));
+        ref.btn.appendChild(elm('span', null, 'Buying'));
+      } else if (equipped) {
+        ref.btn.textContent = 'Equipped';
+      } else if (held) {
+        ref.btn.textContent = id === 'none' ? 'Take off' : 'Equip';
+      } else {
+        ref.btn.appendChild(elm('span', null, 'Buy for'));
+        ref.btn.appendChild(elm('span', 'shop-coin shop-coin-sm'));
+        ref.btn.appendChild(elm('span', null, String(price)));
+      }
+    }
+  }
+
+  function clearTrailPending() {
+    trailPendingId = null;
+    if (trailPendingTimer) { clearTimeout(trailPendingTimer); trailPendingTimer = 0; }
+  }
+
+  /** The purchase landed when the server's ownedTrails says so, never before. */
+  function checkTrailPending() {
+    if (!trailPendingId) return;
+    if (ownsTrail(trailPendingId)) {
+      const bought = TRAILS[trailPendingId];
+      clearTrailPending();
+      game.audio?.play?.('success');
+      game.toast(`${bought.name} is yours!`);
+      preview?.celebrate(1);
+    }
+  }
+
+  function onTrailAction(id, cardEl) {
+    if (trailPendingId) return;
+    const tr = TRAILS[id];
+    if (!tr) return;
+
+    if (ownsTrail(id)) {
+      if ((game.state.trail || 'none') === id) { game.audio?.play?.('click'); return; }
+      // 'none' is a real owned entry, so taking a flourish off is the same
+      // road as putting one on and needs no special case
+      game.equipTrail(id);
+      game.audio?.play?.('pop');
+      preview?.celebrate(0.7);
+      refreshTrails();
+      return;
+    }
+
+    // Unreachable while the rack hides them, and still refused here: a
+    // milestone flourish is proof of play and coins never buy one.
+    if (tr.milestone) {
+      game.audio?.play?.('fail');
+      game.toast('That one is earned, not bought. Fill your stamp album!');
+      shake(cardEl);
+      return;
+    }
+    // there is no offline road for a trail: the ledger is the server's, and a
+    // local "purchase" would be a promise nobody else could see
+    if (!game.net?.connected) {
+      game.audio?.play?.('fail');
+      game.toast('The stallholder is paddling back to shore. Try again in a moment.');
+      shake(cardEl);
+      return;
+    }
+    if (game.state.coins < tr.price) {
+      game.audio?.play?.('fail');
+      game.toast(`${tr.name} costs ${tr.price}. You need ${tr.price - game.state.coins} more.`);
+      shake(cardEl);
+      return;
+    }
+
+    trailPendingId = id;
+    game.audio?.play?.('click');
+    game.net.send({ t: 'buy-trail', trail: id });
+    refreshTrails();
+    trailPendingTimer = setTimeout(() => {
+      if (trailPendingId !== id) return;
+      clearTrailPending();
+      refreshTrails();
+      game.toast('The shopkeeper is still counting. Try again.');
+    }, 8000);
+  }
+
   // ---- tabs ----------------------------------------------------------------
   const tabs = [...root.querySelectorAll('.shop-tab')];
   const panes = [...root.querySelectorAll('.shop-pane')];
@@ -1711,7 +2042,13 @@ export function openShop(game) {
       t.setAttribute('aria-selected', on ? 'true' : 'false');
     }
     for (const p of panes) p.classList.toggle('is-on', p.dataset.pane === name);
-    subEl.textContent = name === 'furniture' ? SUB_FURN : name === 'stall' ? SUB_STALL : SUB_WEAR;
+    subEl.textContent = name === 'furniture' ? SUB_FURN
+      : name === 'stall' ? SUB_STALL
+        : name === 'trails' ? SUB_TRAIL : SUB_WEAR;
+    // The flourishes only animate while somebody is looking at them. The rack
+    // is built at the very end of open(), so the first selectTab() lands here
+    // with no cards yet and buildTrails() starts the loop itself.
+    if (name === 'trails' && trailRefs.size) startTrailArt(); else stopTrailArt();
   }
   for (const t of tabs) {
     t.addEventListener('click', () => {
@@ -1720,7 +2057,7 @@ export function openShop(game) {
       game.audio?.play?.('click');
     });
   }
-  selectTab(['hats', 'furniture', 'stall'].includes(lastTab) ? lastTab : 'colors');
+  selectTab(['hats', 'trails', 'furniture', 'stall'].includes(lastTab) ? lastTab : 'colors');
 
   // ---- live state ----------------------------------------------------------
   function setCoins(total) {
@@ -1732,13 +2069,25 @@ export function openShop(game) {
   purseN.textContent = String(game.state.coins);
 
   const unsubs = [
-    game.events.on('coins', (total) => { setCoins(total); checkPending(); refreshHats(); refreshFurniture(); }),
+    game.events.on('coins', (total) => {
+      setCoins(total);
+      checkPending();
+      checkTrailPending();
+      refreshHats();
+      refreshTrails();
+      refreshFurniture();
+    }),
     game.events.on('profile', () => {
       purseN.textContent = String(game.state.coins);
       checkPending();
+      checkTrailPending();
       stageName.textContent = game.state.name || 'Capybara';
       refreshSwatches();
       refreshHats();
+      // a milestone flourish arriving changes WHICH cards exist, so the rack is
+      // rebuilt only when the list itself moved and merely repainted otherwise
+      if (shopEntries(TRAILS, ownsTrail).map(([id]) => id).join(',') !== trailKey) buildTrails();
+      else refreshTrails();
       refreshFurniture();
       syncPreview();
     }),
@@ -1783,7 +2132,12 @@ export function openShop(game) {
     openInstance = null;
     clearPending();
     clearFurnPending();
+    clearTrailPending();
     clearDyePending();
+    stopTrailArt();
+    // the previews hold private particle pools and one GL context of their own
+    try { trailStage?.dispose(); } catch { /* context may already be lost */ }
+    trailStage = null;
     clearInterval(rotTick);
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
@@ -1854,6 +2208,7 @@ export function openShop(game) {
   for (const key of finds) preview?.takeFind(key);
   refreshDyeNote();
   buildRacks();
+  buildTrails();
   askRotation();
 
   openInstance = { close };

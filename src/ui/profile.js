@@ -112,6 +112,123 @@ function nextCut(id, best) {
   return null;
 }
 
+/**
+ * "Their game", the one line of best-of that people actually want to read.
+ *
+ * `plays` (a {gameId: runs} map) is the honest answer and wins whenever the
+ * server volunteers it. Until it does, the ladder answers instead: the game
+ * they are furthest up is the game they have been playing. Both are labelled
+ * differently in the card, because "most played" and "best at" are not the same
+ * brag and pretending otherwise is how a stat line stops being trusted.
+ *
+ * @returns {{id:string, n:number|null, why:'plays'|'medal'}|null}
+ */
+export function favoriteGame(bests, plays) {
+  if (plays && typeof plays === 'object') {
+    let top = null;
+    // every game can be someone's favourite; only three of them have a medal
+    // ladder, so the fallback below is necessarily narrower than this
+    for (const id of Object.keys(MINIGAMES)) {
+      const n = Math.floor(Number(Object.prototype.hasOwnProperty.call(plays, id) ? plays[id] : 0));
+      if (!Number.isFinite(n) || n <= 0) continue;
+      if (!top || n > top.n) top = { id, n, why: 'plays' };
+    }
+    if (top) return top;
+  }
+  // No plays: rank by how far up its own ladder each best sits, so a 4000 sled
+  // run and a 100 fish haul can be compared at all.
+  let best = null;
+  for (const id of Object.keys(MEDAL_TIERS)) {
+    const v = bestOf(bests, id);
+    if (v == null) continue;
+    const cuts = MEDAL_TIERS[id];
+    const rung = Math.min(1.6, v / cuts[2]);
+    if (!best || rung > best.rung) best = { id, n: v, why: 'medal', rung };
+  }
+  return best ? { id: best.id, n: best.n, why: 'medal' } : null;
+}
+
+/** "Day 42 in the cove" from an ms epoch. null when the server did not say. */
+export function daysInCove(since, now = Date.now()) {
+  const t = Math.floor(Number(since));
+  if (!Number.isFinite(t) || t <= 0 || t > now + 86_400_000) return null;
+  const d = Math.floor((now - t) / 86_400_000) + 1;
+  return d >= 1 && d < 40_000 ? d : null;
+}
+
+/** Staff badges. A role of 'player' draws nothing: the badge is for the few. */
+const ROLE_BADGE = { mod: 'Cove keeper', admin: 'Cove admin' };
+
+/** How many stamps the owner may pin above everything else. Three is a shelf. */
+export const SHOWCASE_MAX = 3;
+
+/**
+ * The owner's pinned stamps: strings, deduped, capped, and (when we know their
+ * album) never showing a stamp they have not earned. A pick that outlives the
+ * catalog is dropped rather than drawn as a mystery tile.
+ */
+export function normalizeShowcase(raw, earnedIds) {
+  const list = Array.isArray(raw) ? raw
+    : Array.isArray(raw?.showcase) ? raw.showcase : null;
+  if (!list) return null; // null = "the server did not say", not "empty"
+  const earned = earnedIds instanceof Set ? earnedIds
+    : Array.isArray(earnedIds) ? new Set(earnedIds) : null;
+  const out = [];
+  for (const v of list) {
+    const id = typeof v === 'string' ? v : (v && typeof v.id === 'string' ? v.id : '');
+    if (!id || out.includes(id)) continue;
+    if (earned && !earned.has(id)) continue;
+    out.push(id);
+    if (out.length >= SHOWCASE_MAX) break;
+  }
+  return out;
+}
+
+/**
+ * Local mirror of the pick, keyed by account name.
+ *
+ * The server is the authority the moment it carries `showcase` (see the
+ * orchestrator line in this wave's report); until then the pick still has to
+ * survive a refresh, and a guest has no record to write to at all. Storage
+ * failures are silent: a browser with storage switched off loses the pin, not
+ * the card.
+ */
+function showcaseKey(name) {
+  return `capy.showcase.${String(name || 'guest').toLowerCase()}`;
+}
+
+function readLocalShowcase(name) {
+  try {
+    const raw = globalThis.localStorage?.getItem(showcaseKey(name));
+    return raw ? normalizeShowcase(JSON.parse(raw)) : null;
+  } catch { return null; }
+}
+
+function writeLocalShowcase(name, ids) {
+  try { globalThis.localStorage?.setItem(showcaseKey(name), JSON.stringify(ids)); } catch { /* private mode */ }
+}
+
+/**
+ * Stamps seen in the album, so a stamp earned since your last look can SHINE.
+ * Per account, ids only, and it is a nicety: a browser that cannot store it
+ * just never shines, which is exactly what happens today.
+ */
+function seenKey(name) {
+  return `capy.album.seen.${String(name || 'guest').toLowerCase()}`;
+}
+
+function readSeen(name) {
+  try {
+    const raw = globalThis.localStorage?.getItem(seenKey(name));
+    const list = raw ? JSON.parse(raw) : null;
+    return new Set(Array.isArray(list) ? list.filter((v) => typeof v === 'string') : []);
+  } catch { return new Set(); }
+}
+
+function writeSeen(name, ids) {
+  try { globalThis.localStorage?.setItem(seenKey(name), JSON.stringify([...ids].slice(-200))); } catch { /* private mode */ }
+}
+
 function flavorTitle(bests, isBot, isSelf) {
   if (isBot) return 'Local legend';
   const ids = Object.keys(MEDAL_TIERS);
@@ -140,6 +257,62 @@ function flavorTitle(bests, isBot, isSelf) {
 // those exports, FALLBACK_STAMPS/MILESTONES keep the tab, the slam and the
 // milestone bar honest instead of shipping an empty box. Shared always wins.
 // ---------------------------------------------------------------------------
+
+/**
+ * The album's shelves. Forty tiles in one grid is a wall; five headed shelves
+ * with their own completion is something you browse, and there is always one
+ * shelf sitting at "two to go" pulling you back.
+ *
+ * A shared STAMPS entry may name its own shelf (`section` / `group` / `sect`);
+ * anything unrecognised lands on 'odds', which is only drawn if it has tiles.
+ */
+export const STAMP_SECTIONS = [
+  { key: 'play', name: 'Games and glory', blurb: 'Runs, races and hauls, scored on your own.' },
+  { key: 'den', name: 'Across the table', blurb: 'Won against another capybara who was really there.' },
+  { key: 'cove', name: 'Out in the cove', blurb: 'Weather, water and being somewhere at the right hour.' },
+  { key: 'make', name: 'Making things', blurb: 'Pixels, dens and other evidence you were here.' },
+  { key: 'social', name: 'Good company', blurb: 'Nobody earns these on their own.' },
+  { key: 'grind', name: 'The long haul', blurb: 'The ones that take a while.' },
+  { key: 'odds', name: 'Odds and ends', blurb: 'Cove secrets.' },
+];
+
+const SECTION_KEYS = new Set(STAMP_SECTIONS.map((s) => s.key));
+
+/**
+ * Shelf for every stamp id this module knows by name.
+ *
+ * The live catalog is shared/constants.js STAMPS; the ids below cover it, and
+ * the leftovers are this module's older FALLBACK ids, which only matter on a
+ * build whose shared STAMPS has not landed. A shared entry may always overrule
+ * this by naming its own `section` (see decorate), and anything unmapped lands
+ * on 'odds', which is drawn only when it has tiles.
+ */
+const SECTION_OF = {
+  // --- shared/constants.js STAMPS ---
+  angler: 'play', reel_master: 'play', downhill: 'play', speed_demon: 'play',
+  barista: 'play', shift_lead: 'play', all_rounder: 'play', racer: 'play',
+  photo_finish: 'play', hat_trick: 'play', hider: 'play', doodler: 'play',
+  prospector: 'play', gem_hunter: 'play', motherlode: 'play',
+  duelist: 'den', sweep: 'den', grandmaster: 'den', card_shark: 'den',
+  paddle_pro: 'den', four_up: 'den', shuffler: 'den', den_regular: 'den',
+  explorer: 'cove', globetrotter: 'cove', night_owl: 'cove', deep_breath: 'cove',
+  whale_rider: 'cove', pod: 'cove', bottler: 'cove', beachcomber: 'cove',
+  snow_fight: 'cove', volley: 'cove', toasty: 'cove',
+  first_dab: 'make', muralist: 'make', cove_painter: 'make', decorator: 'make',
+  first_hello: 'social', party_planner: 'social', host_most: 'social',
+  party_animal: 'social', socialite: 'social', chatterbox: 'social',
+  regular: 'grind', veteran: 'grind', quester: 'grind', clean_sweep: 'grind',
+  devoted: 'grind', collector: 'grind',
+  // --- this module's fallback catalog, for a build without shared STAMPS ---
+  first_splash: 'play', reel_it_in: 'play', blend_master: 'play', prop_star: 'play',
+  seeker: 'play', quick_draw: 'play', good_guess: 'play', glimmer: 'play',
+  checkmate: 'den', clash: 'den',
+  sunriser: 'cove', rain_dance: 'cove', snowballer: 'cove', campfire: 'cove',
+  lantern: 'cove', message: 'cove', slow_steady: 'cove',
+  first_pixel: 'make', open_house: 'make',
+  host_with_most: 'social', social: 'social',
+  deep_pockets: 'grind', legend: 'grind',
+};
 
 // id, name, what it is for, glyph, hue. Feats, not grind: every line here is a
 // thing you did in front of other capybaras.
@@ -184,7 +357,9 @@ const FALLBACK_STAMPS = [
   ['regular', 'Regular', 'Play on seven different days.', 'calendar', 0x9b6bd4],
   ['hat_trick', 'Hat Trick', 'Own ten different hats.', 'hat', 0xf29ab0],
   ['legend', 'Legend of the Cove', 'Earn every other stamp in the album.', 'crown', 0xf2c744],
-].map(([id, name, desc, glyph, hue]) => ({ id, name, desc, glyph, hue }));
+].map(([id, name, desc, glyph, hue]) => ({
+  id, name, desc, how: desc, glyph, hue, sect: SECTION_OF[id] || 'odds',
+}));
 
 // total stamps -> exclusive reward coins cannot buy
 const FALLBACK_MILESTONES = [
@@ -223,6 +398,9 @@ function decorate(id, raw) {
   // (how); the album shows the flavour once earned and the condition until then
   const how = (typeof raw?.how === 'string' && raw.how.trim())
     || (typeof raw?.desc === 'string' && raw.desc.trim()) || known?.desc || 'A cove secret.';
+  const claimed = [raw?.section, raw?.group, raw?.sect].find(
+    (v) => typeof v === 'string' && SECTION_KEYS.has(v),
+  );
   return {
     id,
     name: (typeof raw?.name === 'string' && raw.name.trim()) || known?.name || id,
@@ -230,6 +408,7 @@ function decorate(id, raw) {
     how,
     glyph,
     hue,
+    sect: claimed || known?.sect || SECTION_OF[id] || 'odds',
   };
 }
 
@@ -279,6 +458,41 @@ export function milestoneTrack() {
 }
 
 /**
+ * The trail / aura slot.
+ *
+ * That cosmetic is another agent's (fleet C1) and lands on its own schedule, so
+ * this card is deliberately incurious about it: the EQUIPPED ID is the whole
+ * contract. A catalog (`SHARED.TRAILS` / `SHARED.AURAS`, array or id-keyed
+ * object) upgrades the id to a name and a colour when it exists; without one
+ * the id is title-cased and shown anyway, because "wearing something" is the
+ * social fact and the pretty name is only decoration. Nothing equipped, or no
+ * slot at all on this build, draws nothing.
+ *
+ * @returns {{kind:string, id:string, name:string, color:number|null}|null}
+ */
+export function equippedFlair(src) {
+  if (!src || typeof src !== 'object') return null;
+  const slots = [
+    ['Trail', src.trail ?? src.equippedTrail, SHARED.TRAILS],
+    ['Aura', src.aura ?? src.equippedAura, SHARED.AURAS],
+  ];
+  for (const [kind, raw, catalog] of slots) {
+    const id = typeof raw === 'string' ? raw.trim()
+      : (raw && typeof raw === 'object' && typeof raw.id === 'string') ? raw.id.trim() : '';
+    if (!id || id === 'none') continue;
+    let entry = null;
+    if (Array.isArray(catalog)) entry = catalog.find((e) => e && e.id === id) || null;
+    else if (catalog && typeof catalog === 'object'
+      && Object.prototype.hasOwnProperty.call(catalog, id)) entry = catalog[id];
+    const name = (typeof entry?.name === 'string' && entry.name.trim())
+      || id.replace(/[_-]+/g, ' ').replace(/^./, (c) => c.toUpperCase());
+    const c = Number(entry?.color ?? entry?.hue ?? (raw && typeof raw === 'object' ? raw.color : NaN));
+    return { kind, id, name, color: Number.isFinite(c) && c > 0 ? c : null };
+  }
+  return null;
+}
+
+/**
  * Parse a 'stamps' frame (or a stamps blob hanging off a profile).
  * Accepts [ids], {stamps:[ids]}, {earned:[ids]}, {stamps:{id:true}}.
  */
@@ -297,6 +511,71 @@ export function normalizeStamps(raw) {
   const owner = raw && typeof raw === 'object' && !Array.isArray(raw)
     ? (raw.id ?? raw.playerId ?? null) : null;
   return { id: owner == null ? null : String(owner), ids: [...new Set(ids)] };
+}
+
+/**
+ * Split a catalog onto its shelves and count each one.
+ * Empty shelves are dropped, so a server whose STAMPS never mention 'odds'
+ * simply never draws that heading.
+ *
+ * @returns {{key:string, name:string, blurb:string, stamps:object[],
+ *            got:number, total:number, pct:number}[]}
+ */
+export function albumSections(catalog, earnedIds) {
+  const earned = earnedIds instanceof Set ? earnedIds : new Set(earnedIds || []);
+  const byKey = new Map(STAMP_SECTIONS.map((s) => [s.key, { ...s, stamps: [], got: 0 }]));
+  for (const s of Array.isArray(catalog) ? catalog : []) {
+    if (!s || typeof s.id !== 'string') continue;
+    const bucket = byKey.get(s.sect) || byKey.get('odds');
+    if (!bucket) continue;
+    bucket.stamps.push(s);
+    if (earned.has(s.id)) bucket.got++;
+  }
+  const out = [];
+  for (const b of byKey.values()) {
+    if (!b.stamps.length) continue;
+    out.push({ ...b, total: b.stamps.length, pct: Math.round((b.got / b.stamps.length) * 100) });
+  }
+  return out;
+}
+
+/**
+ * The charm board, from any of the three shapes that carry it: the `charm`
+ * frame's `mine`, the profile ride-along's `charms`, or a bare array. Newest
+ * first is the server's order and it is kept, because a card shows the top row.
+ *
+ * `count` is the LIFETIME total, which is not the length of the list: the
+ * ride-along is capped (server/charms.js CARD_CHARMS) and the count is not.
+ */
+export function normalizeCharms(raw) {
+  const list = Array.isArray(raw) ? raw
+    : Array.isArray(raw?.charms) ? raw.charms
+      : Array.isArray(raw?.mine) ? raw.mine : [];
+  const found = [];
+  for (const c of list) {
+    if (!c) continue;
+    if (typeof c === 'string') { found.push({ id: c, name: c, week: null, at: 0 }); continue; }
+    if (typeof c !== 'object' || typeof c.id !== 'string' || !c.id) continue;
+    found.push({
+      id: c.id,
+      name: (typeof c.name === 'string' && c.name.trim()) || c.id,
+      week: typeof c.week === 'string' && c.week ? c.week : null,
+      at: Number.isFinite(Number(c.at)) ? Number(c.at) : 0,
+    });
+  }
+  const n = Math.floor(Number(raw?.charmCount));
+  return {
+    found,
+    count: Number.isFinite(n) && n >= found.length ? n : found.length,
+  };
+}
+
+/** Did this board already collect the charm for `week`? null = we cannot tell. */
+export function foundThisWeek(board, week) {
+  if (!week || !board) return null;
+  if (!Array.isArray(board.found)) return null;
+  if (!board.found.some((c) => c.week)) return board.found.length ? null : false;
+  return board.found.some((c) => c.week === week);
 }
 
 // ---- procedural stamp art -------------------------------------------------
@@ -866,6 +1145,23 @@ function normalizeProfile(raw) {
     bests: p.bests && typeof p.bests === 'object' ? p.bests : {},
     isFriend: typeof p.isFriend === 'boolean' ? p.isFriend
       : typeof p.friend === 'boolean' ? p.friend : null,
+    // ---- profile v2 ride-alongs ------------------------------------------
+    // Every one of these is OPTIONAL and every one degrades to "not drawn".
+    // `charms`/`charmCount` already ship (server/charms.js profileBits rides
+    // both publicProfile and the inspect frame since wave 13E); the rest are
+    // the additive fields this wave asks the orchestrator for, and the card is
+    // written so that a server without them looks finished rather than broken.
+    charms: normalizeCharms(p),
+    // ms epoch of the account's first day, for the "Day 42 in the cove" pill
+    since: Number.isFinite(Number(p.since ?? p.created)) ? Number(p.since ?? p.created) : null,
+    // {gameId: runs}; without it the best-of line falls back to the ladder
+    plays: p.plays && typeof p.plays === 'object' ? p.plays : null,
+    showcase: normalizeShowcase(p),
+    // staff only: the server sends a role for a keeper, and nothing for
+    // everyone else, so a missing role is a player and never a downgrade
+    role: typeof p.role === 'string' && Object.prototype.hasOwnProperty.call(ROLE_BADGE, p.role)
+      ? p.role : null,
+    flair: equippedFlair(p),
   };
 }
 
@@ -1051,6 +1347,7 @@ const CSS = `
   animation: pf-pop 0.26s backwards var(--spring);
 }
 .pf-drawer.is-report { background: rgba(232, 101, 122, 0.09); box-shadow: inset 0 0 0 2px rgba(232, 101, 122, 0.2); }
+.pf-drawer.is-pick { background: rgba(242, 182, 74, 0.13); box-shadow: inset 0 0 0 2px rgba(242, 182, 74, 0.34); }
 .pf-drawer.is-mod { background: rgba(79, 179, 232, 0.1); box-shadow: inset 0 0 0 2px rgba(79, 179, 232, 0.26); }
 .pf-dr-h { display: flex; align-items: center; gap: 7px; font-weight: 900; font-size: 13px; margin-bottom: 8px; }
 .pf-dr-h b { color: var(--accent); overflow-wrap: anywhere; }
@@ -1196,11 +1493,12 @@ const CSS = `
 }
 
 /* ---- stamp album (wave 7) ---- */
-.pf-tabs { display: flex; gap: 6px; margin-top: 6px; }
+.pf-tabs { display: flex; gap: 5px; margin-top: 6px; }
 .pf-tab {
   flex: 1; border: 0; cursor: pointer; font-family: var(--font); color: #a3906c;
-  font-size: 10px; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase;
-  padding: 7px 8px; border-radius: 999px; background: rgba(45, 36, 23, 0.06);
+  font-size: 9.5px; font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 7px 4px; border-radius: 999px; background: rgba(45, 36, 23, 0.06);
+  white-space: nowrap;
   transition: background 0.16s ease, color 0.16s ease, scale 0.12s ease;
 }
 .pf-tab:hover { background: rgba(45, 36, 23, 0.11); }
@@ -1263,6 +1561,184 @@ const CSS = `
   color: var(--muted); padding: 16px 10px; line-height: 1.5;
 }
 
+/* ---- profile v2: header, showcase, charm board, best-of ------------------ */
+
+/* the staff badge. Ribbon-shaped and gold-on-ink so it reads as an office,
+   not as a decoration somebody bought. */
+.pf-badge {
+  font-size: 9px; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 4px 10px; border-radius: 999px; flex: none; color: #fff5d8;
+  background: linear-gradient(180deg, #6b4f35 0%, #4a3524 100%);
+  box-shadow: inset 0 0 0 1.5px rgba(242, 182, 74, 0.7), 0 2px 5px rgba(45, 36, 23, 0.24);
+}
+.pf-badge.is-admin { background: linear-gradient(180deg, #b0567a 0%, #7d3252 100%); }
+
+/* the fact strip under the title: three or four little pills of "who is this" */
+.pf-facts { display: flex; gap: 5px; flex-wrap: wrap; }
+.pf-fact {
+  display: inline-flex; align-items: baseline; gap: 4px;
+  font-size: 10.5px; font-weight: 800; color: #8f7d5c;
+  background: rgba(45, 36, 23, 0.06); border-radius: 999px; padding: 4px 10px;
+}
+.pf-fact b { font-size: 12px; font-weight: 900; color: var(--ink); }
+.pf-fact.is-flair { background: rgba(155, 107, 212, 0.16); color: #6b4796; }
+.pf-fact.is-flair b { color: #4f3172; }
+.pf-fact-swatch {
+  width: 9px; height: 9px; border-radius: 50%; align-self: center;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.75), 0 0 7px currentColor;
+}
+
+/* ---- showcase: the three stamps they chose to be known for --------------- */
+.pf-show { margin-top: 2px; }
+.pf-show-row { display: flex; gap: 8px; align-items: stretch; }
+.pf-slot {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 4px 7px; border-radius: 16px; background: var(--card); border: 0;
+  font-family: var(--font); color: var(--ink); text-align: center;
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.06);
+  animation: pf-pop 0.34s backwards var(--spring); animation-delay: calc(var(--i) * 80ms);
+}
+/* a filled slot is a little display case: warm light behind the paper */
+.pf-slot.is-full {
+  background: radial-gradient(ellipse 80% 70% at 50% 34%, #fffaea 0%, #ffeec9 62%, #f7e0ad 100%);
+  box-shadow: 0 3px 0 rgba(158, 111, 20, 0.18), inset 0 0 0 2px rgba(255, 255, 255, 0.75);
+}
+.pf-slot.is-empty { background: rgba(45, 36, 23, 0.045); box-shadow: inset 0 0 0 2px rgba(45, 36, 23, 0.07); }
+.pf-slot canvas { display: block; }
+.pf-slot-name {
+  font-size: 10px; font-weight: 900; line-height: 1.15; color: var(--ink); overflow-wrap: anywhere;
+}
+.pf-slot.is-empty .pf-slot-name { color: #b6a688; }
+.pf-slot-hole {
+  width: 58px; height: 58px; border-radius: 14px; display: flex; align-items: center;
+  justify-content: center; font-size: 22px; font-weight: 900; color: #cbbb98;
+  box-shadow: inset 0 0 0 2.5px rgba(45, 36, 23, 0.12);
+}
+button.pf-slot { cursor: pointer; transition: transform 0.14s ease, box-shadow 0.16s ease; }
+button.pf-slot:hover { transform: translateY(-2px); box-shadow: 0 7px 14px rgba(45, 36, 23, 0.16); }
+button.pf-slot:active { transform: translateY(0); }
+button.pf-slot:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
+
+.pf-sub-head {
+  display: flex; align-items: baseline; gap: 8px; margin-top: 6px;
+}
+.pf-sub-head .pf-section { margin-top: 0; }
+.pf-sub-note { font-size: 10.5px; font-weight: 700; color: #b6a688; margin-left: auto; }
+
+/* the picker drawer reuses the report drawer's shell */
+.pf-pick-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(58px, 1fr));
+  gap: 6px; max-height: 30vh; overflow-y: auto; padding: 2px;
+}
+.pf-pick {
+  border: 0; cursor: pointer; font-family: var(--font); color: var(--ink);
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 4px 2px 5px; border-radius: 12px; background: #fffdf6;
+  box-shadow: 0 2px 0 rgba(45, 36, 23, 0.1);
+  transition: scale 0.12s ease, box-shadow 0.16s ease;
+}
+.pf-pick:hover { scale: 1.04; }
+.pf-pick:active { scale: 0.95; }
+.pf-pick:focus-visible { outline: 3px solid var(--accent2); outline-offset: 2px; }
+.pf-pick.on { background: linear-gradient(180deg, #ffd98a 0%, var(--gold) 100%); box-shadow: 0 2px 0 rgba(158, 111, 20, 0.34); }
+.pf-pick span { font-size: 8.5px; font-weight: 900; line-height: 1.1; text-align: center; overflow-wrap: anywhere; }
+
+/* ---- charm hunt board ---------------------------------------------------- */
+.pf-charm-week {
+  display: flex; align-items: center; gap: 11px; border-radius: 16px; padding: 10px 13px;
+  background: linear-gradient(180deg, #fffdf4 0%, #f8ecd2 100%);
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.07);
+}
+.pf-charm-week.is-found {
+  background: linear-gradient(180deg, #fff7dd 0%, #ffe6ac 100%);
+  box-shadow: 0 3px 0 rgba(158, 111, 20, 0.22);
+}
+.pf-charm-orb {
+  position: relative; width: 34px; height: 34px; border-radius: 50%; flex: none;
+  background: radial-gradient(circle at 34% 28%, #fffdf2 0%, #d9cbaa 62%, #b5a684 100%);
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.6), 0 2px 5px rgba(45, 36, 23, 0.2);
+}
+.pf-charm-week.is-found .pf-charm-orb {
+  background: radial-gradient(circle at 34% 28%, #fff6c9 0%, var(--gold) 58%, #c98c1d 100%);
+}
+.pf-charm-week.is-found .pf-charm-orb::after {
+  content: ''; position: absolute; inset: -5px; border-radius: 50%;
+  border: 2px solid rgba(242, 182, 74, 0.55); animation: fr-ping 3.2s ease-out infinite;
+}
+.pf-charm-txt { flex: 1; min-width: 0; }
+.pf-charm-name { font-weight: 900; font-size: 13.5px; line-height: 1.2; overflow-wrap: anywhere; }
+.pf-charm-sub { font-size: 11px; font-weight: 700; color: #a3906c; line-height: 1.35; }
+.pf-charm-sub b { color: var(--ink); }
+.pf-charm-tally { font-weight: 900; font-size: 20px; line-height: 1; flex: none; color: var(--accent); }
+.pf-charm-tally small { display: block; font-size: 9px; letter-spacing: 0.08em; color: #b6a688; text-transform: uppercase; }
+
+.pf-charm-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
+  gap: 6px; max-height: 32vh; overflow-y: auto; padding: 2px; margin-top: 2px;
+}
+.pf-charm-tile {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 5px; border-radius: 14px; background: var(--card); text-align: center;
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.06);
+  animation: pf-pop 0.3s backwards var(--spring); animation-delay: calc(var(--i) * 24ms);
+}
+.pf-charm-bead {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: radial-gradient(circle at 34% 28%, #fff6c9 0%, var(--gold) 56%, #b8801a 100%);
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.5), 0 2px 4px rgba(45, 36, 23, 0.18);
+}
+.pf-charm-tile b { font-size: 9.5px; font-weight: 900; line-height: 1.15; overflow-wrap: anywhere; }
+.pf-charm-tile span { font-size: 9px; font-weight: 800; color: #b6a688; }
+
+/* ---- best-of ------------------------------------------------------------- */
+.pf-fav {
+  display: flex; align-items: center; gap: 11px; border-radius: 16px; padding: 9px 13px;
+  background: linear-gradient(180deg, #fffdf6 0%, #f3ecdc 100%);
+  box-shadow: 0 3px 0 rgba(45, 36, 23, 0.06);
+}
+.pf-fav-txt { flex: 1; min-width: 0; }
+.pf-fav-k { font-size: 9.5px; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; color: #b6a688; }
+.pf-fav-v { font-weight: 900; font-size: 14px; line-height: 1.2; overflow-wrap: anywhere; }
+.pf-fav-sub { font-size: 10.5px; font-weight: 700; color: #a3906c; }
+
+/* ---- album shelves + the shine on a new earn ----------------------------- */
+.pf-shelf { margin-top: 9px; }
+.pf-shelf:first-child { margin-top: 2px; }
+.pf-shelf-h { display: flex; align-items: baseline; gap: 7px; margin-bottom: 5px; }
+.pf-shelf-n { font-size: 11.5px; font-weight: 900; color: var(--ink); }
+.pf-shelf-c { font-size: 10px; font-weight: 800; color: #b6a688; margin-left: auto; flex: none; }
+.pf-shelf-bar {
+  position: relative; height: 5px; border-radius: 999px; background: rgba(45, 36, 23, 0.09);
+  margin-bottom: 7px; overflow: hidden;
+}
+.pf-shelf-fill {
+  position: absolute; inset: 0 auto 0 0; border-radius: 999px; width: 0;
+  background: linear-gradient(90deg, var(--gold) 0%, var(--accent) 100%);
+  transition: width 0.6s var(--spring);
+}
+.pf-shelf.is-done .pf-shelf-c { color: var(--accent); }
+.pf-shelf .pf-album { max-height: none; overflow: visible; }
+/* the album pane scrolls once, not per shelf */
+.pf-shelves { max-height: 44vh; overflow-y: auto; padding: 2px; }
+
+/* a stamp earned since you last opened the album gets one sweep of light and a
+   gold edge that stays until you have looked at it. */
+.pf-stamp.is-new {
+  box-shadow: 0 3px 0 rgba(158, 111, 20, 0.3), 0 0 0 2px var(--gold);
+}
+.pf-stamp.is-new::after {
+  content: ''; position: absolute; inset: 0; border-radius: 13px; pointer-events: none;
+  background: linear-gradient(100deg, rgba(255, 255, 255, 0) 38%, rgba(255, 255, 255, 0.85) 50%, rgba(255, 255, 255, 0) 62%);
+  background-size: 260% 100%;
+  animation: pf-shine 2.6s ease-in-out infinite;
+}
+.pf-stamp-new-pip {
+  position: absolute; top: -4px; right: -3px; padding: 1px 6px; border-radius: 999px;
+  background: var(--accent); color: #fff; font-size: 8px; font-weight: 900;
+  letter-spacing: 0.06em; text-transform: uppercase; border: 2px solid var(--cream);
+}
+
+@keyframes pf-shine { 0% { background-position: 130% 0; } 55%, 100% { background-position: -30% 0; } }
 @keyframes pf-fade { from { opacity: 0; } }
 @keyframes pf-rise { from { opacity: 0; transform: translateY(16px) scale(0.95); } }
 @keyframes pf-pop { from { opacity: 0; transform: translateY(9px) scale(0.92); } }
@@ -1276,8 +1752,11 @@ const CSS = `
 }
 @media (prefers-reduced-motion: reduce) {
   .pf-card, .fr-card, .pf-row, .fr-row, .fr-den, .fr-dot.is-on::after,
-  .fr-hud-badge, .fr-empty-art, .pf-stamp, .pf-drawer { animation: none; }
-  .pf-mile-fill { transition: none; }
+  .fr-hud-badge, .fr-empty-art, .pf-stamp, .pf-drawer, .pf-slot, .pf-charm-tile,
+  .pf-stamp.is-new::after, .pf-charm-week.is-found .pf-charm-orb::after { animation: none; }
+  .pf-mile-fill, .pf-shelf-fill { transition: none; }
+  /* the shine is the whole point of the tile, so keep the light, lose the sweep */
+  .pf-stamp.is-new::after { background: rgba(255, 255, 255, 0.28); }
 }
 `;
 
@@ -1380,6 +1859,17 @@ function buildTurntable(canvas, look) {
 
 let openInstance = null;
 
+/**
+ * The last {t:'charm'} frame anyone saw, cached across cards.
+ *
+ * src/world/charm.js asks for it on every room build, so by the time a card is
+ * opened this is nearly always warm and the charm tab paints instantly. A card
+ * asks for itself only when the cache is empty (that read is budgeted server
+ * side), and a server with no hunt at all simply leaves this null forever,
+ * which the tab draws as a calm sentence rather than a spinner.
+ */
+let lastCharm = null;
+
 function elm(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -1403,6 +1893,11 @@ function localLook(game, playerId) {
     color: Number.isFinite(Number(p.color)) ? Number(p.color) : null,
     hat: typeof p.hat === 'string' && Object.prototype.hasOwnProperty.call(HATS, p.hat) ? p.hat : null,
     bot: !!p.bot,
+    // The flourish slot rides the world-tag snapshot (src/player/trails.js reads
+    // the very same `r.p.trail` to draw it behind them), so the card can name
+    // what somebody is wearing without asking the server a second time. If the
+    // slot does not exist on this build, this is undefined and nothing is drawn.
+    flair: equippedFlair(p),
   };
 }
 
@@ -1440,6 +1935,23 @@ export function openProfile(game, playerId) {
     // the 40-stamp milestone title, when the server has one for them: it beats
     // the flavour line below, because it was actually earned
     title: (isSelf && typeof game.state.title === 'string' && game.state.title) || '',
+    // ---- profile v2 ------------------------------------------------------
+    // The charm board rides publicProfile (and the inspect frame) already, so
+    // for ourselves it is on game.state the moment we are welcomed.
+    charms: isSelf ? normalizeCharms(game.state) : { found: [], count: 0 },
+    charmsKnown: isSelf,
+    since: isSelf && Number.isFinite(Number(game.state.since ?? game.state.created))
+      ? Number(game.state.since ?? game.state.created) : null,
+    plays: isSelf && game.state.plays && typeof game.state.plays === 'object' ? game.state.plays : null,
+    // the pick: the server's when it carries one, this browser's until then
+    showcase: isSelf
+      ? (normalizeShowcase(game.state) || readLocalShowcase(game.state.name))
+      : null,
+    // our own role we always know; a staff badge on someone ELSE needs the
+    // server to volunteer it, and a card that is never told draws no badge
+    role: isSelf && Object.prototype.hasOwnProperty.call(ROLE_BADGE, game.state.role)
+      ? game.state.role : null,
+    flair: isSelf ? equippedFlair(game.state) : (local?.flair || null),
     loaded: isSelf,
   };
 
@@ -1460,12 +1972,31 @@ export function openProfile(game, playerId) {
             <div class="pf-name-row"><span class="pf-name"></span></div>
             <div class="pf-title"></div>
           </div>
+          <div class="pf-facts"></div>
           <div class="pf-where"></div>
           <div class="pf-tabs">
-            <button class="pf-tab is-on" type="button" data-tab="medals">Achievements</button>
+            <button class="pf-tab is-on" type="button" data-tab="best">Highlights</button>
+            <button class="pf-tab" type="button" data-tab="charms">Charm hunt</button>
             <button class="pf-tab" type="button" data-tab="album">Stamp album</button>
           </div>
-          <div class="pf-pane" data-pane="medals"><div class="pf-medals"></div></div>
+          <div class="pf-pane" data-pane="best">
+            <div class="pf-show">
+              <div class="pf-sub-head">
+                <span class="pf-section">Showcase</span><span class="pf-sub-note pf-show-note"></span>
+              </div>
+              <div class="pf-show-row"></div>
+            </div>
+            <div class="pf-sub-head"><span class="pf-section">Best of</span></div>
+            <div class="pf-fav-slot"></div>
+            <div class="pf-medals"></div>
+          </div>
+          <div class="pf-pane" data-pane="charms" hidden>
+            <div class="pf-charm-week"></div>
+            <div class="pf-sub-head">
+              <span class="pf-section">Charms found</span><span class="pf-sub-note pf-charm-note"></span>
+            </div>
+            <div class="pf-charm-grid"></div>
+          </div>
           <div class="pf-pane" data-pane="album" hidden>
             <div class="pf-album-head"><span>Stamps in the album</span><b class="pf-album-count">-</b></div>
             <div class="pf-mile">
@@ -1473,11 +2004,12 @@ export function openProfile(game, playerId) {
               <div class="pf-mile-bar"><i class="pf-mile-fill"></i></div>
               <div class="pf-mile-nodes"></div>
             </div>
-            <div class="pf-album"></div>
+            <div class="pf-shelves"></div>
           </div>
           <div class="pf-actions"></div>
           <div class="pf-drawer is-report" hidden></div>
           <div class="pf-drawer is-mod" hidden></div>
+          <div class="pf-drawer is-pick" hidden></div>
         </div>
       </div>
     </div>
@@ -1491,11 +2023,19 @@ export function openProfile(game, playerId) {
   const titleEl = q('.pf-title');
   const whereEl = q('.pf-where');
   const medalsEl = q('.pf-medals');
+  const factsEl = q('.pf-facts');
+  const showRow = q('.pf-show-row');
+  const showNote = q('.pf-show-note');
+  const favSlot = q('.pf-fav-slot');
+  const charmWeekEl = q('.pf-charm-week');
+  const charmGrid = q('.pf-charm-grid');
+  const charmNote = q('.pf-charm-note');
+  const shelvesEl = q('.pf-shelves');
+  const pickEl = q('.pf-drawer.is-pick');
   const actionsEl = q('.pf-actions');
   const outfitDot = q('.pf-dot-color');
   const outfitTxt = q('.pf-outfit-txt');
   const canvas = q('.pf-canvas');
-  const albumEl = q('.pf-album');
   const albumCount = q('.pf-album-count');
   const mileTop = q('.pf-mile-top');
   const mileFill = q('.pf-mile-fill');
@@ -1518,11 +2058,21 @@ export function openProfile(game, playerId) {
   // ---- render --------------------------------------------------------------
   function renderHead() {
     nameEl.textContent = who.name || 'Someone friendly';
-    for (const chip of [...nameRow.querySelectorAll('.pf-chip')]) chip.remove();
+    for (const chip of [...nameRow.querySelectorAll('.pf-chip, .pf-badge')]) chip.remove();
     if (isSelf) nameRow.appendChild(elm('span', 'pf-chip is-self', 'You'));
     else if (who.bot) nameRow.appendChild(elm('span', 'pf-chip', 'Cove local'));
     else if (who.isFriend) nameRow.appendChild(elm('span', 'pf-chip is-friend', 'Friend'));
+    // The staff badge sits ON the name, because knowing who the keepers are is
+    // the point of it. It is drawn from a role the SERVER stated, never guessed.
+    if (who.role && !who.bot) {
+      const badge = elm('span', `pf-badge${who.role === 'admin' ? ' is-admin' : ''}`, ROLE_BADGE[who.role]);
+      badge.title = who.role === 'admin'
+        ? 'Runs the cove. Can do anything a keeper can, and then some.'
+        : 'A cove keeper: they answer reports and keep the place kind.';
+      nameRow.appendChild(badge);
+    }
     titleEl.textContent = who.title || flavorTitle(who.bests, who.bot, isSelf);
+    renderFacts();
 
     const roomName = who.room && Object.prototype.hasOwnProperty.call(ROOM_INFO, who.room)
       ? ROOM_INFO[who.room].name : null;
@@ -1542,6 +2092,307 @@ export function openProfile(game, playerId) {
     outfitDot.style.background = `#${(c >>> 0).toString(16).padStart(6, '0')}`;
     const hatName = who.hat && who.hat !== 'none' ? HATS[who.hat]?.name : null;
     outfitTxt.textContent = hatName ? `Wearing the ${hatName}` : 'No hat, all confidence';
+  }
+
+  /**
+   * The fact strip under the title. Every pill is drawn only when its number is
+   * REAL: a card about a capybara the server has said little about comes out
+   * short, not full of dashes and zeroes. A short honest header still looks
+   * designed; a header of placeholders looks broken.
+   */
+  function renderFacts() {
+    factsEl.textContent = '';
+    if (who.bot) return; // a cove local has no record and never pretends to
+    const add = (value, label, cls = '', title = '') => {
+      const pill = elm('span', `pf-fact${cls ? ` ${cls}` : ''}`);
+      pill.append(elm('b', null, String(value)), document.createTextNode(label));
+      if (title) pill.title = title;
+      factsEl.appendChild(pill);
+      return pill;
+    };
+
+    const day = daysInCove(who.since);
+    if (day != null) add(`Day ${day}`, 'in the cove', '', 'How long they have been washing up here.');
+
+    if (who.stamps != null) {
+      add(who.stamps.length, who.stamps.length === 1 ? 'stamp' : 'stamps', '',
+        'Stamps in their album. The full shelf is on the album tab.');
+    }
+    if (who.charmsKnown && who.charms.count > 0) {
+      add(who.charms.count, who.charms.count === 1 ? 'charm' : 'charms', '',
+        'Weekly charms found. Each one happened exactly once and never comes back.');
+    }
+    if (who.flair) {
+      // reads "Aurora wake trail": the name first, because the name is the brag
+      const pill = add(who.flair.name, who.flair.kind.toLowerCase(), 'is-flair',
+        `They are wearing the ${who.flair.name} ${who.flair.kind.toLowerCase()}.`);
+      if (who.flair.color != null) {
+        const dot = elm('i', 'pf-fact-swatch');
+        dot.style.color = hex(who.flair.color);
+        dot.style.background = hex(who.flair.color);
+        pill.prepend(dot);
+      }
+    }
+  }
+
+  // ---- showcase ------------------------------------------------------------
+  // Three stamps, pinned above everything else. This is the part of the card
+  // people decorate, so the pick belongs to the owner and to nobody else: an
+  // un-picked card auto-fills with their newest, and SAYS that it did.
+
+  function showcasePick() {
+    const earned = who.stamps || [];
+    const chosen = Array.isArray(who.showcase)
+      ? who.showcase.filter((id) => !earned.length || earned.includes(id))
+      : null;
+    if (chosen && chosen.length) return { ids: chosen.slice(0, SHOWCASE_MAX), auto: false };
+    return { ids: earned.slice(-SHOWCASE_MAX).reverse(), auto: true };
+  }
+
+  function renderShowcase() {
+    showRow.textContent = '';
+    const { ids, auto } = showcasePick();
+    const canEdit = isSelf && (who.stamps || []).length > 0;
+
+    showNote.textContent = who.stamps == null ? ''
+      : canEdit ? (auto ? 'Tap a slot to pin your own' : 'Tap to change')
+        : auto ? (ids.length ? 'Their newest' : '') : 'Their pick';
+
+    for (let i = 0; i < SHOWCASE_MAX; i++) {
+      const id = ids[i] || null;
+      const stamp = id ? stampById(id) : null;
+      const slot = elm(canEdit ? 'button' : 'div',
+        `pf-slot ${stamp ? 'is-full' : 'is-empty'}`);
+      slot.style.setProperty('--i', String(i));
+      if (canEdit) {
+        slot.type = 'button';
+        slot.title = stamp ? `${stamp.name} : tap to change your showcase` : 'Pin a stamp here';
+        slot.addEventListener('click', () => openPicker());
+      } else if (stamp) {
+        slot.title = `${stamp.name} : ${stamp.desc}`;
+      }
+
+      if (stamp) {
+        const c = document.createElement('canvas');
+        paintStampCanvas(c, stamp, true, 58);
+        slot.appendChild(c);
+        slot.appendChild(elm('div', 'pf-slot-name', stamp.name));
+      } else {
+        slot.appendChild(elm('div', 'pf-slot-hole', canEdit ? '+' : '·'));
+        slot.appendChild(elm('div', 'pf-slot-name',
+          who.stamps == null ? 'Looking' : canEdit ? 'Pin one' : 'Empty'));
+      }
+      showRow.appendChild(slot);
+    }
+  }
+
+  /** Commit a pick: the server first (when it takes one), this browser always. */
+  function saveShowcase(ids) {
+    who.showcase = ids.slice(0, SHOWCASE_MAX);
+    if (isSelf) {
+      game.state.showcase = [...who.showcase];
+      writeLocalShowcase(game.state.name, who.showcase);
+      // A server without the setting drops this frame on the floor (there is no
+      // default case in the switch), which is exactly the degrade we want: the
+      // pin still works, it just stops travelling to other people's cards.
+      if (game.net?.connected) {
+        try { game.net.send({ t: 'profile-set', showcase: [...who.showcase] }); } catch { /* closing socket */ }
+      }
+    }
+    renderShowcase();
+  }
+
+  let picker = null; // {ids:[...]} while the drawer is open
+
+  function closePicker(silent = false) {
+    if (!picker) return;
+    picker = null;
+    renderPicker();
+    if (!silent) game.audio?.play?.('click');
+  }
+
+  function openPicker() {
+    if (!isSelf) return;
+    closeReport(true);
+    closeMod(true);
+    picker = { ids: showcasePick().ids.slice() };
+    renderPicker();
+    game.audio?.play?.('open');
+  }
+
+  function renderPicker() {
+    pickEl.textContent = '';
+    if (!picker) { pickEl.hidden = true; return; }
+    pickEl.hidden = false;
+
+    const h = elm('div', 'pf-dr-h');
+    h.append('Your showcase');
+    const x = elm('button', 'pf-sb pf-dr-x', 'Close');
+    x.type = 'button';
+    x.addEventListener('click', () => closePicker());
+    h.appendChild(x);
+    pickEl.appendChild(h);
+
+    pickEl.appendChild(elm('div', 'pf-dr-sub',
+      `Pick up to ${SHOWCASE_MAX}. These sit at the top of your card, where people look first.`));
+
+    const earned = new Set(who.stamps || []);
+    const mine = stampCatalog().filter((s) => earned.has(s.id));
+    const grid = elm('div', 'pf-pick-grid');
+    for (const s of mine) {
+      const on = picker.ids.includes(s.id);
+      const b = elm('button', `pf-pick${on ? ' on' : ''}`);
+      b.type = 'button';
+      b.title = on ? `${s.name} : tap to unpin` : s.name;
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      const c = document.createElement('canvas');
+      paintStampCanvas(c, s, true, 44);
+      b.append(c, elm('span', null, s.name));
+      b.addEventListener('click', () => {
+        if (on) picker.ids = picker.ids.filter((v) => v !== s.id);
+        else if (picker.ids.length < SHOWCASE_MAX) picker.ids.push(s.id);
+        else { game.toast('Three at a time. Unpin one first.', 2600); return; }
+        renderPicker();
+        game.audio?.play?.('click');
+      });
+      grid.appendChild(b);
+    }
+    if (!mine.length) {
+      grid.appendChild(elm('div', 'pf-album-empty',
+        'Nothing to pin yet. Play a run, throw a snowball, add a pixel to the mural: the first one comes fast.'));
+    }
+    pickEl.appendChild(grid);
+
+    const btns = elm('div', 'pf-dr-btns');
+    const clear = elm('button', 'pf-sb', 'Clear');
+    clear.type = 'button';
+    clear.disabled = !picker.ids.length;
+    clear.addEventListener('click', () => { picker.ids = []; renderPicker(); game.audio?.play?.('click'); });
+    const save = elm('button', 'pf-sb warm', 'Pin them');
+    save.type = 'button';
+    save.addEventListener('click', () => {
+      saveShowcase(picker.ids);
+      closePicker(true);
+      game.audio?.play?.('success');
+      stage?.celebrate();
+    });
+    btns.append(clear, save);
+    pickEl.appendChild(btns);
+  }
+
+  // ---- best of -------------------------------------------------------------
+
+  function renderBestOf() {
+    favSlot.textContent = '';
+    const fav = favoriteGame(who.bests, who.plays);
+    if (!fav) {
+      const row = elm('div', 'pf-fav');
+      row.appendChild(elm('div', 'pf-medal is-none'));
+      const txt = elm('div', 'pf-fav-txt');
+      txt.appendChild(elm('div', 'pf-fav-k', 'Their game'));
+      txt.appendChild(elm('div', 'pf-fav-v', isSelf ? 'Still to be decided' : 'Nothing on the board yet'));
+      txt.appendChild(elm('div', 'pf-fav-sub', isSelf
+        ? 'One run of anything and this line fills in.'
+        : 'They have not put a score up. Yet.'));
+      row.appendChild(txt);
+      favSlot.appendChild(row);
+      return;
+    }
+    const meta = Object.prototype.hasOwnProperty.call(MINIGAMES, fav.id) ? MINIGAMES[fav.id] : null;
+    const best = bestOf(who.bests, fav.id);
+    const tier = medalTier(fav.id, best);
+    const row = elm('div', 'pf-fav');
+    row.appendChild(elm('div', `pf-medal ${TIER_CLASS[tier]}`));
+    const txt = elm('div', 'pf-fav-txt');
+    txt.appendChild(elm('div', 'pf-fav-k', fav.why === 'plays' ? 'Most played' : 'Strongest game'));
+    txt.appendChild(elm('div', 'pf-fav-v', meta?.name || fav.id));
+    txt.appendChild(elm('div', 'pf-fav-sub', fav.why === 'plays'
+      ? `${fav.n} ${fav.n === 1 ? 'run' : 'runs'}${best != null ? `, best ${best}` : ''}`
+      : `${TIER_LABEL[tier]}${best != null ? `, best ${best}` : ''}. ${MEDAL_BLURB[fav.id] || ''}`.trim()));
+    row.appendChild(txt);
+    favSlot.appendChild(row);
+  }
+
+  // ---- charm hunt ----------------------------------------------------------
+  // The board that has ridden publicProfile since wave 13E and has never once
+  // been drawn. Two facts, in this order: is this week's charm theirs, and how
+  // many have they collected in their whole time here.
+
+  function renderCharms() {
+    const board = who.charms;
+    const week = typeof lastCharm?.week === 'string' ? lastCharm.week : null;
+    // for ourselves the live frame is the authority; for anyone else the board
+    // is all we have, and a board with no weeks on it cannot answer at all
+    const got = isSelf && lastCharm ? !!lastCharm.claimed : foundThisWeek(board, week);
+
+    charmWeekEl.textContent = '';
+    charmWeekEl.classList.toggle('is-found', got === true);
+    charmWeekEl.appendChild(elm('div', 'pf-charm-orb'));
+    const txt = elm('div', 'pf-charm-txt');
+    if (!lastCharm) {
+      txt.appendChild(elm('div', 'pf-charm-name', 'This week\'s charm'));
+      txt.appendChild(elm('div', 'pf-charm-sub', 'The hunt has not spoken up yet. Walk into a room and it will.'));
+    } else {
+      txt.appendChild(elm('div', 'pf-charm-name',
+        typeof lastCharm.name === 'string' && lastCharm.name ? lastCharm.name : 'This week\'s charm'));
+      const sub = elm('div', 'pf-charm-sub');
+      if (got === true) {
+        sub.append('Found ');
+        sub.appendChild(elm('b', null, isSelf ? 'by you' : 'by them'));
+        sub.append('. It never comes back.');
+      } else if (got === false) {
+        sub.textContent = isSelf
+          ? (typeof lastCharm.hint === 'string' && lastCharm.hint ? lastCharm.hint : 'Still out there. Go and look.')
+          : 'Still out there for them.';
+      } else {
+        sub.textContent = 'Somewhere in the cove, glinting.';
+      }
+      txt.appendChild(sub);
+    }
+    charmWeekEl.appendChild(txt);
+
+    const n = Math.floor(Number(lastCharm?.found));
+    if (Number.isFinite(n) && n > 0) {
+      const tally = elm('div', 'pf-charm-tally', String(n));
+      tally.append(elm('small', null, n === 1 ? 'finder' : 'finders'));
+      tally.title = 'How many capybaras have found this week\'s charm.';
+      charmWeekEl.appendChild(tally);
+    }
+
+    charmNote.textContent = who.charmsKnown
+      ? (board.count ? `${board.count} in total` : '')
+      : '';
+
+    charmGrid.textContent = '';
+    if (!who.charmsKnown) {
+      // A profile that has come back WITHOUT a board is a cove whose hunt has
+      // not started (or a server older than wave 13E). Say that once, plainly,
+      // rather than leaving "asking..." up for the rest of the session.
+      charmGrid.appendChild(elm('div', 'pf-album-empty', who.loaded
+        ? 'No charm board came back for them. The hunt may not have started here yet.'
+        : 'Asking about their charms...'));
+      return;
+    }
+    if (!board.found.length) {
+      charmGrid.appendChild(elm('div', 'pf-album-empty', isSelf
+        ? 'No charms yet. One small thing hides in one room each week, and it is worth going to look.'
+        : 'No charms on their shelf yet.'));
+      return;
+    }
+    board.found.forEach((c, i) => {
+      const tile = elm('div', 'pf-charm-tile');
+      tile.style.setProperty('--i', String(i));
+      tile.appendChild(elm('div', 'pf-charm-bead'));
+      tile.appendChild(elm('b', null, c.name));
+      if (c.week) tile.appendChild(elm('span', null, c.week));
+      tile.title = c.week ? `${c.name}, found in ${c.week}` : c.name;
+      charmGrid.appendChild(tile);
+    });
+    // the ride-along is capped; say so rather than quietly showing a short shelf
+    if (board.count > board.found.length) {
+      charmGrid.appendChild(elm('div', 'pf-album-empty',
+        `...and ${board.count - board.found.length} more further back.`));
+    }
   }
 
   function renderMedals() {
@@ -1588,7 +2439,11 @@ export function openProfile(game, playerId) {
     const earned = new Set(who.stamps || []);
     const count = earned.size;
 
-    albumCount.textContent = known ? `${count} / ${cat.length}` : '-';
+    const pct = cat.length ? Math.round((count / cat.length) * 100) : 0;
+    albumCount.textContent = known ? `${count} / ${cat.length} : ${pct}%` : '-';
+    albumCount.title = known
+      ? `${pct}% of the album is filled in.`
+      : 'Counting the album...';
 
     const next = track.find((m) => m.at > count);
     mileTop.textContent = '';
@@ -1606,23 +2461,82 @@ export function openProfile(game, playerId) {
     mileFill.style.width = `${Math.min(100, (count / trackMax) * 100)}%`;
     for (const r of mileRefs) r.node.classList.toggle('is-hit', known && count >= r.m.at);
 
-    albumEl.textContent = '';
+    shelvesEl.textContent = '';
     if (!known) {
-      albumEl.appendChild(elm('div', 'pf-album-empty',
+      shelvesEl.appendChild(elm('div', 'pf-album-empty',
         isSelf ? 'Fetching your album from the cove...' : 'Asking around about their album...'));
       return;
     }
-    cat.forEach((s, i) => {
-      const got = earned.has(s.id);
-      const tile = elm('div', `pf-stamp${got ? ' is-earned' : ''}`);
-      tile.style.setProperty('--i', String(i));
-      const c = document.createElement('canvas');
-      paintStampCanvas(c, s, got, 62);
-      tile.appendChild(c);
-      tile.appendChild(elm('div', 'pf-stamp-name', got ? s.name : 'Locked'));
-      tile.title = got ? `${s.name} : ${s.desc}` : `Not yet : ${s.how || s.desc}`;
-      albumEl.appendChild(tile);
-    });
+
+    // Shelves, each with its own completion, so there is always one sitting at
+    // "two to go" rather than one bar that barely moves for a month.
+    let n = 0;
+    for (const sec of albumSections(cat, earned)) {
+      const shelf = elm('div', `pf-shelf${sec.got === sec.total ? ' is-done' : ''}`);
+      const head = elm('div', 'pf-shelf-h');
+      head.appendChild(elm('span', 'pf-shelf-n', sec.name));
+      head.appendChild(elm('span', 'pf-shelf-c',
+        sec.got === sec.total ? `Full shelf : ${sec.total}` : `${sec.got} / ${sec.total} : ${sec.pct}%`));
+      head.title = sec.blurb;
+      shelf.appendChild(head);
+      const bar = elm('div', 'pf-shelf-bar');
+      const fill = elm('i', 'pf-shelf-fill');
+      fill.style.width = `${sec.pct}%`;
+      bar.appendChild(fill);
+      shelf.appendChild(bar);
+
+      const grid = elm('div', 'pf-album');
+      for (const s of sec.stamps) {
+        const got = earned.has(s.id);
+        // "new" is only ever about your OWN album, and only about stamps that
+        // landed since the last time you looked at this shelf.
+        const isNew = got && isSelf && fresh.has(s.id);
+        const tile = elm('div', `pf-stamp${got ? ' is-earned' : ''}${isNew ? ' is-new' : ''}`);
+        tile.style.setProperty('--i', String(n++));
+        const c = document.createElement('canvas');
+        paintStampCanvas(c, s, got, 62);
+        tile.appendChild(c);
+        tile.appendChild(elm('div', 'pf-stamp-name', got ? s.name : 'Locked'));
+        if (isNew) tile.appendChild(elm('span', 'pf-stamp-new-pip', 'New'));
+        tile.title = got ? `${s.name} : ${s.desc}` : `Not yet : ${s.how || s.desc}`;
+        grid.appendChild(tile);
+      }
+      shelf.appendChild(grid);
+      shelvesEl.appendChild(shelf);
+    }
+  }
+
+  /**
+   * Stamps earned since this account last had the album open. The set is
+   * computed ONCE per card (so the shine does not vanish while you are looking
+   * at it) and cleared when the album tab has been seen for a beat.
+   */
+  const fresh = new Set();
+  let seenTimer = 0;
+
+  function markFresh() {
+    if (!isSelf || who.stamps == null) return;
+    const seen = readSeen(game.state.name);
+    // A first-ever look is not forty new stamps: seed the store silently and
+    // shine nothing. The shine means "since last time", and there was no last
+    // time.
+    if (!seen.size) { writeSeen(game.state.name, new Set(who.stamps)); return; }
+    for (const id of who.stamps) if (!seen.has(id)) fresh.add(id);
+  }
+
+  /**
+   * The album has been looked at: stop shining these next time.
+   * Only a real look counts. Closing the card from the Highlights tab leaves
+   * the shine armed, because a new stamp you were never shown is still new.
+   */
+  let albumViewed = false;
+  function settleFresh() {
+    if (!isSelf || who.stamps == null || seenTimer) return;
+    albumViewed = true;
+    seenTimer = setTimeout(() => {
+      seenTimer = 0;
+      writeSeen(game.state.name, new Set(who.stamps || []));
+    }, 1200);
   }
 
   let askedStamps = false;
@@ -1639,13 +2553,20 @@ export function openProfile(game, playerId) {
     }, 4000);
   }
 
+  /** The hunt, asked for once and only when nobody has heard from it yet. */
+  function askCharm() {
+    if (lastCharm || !game.net?.connected) return;
+    try { game.net.send({ t: 'charm' }); } catch { /* a closing socket is fine */ }
+  }
+
   for (const tab of root.querySelectorAll('.pf-tab')) {
     tab.addEventListener('click', () => {
       const which = tab.dataset.tab;
       for (const t of root.querySelectorAll('.pf-tab')) t.classList.toggle('is-on', t === tab);
       for (const p of root.querySelectorAll('.pf-pane')) p.hidden = p.dataset.pane !== which;
       game.audio?.play?.('click');
-      if (which === 'album') askStamps();
+      if (which === 'album') { askStamps(); settleFresh(); }
+      if (which === 'charms') askCharm();
     });
   }
 
@@ -2049,6 +2970,7 @@ export function openProfile(game, playerId) {
         if (b.disabled) return;
         if (report) { closeReport(); return; }
         closeMod(true);
+        closePicker(true);
         report = { reason: '', note: '', sending: false, done: false, err: '' };
         renderReport();
         renderActions();
@@ -2065,6 +2987,7 @@ export function openProfile(game, playerId) {
     m.addEventListener('click', () => {
       if (mod) { closeMod(); return; }
       closeReport(true);
+      closePicker(true);
       mod = { account: null, asked: false, drawer: null };
       renderMod();
       renderActions();
@@ -2151,11 +3074,15 @@ export function openProfile(game, playerId) {
 
   function renderAll() {
     renderHead();
+    renderShowcase();
+    renderBestOf();
     renderMedals();
+    renderCharms();
     renderAlbum();
     renderActions();
   }
 
+  markFresh();
   renderAll();
 
   // ---- live data -----------------------------------------------------------
@@ -2185,6 +3112,22 @@ export function openProfile(game, playerId) {
       if (raw && typeof raw === 'object' && raw.stamps != null) {
         who.stamps = normalizeStamps(raw).ids;
       }
+      // ---- profile v2 ride-alongs, each additive and each optional --------
+      // charms/charmCount have shipped since wave 13E and were never drawn;
+      // the rest arrive with the orchestrator's inspect line and are simply
+      // absent until then.
+      if (raw && typeof raw === 'object'
+        && (Array.isArray(raw.charms) || raw.charmCount != null)) {
+        who.charms = normalizeCharms(raw);
+        who.charmsKnown = true;
+      }
+      if (p.since != null) who.since = p.since;
+      if (p.plays) who.plays = p.plays;
+      if (p.role) who.role = p.role;
+      if (p.flair) who.flair = p.flair;
+      // Our OWN pick is ours: a profile frame about us never overwrites a pin we
+      // just made locally with an older (or absent) server answer.
+      if (p.showcase && !isSelf) who.showcase = p.showcase;
       who.loaded = true;
       stage?.setLook(who.color, who.hat);
       renderAll();
@@ -2201,14 +3144,37 @@ export function openProfile(game, playerId) {
         who.title = payload.title.trim().slice(0, 32);
         if (isSelf) game.state.title = who.title;
       }
+      markFresh();
       renderAlbum();
+      renderShowcase();
       renderHead();
     }),
-    // a stamp earned while the card is open lands in the album straight away
+    // a stamp earned while the card is open lands in the album straight away,
+    // shining, whatever tab you happen to be on
     game.events.on('stamp', (m) => {
       if (!isSelf || !m || typeof m.id !== 'string') return;
+      const already = (who.stamps || []).includes(m.id);
       who.stamps = [...new Set([...(who.stamps || []), m.id])];
+      if (!already) {
+        fresh.add(m.id);
+        stage?.celebrate();
+      }
       renderAlbum();
+      renderShowcase();
+      renderHead();
+    }),
+    // The hunt. Any card that hears it caches it for the next one, and a charm
+    // claimed while the card is open flips this week's line to "found" without
+    // a re-open.
+    game.events.on('charm', (m) => {
+      if (!m || typeof m !== 'object') return;
+      lastCharm = m;
+      if (isSelf && (Array.isArray(m.mine) || m.charmCount != null)) {
+        who.charms = normalizeCharms(m);
+        who.charmsKnown = true;
+        renderHead();
+      }
+      renderCharms();
     }),
     // The report answer rides its OWN name, the same way `mural` answers a
     // mural op: {ok:true, id} or {ok:false, msg, code}. A refusal releases the
@@ -2284,6 +3250,7 @@ export function openProfile(game, playerId) {
     if (game.state.registered) game.net?.send?.({ t: 'friends' });
   }
   askStamps(); // the album tab should be warm the moment it is clicked
+  askCharm();  // and so should the hunt, if nobody has heard from it yet
   // never leave the card stuck on "Checking..."
   const settle = setTimeout(() => {
     if (who.loaded) return;
@@ -2300,6 +3267,10 @@ export function openProfile(game, playerId) {
     clearTimeout(settle);
     if (stampsTimer) { clearTimeout(stampsTimer); stampsTimer = 0; }
     if (reportTimer) { clearTimeout(reportTimer); reportTimer = 0; }
+    // the shine is spent the moment the card closes, whether or not the timer
+    // got there first: re-opening to the same glow is a glow that means nothing
+    if (seenTimer) { clearTimeout(seenTimer); seenTimer = 0; }
+    if (isSelf && albumViewed && who.stamps) writeSeen(game.state.name, new Set(who.stamps));
     for (const off of unsubs) { try { off(); } catch { /* already gone */ } }
     removeEventListener('keydown', onKey, true);
     root.removeEventListener('pointerdown', onBackdrop);
@@ -2319,6 +3290,7 @@ export function openProfile(game, playerId) {
     // Escape unwinds one layer at a time: a half-typed ban reason should not
     // take the whole card with it.
     if (mod?.drawer) { mod.drawer = null; renderMod(); return; }
+    if (picker) { closePicker(); return; }
     if (report) { closeReport(); return; }
     if (mod) { closeMod(); return; }
     close();

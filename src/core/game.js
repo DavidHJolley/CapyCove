@@ -1,6 +1,6 @@
 import { Emitter } from './events.js';
 import {
-  BODY_COLORS, clampCoinsForGame, DEFAULT_ROOM, FURNITURE, HATS, MINIGAMES, NAME_MAX_LEN,
+  BODY_COLORS, clampCoinsForGame, DEFAULT_ROOM, FURNITURE, HATS, MINIGAMES, NAME_MAX_LEN, TRAILS,
 } from '../../shared/constants.js';
 
 /**
@@ -84,6 +84,7 @@ function cleanMuteUntil(v) {
 const GUEST_COINS_MAX = 9_999_999;
 const GUEST_BEST_MAX = 9_999_999; // server keeps scores 0 < s < 10_000_000
 const GUEST_HATS_MAX = 64; // mirrors the server's ownedHats .slice(0, 64)
+const GUEST_TRAILS_MAX = 32; // the flourish catalog is half the size; same idea
 const GUEST_FURN_MAX = 999; // per id; guests have no house, so this is pure paranoia
 const DEFAULT_COLOR = BODY_COLORS[0];
 
@@ -102,6 +103,7 @@ function intIn(v, lo, hi, fallback = lo) {
  * claiming one is a guest who edited the file.
  */
 const ownableHat = (id) => typeof id === 'string' && has(HATS, id) && !HATS[id].milestone;
+const ownableTrail = (id) => typeof id === 'string' && has(TRAILS, id) && !TRAILS[id].milestone;
 const ownableFurn = (id) => has(FURNITURE, id) && !FURNITURE[id].milestone;
 
 /**
@@ -131,6 +133,20 @@ function cleanGuestProfile(src) {
   }
   out.ownedHats = hats;
   out.hat = typeof src.hat === 'string' && hats.includes(src.hat) ? src.hat : 'none';
+
+  // the flourish slot, read exactly the way the hats above are: allowlisted
+  // against the shared catalog, milestone flourishes dropped (they are written
+  // by server/progress.js onto an ACCOUNT record and are never a guest's to
+  // claim), capped, and 'none' always present so there is something to wear
+  const trails = ['none'];
+  if (Array.isArray(src.ownedTrails)) {
+    for (const id of src.ownedTrails) {
+      if (trails.length >= GUEST_TRAILS_MAX) break;
+      if (ownableTrail(id) && !trails.includes(id)) trails.push(id);
+    }
+  }
+  out.ownedTrails = trails;
+  out.trail = typeof src.trail === 'string' && trails.includes(src.trail) ? src.trail : 'none';
 
   const bests = {};
   if (src.bests && typeof src.bests === 'object') {
@@ -179,6 +195,8 @@ class Game {
       color: 0xb08a5a,
       hat: 'none',
       ownedHats: ['none'],
+      trail: 'none',
+      ownedTrails: ['none'],
       ownedFurniture: {},
       bests: {},
       // wave 9E: server-owned, never persisted (MOD_FIELDS above)
@@ -203,6 +221,9 @@ class Game {
    * and costs a hand-edited file everything it invented.
    */
   applyProfile(p) {
+    // one assign carries the whole welcome profile, so `trail`/`ownedTrails`
+    // land here the same way `hat`/`ownedHats` do (server/auth.js
+    // publicProfile sends copies of both arrays, never the live records)
     Object.assign(this.state, p);
     // AFTER the assign, and unconditionally: role/caps/muteUntil are re-derived
     // from this profile every time, so a frame that has lost them takes the
@@ -374,11 +395,38 @@ class Game {
   }
 
   // ---- wardrobe / shop -----------------------------------------------------
+  /**
+   * The 'custom' frame is the WHOLE look, never a delta: the server assigns
+   * every field it is given and broadcasts the lot, so a frame that leaves the
+   * trail out would have equipping a hat quietly take everyone else's copy of
+   * your flourish off. Every sender below goes through here for that reason.
+   */
+  _sendCustom() {
+    this.net?.send({
+      t: 'custom', color: this.state.color, hat: this.state.hat, trail: this.state.trail,
+    });
+  }
+
   equipHat(id) {
     if (!this.state.ownedHats.includes(id)) return false;
     this.state.hat = id;
     this.engine?.playerAvatar?.setHat(id);
-    this.net?.send({ t: 'custom', color: this.state.color, hat: id });
+    this._sendCustom();
+    this.events.emit('profile', this.state);
+    this.saveLocal();
+    return true;
+  }
+
+  /**
+   * The flourish slot (walk trails and idle auras), equipped exactly the way a
+   * hat is. Nothing is rendered from here: src/player/trails.js reads
+   * `game.state.trail` every frame for the local capybara, and everyone else
+   * sees it through the 'custom' broadcast and the join snapshot.
+   */
+  equipTrail(id) {
+    if (!this.state.ownedTrails.includes(id)) return false;
+    this.state.trail = id;
+    this._sendCustom();
     this.events.emit('profile', this.state);
     this.saveLocal();
     return true;
@@ -387,7 +435,7 @@ class Game {
   setColor(hex) {
     this.state.color = hex;
     this.engine?.playerAvatar?.setColor(hex);
-    this.net?.send({ t: 'custom', color: hex, hat: this.state.hat });
+    this._sendCustom();
     this.events.emit('profile', this.state);
     this.saveLocal();
   }

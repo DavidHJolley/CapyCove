@@ -49,6 +49,24 @@ import { MINIGAMES } from '../../../shared/constants.js';
  *    server tally always overwrites it, and nothing here ever ends a round.
  *    A client that could skip a round on its own would be a griefing tool.
  *
+ * V2 (this pass), and what it did NOT need from the wire:
+ *  - WORD PACKS. Words are still the server's, always. This file adds the SHELF
+ *    a word came off (PACKS) so a round can be announced and a reveal can be
+ *    stamped with its theme. A `pack` field on 'dd-words'/'dd-state' is read if
+ *    the server ever sends one and WINS over local classification; until then a
+ *    pack is only ever inferred from a word that is already public (the drawer's
+ *    own, or the reveal). Solo runs are a themed tour of three shelves.
+ *  - THE ERASER. PALETTE[8] is the colour of the paper. That makes a rubber a
+ *    crayon: same 'dd-stroke' frame, same colour index, same undo, no new op,
+ *    no server change. See the PALETTE comment.
+ *  - PODIUM AWARDS. BEST GUESSER and BEST ARTIST are tallied locally out of the
+ *    'dd-correct' frames every client in the round already receives (points to
+ *    the guesser, drawerPoints to the drawer), so every screen agrees without a
+ *    new field. Additive `guessScore`/`drawScore` on the 'dd-end' standings rows
+ *    is already read and OVERRIDES the local tally if the server ever sends it.
+ *  - THE SKIP VOTE is unchanged on the wire ({t:'dd-vote', skip:true}) and
+ *    re-worded on screen: it asks for a NEW WORD, not for a drawer to go away.
+ *
  * DEVIATIONS from the spec, on purpose:
  *  - Near-miss ("so close!") is server-driven in party mode (dd-correct.near).
  *    Until a server near-miss frame is seen we also run a local fallback: a
@@ -81,8 +99,26 @@ const PALETTE = [
   '#9b6ee0', // grape
   '#b08a5a', // capy brown
   '#ff9a3c', // mango
+  PAPER,     // 8 = THE ERASER (see below)
 ];
+const CRAYONS = 8;               // PALETTE entries that are actual crayons
+const ERASER = 8;                // ...and the one that is a rubber
+
+/**
+ * THE ERASER IS A CRAYON THE COLOUR OF PAPER. That is not a shortcut, it is the
+ * only way an eraser can exist here without touching the wire: `dd-stroke`
+ * relays a colour INDEX, every client clamps it into PALETTE, and a stroke in
+ * PALETTE[8] lands on every easel as the cream the paper already is. It undoes
+ * with the same UNDO, it replays out of `strokes` in the same order, it flattens
+ * into the report snapshot (which paints its own PAPER ground first), and it
+ * costs the protocol exactly zero new fields. A destructive eraser -- one that
+ * edited the stroke list -- would have needed a new op, a new server case, and a
+ * new way for two clients to disagree about what is on the paper.
+ */
 const WIDTHS = [7, 15, 28];      // thin / chunky / fat
+// The eraser shares the three widths on purpose: `w` is a wire index, so a
+// rubber with sizes of its own would land on every other easel as a crayon-sized
+// hole. Big mistakes have CLEAR; this is for the whisker you drew too long.
 const SIZE_LABELS = ['S', 'M', 'L'];
 
 const MAX_STROKES = 400;         // per drawing, ours and theirs
@@ -118,8 +154,99 @@ const REPORT_REASONS = [
 const SOLO_ROUNDS = 6;
 const SOLO_TIMES = [45, 42, 38, 34, 31, 28];   // escalation: the clock tightens
 const SOLO_MAX = SOLO_ROUNDS * 120;            // 100 speed + 20 streak per round
+const SOLO_PER_PACK = 2;         // two doodles per themed shelf, three shelves
 const REPLAY_FRAC = 0.6;         // Doodles finishes her drawing this far in
 const LIFT = 44;                 // "pen lift" cost between replayed strokes
+
+// ------------------------------------------------------------- word packs ---
+/**
+ * THE SHELVES OF THE SKETCHBOOK. A pack is a THEME, not a word list: the party
+ * words still belong to the server (server/index.js DOODLE_WORDS) and always
+ * will. This table only knows which shelf a word came off, which buys three
+ * things a word alone cannot:
+ *   - the round card can announce "this one is off the SNACK SHACK shelf",
+ *   - the reveal can stamp the shelf next to the answer (classified from the
+ *     word the server just made public, so it leaks nothing),
+ *   - the solo sketchbook can run an actual THEMED TOUR instead of six
+ *     unrelated doodles.
+ * If the server ever labels the round itself (`pack` on dd-words/dd-state, see
+ * the orchestrator note), that label WINS: this table is the fallback that keeps
+ * the feature honest until it does, and the fallback that keeps it working for
+ * any word a future server invents (unknown words land on Odds & Ends).
+ */
+const PACKS = [
+  {
+    id: 'cove', name: 'Cove Life', color: '#4fb3e8',
+    blurb: 'Things you can point at without leaving the island.',
+    words: `top hat, lantern, mushroom, barrel, crate, fountain, palm tree,
+      seashell, surfboard, beach ball, sandcastle, disco ball, speaker,
+      headphones, drum, guitar, piano, trumpet, microphone, neon sign, campfire,
+      tent, lamp post, bridge, ladder, bucket, shovel, wheelbarrow, rope, anchor,
+      sailboat, canoe, paddle, lighthouse, compass, telescope, backpack, wagon,
+      bicycle, skateboard, rocket, robot, teddy bear, beanbag, sofa, bookshelf,
+      aquarium, fireplace, pillow, blanket, alarm clock, mailbox, postcard,
+      viking helm, pirate hat, propeller cap, flower pot, cactus, vine,
+      waterfall, hammock, torch, statue, boat`,
+  },
+  {
+    id: 'games', name: 'Game Day', color: '#e8657a',
+    blurb: 'Everything the cove hands you when it wants you to play.',
+    words: `chairlift, pickaxe, minecart, crystal, sled, fishing rod,
+      treasure chest, trophy, medal, crown, gemstone, kart`,
+  },
+  {
+    id: 'food', name: 'Snack Shack', color: '#f2b64a',
+    blurb: 'Straight off the blender, the griddle and the counter.',
+    words: `smoothie, cocoa, marshmallow, blender, banana, mango, strawberry,
+      pineapple, waffle, pancake, cupcake, cookie, donut, ice cream, popcorn,
+      teapot, mug, apron, chef hat, birthday cake`,
+  },
+  {
+    id: 'seasons', name: 'Seasons', color: '#7ac74f',
+    blurb: 'Weather, holidays and whatever the sky is doing today.',
+    words: `snowman, iceberg, snowball, mitten, scarf, balloon, kite, umbrella,
+      sunglasses, present, ribbon, candle, party hat, confetti, sunflower, acorn,
+      pinecone, rainbow, snowflake, moon, star, flower`,
+  },
+  {
+    id: 'critters', name: 'Critter Corner', color: '#9b6ee0',
+    blurb: 'The neighbours. Some of them have more legs than you.',
+    words: `shark, crab, jellyfish, starfish, dolphin, butterfly, toucan, frog,
+      turtle, snail, duckling, otter, bumblebee, firefly, owl, parrot, monkey,
+      fish`,
+  },
+];
+const PACK_WILD = {
+  id: 'wild', name: 'Odds & Ends', color: '#b08a5a',
+  blurb: 'The shelf for everything that fits on no other shelf.',
+};
+
+/** word -> pack, built once at import (pure data, no DOM, no side effects). */
+const PACK_OF = (() => {
+  const map = new Map();
+  for (const p of PACKS) {
+    for (const raw of p.words.split(',')) {
+      const w = normWord(raw);
+      if (w) map.set(w, p);
+    }
+  }
+  return map;
+})();
+
+/** The shelf a word came off. Unknown words are Odds & Ends, never an error. */
+function packOf(word) {
+  return PACK_OF.get(normWord(word)) || PACK_WILD;
+}
+
+/** A pack named by the server (additive fields), if it named one at all. */
+function packFrom(m) {
+  const raw = m?.pack ?? m?.packId ?? m?.theme ?? m?.packName;
+  if (raw == null) return null;
+  const key = normWord(raw);
+  if (!key) return null;
+  return PACKS.find((p) => p.id === key || normWord(p.name) === key)
+    || { id: key, name: String(raw).slice(0, 22), color: PACK_WILD.color, blurb: '' };
+}
 
 const PI = Math.PI;
 const TAU = PI * 2;
@@ -351,8 +478,10 @@ function S(c, w, ...parts) {
 const D = (word, hard, strokes) => ({ word, hard, strokes });
 
 /**
- * Doodles' sketchbook: 17 all-ages, on-theme drawings. `hard` (1-3) drives the
- * solo escalation curve: easy shapes first, fiddly ones once you are warm.
+ * Doodles' sketchbook: 27 all-ages, on-theme drawings. `hard` (1-3) drives the
+ * solo escalation curve: easy shapes first, fiddly ones once you are warm. Every
+ * word here is on a PACK shelf (see PACKS), which is what lets a solo run be a
+ * themed tour instead of six unrelated scribbles.
  */
 const DRAWINGS = [
   D('fish', 1, [
@@ -557,6 +686,122 @@ const DRAWINGS = [
     S(3, 2, 500, 360, 512, 620),
     S(3, 1, A(430, 496, 82, 46, 1.72 * PI, 2.62 * PI)),
     S(3, 1, A(596, 560, 82, 46, 1.02 * PI, 1.92 * PI)),
+  ]),
+  // ---- v2: ten more, so every shelf has a full run's worth ------------------
+  D('ice cream', 1, [
+    S(6, 1, 418, 372, 500, 646, 582, 372),
+    S(6, 0, 452, 442, 486, 408),
+    S(6, 0, 486, 508, 540, 452),
+    S(1, 1, E(500, 352, 98, 78)),
+    S(2, 1, E(500, 262, 80, 60)),
+    S(3, 1, E(500, 188, 64, 50)),
+    S(1, 1, E(500, 124, 22, 20)),
+    S(6, 0, 500, 106, 522, 78),
+  ]),
+  D('donut', 1, [
+    S(6, 1, E(500, 350, 198, 176)),
+    S(6, 1, E(500, 350, 74, 66)),
+    S(1, 2, A(500, 350, 170, 150, 0.98 * PI, 2.04 * PI)),
+    S(1, 1, 336, 372, 358, 428, 396, 396),
+    S(1, 1, 646, 358, 630, 420, 592, 386),
+    S(3, 0, 430, 250, 470, 236),
+    S(4, 0, 548, 232, 588, 248),
+    S(2, 0, 384, 306, 420, 292),
+    S(5, 0, 604, 300, 640, 316),
+    S(3, 0, 500, 208, 540, 202),
+  ]),
+  D('teapot', 2, [
+    S(0, 1, E(480, 420, 150, 125)),
+    S(0, 1, A(480, 295, 92, 40, PI, TAU)),
+    S(0, 1, 388, 295, 572, 295),
+    S(0, 1, E(480, 248, 22, 20)),
+    S(0, 1, 620, 366, 744, 300, 768, 356, 638, 424),
+    S(0, 1, A(330, 400, 70, 76, 0.5 * PI, 1.5 * PI)),
+    S(1, 1, 362, 456, 598, 456),
+    S(2, 0, 552, 214, 586, 188, 552, 158, 586, 128),
+    S(2, 0, 626, 236, 660, 210, 626, 180, 660, 150),
+  ]),
+  D('kite', 1, [
+    S(1, 1, 500, 116, 664, 336, 500, 556, 336, 336, 500, 116),
+    S(1, 0, 500, 116, 500, 556),
+    S(1, 0, 336, 336, 664, 336),
+    S(6, 1, 500, 556, 546, 616, 470, 654, 528, 694),
+    S(2, 1, 520, 592, 572, 604),
+    S(2, 1, 486, 636, 434, 648),
+    S(3, 0, 396, 268, 448, 240),
+  ]),
+  D('umbrella', 2, [
+    S(1, 1, A(500, 402, 262, 202, PI, TAU)),
+    S(1, 1, 238, 402, 304, 456, 370, 402, 435, 456, 500, 402, 565, 456,
+      630, 402, 696, 456, 762, 402),
+    S(1, 0, 500, 200, 370, 402),
+    S(1, 0, 500, 200, 630, 402),
+    S(6, 2, 500, 206, 500, 560),
+    S(6, 2, A(452, 560, 48, 44, 0, PI)),
+    S(4, 0, 300, 520, 274, 592),
+    S(4, 0, 700, 508, 726, 580),
+    S(4, 0, 630, 560, 610, 620),
+  ]),
+  D('present', 1, [
+    S(4, 1, 332, 322, 332, 582, 668, 582, 668, 322, 332, 322),
+    S(4, 1, 310, 322, 310, 252, 690, 252, 690, 322, 310, 322),
+    S(1, 2, 500, 252, 500, 582),
+    S(1, 2, 312, 288, 688, 288),
+    S(1, 1, E(452, 210, 48, 40)),
+    S(1, 1, E(548, 210, 48, 40)),
+    S(1, 1, 486, 236, 500, 254, 514, 236),
+  ]),
+  D('trophy', 2, [
+    S(2, 1, 382, 218, 402, 402, 500, 472, 598, 402, 618, 218),
+    S(2, 1, 364, 218, 636, 218),
+    S(2, 1, 382, 244, 302, 254, 298, 334, 376, 356),
+    S(2, 1, 618, 244, 698, 254, 702, 334, 624, 356),
+    S(2, 1, 500, 472, 500, 540),
+    S(6, 1, 418, 540, 582, 540, 610, 600, 390, 600, 418, 540),
+    S(0, 0, 500, 268, 516, 306, 558, 310, 526, 338, 536, 380, 500, 358,
+      464, 380, 474, 338, 442, 310, 484, 306, 500, 268),
+  ]),
+  D('lighthouse', 2, [
+    S(0, 1, 418, 604, 448, 262, 552, 262, 582, 604),
+    S(1, 2, 434, 380, 566, 380),
+    S(1, 2, 425, 472, 575, 472),
+    S(0, 1, 440, 262, 440, 200, 560, 200, 560, 262),
+    S(0, 1, 428, 200, 500, 148, 572, 200),
+    S(2, 2, E(500, 232, 26, 24)),
+    S(2, 0, 572, 214, 726, 172),
+    S(2, 0, 572, 248, 738, 258),
+    S(2, 0, 428, 214, 274, 172),
+    S(2, 0, 428, 248, 262, 258),
+    S(6, 1, 330, 612, 670, 612),
+  ]),
+  D('butterfly', 2, [
+    S(0, 2, 500, 250, 500, 468),
+    S(0, 2, dot(500, 234)),
+    S(5, 1, 494, 282, 378, 178, 296, 240, 328, 352, 492, 362),
+    S(5, 1, 506, 282, 622, 178, 704, 240, 672, 352, 508, 362),
+    S(5, 1, 494, 382, 388, 428, 370, 522, 452, 512, 496, 452),
+    S(5, 1, 506, 382, 612, 428, 630, 522, 548, 512, 504, 452),
+    S(2, 0, E(388, 268, 28, 24)),
+    S(2, 0, E(612, 268, 28, 24)),
+    S(1, 0, E(414, 460, 20, 18)),
+    S(1, 0, E(586, 460, 20, 18)),
+    S(0, 0, 494, 236, 448, 176),
+    S(0, 0, 506, 236, 552, 176),
+  ]),
+  D('owl', 3, [
+    S(6, 1, E(500, 392, 172, 190)),
+    S(6, 1, 382, 244, 352, 158, 434, 208),
+    S(6, 1, 618, 244, 648, 158, 566, 208),
+    S(0, 1, E(440, 342, 56, 52)),
+    S(0, 1, E(560, 342, 56, 52)),
+    S(0, 2, dot(444, 342)),
+    S(0, 2, dot(556, 342)),
+    S(2, 1, 500, 370, 468, 414, 532, 414, 500, 370),
+    S(6, 0, A(500, 474, 92, 74, PI, TAU)),
+    S(6, 0, A(384, 424, 54, 108, 1.62 * PI, 2.48 * PI)),
+    S(2, 1, 462, 572, 462, 604),
+    S(2, 1, 538, 572, 538, 604),
+    S(0, 1, 286, 606, 714, 606),
   ]),
 ];
 
@@ -822,7 +1067,78 @@ const STYLE = `
   padding:6px 14px;font-weight:800;font-size:13px;}
 .mg-dd-li b{margin-left:auto;color:#3f7a2c;}
 .mg-dd-li.mg-dd-me{background:rgba(122,199,79,.26);}
-@media (max-width:780px){.mg-dd-side{display:none;}.mg-dd-feed{height:52px;}}
+
+/* ---- v2: word packs, the reveal, the podium and a kinder skip vote ------- */
+.mg-dd-pk{display:inline-flex;align-items:center;gap:8px;background:rgba(255,253,246,.92);
+  border-radius:999px;padding:5px 14px 5px 8px;font-size:11.5px;font-weight:900;letter-spacing:.13em;
+  color:#33291c;box-shadow:0 3px 0 rgba(24,50,20,.3);}
+.mg-dd-pk i{width:15px;height:15px;border-radius:50%;border:3px solid #fffdf6;box-shadow:0 0 0 1px rgba(0,0,0,.12);}
+.mg-dd-pk.mg-dd-big{font-size:14px;padding:8px 20px 8px 10px;}
+.mg-dd-pk.mg-dd-big i{width:19px;height:19px;}
+.mg-dd-topk{position:relative;z-index:9;display:flex;justify-content:center;margin:-2px 0 4px;}
+.mg-dd-topk:empty{display:none;}
+
+/* the round card: a beat of theatre between rounds, never a wall */
+.mg-dd-card.mg-dd-slim{width:min(460px,100%);padding:22px 26px;}
+.mg-dd-card.mg-dd-slim h2{font-size:clamp(20px,3vw,28px);margin-bottom:2px;}
+.mg-dd-rnum{font-size:11px;font-weight:900;letter-spacing:.22em;opacity:.55;}
+.mg-dd-who{display:flex;align-items:center;justify-content:center;gap:10px;margin:12px 0 6px;
+  font-weight:900;font-size:15px;}
+.mg-dd-who canvas{border-radius:50%;background:rgba(0,0,0,.06);}
+.mg-dd-blurb{font-size:13px;font-weight:700;opacity:.72;margin-top:10px;line-height:1.4;}
+.mg-dd-tip{font-size:11px;font-weight:900;letter-spacing:.1em;opacity:.5;margin-top:12px;}
+
+/* the reveal: letters land one at a time, then the answer stamps the paper */
+.mg-dd-word.mg-dd-rev .mg-dd-l.mg-dd-shown{animation:mg-dd-land .5s cubic-bezier(.2,1.6,.35,1) backwards;}
+@keyframes mg-dd-land{from{transform:translateY(-26px) rotateX(90deg) scale(.6);opacity:0}
+  60%{transform:translateY(3px) rotateX(0) scale(1.12);opacity:1}}
+.mg-dd-stamp{position:absolute;left:50%;top:50%;z-index:5;transform:translate(-50%,-50%);
+  display:flex;flex-direction:column;align-items:center;gap:9px;pointer-events:none;}
+.mg-dd-stamp b{display:block;background:#fffdf6;color:#3f7a2c;border:6px solid #7ac74f;border-radius:22px;
+  padding:12px 34px;font-size:clamp(26px,5.4vw,52px);letter-spacing:.03em;text-transform:uppercase;
+  box-shadow:0 12px 0 rgba(24,50,20,.3),0 22px 40px rgba(8,22,6,.35);
+  animation:mg-dd-stamp .62s cubic-bezier(.2,1.5,.35,1);}
+.mg-dd-stamp.mg-dd-cold b{color:#c94a3e;border-color:#e8657a;}
+@keyframes mg-dd-stamp{0%{opacity:0;transform:scale(2.1) rotate(-9deg)}
+  55%{opacity:1;transform:scale(.92) rotate(2deg)}100%{transform:scale(1) rotate(-1.5deg)}}
+.mg-dd-stamp small{font-size:12px;font-weight:900;letter-spacing:.14em;color:#fffdf6;
+  text-shadow:0 2px 8px rgba(0,0,0,.55);animation:mg-dd-slide .5s .2s backwards;}
+.mg-dd-stamp.mg-dd-out{opacity:0;transition:opacity .45s ease;}
+
+/* tools: the rubber sits with the crayons but is obviously not one of them */
+.mg-dd-sw.mg-dd-rub{background:${PAPER};border-style:dashed;position:relative;}
+.mg-dd-sw.mg-dd-rub::after{content:"";position:absolute;inset:7px;border-radius:3px;
+  background:linear-gradient(135deg,#f2b64a 0 50%,#fffdf6 50% 100%);transform:rotate(-18deg);}
+.mg-dd-tbtn:disabled{opacity:.42;cursor:default;transform:none;}
+.mg-dd-tbtn b{color:#3f7a2c;}
+
+/* the skip vote: a request for a new word, not a boo */
+.mg-dd-skipwrap{display:flex;align-items:center;gap:9px;background:rgba(255,253,246,.86);
+  border-radius:999px;padding:4px 14px 4px 5px;box-shadow:0 3px 0 rgba(24,50,20,.3);}
+.mg-dd-skipwrap.mg-dd-off{display:none;}
+.mg-dd-meter{display:flex;gap:5px;}
+.mg-dd-meter i{width:11px;height:11px;border-radius:50%;background:rgba(45,36,23,.18);transition:.2s;}
+.mg-dd-meter i.mg-dd-on{background:#f2b64a;transform:scale(1.18);}
+.mg-dd-meter i.mg-dd-mine{background:#7ac74f;}
+.mg-dd-hint{font-size:11px;font-weight:900;letter-spacing:.08em;opacity:.62;}
+.mg-dd-votes{display:flex;align-items:center;gap:8px;}
+
+/* podium v2: crowns, portraits and the two awards that are not just "score" */
+.mg-dd-crown{font-size:20px;line-height:1;margin-bottom:-4px;color:#f2b64a;
+  text-shadow:0 2px 0 rgba(0,0,0,.15);animation:mg-dd-pulse 1.6s ease-in-out infinite;}
+.mg-dd-awards{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:4px 0 12px;}
+.mg-dd-aw{display:flex;align-items:center;gap:10px;background:rgba(255,253,246,.9);border-radius:18px;
+  padding:8px 16px 8px 8px;box-shadow:0 4px 0 rgba(24,50,20,.22);min-width:184px;
+  animation:mg-dd-in .45s cubic-bezier(.2,1.35,.4,1) backwards;}
+.mg-dd-aw canvas{border-radius:50%;background:rgba(0,0,0,.06);flex:none;}
+.mg-dd-aw div{text-align:left;line-height:1.25;}
+.mg-dd-aw u{display:block;text-decoration:none;font-size:9.5px;font-weight:900;letter-spacing:.16em;
+  color:#c98e26;}
+.mg-dd-aw b{font-size:14px;}
+.mg-dd-aw span{display:block;font-size:11px;font-weight:800;opacity:.6;}
+.mg-dd-aw.mg-dd-art u{color:#3f7a2c;}
+@media (max-width:780px){.mg-dd-side{display:none;}.mg-dd-feed{height:52px;}
+  .mg-dd-stamp b{border-width:4px;padding:9px 20px;}}
 `;
 
 // -------------------------------------------------------------------- game --
@@ -854,6 +1170,7 @@ export class DoodleGame extends Minigame {
 
     // brush
     this.color = 0;
+    this.lastCrayon = 0;   // what E puts back in your hand
     this.width = 1;
     this.drawing = false;
     this.strokeSeq = 0;
@@ -884,6 +1201,10 @@ export class DoodleGame extends Minigame {
     this.party = null;
     this.ctxRef = null;
     this.serverNear = false;
+
+    // v2: the shelf this round came off, and the word stamp on the easel
+    this.pack = null;
+    this.stampEl = null;
 
     // wave 10: last time we handed a drawing to the caretakers
     this._lastReportAt = 0;
@@ -931,8 +1252,12 @@ export class DoodleGame extends Minigame {
       guessbar: q('guessbar'),
       input: q('input'),
       send: q('send'),
+      topk: q('topk'),
       acts: q('acts'),
+      skipwrap: q('skipwrap'),
       skip: q('skip'),
+      meter: q('meter'),
+      skiphint: q('skiphint'),
       report: q('report'),
       votes: q('votes'),
       feed: q('feed'),
@@ -985,6 +1310,8 @@ export class DoodleGame extends Minigame {
     this.parts.length = 0;
     this.live = null;
     this.replay = null;
+    this.stampEl = null;
+    this.pack = null;
     this.ctx = null;
     this.bctx = null;
     this.buf = null;
@@ -1019,6 +1346,7 @@ export class DoodleGame extends Minigame {
         <div class="mg-dd-chip mg-dd-clock" data-el="clock"><b>0</b><small>s</small></div>
         <button class="mg-dd-quit" data-el="quit">QUIT</button>
       </div>
+      <div class="mg-dd-topk" data-el="topk"></div>
       <div class="mg-dd-tbar" data-el="tbarWrap"><i data-el="tbar"></i></div>
       <div class="mg-dd-body">
         <aside class="mg-dd-side mg-dd-hide" data-el="side">
@@ -1042,6 +1370,7 @@ export class DoodleGame extends Minigame {
             <div class="mg-dd-sep"></div>
             <button class="mg-dd-tbtn" data-el="undo">UNDO</button>
             <button class="mg-dd-tbtn" data-el="clear">CLEAR</button>
+            <span class="mg-dd-hint" style="color:#e8ffcf;opacity:.75">1-8 &middot; E &middot; Z</span>
           </div>
           <div class="mg-dd-guess" data-el="guessbar">
             <input data-el="input" type="text" maxlength="26" autocomplete="off" spellcheck="false"
@@ -1049,7 +1378,11 @@ export class DoodleGame extends Minigame {
             <button data-el="send">GUESS</button>
           </div>
           <div class="mg-dd-acts" data-el="acts">
-            <button class="mg-dd-act" data-el="skip">SKIP THIS DRAWER</button>
+            <span class="mg-dd-skipwrap" data-el="skipwrap">
+              <button class="mg-dd-act" data-el="skip">ASK FOR A NEW WORD</button>
+              <span class="mg-dd-meter" data-el="meter"></span>
+              <span class="mg-dd-hint" data-el="skiphint"></span>
+            </span>
             <button class="mg-dd-act mg-dd-flag" data-el="report">REPORT DRAWING</button>
             <span class="mg-dd-votes" data-el="votes"></span>
           </div>
@@ -1063,7 +1396,7 @@ export class DoodleGame extends Minigame {
   _buildTools() {
     const sw = this.el.swatches;
     this.swEls = [];
-    PALETTE.forEach((col, i) => {
+    PALETTE.slice(0, CRAYONS).forEach((col, i) => {
       const b = document.createElement('button');
       b.className = `mg-dd-sw${i === this.color ? ' mg-dd-sel' : ''}`;
       b.style.background = col;
@@ -1072,6 +1405,13 @@ export class DoodleGame extends Minigame {
       sw.appendChild(b);
       this.swEls.push(b);
     });
+    // the rubber lives at the end of the crayon rail, where a hand reaches for it
+    const rub = document.createElement('button');
+    rub.className = `mg-dd-sw mg-dd-rub${this.color === ERASER ? ' mg-dd-sel' : ''}`;
+    rub.title = 'Eraser (E)';
+    rub.addEventListener('click', () => this._setColor(ERASER));
+    sw.appendChild(rub);
+    this.swEls.push(rub);
     const sz = this.el.sizes;
     this.szEls = [];
     WIDTHS.forEach((_, i) => {
@@ -1129,6 +1469,7 @@ export class DoodleGame extends Minigame {
       const t = e.target;
       if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) return;
       if (e.key >= '1' && e.key <= '8') this._setColor(Number(e.key) - 1);
+      else if (e.key === 'e' || e.key === 'E') this._toggleEraser();
       else if (e.key === 'z' || e.key === 'Z') this._undo();
       else if (e.key === '[') this._setWidth(Math.max(0, this.width - 1));
       else if (e.key === ']') this._setWidth(Math.min(WIDTHS.length - 1, this.width + 1));
@@ -1226,15 +1567,20 @@ export class DoodleGame extends Minigame {
     }
     // brush ghost so the drawer can feel the crayon before touching paper
     if (this.hover && this._iAmDrawer() && !this.drawing) {
+      const rub = this.color === ERASER;
       ctx.beginPath();
       ctx.arc(this.hover.x, this.hover.y, Math.max(4, WIDTHS[this.width] / 2), 0, TAU);
-      ctx.strokeStyle = 'rgba(45,36,23,.35)';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = rub ? 'rgba(232,101,122,.75)' : 'rgba(45,36,23,.35)';
+      ctx.lineWidth = rub ? 3 : 2;
+      if (rub) ctx.setLineDash([9, 7]);
       ctx.stroke();
-      ctx.fillStyle = PALETTE[this.color];
-      ctx.globalAlpha = 0.35;
-      ctx.fill();
-      ctx.globalAlpha = 1;
+      ctx.setLineDash([]);
+      if (!rub) {
+        ctx.fillStyle = PALETTE[this.color];
+        ctx.globalAlpha = 0.35;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
     }
     for (const p of this.parts) {
       ctx.globalAlpha = clamp(p.life / 0.5, 0, 1);
@@ -1338,6 +1684,7 @@ export class DoodleGame extends Minigame {
     this.live = null;
     if (s) this._commit(s);
     this._flushStroke(true);
+    this._paintTools();
   }
 
   _flushStroke(end = false) {
@@ -1365,10 +1712,23 @@ export class DoodleGame extends Minigame {
 
   _setColor(i) {
     if (!Number.isFinite(i) || i < 0 || i >= PALETTE.length) return;
+    if (i < CRAYONS) this.lastCrayon = i;
     this.color = i;
     this.swEls?.forEach((b, k) => b.classList.toggle('mg-dd-sel', k === i));
     this.game.audio?.play?.('tick');
     this.dirty = true;
+  }
+
+  /** E is a toggle: rubber, then straight back to the crayon you were holding. */
+  _toggleEraser() {
+    this._setColor(this.color === ERASER ? this.lastCrayon : ERASER);
+  }
+
+  /** UNDO tells you whether there is anything left to undo. */
+  _paintTools() {
+    const u = this.el.undo;
+    if (!u) return;
+    u.disabled = !(this._canDraw() && this.strokes.length > 0);
   }
 
   _setWidth(i) {
@@ -1379,12 +1739,18 @@ export class DoodleGame extends Minigame {
     this.dirty = true;
   }
 
+  /**
+   * Take back YOUR last stroke -- including an eraser stroke, which is why the
+   * rubber had to be a crayon: undo is one list and one op, and it does not have
+   * to know which of the two it just removed.
+   */
   _undo() {
     if (!this._canDraw() || !this.strokes.length) return;
     this.strokes.pop();
     this._recommit();
     this.game.audio?.play?.('whoosh');
     this.game.net?.send?.({ t: 'dd-stroke', op: 'undo' });
+    this._paintTools();
   }
 
   /** Two-tap clear: an accidental wipe 60s into a drawing is heartbreaking. */
@@ -1400,6 +1766,7 @@ export class DoodleGame extends Minigame {
       this._recommit();
       this.game.audio?.play?.('whoosh');
       this.game.net?.send?.({ t: 'dd-stroke', op: 'clear' });
+      this._paintTools();
       return;
     }
     this.clearArmed = now;
@@ -1519,16 +1886,97 @@ export class DoodleGame extends Minigame {
    * break and any other character for a revealed one. `full` paints it green
    * (the reveal at the end of a round, or the drawer's own word).
    */
-  _setMask(mask, full = false) {
+  _setMask(mask, full = false, anim = false) {
     const el = this.el.word;
     if (!el) return;
-    el.className = `mg-dd-word${full ? ' mg-dd-full' : ''}`;
+    el.className = `mg-dd-word${full ? ' mg-dd-full' : ''}${anim ? ' mg-dd-rev' : ''}`;
     const chars = normMask(mask).split('');
+    let n = 0;
     el.innerHTML = chars.map((c) => {
       if (c === ' ') return '<div class="mg-dd-l mg-dd-gap"></div>';
       if (c === '_') return '<div class="mg-dd-l"></div>';
-      return `<div class="mg-dd-l mg-dd-shown">${esc(c)}</div>`;
+      // the reveal lands letter by letter, left to right, ~45ms apart: long
+      // enough to read as an ANSWER arriving, short enough to never be a wait
+      const d = anim ? ` style="animation-delay:${n * 45}ms"` : '';
+      n++;
+      return `<div class="mg-dd-l mg-dd-shown"${d}>${esc(c)}</div>`;
     }).join('');
+  }
+
+  // ------------------------------------------------------- v2: packs + reveal
+  /** The shelf pill. `pack` null clears it; nothing else is ever hidden here. */
+  _setPack(pack) {
+    this.pack = pack || null;
+    const host = this.el.topk;
+    if (!host) return;
+    host.innerHTML = pack ? this._packChip(pack) : '';
+  }
+
+  _packChip(pack, big = false) {
+    if (!pack) return '';
+    return `<span class="mg-dd-pk${big ? ' mg-dd-big' : ''}">`
+      + `<i style="background:${esc(pack.color || PACK_WILD.color)}"></i>${esc(pack.name)}</span>`;
+  }
+
+  /**
+   * THE ANSWER LANDS ON THE PAPER. The rail up top flips its letters open; this
+   * is the other half, the bit worth a screenshot: the word slams down over the
+   * drawing with its shelf underneath it. Cold (nobody got it) stamps coral
+   * instead of green, because "it was OTTER" and "you got OTTER" should never
+   * look the same from across the room.
+   */
+  _stamp(word, { cold = false, note = '' } = {}) {
+    const host = this.el.paper;
+    if (!host || !word) return;
+    this.stampEl?.remove();
+    const d = document.createElement('div');
+    d.className = `mg-dd-stamp${cold ? ' mg-dd-cold' : ''}`;
+    d.innerHTML = `<b>${esc(word)}</b>`
+      + (note ? `<small>${esc(note)}</small>` : '')
+      + (this.pack ? this._packChip(this.pack) : '');
+    host.appendChild(d);
+    this.stampEl = d;
+    this._after(2100, () => d.classList.add('mg-dd-out'));
+    this._after(2600, () => { if (this.stampEl === d) this.stampEl = null; d.remove(); });
+  }
+
+  _clearStamp() {
+    this.stampEl?.remove();
+    this.stampEl = null;
+  }
+
+  /**
+   * The round card. Two seconds of "here is who, here is which shelf", then it
+   * gets out of the way on its own. It only ever appears in dead air (the pick
+   * phase, or between solo doodles), so the first minute still teaches itself
+   * exactly the way it did before.
+   */
+  _roundCard({ title, sub, pack, who, blurb, ms = 1900, then = null }) {
+    this._over(`
+      <div class="mg-dd-card mg-dd-slim">
+        <div class="mg-dd-rnum">${esc(sub || '')}</div>
+        <h2>${esc(title || '')}</h2>
+        ${pack ? `<div style="margin:12px 0 2px">${this._packChip(pack, true)}</div>` : ''}
+        ${who ? `<div class="mg-dd-who" data-who="1"><span>${esc(who.name)}</span></div>` : ''}
+        ${blurb ? `<div class="mg-dd-blurb">${esc(blurb)}</div>` : ''}
+        <div class="mg-dd-tip">TAP ANYWHERE TO CARRY ON</div>
+      </div>`);
+    const slot = this.el.over?.querySelector('[data-who]');
+    if (slot && who) slot.prepend(capyCanvas(34, hexOf(who.color)));
+    const card = this.el.over;
+    const seq = this._overSeq;
+    let closed = false;
+    // A stale timer must never shut a card that has already been replaced by a
+    // real one (the word picks, the results): the serial is that check. `then`
+    // still runs either way, because it is what starts the round.
+    const close = () => {
+      if (closed || this.dead) return;
+      closed = true;
+      if (this._overSeq === seq && card?.classList.contains('mg-dd-on')) this._closeOver();
+      if (typeof then === 'function') then();
+    };
+    card?.addEventListener('click', close, { once: true });
+    this._after(ms, close);
   }
 
   _badge(text) {
@@ -1605,6 +2053,10 @@ export class DoodleGame extends Minigame {
   _over(html) {
     const o = this.el.over;
     if (!o) return;
+    // Every overlay gets a serial number. A timed card that wants to shut itself
+    // later checks it first, so a two-second round card can never take the
+    // results screen down with it when the round ends inside its own timer.
+    this._overSeq = (this._overSeq || 0) + 1;
     o.innerHTML = html;
     o.classList.add('mg-dd-on');
   }
@@ -1689,12 +2141,12 @@ export class DoodleGame extends Minigame {
       <div class="mg-dd-card">
         <h1>Capy Doodles</h1>
         <div class="mg-dd-sub">DOODLES THE CAPYBARA DRAWS. YOU NAME IT BEFORE THE CLOCK DOES.</div>
-        <div class="mg-dd-swatches">${PALETTE.map((c) => `<i style="background:${c}"></i>`).join('')}</div>
+        <div class="mg-dd-swatches">${PALETTE.slice(0, CRAYONS).map((c) => `<i style="background:${c}"></i>`).join('')}</div>
         <div class="mg-dd-how">
           <div><i>1</i><span>Doodles picks a word and starts scribbling. The blanks up top show how long it is.</span></div>
           <div><i>2</i><span>Type your guess and hit <b>Enter</b>. Guess early, score big: 100 points fading to 40.</span></div>
           <div><i>3</i><span>Letters flip open as the round runs on, and a near miss earns a cheeky "so close!".</span></div>
-          <div><i>4</i><span>Six doodles, and each one gives you less time than the last. Streaks pay a bonus.</span></div>
+          <div><i>4</i><span>Six doodles off three themed shelves, and each one gives you less time than the last. Streaks pay a bonus.</span></div>
         </div>
         <div class="mg-dd-stats">
           <div class="mg-dd-stat"><b>${best}</b><span>YOUR BEST</span></div>
@@ -1739,21 +2191,8 @@ export class DoodleGame extends Minigame {
     this.parts.length = 0;
     this._recommit();
 
-    // pick six drawings, easy first: that is the escalation curve
-    const byTier = [[], [], []];
-    for (const d of DRAWINGS) byTier[clamp(d.hard, 1, 3) - 1].push(d);
-    for (const t of byTier) t.sort(() => Math.random() - 0.5);
-    const order = [];
-    const take = (tier, n) => { while (n-- > 0 && byTier[tier].length) order.push(byTier[tier].pop()); };
-    take(0, 2);   // warm up on the simple silhouettes
-    take(1, 3);   // then the fiddlier ones
-    take(2, 1);   // finish on a proper puzzle
-    while (order.length < SOLO_ROUNDS) {
-      const spare = byTier[0].pop() || byTier[1].pop() || byTier[2].pop();
-      if (!spare) break;
-      order.push(spare);
-    }
-    this.solo = { order, round: 0, results: [], word: '', shown: [] };
+    const order = this._soloTour();
+    this.solo = { order, round: 0, results: [], word: '', shown: [], pack: null };
     this.soloDrawer = 'bot';
     this.soloScores = new Map([['bot', 0], ['me', 0]]);
     this._buildRows([
@@ -1766,12 +2205,79 @@ export class DoodleGame extends Minigame {
     if (this.el.sideh) this.el.sideh.textContent = 'THE EASEL';
   }
 
+  /**
+   * THE SKETCHBOOK TOUR. Six doodles used to be six unrelated shapes; now they
+   * are three SHELVES of two, announced as you reach them, and still ordered
+   * easy-to-fiddly so the escalation curve is exactly the one that was tuned.
+   * A run is a tour of the cove ("Snack Shack, then Critter Corner, then Game
+   * Day"), which is a thing you can tell someone about afterwards.
+   */
+  _soloTour() {
+    const byPack = new Map();
+    for (const d of DRAWINGS) {
+      const p = packOf(d.word);
+      if (!byPack.has(p.id)) byPack.set(p.id, { pack: p, list: [] });
+      byPack.get(p.id).list.push(d);
+    }
+    const shelves = [...byPack.values()].filter((s) => s.list.length >= SOLO_PER_PACK);
+    for (const s of shelves) {
+      s.list.sort(() => Math.random() - 0.5);
+      s.take = s.list.slice(0, SOLO_PER_PACK).sort((a, b) => a.hard - b.hard);
+      s.heat = s.take.reduce((a, d) => a + clamp(d.hard, 1, 3), 0) / s.take.length;
+    }
+    shelves.sort(() => Math.random() - 0.5);
+    const want = Math.ceil(SOLO_ROUNDS / SOLO_PER_PACK);
+    const chosen = shelves.slice(0, want).sort((a, b) => a.heat - b.heat); // gentlest shelf first
+    const order = [];
+    for (const s of chosen) for (const d of s.take) order.push({ d, pack: s.pack });
+    // a sketchbook with too few shelves still owes you six doodles
+    if (order.length < SOLO_ROUNDS) {
+      const used = new Set(order.map((o) => o.d.word));
+      const spare = DRAWINGS.filter((d) => !used.has(d.word)).sort((a, b) => a.hard - b.hard);
+      while (order.length < SOLO_ROUNDS && spare.length) {
+        const d = spare.shift();
+        order.push({ d, pack: packOf(d.word) });
+      }
+    }
+    return order.slice(0, SOLO_ROUNDS);
+  }
+
   _soloNext() {
     const S0 = this.solo;
     if (!S0) return;
     if (S0.round >= S0.order.length) { this._soloResults(); return; }
     const idx = S0.round;
-    const d = S0.order[idx];
+    const entry = S0.order[idx];
+    // A new shelf gets announced; the second doodle off it just starts. The
+    // clock does NOT run under the card: the round begins when the card leaves,
+    // whether that is the timer or an impatient tap.
+    if (entry.pack !== S0.pack) {
+      S0.pack = entry.pack;
+      this._setPack(entry.pack);
+      this.phase = 'wait';
+      this._clearStamp();
+      this._badge('');
+      this._showGuess(false);
+      this.game.audio?.play?.('open');
+      this._roundCard({
+        sub: `SHELF ${Math.floor(idx / SOLO_PER_PACK) + 1} OF ${Math.ceil(S0.order.length / SOLO_PER_PACK)}`,
+        title: entry.pack.name,
+        blurb: entry.pack.blurb,
+        ms: 1700,
+        then: () => this._soloBegin(idx),
+      });
+      return;
+    }
+    this._soloBegin(idx);
+  }
+
+  _soloBegin(idx) {
+    const S0 = this.solo;
+    if (!S0 || this.dead || S0.round !== idx) return;
+    const entry = S0.order[idx];
+    if (!entry) { this._soloResults(); return; }
+    const d = entry.d;
+    this._clearStamp();
     S0.word = normWord(d.word);
     S0.shown = [];
     S0.guesses = 0;
@@ -1895,11 +2401,12 @@ export class DoodleGame extends Minigame {
     this.streak++;
     this._setScore(this.score + pts);
     this.soloScores.set('me', this.score);
-    S0.results.push({ word: S0.word, pts, got: true });
+    S0.results.push({ word: S0.word, pts, got: true, pack: S0.pack });
     this._setDot(idx, 'hit');
     this._updateRows();
     this.phase = 'reveal';
-    this._setMask(S0.word, true);
+    this._setMask(S0.word, true, true);
+    this._stamp(S0.word, { note: `+${pts}${bonus ? `  (streak +${bonus})` : ''}` });
     this._setRole('GOT IT!');
     this._badge('');
     this._showGuess(false);
@@ -1920,9 +2427,10 @@ export class DoodleGame extends Minigame {
     const idx = S0.round;
     this.phase = 'reveal';
     this.streak = 0;
-    S0.results.push({ word: S0.word, pts: 0, got: false });
+    S0.results.push({ word: S0.word, pts: 0, got: false, pack: S0.pack });
     this._setDot(idx, 'miss');
-    this._setMask(S0.word, true);
+    this._setMask(S0.word, true, true);
+    this._stamp(S0.word, { cold: true, note: 'time!' });
     this._setRole(`IT WAS "${S0.word.toUpperCase()}"`);
     this._badge('');
     this._showGuess(false);
@@ -1957,13 +2465,31 @@ export class DoodleGame extends Minigame {
     if (isBest) this._burst(W / 2, H * 0.4, 40);
     const rows = this.solo.results.map((r) => `
       <div class="mg-dd-li${r.got ? ' mg-dd-me' : ''}">
-        <span>${r.got ? '&#10003;' : '&#10007;'} ${esc(r.word)}</span><b>${r.got ? `+${r.pts}` : '0'}</b>
+        <span>${r.got ? '&#10003;' : '&#10007;'} ${esc(r.word)}</span>
+        ${r.pack ? `<span class="mg-dd-pk"><i style="background:${esc(r.pack.color)}"></i>${esc(r.pack.name)}</span>` : ''}
+        <b>${r.got ? `+${r.pts}` : '0'}</b>
       </div>`).join('');
+    // A CLEAN SHELF is worth saying out loud and worth exactly zero points: the
+    // coin road is the score, and the score is the one this run was tuned for.
+    const shelves = new Map();
+    for (const r of this.solo.results) {
+      if (!r.pack) continue;
+      const s = shelves.get(r.pack.id) || { pack: r.pack, n: 0, got: 0 };
+      s.n++;
+      if (r.got) s.got++;
+      shelves.set(r.pack.id, s);
+    }
+    const swept = [...shelves.values()].filter((s) => s.n >= SOLO_PER_PACK && s.got === s.n);
+    const tour = [...shelves.values()].map((s) => this._packChip(s.pack)).join(' ');
+    this._setPack(null);
+    this._clearStamp();
     this._over(`
       <div class="mg-dd-card">
         ${isBest ? '<div class="mg-dd-ribbon">NEW SKETCHBOOK RECORD</div>' : ''}
+        ${swept.length ? `<div class="mg-dd-ribbon">CLEAN SHELF: ${swept.map((s) => esc(s.pack.name.toUpperCase())).join(' &middot; ')}</div>` : ''}
         <h2>Sketchbook closed</h2>
         <div class="mg-dd-sub">${esc(this._verdict(got))}</div>
+        ${tour ? `<div class="mg-dd-awards" style="margin:2px 0 10px">${tour}</div>` : ''}
         <div class="mg-dd-stats">
           <div class="mg-dd-stat"><b>${score}</b><span>SCORE</span></div>
           <div class="mg-dd-stat mg-dd-gold"><b>${coins}</b><span>COINS</span></div>
@@ -2039,6 +2565,11 @@ export class DoodleGame extends Minigame {
       // handed to the caretakers (one report per round, per reporter)
       skip: { votes: 0, need: 0, of: 0, mine: false, passed: false },
       reported: new Set(),
+      // v2: who is good at WHICH HALF of this game. Both numbers are built from
+      // the same `dd-correct` frames every client in the round receives, so the
+      // podium says the same thing on every screen without a new wire field.
+      stats: new Map(players.map((p) => [p.id, { guess: 0, art: 0, got: 0, seen: 0, drew: 0, fast: 0 }])),
+      pack: null,
     };
     this.maxScore = Math.max(120, (this.party.rounds - 1) * 100 + 15 * (players.length - 1));
   }
@@ -2062,11 +2593,11 @@ export class DoodleGame extends Minigame {
       <div class="mg-dd-card">
         <h1>Capy Doodles</h1>
         <div class="mg-dd-sub">${P.players.length} CAPYS AT THE STONE EASEL</div>
-        <div class="mg-dd-swatches">${PALETTE.map((c) => `<i style="background:${c}"></i>`).join('')}</div>
+        <div class="mg-dd-swatches">${PALETTE.slice(0, CRAYONS).map((c) => `<i style="background:${c}"></i>`).join('')}</div>
         <div class="mg-dd-how">
           <div><i>1</i><span>Each round one capy draws a secret word. Everyone else types guesses down below.</span></div>
           <div><i>2</i><span>First correct guess takes 100, the next ones a little less: be quick, not careful.</span></div>
-          <div><i>3</i><span>Drawing? Pick a word, then crayon away. You bank 15 for every capy who gets it.</span></div>
+          <div><i>3</i><span>Drawing? Pick a word, then crayon away: eight crayons, three sizes, a rubber and an undo. You bank 15 for every capy who gets it.</span></div>
           <div><i>4</i><span>${names}</span></div>
         </div>
         <div class="mg-dd-btns"><button class="mg-dd-btn" data-a="go">TO THE EASEL</button></div>
@@ -2097,6 +2628,38 @@ export class DoodleGame extends Minigame {
     return hit ? hit.name : 'Someone';
   }
 
+  _colorOf(id) {
+    const P = this.party;
+    const hit = P?.players.find((p) => p.id === id);
+    return hit ? hit.color : 0xb08a5a;
+  }
+
+  /** Per-capy tally row, created on demand (a late roster still counts). */
+  _stat(id) {
+    const P = this.party;
+    if (!P || !id) return null;
+    let row = P.stats.get(id);
+    if (!row) { row = { guess: 0, art: 0, got: 0, seen: 0, drew: 0, fast: 0 }; P.stats.set(id, row); }
+    return row;
+  }
+
+  /**
+   * The round's shelf. The server naming it wins (`pack` on dd-words/dd-state,
+   * see the orchestrator note); otherwise we classify, and we only ever classify
+   * a word that is ALREADY public: the drawer's own word, or the reveal. A pack
+   * inferred from a word a guesser must not have would be a hint they did not
+   * earn, so there is deliberately no third case.
+   */
+  _packFromRound(m) {
+    const P = this.party;
+    if (!P) return;
+    const named = packFrom(m);
+    if (named) { P.pack = named; this._setPack(named); return; }
+    if (P.pack) return;
+    const known = (this.phase === 'reveal' || this._iAmDrawer()) ? P.word : '';
+    if (known) { P.pack = packOf(known); this._setPack(P.pack); }
+  }
+
   _onState(m) {
     const P = this.party;
     if (!P || this.dead || P.over) return;
@@ -2114,7 +2677,14 @@ export class DoodleGame extends Minigame {
     const rounds = num(m.rounds, m.of);
     if (round != null) {
       const r = Math.max(1, Math.round(round));
-      if (r !== P.round) { P.picked = false; P.word = ''; P.correct.clear(); this._resetSkip(); }
+      if (r !== P.round) {
+        P.picked = false;
+        P.word = '';
+        P.correct.clear();
+        P.pack = null;
+        this._setPack(null);
+        this._resetSkip();
+      }
       P.round = r;
     }
     if (rounds != null && rounds > 0) {
@@ -2187,6 +2757,7 @@ export class DoodleGame extends Minigame {
     // A server that would rather carry the skip tally on the state frame than
     // spend a message type on it is answered here, with the same reader.
     if (m.votes != null || m.skipVotes != null || m.skipNeed != null) this._onVote(m);
+    this._packFromRound(m);
     this._updateRows();
     this._paintActs();
   }
@@ -2199,6 +2770,7 @@ export class DoodleGame extends Minigame {
     P.remote = null;
     P.correct.clear();
     this._resetSkip();
+    this._clearStamp();
     this._recommit();
     this._setRound(`ROUND ${P.round}/${P.rounds}`);
     this._setDot(P.round - 1, 'now');
@@ -2224,6 +2796,17 @@ export class DoodleGame extends Minigame {
     } else {
       this._setRole(`${this._nameOf(P.drawerId).toUpperCase()} IS PICKING A WORD`);
       this._badge('WAITING FOR A WORD');
+      // The guessers' round card. It lands in the pick phase, which is fifteen
+      // seconds of watching an empty easel, so it costs the round nothing and
+      // turns "wait" into "round three, Rosa is up, Snack Shack".
+      this._roundCard({
+        sub: `ROUND ${P.round} OF ${P.rounds}`,
+        title: `${this._nameOf(P.drawerId)} takes the crayons`,
+        pack: P.pack,
+        who: { name: this._nameOf(P.drawerId), color: this._colorOf(P.drawerId) },
+        blurb: P.pack ? P.pack.blurb : 'Blanks up top, guess box down below. First one in scores most.',
+        ms: 2000,
+      });
     }
   }
 
@@ -2246,6 +2829,8 @@ export class DoodleGame extends Minigame {
     this._showTools(mine);
     this._showGuess(!mine && !P.correct.has(P.meId), 'Type your guess, hit Enter');
     this._paintActs();
+    this._paintTools();
+    this._clearStamp();
     this.el.paper?.classList.toggle('mg-dd-draw', mine);
     if (mine) {
       this._drawerWord();
@@ -2283,11 +2868,27 @@ export class DoodleGame extends Minigame {
     this._showGuess(false);
     this._showTools(false);
     this._badge('');
+    const ds = this._stat(P.drawerId);
+    if (ds) ds.drew++;
     const w = normWord(word || P.word);
     if (w) {
       P.word = w;
-      this._setMask(w, true);
+      if (!P.pack) { P.pack = packOf(w); this._setPack(P.pack); }
+      this._setMask(w, true, true);
       this._setRole(`THE WORD WAS "${w.toUpperCase()}"`);
+      // WHO GOT IT is the story of the round, so the stamp tells it: a green
+      // stamp with a headcount when the jungle read it, a coral one when the
+      // drawing took its secret with it.
+      const n = P.correct.size;
+      const solved = n > 0;
+      const drawer = this._nameOf(P.drawerId);
+      this._stamp(w, {
+        cold: !solved,
+        note: solved
+          ? (n === 1 ? `1 capy read ${drawer}` : `${n} capys read ${drawer}`)
+          : `nobody read ${drawer}`,
+      });
+      if (solved) this._burst(W / 2, H * 0.62, 18);
     } else {
       this._setRole('ROUND OVER');
     }
@@ -2309,6 +2910,17 @@ export class DoodleGame extends Minigame {
     // the last one (the state frame that resets this may still be in flight)
     const round = num(m?.round, m?.r);
     if (round != null && Math.round(round) > P.round) { P.picked = false; P.word = ''; }
+    // The shelf, if the server named it; failing that, three words that all live
+    // on the same shelf ARE the shelf. Only the drawer ever sees this frame, and
+    // they are allowed to know what they are about to draw.
+    const named = packFrom(m);
+    if (named) { P.pack = named; this._setPack(named); } else {
+      const packs = words.map((w) => packOf(w));
+      if (packs.length === 3 && packs.every((p) => p === packs[0]) && packs[0] !== PACK_WILD) {
+        P.pack = packs[0];
+        this._setPack(packs[0]);
+      }
+    }
     this._showPicks(words);
   }
 
@@ -2331,10 +2943,11 @@ export class DoodleGame extends Minigame {
       <div class="mg-dd-card">
         <h2>Your turn to draw</h2>
         <div class="mg-dd-sub">PICK A WORD. THE OTHERS ONLY SEE BLANKS.</div>
+        ${P.pack ? `<div style="margin:4px 0 -4px">${this._packChip(P.pack, true)}</div>` : ''}
         <div class="mg-dd-picks">
           ${words.map((w, i) => `<button class="mg-dd-pick" data-i="${i}">${esc(w)}</button>`).join('')}
         </div>
-        <div class="mg-dd-sub" style="margin:10px 0 0">CRAYONS ON KEYS 1-8 &middot; Z UNDOES</div>
+        <div class="mg-dd-sub" style="margin:10px 0 0">CRAYONS ON 1-8 &middot; E ERASES &middot; Z UNDOES</div>
       </div>`);
     this.el.over.querySelectorAll('.mg-dd-pick').forEach((b) => {
       b.addEventListener('click', () => {
@@ -2515,6 +3128,18 @@ export class DoodleGame extends Minigame {
     if (drawerPts != null && P.drawerId) {
       P.scores.set(P.drawerId, (P.scores.get(P.drawerId) || 0) + drawerPts);
     }
+    // the two halves of the game, tallied apart (see P.stats)
+    const gs = this._stat(id);
+    if (gs) {
+      gs.guess += Math.max(0, pts);
+      gs.got++;
+      gs.fast = Math.max(gs.fast, clamp(this.timeLeft / Math.max(1, this.timeTotal), 0, 1));
+    }
+    const ds = this._stat(P.drawerId);
+    if (ds && id) {
+      ds.art += Math.max(0, drawerPts ?? 15);
+      ds.seen++;
+    }
     if (id && id === P.meId) {
       this._setScore(P.scores.get(P.meId) || 0);
       this._burst(W / 2, H / 2, 30);
@@ -2524,6 +3149,13 @@ export class DoodleGame extends Minigame {
       this._showGuess(false);
       this._setRole('GOT IT! SIT TIGHT.');
       this._feed(`<b>you</b> got it &middot; +${Math.round(pts)}`, 'mg-dd-good');
+      // You earned the word, so you get the reveal early -- the server already
+      // handed it to you and nobody else. This is the payoff shot of the round.
+      if (P.word) {
+        if (!P.pack) { P.pack = packOf(P.word); this._setPack(P.pack); }
+        this._setMask(P.word, true, true);
+        this._stamp(P.word, { note: `+${Math.round(pts)} to you` });
+      }
     } else {
       if (this._iAmDrawer()) {
         this._setScore(P.scores.get(P.meId) || 0);
@@ -2544,6 +3176,8 @@ export class DoodleGame extends Minigame {
     this._showTools(false);
     this._paintActs();
     this._badge('');
+    this._clearStamp();
+    this._setPack(null);
     // the server's own bookkeeping wins over our running tally: it refereed
     // every guess, and its `scores` is the list the podium coins were paid from
     const raw = Array.isArray(m?.standings) ? m.standings
@@ -2566,6 +3200,19 @@ export class DoodleGame extends Minigame {
       const p = P.players.find((q) => q.id === row.id);
       if (p) row.color = p.color;
     }
+    // If the referee ever splits the halves itself (additive `guessScore` /
+    // `drawScore` on the standings rows), its numbers replace our tally: the
+    // server saw every round, including the ones we joined late or missed.
+    for (const s of raw) {
+      const id = this._idOf(s?.id);
+      const gp = num(s?.guessScore, s?.guessPts);
+      const ap = num(s?.drawScore, s?.drawPts, s?.artScore);
+      if (!id || (gp == null && ap == null)) continue;
+      const st = this._stat(id);
+      if (!st) continue;
+      if (gp != null) st.guess = Math.max(0, gp);
+      if (ap != null) st.art = Math.max(0, ap);
+    }
     list.sort((a, b) => b.score - a.score);
     const meIdx = list.findIndex((r) => r.id === P.meId);
     const me = meIdx >= 0 ? list[meIdx] : null;
@@ -2584,6 +3231,7 @@ export class DoodleGame extends Minigame {
       const r = list[i];
       if (!r) return '';
       return `<div class="mg-dd-pod mg-dd-p${i + 1}" data-av="${i}">
+          ${i === 0 ? '<div class="mg-dd-crown">&#9733;</div>' : ''}
           <span>${esc(r.name)}</span><u>${r.score}</u>
           <div class="mg-dd-plinth">${i + 1}</div>
         </div>`;
@@ -2598,6 +3246,7 @@ export class DoodleGame extends Minigame {
         <h2>${place === 1 ? 'You win the crayon crown!' : 'Doodles done'}</h2>
         <div class="mg-dd-sub">${place === 1 ? 'THE JUNGLE BOWS TO YOUR EYES' : `YOU FINISHED ${place}${place === 2 ? 'ND' : place === 3 ? 'RD' : 'TH'}`}</div>
         <div class="mg-dd-podium">${podium}</div>
+        ${this._awards()}
         ${rest ? `<div class="mg-dd-list">${rest}</div>` : ''}
         <div class="mg-dd-stats">
           <div class="mg-dd-stat"><b>${myScore}</b><span>SCORE</span></div>
@@ -2613,6 +3262,10 @@ export class DoodleGame extends Minigame {
       const r = list[Number(el.dataset.av)];
       if (r) el.prepend(capyCanvas(46, hexOf(r.color)));
     });
+    this.el.over.querySelectorAll('[data-awav]').forEach((el, i) => {
+      el.style.animationDelay = `${180 + i * 120}ms`;
+      el.prepend(capyCanvas(38, hexOf(this._colorOf(this._idOf(el.dataset.awav)))));
+    });
     this.el.over.querySelector('[data-a="solo"]').addEventListener('click', () => {
       this._done = false;
       this._leaveParty();
@@ -2624,6 +3277,47 @@ export class DoodleGame extends Minigame {
     });
   }
 
+  /**
+   * THE TWO AWARDS. A single score column cannot tell you that Rosa never
+   * guessed a thing but drew four doodles everybody read: the podium is the
+   * total, and these are the halves. Both come out of P.stats, which every
+   * client builds from the same dd-correct frames, so two capys comparing
+   * screens see the same winners. An award with no evidence behind it is not
+   * printed at all -- an empty "BEST ARTIST: nobody" is worse than no award.
+   */
+  _awards() {
+    const P = this.party;
+    if (!P) return '';
+    let bg = null;
+    let ba = null;
+    for (const [id, s] of P.stats) {
+      if (s.guess > 0 && (!bg || s.guess > bg.s.guess || (s.guess === bg.s.guess && s.got > bg.s.got))) {
+        bg = { id, s };
+      }
+      if (s.art > 0 && (!ba || s.art > ba.s.art || (s.art === ba.s.art && s.seen > ba.s.seen))) {
+        ba = { id, s };
+      }
+    }
+    const card = (row, cls, title, line) => (row ? `
+      <div class="mg-dd-aw ${cls}" data-awav="${esc(String(row.id))}">
+        <div><u>${title}</u><b>${esc(this._nameOf(row.id))}</b><span>${line}</span></div>
+      </div>` : '');
+    // The counts are ours; the points may be the server's. When the two do not
+    // agree (we joined late, we missed a frame) the count is dropped rather
+    // than printed as a zero next to a hundred points.
+    const gLine = !bg ? ''
+      : bg.s.got > 0
+        ? `${bg.s.got} doodle${bg.s.got === 1 ? '' : 's'} named &middot; ${Math.round(bg.s.guess)} pts`
+        : `${Math.round(bg.s.guess)} points off the guess box`;
+    const aLine = !ba ? ''
+      : ba.s.seen > 0
+        ? `${ba.s.seen} read${ba.s.seen === 1 ? '' : 's'} off ${ba.s.drew || 1} drawing${(ba.s.drew || 1) === 1 ? '' : 's'}`
+        : `${Math.round(ba.s.art)} points off the easel`;
+    const html = card(bg, 'mg-dd-guessr', 'BEST GUESSER', gLine)
+      + card(ba, 'mg-dd-art', 'BEST ARTIST', aLine);
+    return html ? `<div class="mg-dd-awards">${html}</div>` : '';
+  }
+
   /** Drop party wiring and fall back to the solo sketchbook. */
   _leaveParty() {
     for (const off of this.subs) { try { off(); } catch { /* already gone */ } }
@@ -2631,6 +3325,8 @@ export class DoodleGame extends Minigame {
     this.party = null;
     this.mode = 'solo';
     this.endAt = 0; // the solo clock counts itself down
+    this._setPack(null);
+    this._clearStamp();
     if (this.ctxRef && this.game.__partyCtx === this.ctxRef) this.game.__partyCtx = null;
     this.ctxRef = null;
     this._paintActs(); // solo has one drawer and she is a bot: nothing to vote on
@@ -2654,16 +3350,44 @@ export class DoodleGame extends Minigame {
     const S0 = P.skip;
     const need = S0.need || this._skipNeed();
 
+    // THE SKIP VOTE, SAID KINDLY. It used to read "SKIP THIS DRAWER", which is
+    // a vote about a capy; it now reads "ask for a new word", which is a vote
+    // about a WORD, and that is what it always was -- the server rotates the
+    // round, it does not punish anybody. The tally is dots rather than a
+    // fraction so the drawer can glance at it and know exactly how close it is
+    // without doing arithmetic about how many people want them gone.
+    const drawing = this.phase === 'draw';
+    if (this.el.skipwrap) {
+      const show = drawing && (!mine || S0.votes > 0);
+      this.el.skipwrap.classList.toggle('mg-dd-off', !show);
+    }
     if (skip) {
-      // nothing to skip once the round is being revealed: the report button
-      // stays, because that is the moment people decide to press it
-      skip.style.display = mine || this.phase !== 'draw' ? 'none' : '';
-      const done = S0.passed || this.phase !== 'draw';
-      skip.disabled = S0.mine || done;
+      skip.style.display = mine ? 'none' : '';
+      skip.disabled = S0.mine || S0.passed || !drawing;
       skip.classList.toggle('mg-dd-voted', S0.mine && !S0.passed);
-      skip.textContent = S0.passed ? 'SKIPPED'
-        : S0.mine ? `VOTED ${S0.votes}/${need}`
-          : 'SKIP THIS DRAWER';
+      skip.textContent = S0.passed ? 'NEW WORD ON THE WAY'
+        : S0.mine ? 'ASKED'
+          : 'ASK FOR A NEW WORD';
+    }
+    if (this.el.meter) {
+      const dots = clamp(need, 1, 8);
+      const filled = clamp(S0.votes, 0, dots);
+      let html = '';
+      for (let i = 0; i < dots; i++) {
+        // your own vote is the green one: "I did that" beats "somebody did"
+        const mineDot = S0.mine && i === 0;
+        html += `<i class="${i < filled ? `mg-dd-on${mineDot ? ' mg-dd-mine' : ''}` : ''}"></i>`;
+      }
+      this.el.meter.innerHTML = html;
+      this.el.meter.style.display = drawing && (S0.votes > 0 || !mine) ? '' : 'none';
+    }
+    if (this.el.skiphint) {
+      const short = Math.max(0, need - S0.votes);
+      this.el.skiphint.textContent = !drawing ? ''
+        : S0.passed ? 'NEW WORD COMING UP'
+          : mine ? `${S0.votes} ${S0.votes === 1 ? 'CAPY WANTS' : 'CAPYS WANT'} A NEW WORD`
+            : S0.mine ? (short > 0 ? `${short} MORE AND WE MOVE ON` : 'THAT SHOULD DO IT')
+              : S0.votes > 0 ? `${S0.votes} OF ${need} ASKED` : '';
     }
     if (report) {
       const already = P.reported.has(P.round);
@@ -2672,11 +3396,9 @@ export class DoodleGame extends Minigame {
       report.classList.toggle('mg-dd-sent', already);
       report.textContent = already ? 'REPORT SENT' : 'REPORT DRAWING';
     }
-    if (votes) {
-      // the drawer's read-only copy of the same number
-      votes.textContent = mine && S0.votes > 0 && !S0.passed
-        ? `${S0.votes}/${need} VOTED TO SKIP` : '';
-    }
+    // the old free-floating tally now lives inside the pill above; the span
+    // stays (and stays empty) so nothing shifts sideways when it is not needed
+    if (votes) votes.textContent = '';
   }
 
   /** Majority of the capys who could be guessing, drawer excluded. */
@@ -2707,7 +3429,7 @@ export class DoodleGame extends Minigame {
     S0.votes = Math.max(1, S0.votes + 1);
     this.game.audio?.play?.('click');
     this.game.net?.send?.({ t: 'dd-vote', skip: true });
-    this._feed('<b>you</b> voted to skip');
+    this._feed('<b>you</b> asked for a new word');
     this._paintActs();
   }
 
@@ -2735,13 +3457,13 @@ export class DoodleGame extends Minigame {
     // a named voter on a real dd-vote frame is worth a line; a state frame
     // carrying a tally is not (its `id` means something else entirely)
     if (m.t === 'dd-vote' && voter && voter !== P.meId) {
-      this._feed(`<b>${esc(this._nameOf(voter))}</b> voted to skip`);
+      this._feed(`<b>${esc(this._nameOf(voter))}</b> asked for a new word`);
     }
     if (m.passed || m.skipped || (S0.need > 0 && S0.votes >= S0.need)) {
       if (!S0.passed) {
         S0.passed = true;
-        this._badge('SKIPPED BY THE JUNGLE');
-        this._feed('<b>the jungle</b> voted to move on', 'mg-dd-close');
+        this._badge('FRESH WORD COMING UP');
+        this._feed('<b>the jungle</b> asked for a new word', 'mg-dd-close');
         this.game.audio?.play?.('whoosh');
       }
     }

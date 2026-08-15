@@ -47,6 +47,49 @@ const RACE_SEND_HZ = 5;      // race-progress messages per second
 const RIVAL_HIDE = 60;       // hide a rival past this |distance delta|
 const RIVAL_HIDE_BACK = 52;  // ...and sooner behind us, where ground runs out
 
+// ---- v2: air tricks ---------------------------------------------------------
+// A trick is nothing but rotation you chose to carry. Holding a direction in the
+// air winds the rig; letting go AUTO-LEVELS it toward the nearest whole turn, so
+// a rider who never learns the system is never punished by it: a flick of air
+// steering stays below TRICK_COMMIT and levels itself out for free. Only a
+// deliberate, committed spin can land dirty, and the landing gauge shows exactly
+// how close to flat you are the whole way down.
+const SPIN_RATE = 7.4;       // rad/s of yaw while a direction is held
+const FLIP_RATE = 5.6;       // rad/s of pitch while up is held
+const LEVEL_RATE = 9.5;      // rad/s the rig snaps back once you let go
+const TRICK_COMMIT = 1.0;    // rad of rotation before a trick counts (or can fail)
+const TRICK_CLEAN = 0.55;    // land inside this of a whole turn: clean
+const TRICK_WIPE = 1.15;     // ...past this and you land sideways
+const GRAB_MIN = 0.32;       // seconds of tuck before a grab scores
+// Style points, all pre-multiplier, and deliberately small next to distance and
+// snowcoins: style is the seasoning on the run total, not a second economy. The
+// numbers are sized so an expert trick run banks roughly a third of its score in
+// style and a rider who never tricks scores exactly what they scored in v1.
+const ST_SPIN = 5;           // per half turn (a 720 is 20 before the multiplier)
+const ST_FLIP = 12;          // per flip
+const ST_GRAB = 8;           // per second of grab
+const ST_AIR = 6;            // per second of air, only on a landed trick
+const ST_NEAR = 4;           // per near miss
+const ST_GATE = 55;          // per shortcut threaded
+const STYLE_MAX_MUL = 3;
+const STYLE_DECAY = 0.026;   // meter per second while nothing is happening
+const ST_M_NEAR = 0.07;      // meter per near miss
+const ST_M_GATE = 0.45;      // meter per shortcut
+const NEAR_PAD = 1.15;       // how close counts as a near miss (track units)
+const NEAR_GAP = 0.3;        // seconds between near-miss whooshes
+
+// ---- v2: shortcut forks -----------------------------------------------------
+// A fork is a hazard-walled slot with a boost at the end of it, hung under an
+// arch you can read from the spawn horizon. The wide line beside it is always
+// open and costs nothing but the boost, so the fork rewards nerve on sight
+// rather than memorising where the good line lives.
+const GATE_FIRST = 430;      // track units past the start flag for the first arch
+const GATE_LEN = 26;         // how long the slot runs
+const GATE_HALF = 1.6;       // half width of the threadable slot
+const GATE_WALL = 0.75;      // first wall row, out from the slot edge
+const GATE_WARN = 105;       // start the "shortcut ahead" chip this far out
+const GATE_CLEAR = 10;       // clean approach kept in front of the arch mouth
+
 // ---- the start gate lineup (wave 12: races start at two) --------------------
 // The peak's gate owns the lobby, but this menu is one hotspot away from it and
 // a rider standing in here is invisible to the sign outside. So the menu shows
@@ -226,6 +269,34 @@ function rampGeo() {
     { geo: new THREE.ConeGeometry(0.16, 1.0, 6), x: -2.25, y: 1.7, z: -1.6, color: 0xe8657a },
     { geo: new THREE.ConeGeometry(0.16, 1.0, 6), x: 2.25, y: 1.7, z: -1.6, color: 0xe8657a },
   ]);
+}
+
+/**
+ * The shortcut arch: a banner gate wide enough for exactly one sled, with a
+ * chevron under the beam pointing at the slot. Built tall and coral so it reads
+ * from the spawn horizon; that legibility IS the mechanic, since a fork you can
+ * only take by remembering it rewards knowledge instead of nerve.
+ */
+function archGeo() {
+  // The beam sits at 5.4: a full-power kicker launch tops out near 4.3, so the
+  // banner reads as a gate you ride UNDER and never as something you clip.
+  const parts = [];
+  const px = GATE_HALF + 0.55;
+  for (const side of [-1, 1]) {
+    parts.push({ geo: new THREE.CylinderGeometry(0.2, 0.28, 5.4, 7), x: side * px, y: 2.7, color: 0xf3f7fc });
+    parts.push({ geo: new THREE.BoxGeometry(0.52, 0.52, 0.52), x: side * px, y: 5.44, color: 0xe8657a });
+    parts.push({ geo: new THREE.ConeGeometry(0.34, 0.72, 6), x: side * px, y: 6.02, color: 0xf2b64a });
+  }
+  parts.push({ geo: new THREE.BoxGeometry(px * 2 + 0.6, 0.72, 0.34), y: 5.4, color: 0xe8657a });
+  parts.push({ geo: new THREE.BoxGeometry(px * 2 + 0.2, 0.22, 0.4), y: 4.94, color: 0xfff6e3 });
+  // three chevrons stacked under the beam, nose down the hill
+  for (let i = 0; i < 3; i++) {
+    parts.push({
+      geo: new THREE.ConeGeometry(0.46 - i * 0.07, 0.5, 4),
+      y: 4.52 - i * 0.44, z: -0.05, rx: Math.PI, color: i === 0 ? 0xf2b64a : 0xfff0c2,
+    });
+  }
+  return mergeParts(parts);
 }
 
 function flagGeo(color) {
@@ -471,16 +542,17 @@ function buildSledRig(bodyColor, hatId = 'none') {
  * ears and scarf in the wind. Shared so a rival on the same slope is animated
  * by exactly the same maths as the player.
  */
-function poseRider(r, lean, spd, air, time, dt) {
+function poseRider(r, lean, spd, air, time, dt, tuck = 0) {
   const buzz = Math.sin(time * 22) * 0.012 * (0.3 + spd);
-  r.bob.position.y = buzz + (air ? 0.05 : 0);
+  r.bob.position.y = buzz + (air ? 0.05 : 0) - tuck * 0.09;
   r.bob.rotation.z = lean * 0.42;
-  r.bob.rotation.x = -0.12 * spd + (air ? -0.12 : 0);
-  r.head.rotation.y = lean * 0.4;
+  r.bob.rotation.x = -0.12 * spd + (air ? -0.12 : 0) + tuck * 0.55;
+  r.head.rotation.y = lean * 0.4 * (1 - tuck * 0.6);
   r.head.rotation.z = -lean * 0.18;
   for (const a of r.arms) {
-    a.rotation.x = -0.1 + (air ? -0.7 : 0) + buzz * 6;
-    a.rotation.z = lean * 0.25;
+    // a grab folds both paws down onto the rail: the whole read of the pose
+    a.rotation.x = -0.1 + (air ? -0.7 : 0) + buzz * 6 + tuck * 1.85;
+    a.rotation.z = lean * 0.25 - tuck * 0.4;
   }
   for (let i = 0; i < r.ears.length; i++) {
     r.ears[i].rotation.z = Math.sin(time * 17 + i) * 0.12 * (0.4 + spd) - lean * 0.2;
@@ -500,8 +572,10 @@ const CSS = `
 .mg-sled-wrap{position:absolute;inset:0;overflow:hidden;font-family:var(--font);
   color:var(--ink);user-select:none;-webkit-user-select:none;background:#cfe6f7;}
 .mg-sled-wrap canvas{position:absolute;inset:0;width:100%;height:100%;display:block;}
-.mg-sled-vig{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s ease;
+.mg-sled-vig{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .3s ease,background .5s ease;
   background:radial-gradient(ellipse 62% 58% at 50% 52%,rgba(0,0,0,0) 40%,rgba(26,52,78,.55) 100%);}
+/* deep into a style streak the tunnel goes coral: the run LOOKS different */
+.mg-sled-vig.hot{background:radial-gradient(ellipse 58% 54% at 50% 52%,rgba(0,0,0,0) 36%,rgba(150,52,96,.6) 100%);}
 .mg-sled-flash{position:absolute;inset:0;pointer-events:none;opacity:0;}
 .mg-sled-flash.hit{animation:mg-sled-fhit .42s ease-out;background:radial-gradient(ellipse at 50% 55%,rgba(232,64,64,0) 35%,rgba(216,50,50,.85) 100%);}
 .mg-sled-flash.boost{animation:mg-sled-fboost .5s ease-out;background:radial-gradient(ellipse at 50% 60%,rgba(126,227,255,0) 30%,rgba(126,227,255,.6) 100%);}
@@ -522,6 +596,17 @@ const CSS = `
 .mg-sled-bar{margin-top:5px;height:7px;border-radius:99px;background:#e7ecf2;overflow:hidden;}
 .mg-sled-bar i{display:block;height:100%;width:0%;border-radius:99px;
   background:linear-gradient(90deg,#4fb3e8,#7ac74f 55%,#f2b64a 78%,#e8657a);transition:width .12s linear;}
+/* the style meter: multiplier chip, fill bar, banked total */
+.mg-sled-srow{display:flex;align-items:center;gap:7px;margin-top:8px;}
+.mg-sled-mul{font-size:14px;font-weight:900;color:#8a7a5a;min-width:26px;transition:color .2s ease;}
+.mg-sled-mul.hot{color:var(--accent);}
+.mg-sled-mul.pop{animation:mg-sled-mulpop .5s ease;}
+@keyframes mg-sled-mulpop{35%{scale:1.55;color:#f2b64a}}
+.mg-sled-sbar{flex:1;height:7px;border-radius:99px;background:#e7ecf2;overflow:hidden;}
+.mg-sled-sbar i{display:block;height:100%;width:0%;border-radius:99px;
+  background:linear-gradient(90deg,#7fe3ff,#b98cf0 60%,#e8657a);transition:width .14s linear;}
+.mg-sled-sval{font-size:11.5px;font-weight:900;color:#b98cf0;min-width:30px;text-align:right;}
+
 .mg-sled-heart{width:27px;height:25px;fill:var(--accent);filter:drop-shadow(0 2px 0 rgba(45,36,23,.18));
   transition:transform .2s ease;}
 .mg-sled-heart.gone{fill:#d7cfc0;transform:scale(.72);}
@@ -533,8 +618,35 @@ const CSS = `
 .mg-sled-pop{position:absolute;left:0;top:0;translate:-50% 0;white-space:nowrap;font-weight:900;
   font-size:26px;color:#fff;text-shadow:0 3px 0 rgba(45,36,23,.35);animation:mg-sled-pop 1s ease-out forwards;}
 .mg-sled-pop.gold{color:var(--gold);} .mg-sled-pop.air{color:#7fe3ff;} .mg-sled-pop.bad{color:#ff8f8f;}
+.mg-sled-pop.style{color:#d9b3ff;font-size:31px;letter-spacing:.03em;}
+.mg-sled-pop.big{font-size:38px;color:#ffe9a8;letter-spacing:.04em;}
 @keyframes mg-sled-pop{from{opacity:0;translate:-50% 18px;scale:.6}
   25%{opacity:1;translate:-50% -6px;scale:1.12}to{opacity:0;translate:-50% -70px;scale:1}}
+
+/* ---- the trick readout: live name + the landing gauge ---- */
+.mg-sled-trick{position:absolute;left:50%;top:20%;translate:-50% 0;display:none;
+  flex-direction:column;align-items:center;gap:9px;pointer-events:none;}
+.mg-sled-trick.on{display:flex;}
+.mg-sled-tname{font-size:30px;font-weight:900;color:#fff;letter-spacing:.05em;
+  text-shadow:0 3px 0 rgba(45,36,23,.4);}
+.mg-sled-gauge{position:relative;width:190px;height:13px;border-radius:99px;
+  background:rgba(255,253,246,.55);box-shadow:0 3px 10px rgba(26,52,78,.3);overflow:hidden;}
+.mg-sled-gauge u{position:absolute;left:50%;top:0;bottom:0;width:34%;translate:-50% 0;
+  background:rgba(122,199,79,.75);}
+.mg-sled-gauge i{position:absolute;top:-3px;width:9px;height:19px;border-radius:99px;
+  background:#fff;box-shadow:0 2px 5px rgba(26,52,78,.45);translate:-50% 0;transition:left .06s linear;}
+.mg-sled-gauge.ok i{background:#7ac74f;} .mg-sled-gauge.bad i{background:#ff8f8f;}
+.mg-sled-glbl{font-size:11px;font-weight:900;letter-spacing:.16em;text-transform:uppercase;
+  color:#fff;text-shadow:0 2px 0 rgba(45,36,23,.35);opacity:.85;}
+
+/* ---- the shortcut call-out ---- */
+.mg-sled-sc{position:absolute;left:50%;top:11%;translate:-50% 0;display:none;align-items:center;gap:9px;
+  background:rgba(232,101,122,.94);color:#fff;font-size:14px;font-weight:900;letter-spacing:.05em;
+  padding:7px 17px;border-radius:999px;box-shadow:0 5px 16px rgba(26,52,78,.35);pointer-events:none;}
+.mg-sled-sc.on{display:flex;animation:mg-sled-scin .3s ease;}
+.mg-sled-sc b{font-size:19px;line-height:1;}
+@keyframes mg-sled-scin{from{opacity:0;scale:.8}}
+@media (prefers-reduced-motion:reduce){.mg-sled-sc.on{animation:none;}}
 
 .mg-sled-count{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   pointer-events:none;}
@@ -609,6 +721,13 @@ const CSS = `
 .mg-sled-ntag.on{display:flex;}
 .mg-sled-ntag i{width:13px;height:13px;border-radius:99px;box-shadow:inset 0 -3px 0 rgba(0,0,0,.18);}
 .mg-sled-ntag u{text-decoration:none;font-size:10.5px;color:#8a7a5a;font-weight:900;}
+/* a rival's moment, popped over their own tag: the race reads as a race */
+.mg-sled-ntag em{position:absolute;left:50%;bottom:100%;translate:-50% -5px;font-style:normal;
+  font-size:14px;font-weight:900;color:#fff;text-shadow:0 2px 0 rgba(45,36,23,.45);opacity:0;
+  white-space:nowrap;}
+.mg-sled-ntag em.go{animation:mg-sled-rpop 1.1s ease-out;}
+@keyframes mg-sled-rpop{from{opacity:0;translate:-50% 6px;scale:.7}
+  22%{opacity:1;translate:-50% -6px;scale:1.1}to{opacity:0;translate:-50% -34px;scale:.95}}
 .mg-sled-race{top:118px;left:16px;min-width:150px;display:none;}
 .mg-sled-race.on{display:block;}
 .mg-sled-place{font-size:23px;line-height:1.05;color:var(--accent);}
@@ -691,8 +810,11 @@ export class SledGame extends Minigame {
     this._seatFreed = false;
     this._bailed = false;
     this.props = [];
+    this.gates = [];       // shortcut forks, in track order
     this.parts = [];       // live particles
     this.keys = new Set();
+    this.pointerHold = false;
+    this._taughtTrick = false;   // the "let go" nudge fires once per session
     this.race = null;      // set when game.__raceCtx handed us a race
     this.ctxRef = null;
     this.boardEl = null;
@@ -750,7 +872,9 @@ export class SledGame extends Minigame {
         hat: typeof p.hat === 'string' ? p.hat : 'none',
         d: 0, x: 0, done: false, vd: 0, lastD: 0, lastT: 0,
         dSm: 0, xSm: 0, xPrev: 0, lean: 0, seen: false,
-        root: null, face: null, rig: null, tag: null,
+        // v2 ghost colour: what the track did to them, read off the shared seed
+        scanS: null, vAvg: 0, popT: -9, wipeT: -9,
+        root: null, face: null, rig: null, tag: null, tagPop: null,
       })),
       standings: null,
       doneSent: false,
@@ -791,6 +915,17 @@ export class SledGame extends Minigame {
         <div class="mg-sled-dist"><b data-f="dist">0</b><span>m</span></div>
         <div class="mg-sled-spd"><b data-f="spd">0</b> km/h</div>
         <div class="mg-sled-bar"><i data-f="bar"></i></div>
+        <div class="mg-sled-srow">
+          <span class="mg-sled-mul" data-f="mul">&times;1</span>
+          <span class="mg-sled-sbar"><i data-f="sbar"></i></span>
+          <span class="mg-sled-sval" data-f="sval">0</span>
+        </div>
+      </div>
+      <div class="mg-sled-sc" data-f="sc"><b data-f="scdir">&#9650;</b><span data-f="sctxt">Shortcut</span></div>
+      <div class="mg-sled-trick" data-f="trick">
+        <div class="mg-sled-tname" data-f="tname"></div>
+        <div class="mg-sled-gauge" data-f="gauge"><u></u><i data-f="gpin"></i></div>
+        <div class="mg-sled-glbl">land it level</div>
       </div>
       <div class="mg-sled-panel mg-sled-tc" data-f="hearts"></div>
       <div class="mg-sled-panel mg-sled-tr" data-f="coinbox">${COIN_ICO}<b data-f="coins">0</b></div>
@@ -818,16 +953,18 @@ export class SledGame extends Minigame {
         const el = document.createElement('div');
         el.className = 'mg-sled-ntag';
         el.innerHTML = `<i style="background:#${(r.color >>> 0).toString(16).padStart(6, '0')}"></i>`
-          + `<span>${esc(r.name)}</span><u data-f="gap"></u>`;
+          + `<span>${esc(r.name)}</span><u data-f="gap"></u><em data-f="pop"></em>`;
         tags.appendChild(el);
         r.tag = el;
         r.tagGap = el.querySelector('[data-f="gap"]');
+        r.tagPop = el.querySelector('[data-f="pop"]');
       }
     }
 
     const tip = document.createElement('div');
     tip.className = 'mg-sled-tip';
-    tip.textContent = 'A / D or mouse to carve  .  Space to hop  .  ramps launch you';
+    tip.textContent = 'A / D or mouse to carve  .  Space to hop  .  '
+      + 'off a kicker, hold a direction to spin and let go to land it';
     tip.style.opacity = '0';
     wrap.appendChild(tip);
     this.tip = tip;
@@ -882,6 +1019,7 @@ export class SledGame extends Minigame {
           <span class="mg-sled-key">A</span><span class="mg-sled-key">D</span>
           <span class="mg-sled-key">&#8592;</span><span class="mg-sled-key">&#8594;</span>
           <span class="mg-sled-key">mouse</span><span class="mg-sled-key">space = hop</span>
+          <span class="mg-sled-key">hold in the air = trick</span>
         </div>
         ${roster || `
         <div class="mg-sled-rules">
@@ -891,6 +1029,11 @@ export class SledGame extends Minigame {
             Blue crystals blast you forward for a burst of speed.</div>
           <div class="mg-sled-rule"><span class="mg-sled-dot" style="background:#f7fbff"></span>
             Kickers send you flying. Longer air, bigger bonus.</div>
+          <div class="mg-sled-rule"><span class="mg-sled-dot" style="background:#b98cf0"></span>
+            In the air, hold a direction to spin (up flips, down grabs).
+            Let go early and you level out. Land flat for style.</div>
+          <div class="mg-sled-rule"><span class="mg-sled-dot" style="background:#e8657a"></span>
+            Coral arches mark a tight shortcut line. Thread it for a boost.</div>
           <div class="mg-sled-rule"><span class="mg-sled-dot" style="background:#367a48"></span>
             Pines, rocks and ice cost a heart. You have three.</div>
         </div>`}
@@ -1001,12 +1144,15 @@ export class SledGame extends Minigame {
     this.glowMat = vcGlow;
 
     const pools = [
-      ['pine', pineGeo(), 170, vcToon],
-      ['rock', rockGeo(), 26, vcToon],
+      // pines carry the backdrop treeline AND both walls of a shortcut slot, so
+      // the pool has to cover a gate landing inside a dressed stretch of hill
+      ['pine', pineGeo(), 240, vcToon],
+      ['rock', rockGeo(), 44, vcToon],
       ['bump', bumpGeo(), 26, vcToon],
-      ['coin', coinGeo(), 84, vcToon],
+      ['coin', coinGeo(), 110, vcToon],
       ['ramp', rampGeo(), 6, vcToon],
-      ['boost', boostGeo(), 6, vcGlow],
+      ['arch', archGeo(), 3, vcToon],
+      ['boost', boostGeo(), 8, vcGlow],
       ['flagA', flagGeo(0xe8657a), 22, vcToon],
       ['flagB', flagGeo(0x4fb3e8), 22, vcToon],
     ];
@@ -1069,9 +1215,11 @@ export class SledGame extends Minigame {
 
     // ---- sled rig ---------------------------------------------------------
     this.rigRoot = new THREE.Group();     // world position + lean + yaw
+    this.rigTrick = new THREE.Group();    // air rotation only: spin (y) + flip (x)
     this.rigFace = new THREE.Group();     // flips the model to face downhill
     this.rigFace.rotation.y = Math.PI;
-    this.rigRoot.add(this.rigFace);
+    this.rigTrick.add(this.rigFace);
+    this.rigRoot.add(this.rigTrick);
     scene.add(this.rigRoot);
     this.rig = buildSledRig(this.game.state.color ?? 0xb08a5a, this.game.state.hat ?? 'none');
     this.rigFace.add(this.rig.rig);
@@ -1179,7 +1327,10 @@ export class SledGame extends Minigame {
   }
 
   _bindInput() {
-    const STEER = ['a', 'A', 'd', 'D', 'ArrowLeft', 'ArrowRight', ' ', 'Spacebar'];
+    // w/s join the swallow list with v2's flip and grab: without it a flip
+    // would double as the world's W = wave emote behind the minigame
+    const STEER = ['a', 'A', 'd', 'D', 'w', 'W', 's', 'S',
+      'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'Spacebar'];
 
     this._on(window, 'keydown', (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -1215,14 +1366,21 @@ export class SledGame extends Minigame {
       this.mouseSteer = true;
     });
 
+    // Pointer: a press on the ground is the hop it has always been; a press
+    // held IN THE AIR is the grab. Ground behaviour is untouched, so nothing a
+    // first-timer already knows changed.
     this._on(this.wrap, 'pointerdown', (e) => {
       if (e.target !== this.renderer.domElement) return;
       if (this.phase === 'splash') {
         if (!this.race) this._beginCountdown();
         return;
       }
-      this._hop();
+      this.pointerHold = true;
+      if (this.airY <= 0.02) this._hop();
     });
+    this._on(window, 'pointerup', () => { this.pointerHold = false; });
+    this._on(window, 'pointercancel', () => { this.pointerHold = false; });
+    this._on(window, 'blur', () => { this.keys.clear(); this.pointerHold = false; });
 
     this._on(window, 'resize', () => this._resize());
   }
@@ -1268,7 +1426,15 @@ export class SledGame extends Minigame {
       if (Number.isFinite(s.x)) r.x = clamp(s.x, -CLAMP_X, CLAMP_X);
       r.done = !!s.done;
       if (r.done) r.vd = 0;
-      if (!r.seen) { r.seen = true; r.dSm = d; r.xSm = r.x; r.xPrev = r.x; }
+      if (!r.seen) { r.seen = true; r.dSm = d; r.xSm = r.x; r.xPrev = r.x; r.scanS = d; }
+      // a rival's pace, smoothed: a sharp drop off it is somebody eating a pine
+      if (!r.done && this.phase === 'run') {
+        if (r.vAvg > 26 && r.vd < r.vAvg * 0.55 && this.time - r.wipeT > 3) {
+          r.wipeT = this.time;
+          this._rivalPop(r, 'OOF!');
+        }
+        r.vAvg = r.vAvg ? lerp(r.vAvg, r.vd, 0.25) : r.vd;
+      }
     }
   }
 
@@ -1353,9 +1519,47 @@ export class SledGame extends Minigame {
       r.tilt.rotation.x = ((ahead - behind) / 5) * 0.9;
       poseRider(r.rig, r.lean, r.done ? 0.2 : 0.72, false, this.time + r.dSm * 0.01, dt);
 
+      this._scanRival(r);
       this._placeTag(r, z, gy);
     }
     this._refreshRaceHud();
+  }
+
+  /**
+   * A rival's highlights, deduced instead of transmitted. The race protocol is
+   * unchanged and still carries only {id, d, x, done}, but the TRACK is seeded
+   * and identical on every client, so knowing where a rival is and how wide
+   * they are riding is enough to know they just hit that kicker, took that
+   * crystal or threaded that arch. No new frame, no new trust.
+   */
+  _scanRival(r) {
+    if (r.scanS == null) { r.scanS = r.d; return; }
+    const from = r.scanS;
+    const to = r.d;
+    r.scanS = to;
+    if (to <= from || to - from > 300 || this.phase !== 'run' || r.done) return;
+    if (this.time - r.popT < 1.1) return;
+    for (const g of this.gates) {
+      if (g.s1 > from && g.s1 <= to && Math.abs(r.x - g.x) < g.half + 0.4) {
+        this._rivalPop(r, 'SHORTCUT!');
+        return;
+      }
+    }
+    for (const p of this.props) {
+      if (p.s <= from || p.s > to) continue;
+      if (p.type === 'ramp' && Math.abs(p.x - r.x) < 2.3) { this._rivalPop(r, 'AIR!'); return; }
+      if (p.type === 'boost' && Math.abs(p.x - r.x) < 1.7) { this._rivalPop(r, 'BOOST!'); return; }
+    }
+  }
+
+  _rivalPop(r, text) {
+    const el = r.tagPop;
+    if (!el) return;
+    r.popT = this.time;
+    el.textContent = text;
+    el.classList.remove('go');
+    void el.offsetWidth;
+    el.classList.add('go');
   }
 
   /** Project a rival to screen space and park their DOM name tag over them. */
@@ -1712,10 +1916,34 @@ export class SledGame extends Minigame {
     this.fov = 56;
     this.smoothY = 0;
     this.props.length = 0;
+    this.gates.length = 0;
     this.parts.length = 0;
     this.spawnS = 60;
+    this.propTop = -Infinity; // furthest s any solid prop reaches (see _addProp)
     this.flagS = 40;
     this.sceneS = -10;
+    this.gateS = Infinity;   // armed by the countdown, off the seeded stream
+
+    // ---- v2: tricks + style ----
+    this.spin = 0;           // yaw wound up this jump (radians, signed)
+    this.flip = 0;           // pitch wound up this jump
+    this.grabT = 0;          // seconds tucked
+    this.grabHeld = 0;       // grab blend for the pose, 0..1
+    this.trickOn = false;    // any rotation input held right now
+    this.trickArmed = false; // this jump got high enough for tricks at all
+    this.airLatch = null;    // steer keys held at take-off, latched out of tricks
+    this.committed = false;  // past TRICK_COMMIT: this one can score, and fail
+    this.style = 0;          // banked style points (score)
+    this.styleMeter = 0;     // 0..1 fill toward the next multiplier
+    this.styleMul = 1;
+    this.tricks = 0;         // clean landings this run
+    this.gatesHit = 0;
+    this.nears = 0;
+    this.nearT = -9;
+    this.nearRun = 0;
+    this.zoom = 0;           // near-miss / shortcut punch-in, decays
+    this.rushAcc = 0;
+    this._trickShown = '';
 
     for (let i = 0; i < SEG_COUNT; i++) {
       const seg = this.segs[i];
@@ -1726,7 +1954,11 @@ export class SledGame extends Minigame {
 
     if (this.heartEls) this.heartEls.forEach((el) => el.classList.remove('gone'));
     this.rigRoot.rotation.set(0, 0, 0);
+    this.rigTrick.rotation.set(0, 0, 0);
     this.rigRoot.visible = true;
+    this.f?.trick?.classList.remove('on');
+    this.f?.sc?.classList.remove('on');
+    this.vig?.classList.remove('hot');
     this._hudCache = {};
     this._refreshHud(true);
   }
@@ -1745,6 +1977,9 @@ export class SledGame extends Minigame {
     // the gate: every seeded chunk measures its difficulty from here, so the
     // layout is identical for anyone riding this seed
     this.trackStart = this.spawnS;
+    // shortcuts are seeded track furniture too, so both sleds in a race meet
+    // the same arch at the same metre
+    this.gateS = this.trackStart + GATE_FIRST;
     this.hud.classList.add('on');
     this.tip.style.opacity = '1';
     this._done = false; // each replay reports its own run
@@ -1760,10 +1995,171 @@ export class SledGame extends Minigame {
 
   _hop() {
     if (this.phase !== 'run' || this.airY > 0.02) return;
+    this._latchAir();
     this.airVY = 6.4;
     this.airY = 0.01;
     this.game.audio?.play?.('pop');
     this._burst(this.sledX, this.groundY, 0.4, 9, 0xffffff, 0.3, 3);
+  }
+
+  // ------------------------------------------------------------ style bank -
+  /**
+   * Bank style. Raw points are multiplied by the live streak multiplier, and
+   * every gain also feeds the meter; filling it steps the multiplier up (to
+   * x3) and leaves the bar part-full so the streak has somewhere to go. Style
+   * is banked score, not a separate currency: it rides the same run total the
+   * server already validates, so nothing here widens what the client is
+   * trusted with.
+   */
+  _addStyle(raw, meter) {
+    if (this.phase !== 'run') return 0;
+    const got = Math.round(raw * this.styleMul);
+    this.style += got;
+    this.styleMeter += meter;
+    while (this.styleMeter >= 1 && this.styleMul < STYLE_MAX_MUL) {
+      this.styleMeter -= 0.7;
+      this.styleMul++;
+      this._popup(`STYLE x${this.styleMul}`, 'style');
+      this.game.audio?.play?.('combo');
+      this.f.mul.classList.remove('pop');
+      void this.f.mul.offsetWidth;
+      this.f.mul.classList.add('pop');
+    }
+    if (this.styleMul >= STYLE_MAX_MUL) this.styleMeter = clamp(this.styleMeter, 0, 1);
+    this.styleMeter = clamp(this.styleMeter, 0, 1);
+    return got;
+  }
+
+  /**
+   * A hit, or a landing you botched: the streak takes ONE step back, never a
+   * slide to zero. The refill is left part full on purpose so the meter's own
+   * decay in _step does not read the empty bar as a second demotion.
+   */
+  _breakStyle() {
+    this.styleMul = Math.max(1, this.styleMul - 1);
+    this.styleMeter = this.styleMul > 1 ? 0.3 : 0;
+  }
+
+  // ----------------------------------------------------------------- tricks -
+  /**
+   * Wind the rig while airborne, unwind it when nothing is held.
+   *
+   * The forgiving half of this is the unwind: LEVEL_RATE snaps the sled toward
+   * the nearest whole turn the instant you let go, so an air-steer flick, a
+   * panicked tap, or a rider who has never heard of tricks all touch down flat.
+   * Only rotation you keep feeding past TRICK_COMMIT can land badly.
+   */
+  _updateTrick(dt) {
+    if (this.phase !== 'run' || this.airY <= 0.02) return;
+    // A hop tops out at 0.89 units and the arming height is 1.0, so nothing you
+    // can do with the space bar alone can start a trick (a kicker clears 1.84
+    // at its weakest): tricks are a KICKER mechanic and the beginner's
+    // whole toolkit (steer, hop, dodge) stays risk free exactly as it was. Once
+    // a jump has ARMED, it stays armed all the way down, so holding into the
+    // snow really does land you sideways. Letting go is the save, and with
+    // LEVEL_RATE it buys back a whole turn in about a third of a second.
+    if (this.airY > 1.0) this.trickArmed = true;
+    const high = this.trickArmed;
+    const k = this.keys;
+    let left = k.has('a') || k.has('A') || k.has('ArrowLeft');
+    let right = k.has('d') || k.has('D') || k.has('ArrowRight');
+    let up = k.has('w') || k.has('W') || k.has('ArrowUp');
+    const down = k.has('s') || k.has('S') || k.has('ArrowDown');
+
+    // A key that was ALREADY down when the sled left the snow is ground
+    // steering the rider carried into the air, not a trick input: carving
+    // around a pine and holding the carve through a kicker must never book a
+    // spin the rider never asked for. _latchAir snapshots those keys at
+    // take-off and they are ignored here until they are let go, so only a
+    // direction PRESSED in the air winds the rig up. Release-then-press in the
+    // same jump still counts, and the mouse path below is untouched.
+    const lat = this.airLatch;
+    if (lat) {
+      if (lat.l && !left) lat.l = false;
+      if (lat.r && !right) lat.r = false;
+      if (lat.u && !up) lat.u = false;
+      left = left && !lat.l;
+      right = right && !lat.r;
+      up = up && !lat.u;
+    }
+
+    let dir = high ? (right ? 1 : 0) - (left ? 1 : 0) : 0;
+    // mouse riders spin by holding the pointer out wide and grab by holding it
+    // down, so the whole system is reachable without touching the keyboard
+    if (high && !dir && this.mouseSteer) {
+      const off = this.mouseX - this.sledX;
+      if (Math.abs(off) > 4.5) dir = off > 0 ? 1 : -1;
+    }
+    const flipping = high && up;
+    const grabbing = high && (down || this.pointerHold);
+
+    if (dir) this.spin += dir * SPIN_RATE * dt;
+    if (flipping) this.flip += FLIP_RATE * dt;
+    if (grabbing) this.grabT += dt;
+    this.grabHeld = lerp(this.grabHeld, grabbing ? 1 : 0, Math.min(1, dt * 12));
+    this.trickOn = !!dir || flipping || grabbing;
+
+    if (!dir && !flipping) {
+      // Unwind toward the nearest whole turn, and unwind HARDER the closer the
+      // snow gets: letting go in time is the save, and it has to feel like one.
+      const rate = LEVEL_RATE * (this.airY < 2.2 ? 1.55 : 1);
+      this.spin = this._unwind(this.spin, dt, rate);
+      this.flip = this._unwind(this.flip, dt, rate);
+    }
+    if (!this.committed
+      && (Math.abs(this.spin) > TRICK_COMMIT || Math.abs(this.flip) > TRICK_COMMIT)) {
+      this.committed = true;
+      this.game.audio?.play?.('slide');
+      if (!this._taughtTrick) { this._taughtTrick = true; this._popup('LET GO TO LEVEL OUT', 'air'); }
+    }
+  }
+
+  /**
+   * Snapshot the steering keys the instant the sled leaves the snow. Everything
+   * already held is carried-over ground steering and is latched OUT of the
+   * trick system until the rider lets go of it (see _updateTrick).
+   */
+  _latchAir() {
+    const k = this.keys;
+    this.airLatch = {
+      l: k.has('a') || k.has('A') || k.has('ArrowLeft'),
+      r: k.has('d') || k.has('D') || k.has('ArrowRight'),
+      u: k.has('w') || k.has('W') || k.has('ArrowUp'),
+    };
+  }
+
+  _unwind(a, dt, rate = LEVEL_RATE) {
+    const TAU = Math.PI * 2;
+    const goal = Math.round(a / TAU) * TAU;
+    const step = rate * dt;
+    const d = goal - a;
+    return Math.abs(d) <= step ? goal : a + Math.sign(d) * step;
+  }
+
+  /** How far off a whole turn the rig currently sits, signed, in radians. */
+  _axisError() {
+    const TAU = Math.PI * 2;
+    const es = this.spin - Math.round(this.spin / TAU) * TAU;
+    const ef = this.flip - Math.round(this.flip / TAU) * TAU;
+    return Math.abs(es) >= Math.abs(ef) ? es : ef;
+  }
+
+  /**
+   * "720 + GRAB", built from whatever is wound up right now. Turns are named in
+   * whole revolutions because whole revolutions are what the landing window
+   * snaps to: the number on screen is the number you have to finish.
+   */
+  _trickName() {
+    const TAU = Math.PI * 2;
+    const spins = Math.round(Math.abs(this.spin) / TAU);
+    const flips = Math.round(Math.abs(this.flip) / TAU);
+    const bits = [];
+    if (spins >= 1) bits.push(`${spins * 360}`);
+    else if (Math.abs(this.spin) > TRICK_COMMIT) bits.push('SPIN');
+    if (flips >= 1) bits.push(flips > 1 ? `${flips}x FLIP` : 'FLIP');
+    else if (Math.abs(this.flip) > TRICK_COMMIT) bits.push('FLIP');
+    if (this.grabT >= GRAB_MIN) bits.push('GRAB');
+    return bits.join(' + ');
   }
 
   // ----------------------------------------------------------- prop spawning -
@@ -1774,6 +2170,15 @@ export class SledGame extends Minigame {
    */
   _addProp(type, s, x, opts = {}) {
     const h = opts.h || 0;
+    // How far down-track the solid props actually REACH. Chunks scatter and
+    // trail well past the s they were asked for (obstacles +-5, a coin chain
+    // hangs another obstacle at +22, a kicker trails coins to +27), so a
+    // shortcut arch has to open past this line or the chunk before it spills
+    // into the slot the HUD just told the rider to thread.
+    if (!opts.deco && HIT[type]) {
+      const rz = HIT[type].r * (opts.sc ?? 1) * 0.9 + 0.7;
+      this.propTop = Math.max(this.propTop, s + rz);
+    }
     this.props.push({
       type,
       s,
@@ -1807,6 +2212,16 @@ export class SledGame extends Minigame {
 
     // The splash sits on a clean groomed run: scenery only, no hazards.
     while (this.phase !== 'splash' && this.spawnS < horizon) {
+      if (this.spawnS >= this.gateS) {
+        // Open the arch past everything already lying on the hill, plus a clear
+        // approach. The chunk before it scatters and trails past its own s, so
+        // laying the slot on top of that s is how an unthreadable arch happens.
+        const gs = Math.max(this.spawnS, this.propTop + GATE_CLEAR);
+        this._spawnShortcut(gs);
+        this.gateS = gs + this._rand(880, 1120);
+        this.spawnS = gs + GATE_LEN + 16;
+        continue;
+      }
       const d = this._diffAt(this.spawnS);
       this._spawnChunk(this.spawnS, d);
       this.spawnS += lerp(32, 17, d) * this._rand(0.85, 1.15);
@@ -1896,6 +2311,100 @@ export class SledGame extends Minigame {
     for (let i = 0; i < 6; i++) {
       this._addProp('coin', s + 9 + i * 3.6, x, { h: 1.3 + Math.sin(((i + 0.7) / 6.8) * Math.PI) * 3.9 });
     }
+  }
+
+  /**
+   * A shortcut fork. Two lines leave the arch: the slot (one sled wide, walled
+   * with pines and rocks, paved with coins and capped by a boost) and the whole
+   * rest of the corridor, which stays deliberately EMPTY so bailing out is a
+   * real choice and not a punishment. Threading it is worth a boost plus style;
+   * missing it costs only the boost.
+   *
+   * Everything here comes off the seeded stream, so a race meets one arch in
+   * one place, and the arch itself is 5 units tall and coral: readable from the
+   * spawn horizon, which is what makes this a test of nerve and not of memory.
+   */
+  _spawnShortcut(s) {
+    const x = clamp(this._rand(-5.4, 5.4), -5.4, 5.4);
+    this._addProp('arch', s, x, { rot: 0, deco: true });
+    const end = s + GATE_LEN;
+
+    // walls: two rows a side, tight enough that clipping one is the real risk
+    for (const side of [-1, 1]) {
+      for (let row = 0; row < 2; row++) {
+        const wx = x + side * (GATE_HALF + GATE_WALL + row * 1.55);
+        if (Math.abs(wx) > PLAY_HALF + 1.6) continue;
+        for (let i = 0; i < 6; i++) {
+          const ws = s + 1 + i * ((GATE_LEN - 2) / 5) + this._rand(-0.7, 0.7);
+          const kind = row === 0
+            ? (this._rnd() < 0.62 ? 'pine' : 'rock')
+            : 'pine';
+          this._addProp(kind, ws, wx, { sc: this._rand(0.9, 1.2) });
+        }
+      }
+    }
+    // the payoff line down the middle of the slot
+    for (let i = 0; i < 7; i++) this._addProp('coin', s + 2.5 + i * 3.2, x, { h: 1.0 });
+    this._addProp('boost', end - 2, x);
+
+    this.gates.push({
+      s0: s, s1: end, x, half: GATE_HALF,
+      live: false, done: false, failed: false, called: false,
+    });
+  }
+
+  /**
+   * Gate bookkeeping: you are "in" if you cross the arch inside the slot, you
+   * stay in while you hold the line, and you clear it by reaching the far end
+   * without drifting wide or eating a wall.
+   */
+  _updateGates() {
+    const t = this.travel;
+    const pt = this.prevTravel;
+    const gates = this.gates;
+    let w = 0;
+    for (let i = 0; i < gates.length; i++) {
+      const g = gates[i];
+      if (t > g.s1 + 95) continue;   // past even a trailing rival's reach: retire
+      gates[w++] = g;
+      if (g.done || this.phase !== 'run') continue;
+      if (pt < g.s0 && t >= g.s0) {
+        g.live = Math.abs(this.sledX - g.x) < g.half + 0.4;
+      } else if (g.live && t > g.s0 && t < g.s1) {
+        if (Math.abs(this.sledX - g.x) > g.half + 1.05) g.live = false;
+      }
+      if (t >= g.s1) {
+        g.done = true;
+        if (g.live && !g.failed) this._clearedShortcut(g);
+      }
+    }
+    gates.length = w;
+  }
+
+  _clearedShortcut(g) {
+    this.gatesHit++;
+    this.boost = Math.max(this.boost, BOOST_TIME * 0.95);
+    this._addStyle(ST_GATE, ST_M_GATE);
+    this._popup('SHORTCUT!', 'big');
+    this.zoom = Math.max(this.zoom, 1);
+    this.game.audio?.play?.('levelup');
+    this._flash('boost');
+    for (let n = 0; n < 16; n++) {
+      this._spawnParticle(
+        g.x + rand(-1.6, 1.6), this.groundY + rand(0.4, 2.6), rand(-2, 1),
+        rand(-1.4, 1.4), rand(0.5, 2.4), rand(12, 24), 0.3, 0xffd77a, rand(0.35, 0.7), 0,
+      );
+    }
+  }
+
+  /** The nearest arch we have not reached yet, for the call-out chip. */
+  _nextGate() {
+    let best = null;
+    for (const g of this.gates) {
+      if (g.done || g.s0 <= this.travel) continue;
+      if (!best || g.s0 < best.s0) best = g;
+    }
+    return best;
   }
 
   // ------------------------------------------------------------- particles -
@@ -2046,14 +2555,31 @@ export class SledGame extends Minigame {
       this.airVY -= GRAVITY * dt;
       this.airY += this.airVY * dt;
       this.airTime += dt;
+      this._updateTrick(dt);
       if (this.airY <= 0) this._land();
     }
+    if (this.airY <= 0.02) {
+      this.grabHeld = lerp(this.grabHeld, 0, Math.min(1, dt * 12));
+      this.trickOn = false;
+    }
 
-    if (this.phase === 'run') this._collide();
+    // ---- style streak decay ----------------------------------------------
+    if (this.phase === 'run') {
+      this.styleMeter = clamp(this.styleMeter - STYLE_DECAY * dt, 0, 1);
+      if (this.styleMeter <= 0 && this.styleMul > 1) {
+        this.styleMul--;
+        this.styleMeter = 0.55;
+      }
+      if (this.time - this.nearT > 2.2) this.nearRun = 0;
+    }
+    this.zoom = Math.max(0, this.zoom - dt * 1.9);
+
+    if (this.phase === 'run') { this._collide(); this._updateGates(); }
     this._spawnAhead();
     this._recycleGround();
     this._layoutProps();
     this._emitSpray(dt);
+    this._emitRush(dt);
     this._updateParticles(dt);
     this._animateRig(dt);
     this._updateCamera(dt);
@@ -2068,18 +2594,107 @@ export class SledGame extends Minigame {
     }
   }
 
+  /**
+   * Touchdown. Air time pays exactly what it always did; on top of that a
+   * committed trick is judged against the landing window the gauge has been
+   * showing all the way down. Clean banks style, sloppy costs the streak and
+   * some speed, and only a rig left more than TRICK_WIPE (about 66 degrees) off
+   * flat actually goes over: at that angle you are landing on the rail, and the
+   * gauge said so in red before you got there.
+   */
   _land() {
     this.airY = 0;
     this.airVY = 0;
-    if (this.phase === 'run' && this.airTime > 0.28) {
-      const bonus = Math.floor(this.airTime * 45);
-      this.airBonus += bonus;
-      this._popup(`AIR +${bonus}`, 'air');
-      this.game.audio?.play?.(this.airTime > 0.85 ? 'ding' : 'pop');
-      this.shake = Math.min(0.5, this.airTime * 0.35);
-    }
+    const air = this.airTime;
+    const committed = this.committed;
+    const err = Math.abs(this._axisError());
+    const grabbed = this.grabT >= GRAB_MIN;
+    const name = this._trickName();
+    const raw = (Math.abs(this.spin) / Math.PI) * ST_SPIN
+      + (Math.abs(this.flip) / (Math.PI * 2)) * ST_FLIP
+      + (grabbed ? this.grabT * ST_GRAB : 0);
+    // A rider who committed and then bailed has unwound back to flat, so there
+    // is nothing left to score: that is a plain air landing, not a free trick.
+    const scored = (committed && raw >= 3) || grabbed;
+
     this.airTime = 0;
+    this.spin = 0;
+    this.flip = 0;
+    this.grabT = 0;
+    this.committed = false;
+    this.trickArmed = false;
+    this.trickOn = false;
+    this.airLatch = null;
+    if (this.f?.trick) this.f.trick.classList.remove('on');
+    this._trickShown = '';
+    if (this.rigTrick) this.rigTrick.rotation.set(0, 0, 0);
+
+    if (this.phase !== 'run') { this._burst(this.sledX, this.groundY, 0.2, 12, 0xffffff, 0.32, 4, 3); return; }
+
+    if (air > 0.28) {
+      const bonus = Math.floor(air * 45);
+      this.airBonus += bonus;
+      this.shake = Math.min(0.5, air * 0.35);
+      if (!scored) {
+        this._popup(`AIR +${bonus}`, 'air');
+        this.game.audio?.play?.(air > 0.85 ? 'ding' : 'pop');
+      }
+    }
     this._burst(this.sledX, this.groundY, 0.2, 12, 0xffffff, 0.32, 4, 3);
+
+    if (!scored) return;
+
+    if (committed && err >= TRICK_WIPE) {
+      this._popup('WIPEOUT', 'bad');
+      this._breakStyle();
+      this._takeLandingCrash();
+      return;
+    }
+    if (committed && err >= TRICK_CLEAN) {
+      this._popup('SLOPPY', 'bad');
+      this.game.audio?.play?.('thud');
+      this.speed *= 0.78;
+      this.shake = Math.max(this.shake, 0.55);
+      this._breakStyle();
+      this._addStyle(raw * 0.3, 0);
+      return;
+    }
+    // clean
+    this.tricks++;
+    const got = this._addStyle(raw + air * ST_AIR, clamp(0.12 + raw / 110, 0.12, 0.45));
+    this._popup(`${name || 'STYLE'}  +${got}`, 'style');
+    this.game.audio?.play?.(raw > 90 ? 'sparkle' : 'ding');
+    this.zoom = Math.max(this.zoom, 0.55);
+    this._burst(this.sledX, this.groundY, 0.2, 14, 0xd9b3ff, 0.3, 3.4, 5);
+  }
+
+  /** A trick landed sideways: same cost as clipping a pine, same mercy frames. */
+  _takeLandingCrash() {
+    this.hearts--;
+    this.combo = 0;
+    this.invuln = INVULN;
+    this.shake = 1;
+    this.speed *= 0.5;
+    this.game.audio?.play?.('fail');
+    this._flash('hit');
+    // same rule as _takeHit: a slot you crashed inside is not a slot you threaded
+    for (const g of this.gates) if (g.live && !g.done) g.failed = true;
+    this._burst(this.sledX, this.groundY + 0.3, 0.2, 20, 0xdfe6ef, 0.36, 5, 6);
+    if (this.heartEls[this.hearts]) this.heartEls[this.hearts].classList.add('gone');
+    if (this.hearts <= 0) this._enterCrash();
+    else this._popup(`${this.hearts} left`, 'bad');
+  }
+
+  _enterCrash() {
+    this.phase = 'crash';
+    this.endT = 0;
+    this.tumble = 0;
+    this.hud.classList.remove('on');
+    this.tip.style.opacity = '0';
+    this.f?.trick?.classList.remove('on');
+    this.f?.sc?.classList.remove('on');
+    this.airVY = 7;
+    this.airY = 0.1;
   }
 
   // ------------------------------------------------------------- collisions -
@@ -2128,6 +2743,7 @@ export class SledGame extends Minigame {
       if (p.type === 'ramp') {
         if (!p.used && dx < 2.3 && p.s <= t + 1.2 && p.s >= pt - 1.2 && this.airY < 0.4) {
           p.used = true;
+          this._latchAir();
           this.airVY = 9.2 + this.speed * 0.14;
           this.airY = 0.05;
           this.airTime = 0;
@@ -2140,10 +2756,18 @@ export class SledGame extends Minigame {
 
       const hit = HIT[p.type];
       if (!hit) continue;
-      if (this.invuln > 0) continue;
       const rz = hit.r * p.sc * 0.9 + 0.7;
-      if (dx < hit.r * p.sc + 0.62 && p.s <= t + rz && p.s >= pt - rz && this.airY < hit.clear * p.sc) {
+      const crossing = p.s <= t + rz && p.s >= pt - rz;
+      if (!crossing) continue;
+      const solid = hit.r * p.sc + 0.62;
+      const low = this.airY < hit.clear * p.sc;
+      if (this.invuln > 0) continue;
+      if (dx < solid && low) {
         this._takeHit(p);
+      } else if (!p.near && low && dx < solid + NEAR_PAD && this.speed > 15) {
+        // one whoosh per tree: the crossing window spans a few frames
+        p.near = true;
+        this._nearMiss(p);
       }
     }
   }
@@ -2158,18 +2782,36 @@ export class SledGame extends Minigame {
     this.sledVX *= -0.35;
     this.game.audio?.play?.('fail');
     this._flash('hit');
+    this._breakStyle();
+    this.nearRun = 0;
+    for (const g of this.gates) if (g.live && !g.done) g.failed = true;
     this._burst(p.x, p.y + 0.4, this.travel - p.s, 20, p.type === 'pine' ? 0xdfeadf : 0xdfe6ef, 0.36, 5, 6);
     if (this.heartEls[this.hearts]) this.heartEls[this.hearts].classList.add('gone');
-    if (this.hearts <= 0) {
-      this.phase = 'crash';
-      this.endT = 0;
-      this.tumble = 0;
-      this.hud.classList.remove('on');
-      this.tip.style.opacity = '0';
-      this.airVY = 7;
-      this.airY = 0.1;
-    } else {
-      this._popup(`${this.hearts} left`, 'bad');
+    if (this.hearts <= 0) this._enterCrash();
+    else this._popup(`${this.hearts} left`, 'bad');
+  }
+
+  /**
+   * The tree you did NOT hit. Shaving one buys a whoosh, a punch of camera zoom
+   * and a little style, which is the whole reason to ride the tight line instead
+   * of the open middle. Throttled so a slalom reads as a rhythm and not a siren.
+   */
+  _nearMiss(p) {
+    if (this.time - this.nearT < NEAR_GAP) return;
+    this.nearT = this.time;
+    this.nears++;
+    this.nearRun++;
+    this.zoom = Math.max(this.zoom, 0.75);
+    this.shake = Math.max(this.shake, 0.13);
+    this.game.audio?.play?.('whoosh');
+    this._addStyle(ST_NEAR, ST_M_NEAR);
+    if (this.nearRun >= 3 && this.nearRun % 3 === 0) this._popup(`${this.nearRun} CLOSE CALLS`, 'style');
+    const side = Math.sign(p.x - this.sledX) || 1;
+    for (let i = 0; i < 5; i++) {
+      this._spawnParticle(
+        this.sledX + side * rand(0.7, 1.3), this.groundY + rand(0.3, 1.4), this.travel - p.s + rand(-0.4, 0.4),
+        side * rand(1, 3.4), rand(0.6, 2.2), rand(3, 7), rand(0.12, 0.22), 0xeaf6ff, rand(0.22, 0.4), 5,
+      );
     }
   }
 
@@ -2266,6 +2908,28 @@ export class SledGame extends Minigame {
     }
   }
 
+  /**
+   * Speed lines, but earned: they only exist while a style streak is running,
+   * so the screen visibly changes when the run is going well. Cheap (a handful
+   * of long thin particles a second) and shares the one particle pool.
+   */
+  _emitRush(dt) {
+    if (this.phase !== 'run' || this.styleMul < 2) return;
+    this.rushAcc += (this.styleMul - 1) * 7 * dt;
+    while (this.rushAcc >= 1) {
+      this.rushAcc -= 1;
+      const side = Math.random() < 0.5 ? -1 : 1;
+      const p = this.parts.length;
+      this._spawnParticle(
+        this.sledX + side * rand(3.4, 9), this.groundY + rand(0.6, 4.2), rand(-34, -20),
+        0, rand(-0.4, 0.6), rand(26, 44), rand(0.1, 0.18),
+        this.styleMul >= STYLE_MAX_MUL ? 0xffc8dd : 0xcbe9ff, rand(0.4, 0.7), 0,
+      );
+      const q = this.parts[p];
+      if (q) q.sz = 9;   // stretched down-track: a streak, not a dot
+    }
+  }
+
   // ----------------------------------------------------------- rig + camera -
   _animateRig(dt) {
     const g = this.rigRoot;
@@ -2292,9 +2956,17 @@ export class SledGame extends Minigame {
       g.rotation.x = lerp(g.rotation.x, slope * 0.9 + clamp(this.airVY, -9, 9) * 0.035, Math.min(1, dt * 8));
     }
 
+    // air rotation rides its own group so lean, slope and tumble all still work
+    if (this.phase === 'crash') {
+      this.rigTrick.rotation.set(0, 0, 0);
+    } else {
+      this.rigTrick.rotation.y = this.spin;
+      this.rigTrick.rotation.x = this.flip;
+    }
+
     // rider: crouch with speed, lean into the turn, ears and scarf in the wind
     const r = this.rig;
-    poseRider(r, lean, clamp(this.speed / 55, 0, 1), this.airY > 0.05, this.time, dt);
+    poseRider(r, lean, clamp(this.speed / 55, 0, 1), this.airY > 0.05, this.time, dt, this.grabHeld);
     r.head.rotation.x = clamp(-this.airVY * 0.02, -0.25, 0.25);
 
     // blob shadow
@@ -2309,7 +2981,9 @@ export class SledGame extends Minigame {
     const cam = this.camera;
     this.smoothY = lerp(this.smoothY, this.groundY, Math.min(1, dt * 2.6));
     const followY = this.smoothY + 4.5 + this.airY * 0.55;
-    const back = 9.2 + clamp(this.speed * 0.045, 0, 1.4);
+    // a near miss or a threaded arch punches the camera in for a beat: the same
+    // "that was close" language the whoosh speaks, said with the lens
+    const back = 9.2 + clamp(this.speed * 0.045, 0, 1.4) - this.zoom * 1.15;
     cam.position.x = lerp(cam.position.x, this.sledX * 0.62, Math.min(1, dt * 5));
     cam.position.y = lerp(cam.position.y, followY, Math.min(1, dt * 5.5));
     cam.position.z = lerp(cam.position.z, back, Math.min(1, dt * 4));
@@ -2325,8 +2999,11 @@ export class SledGame extends Minigame {
 
     const wantFov = 56 + clamp((this.speed - 18) * 0.42, 0, 12) + (this.boost > 0 ? 7 : 0);
     this.fov = lerp(this.fov, wantFov, Math.min(1, dt * 3.5));
-    if (Math.abs(cam.fov - this.fov) > 0.01) {
-      cam.fov = this.fov;
+    // the punch is applied AFTER the smoothing, not smoothed into it: a zoom
+    // that eases in over half a second is not a thrill, it is a drift
+    const fov = this.fov - this.zoom * 5.5;
+    if (Math.abs(cam.fov - fov) > 0.01) {
+      cam.fov = fov;
       cam.updateProjectionMatrix();
     }
 
@@ -2364,11 +3041,64 @@ export class SledGame extends Minigame {
     if (force || this.coins !== c.coins) { c.coins = this.coins; this.f.coins.textContent = this.coins; }
     const vg = clamp((this.speed - 24) / 40, 0, 1) * 0.85 + (this.boost > 0 ? 0.15 : 0);
     if (force || Math.abs(vg - (c.vg ?? -1)) > 0.03) { c.vg = vg; this.vig.style.opacity = vg.toFixed(2); }
+
+    // ---- style meter ------------------------------------------------------
+    if (force || this.styleMul !== c.mul) {
+      c.mul = this.styleMul;
+      this.f.mul.textContent = `×${this.styleMul}`;
+      this.f.mul.classList.toggle('hot', this.styleMul > 1);
+      // a x3 streak recolours the whole tunnel: the moment worth a screenshot
+      this.vig.classList.toggle('hot', this.styleMul >= STYLE_MAX_MUL);
+    }
+    const sb = Math.round(this.styleMeter * 100);
+    if (force || sb !== c.sb) { c.sb = sb; this.f.sbar.style.width = `${sb}%`; }
+    if (force || this.style !== c.style) { c.style = this.style; this.f.sval.textContent = this.style; }
+
+    // ---- the live trick readout + landing gauge ---------------------------
+    const showTrick = this.phase === 'run' && this.airY > 0.02
+      && (this.committed || this.grabT >= GRAB_MIN);
+    if (force || showTrick !== c.showTrick) {
+      c.showTrick = showTrick;
+      this.f.trick.classList.toggle('on', showTrick);
+    }
+    if (showTrick) {
+      const name = this._trickName();
+      if (name !== this._trickShown) { this._trickShown = name; this.f.tname.textContent = name; }
+      const err = this._axisError();
+      const pin = clamp(50 + (err / Math.PI) * 50, 2, 98);
+      this.f.gpin.style.left = `${pin.toFixed(1)}%`;
+      const a = Math.abs(err);
+      const state = a < TRICK_CLEAN ? 'ok' : a < TRICK_WIPE ? '' : 'bad';
+      if (state !== c.gstate) {
+        c.gstate = state;
+        this.f.gauge.className = `mg-sled-gauge${state ? ` ${state}` : ''}`;
+      }
+    }
+
+    // ---- shortcut call-out ------------------------------------------------
+    const g = this.phase === 'run' ? this._nextGate() : null;
+    const away = g ? g.s0 - this.travel : 1e9;
+    const showSc = !!g && away < GATE_WARN;
+    if (force || showSc !== c.showSc) {
+      c.showSc = showSc;
+      this.f.sc.classList.toggle('on', showSc);
+    }
+    if (showSc) {
+      const off = g.x - this.sledX;
+      const dir = off < -1.2 ? '◀' : off > 1.2 ? '▶' : '▲';
+      const m = Math.max(0, Math.round(away * DIST_SCALE));
+      const sig = `${dir}${m}`;
+      if (sig !== c.scSig) {
+        c.scSig = sig;
+        this.f.scdir.textContent = dir;
+        this.f.sctxt.textContent = `Shortcut in ${m}m`;
+      }
+    }
   }
 
   // --------------------------------------------------------------- results -
   _runScore() {
-    return Math.floor(this.dist * DIST_SCALE) + this.coins * 10 + this.airBonus;
+    return Math.floor(this.dist * DIST_SCALE) + this.coins * 10 + this.airBonus + this.style;
   }
 
   _showResults() {
@@ -2380,7 +3110,7 @@ export class SledGame extends Minigame {
 
     const metres = Math.floor(this.dist * DIST_SCALE);
     const coinPts = this.coins * 10;
-    const score = metres + coinPts + this.airBonus;
+    const score = metres + coinPts + this.airBonus + this.style;
     const prevBest = this.game.state.bests?.sled || 0;
     const isBest = score > prevBest;
     const payout = Math.min(this.coinsForScore(score), MINIGAMES.sled.maxCoinsPerRun);
@@ -2390,10 +3120,11 @@ export class SledGame extends Minigame {
     this.game.audio?.play?.(isBest ? 'success' : 'ding');
 
     const racing = !!this.race;
-    const title = score > 2200 ? 'Powder legend'
-      : score > 1400 ? 'Clean lines'
-        : score > 700 ? 'Nice carve'
-          : 'Bunny slope';
+    const title = score > 3400 ? 'Summit royalty'
+      : score > 2200 ? 'Powder legend'
+        : score > 1400 ? 'Clean lines'
+          : score > 700 ? 'Nice carve'
+            : 'Bunny slope';
 
     const card = document.createElement('div');
     card.className = 'mg-sled-card';
@@ -2407,6 +3138,10 @@ export class SledGame extends Minigame {
           <div class="mg-sled-row"><span>Distance</span><b>${metres.toLocaleString()} m</b></div>
           <div class="mg-sled-row"><span>Snowcoins &times; 10</span><b>${this.coins} &rarr; ${coinPts}</b></div>
           <div class="mg-sled-row"><span>Air time bonus</span><b>${this.airBonus}</b></div>
+          <div class="mg-sled-row"><span>Style${this.tricks
+    ? ` &middot; ${this.tricks} clean trick${this.tricks === 1 ? '' : 's'}` : ''}${this.gatesHit
+    ? ` &middot; ${this.gatesHit} shortcut${this.gatesHit === 1 ? '' : 's'}` : ''}</span><b>${
+  this.style.toLocaleString()}</b></div>
           <div class="mg-sled-row total"><span>Score</span><b>${score.toLocaleString()}</b></div>
           <div class="mg-sled-row pay"><span>Coins earned</span><b>+${payout}</b></div>
         </div>

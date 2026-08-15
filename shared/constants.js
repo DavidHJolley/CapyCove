@@ -27,7 +27,10 @@ export const ROOM_INFO = {
 // lacks them. They reject IMPOSSIBLE claims only - never cap honest play.
 export const MINIGAMES = {
   fishing: { name: 'Reel Rush', room: 'beach', maxCoinsPerRun: 120, minRunMs: 6_000 },
-  sled: { name: 'Summit Sprint', room: 'peak', maxCoinsPerRun: 150, minRunMs: 5_000 },
+  // 210: sled v2's trick/shortcut scoring lets an expert 115s run reach ~202
+  // coins honestly (measured headlessly); the old 150 was truncating elite
+  // honest play, which the owner's law forbids. Casual runs are unchanged.
+  sled: { name: 'Summit Sprint', room: 'peak', maxCoinsPerRun: 210, minRunMs: 5_000 },
   smoothie: { name: 'Smoothie Scramble', room: 'cafe', maxCoinsPerRun: 130, minRunMs: 6_000 },
   pong: { name: 'Paddle Panic', room: 'lounge', maxCoinsPerRun: 60, minRunMs: 8_000, minMatchMs: 6_000, minMoves: 8 },
   shuffle: { name: 'Shuffle Showdown', room: 'lounge', maxCoinsPerRun: 70, minRunMs: 10_000, minMatchMs: 10_000, minMoves: 3 },
@@ -64,6 +67,33 @@ export const HATS = {
   // the only thing that ever puts one in ownedHats.
   snorkel: { name: 'Diver Snorkel', price: 0, milestone: true },
   golden_pick: { name: 'Golden Pickaxe', price: 0, milestone: true },
+};
+
+// Walk trails and idle auras: the flourish slot. One worn at a time (a trail OR
+// an aura), synced like hats so everyone sees everyone's. The RECIPES (what each
+// one actually looks like) live in src/player/trails.js keyed by these same ids,
+// exactly as HATS relates to the avatar: prices here, art there, and neither
+// file imports the other.
+export const TRAILS = {
+  none: { name: 'No Trail', price: 0 },
+  petals: { name: 'Petal Path', price: 200 },
+  sparkles: { name: 'Paw Sparkles', price: 300 },
+  glowring: { name: 'Soft Glow Ring', price: 350, aura: true },
+  notes: { name: 'Tiny Tunes', price: 450 },
+  bubbles: { name: 'Bubble Drift', price: 550 },
+  snow: { name: 'Snow Glitter', price: 700 },
+  stardrift: { name: 'Drifting Stars', price: 800, aura: true },
+  fireflies: { name: 'Firefly Wisp', price: 950 },
+  leaves: { name: 'Leaf Flurry', price: 1100 },
+  embers: { name: 'Cocoa Embers', price: 1300 },
+  butterflies: { name: 'Butterfly Friends', price: 1500, aura: true },
+  stars: { name: 'Starfall', price: 1700 },
+  rainbow: { name: 'Rainbow Ribbon', price: 2000 },
+  // Milestone rewards (see MILESTONES): earned from the stamp album, never
+  // bought. Same rule as the milestone hats: price 0 is a placeholder, the shop
+  // hides every `milestone: true` entry and the server refuses to sell one.
+  tidewake: { name: 'Tide Wake', price: 0, milestone: true },
+  goldpaw: { name: 'Golden Pawprints', price: 0, milestone: true },
 };
 
 // Avatar body colors offered at signup / wardrobe.
@@ -285,8 +315,10 @@ export const MILESTONES = [
   { stamps: 5, name: 'Diver Snorkel', kind: 'hat', reward: { type: 'hat', id: 'snorkel', name: 'Diver Snorkel' } },
   { stamps: 12, name: 'Aurora dye', kind: 'color', reward: { type: 'color', id: 0x7ff0d0, name: 'Aurora Dye' } },
   { stamps: 20, name: 'Whale-song gramophone', kind: 'furniture', reward: { type: 'furniture', id: 'gramophone', name: 'Whale-Song Gramophone' } },
+  { stamps: 25, name: 'Tide Wake trail', kind: 'trail', reward: { type: 'trail', id: 'tidewake', name: 'Tide Wake' } },
   { stamps: 30, name: 'Golden pickaxe', kind: 'hat', reward: { type: 'hat', id: 'golden_pick', name: 'Golden Pickaxe' } },
   { stamps: 40, name: '"Legend of the Cove" title', kind: 'title', reward: { type: 'title', id: 'legend', name: 'Legend of the Cove' } },
+  { stamps: 45, name: 'Golden Pawprints trail', kind: 'trail', reward: { type: 'trail', id: 'goldpaw', name: 'Golden Pawprints' } },
 ];
 
 export function clampCoinsForGame(gameId, coins) {

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Room } from '../room.js';
 import { makeToon, makeGlow, canvasTexture } from '../../core/materials.js';
+import { makeWater, waveHeight } from '../water.js';
 import { BOT_ZONES } from '../../../shared/constants.js';
 
 /**
@@ -49,17 +50,18 @@ function sandY(x, z) {
   return y * (1 - lip) - lip * lip * 0.72;
 }
 
-// Swell: three crossed sine trains. Amplitude sums to 0.28, which keeps the
-// surface above the sand lip (-0.72) and below the dry beach at all times.
-const W1A = 0.13, W1K = 0.62, W1S = 1.15;
-const W2A = 0.09, W2K = 0.85, W2S = -0.9;
-const W3A = 0.06, W3K = 0.40, W3S = 1.9;
-
-/** Sea surface offset at (x,z) and time t. Shared by water, foam, boat, floats. */
+/**
+ * Sea surface offset at (x,z) and time t. Shared by the water shader, the foam
+ * ribbon, the rowboat, the fishing floats and the beach ball's buoyancy.
+ *
+ * The swell itself now lives in src/world/water.js (COVE_WAVES: three crossed
+ * sine trains, amplitudes summing to 0.28, which is what keeps the surface
+ * above the sand lip at -0.72 and below the dry beach at all times). The GPU
+ * draws it from the same table, so this is a mirror rather than a second
+ * opinion: the ball floats exactly where the water was rasterised.
+ */
 function waveY(x, z, t) {
-  return W1A * Math.sin(x * W1K + t * W1S)
-    + W2A * Math.sin(z * W2K + t * W2S)
-    + W3A * Math.sin((x + z) * W3K + t * W3S);
+  return waveHeight(x, z, t);
 }
 
 /** Pull a point inland so props never end up standing in the surf. */
@@ -145,6 +147,12 @@ function readWeather(w) {
 }
 
 const smoothstep = (u) => u * u * (3 - 2 * u);
+
+/** Rec.709 luminance of a THREE.Color, in whatever space the colour is held in.
+ *  Only ever used as a RATIO against NOON_SEA_LUM, so the space cancels out. */
+const lum = (c) => c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
+/** The sea at noon: the reference the shore foam's brightness is measured in. */
+const NOON_SEA_LUM = lum(new THREE.Color(SKY[1].water));
 const lerp = (a, b, u) => a + (b - a) * u;
 
 // ---------------------------------------------------------------- scratch
@@ -739,16 +747,40 @@ export class BeachRoom extends Room {
     if (rain > 0.01) _mix.lerp(_mixB.setHex(0x8fa0ac), rain * 0.55);
     scene.fog.color.copy(_mix);
     scene.background.copy(_mix);
+    // The sea takes BOTH ends of its depth ramp from the same LUT the flat deep
+    // circle behind it uses, so the near-shore turquoise and the open blue swing
+    // through the day together and the two meshes never disagree at the seam.
     mixHex(A.water, B.water, f, _mix);
-    this._waterMat.color.copy(_mix).multiplyScalar(gloom);
+    this._water.setTint(_mix.multiplyScalar(gloom));
+    // How bright the sea itself is this hour, against how bright it is at noon.
+    // The foam is pinned to THIS and nothing else (see below), so it is measured
+    // here while _mix still holds the water colour.
+    const seaK = clamp01(lum(_mix) / NOON_SEA_LUM);
     mixHex(A.deep, B.deep, f, _mix);
-    this._deepMat.color.copy(_mix).multiplyScalar(gloom);
+    _mix.multiplyScalar(gloom);
+    this._water.setDeep(_mix);
+    this._deepMat.color.copy(_mix);
+    // FOAM IS A CONTRAST, NOT A COLOUR. Surf reads as white because it sits a
+    // few stops above the water it is in; paint it a fixed white and it stops
+    // being surf the moment the sea gets dark. The old floor (0.6 + 0.4*unlit)
+    // was tuned against absolute paper, so measured across the break it ran
+    // +35% over the sea at noon and +530% at midnight: after dark the shoreline
+    // became the brightest, highest-contrast object in the frame and pulled the
+    // eye clean off the bonfire, which is the one thing that room is FOR at
+    // night. So the foam now tracks the sea's own luminance instead - noon is
+    // unchanged, dusk barely moves, midnight comes down to a moonlit line a
+    // couple of stops over the water. The small floor is what keeps it reading
+    // as surf at all under a new moon, and the amount follows it down so less
+    // of the sea is painted after dark as well.
+    const foamK = Math.max(0.1, seaK);
+    _mix.setHex(0xfffdf6).multiplyScalar(foamK);
+    this._water.setFoam(_mix, (0.92 - rain * 0.3) * (0.6 + 0.4 * foamK));
+    const un = lerp(A.unlit, B.unlit, f) * gloom;
     mixHex(A.cloud, B.cloud, f, _mix);
     this._cloudMat.color.copy(_mix).lerp(_mixB.setHex(0x9aa3ad), rain * 0.6);
 
     // unlit decals (foam, wet sand, paths, sign faces) have no light to dim
     // them, so they follow the sky by hand or they glow like paper at midnight
-    const un = lerp(A.unlit, B.unlit, f) * gloom;
     for (const u of this._unlit) u.mat.color.setHex(u.hex).multiplyScalar(un);
 
     // Sun glitter belongs to the sun. The scatter is baked along the western
@@ -757,6 +789,12 @@ export class BeachRoom extends Room {
     const up = smoothstep(clamp01((elev + 0.14) / 0.4));
     const west = smoothstep(clamp01((dayT - 0.06) / 0.16));
     this._glintAmt = (0.3 + 0.8 * up * west) * (1 - rain * 0.8);
+    // The sea's own specular band takes the key light's DIRECTION and COLOUR,
+    // which is the whole night behaviour in one line: the key keeps the sun's
+    // azimuth after dark and turns moon-blue (SKY[3].sun), so the glitter path
+    // narrows into a cold moon trail without a second code path. The sprite
+    // glints on top are the sparkle; this is the sheen underneath them.
+    this._water.setSun(_dir, sun.color, this._glintAmt * 0.5);
 
     if (this._skyDirty <= 0) { this._paintSky(A, B, f, rain); this._skyDirty = 0.2; }
     else this._skyDirty -= dt;
@@ -1045,24 +1083,44 @@ export class BeachRoom extends Room {
     deep.position.y = -0.9;
     scene.add(deep);
 
-    // Animated swell (NOT walkable). MeshToonMaterial has no flatShading, so
-    // update() rewrites analytic normals each frame; the toon ramp then bands
-    // the wave faces, which is the look we want anyway.
-    const WSEG = 40, WSIZE = 62;
-    const wg = new THREE.PlaneGeometry(WSIZE, WSIZE, WSEG, WSEG);
-    this._waterMat = makeToon(0x3ba7dd, { unique: true });
-    const water = new THREE.Mesh(wg, this._waterMat);
-    water.rotation.x = -Math.PI / 2;
-    water.position.set(-3, WATER_Y, 3);
-    water.frustumCulled = false;
-    scene.add(water);
-    const wp = wg.attributes.position;
-    const wx = new Float32Array(wp.count), wz = new Float32Array(wp.count);
-    for (let i = 0; i < wp.count; i++) {
-      wx[i] = wp.getX(i) + water.position.x;
-      wz[i] = water.position.z - wp.getY(i);
-    }
-    this.anim.water = water; this.anim.wx = wx; this.anim.wz = wz;
+    // Animated swell (NOT walkable), one mesh, one draw call: the shared cove
+    // water (src/world/water.js). The swell, its analytic normals, the banded
+    // shore foam, the five-step depth falloff and the specular glitter band all
+    // live in the vertex/fragment injection, so this room's update() no longer
+    // rewrites 1681 positions and 1681 normals on the CPU every frame - it
+    // writes one uniform. The wave table is the same one waveY() reads, so
+    // everything floating on the sea still agrees with what was drawn.
+    //
+    // The shore is described analytically in the SAME polar form shoreR() uses
+    // (11.3 + 2.5cos(th+0.45) + 0.4sin(3th+0.7) about the cove centre), which is
+    // how the foam arcs can hug this cove's real coastline with no texture.
+    // depthRange 17 runs the tint out to open blue BEFORE the plane's rim meets
+    // the deep circle behind it, so the two meshes agree on colour at the seam
+    // (raycast either side of it and both resolve to #2b7db6). The module
+    // default is 22, which would still be climbing at the rim.
+    this._water = makeWater({
+      width: 62,
+      segments: 56,
+      center: { x: -3, z: 3 },
+      y: WATER_Y,
+      shallow: 0x3ba7dd,
+      deep: 0x2b7fb8,
+      foam: 0xfffdf6,
+      foamAmount: 0.92,
+      glintAmount: 0.5,
+      // 3 puts the sunset glitter on the whole western half of the cove and
+      // almost none behind the dunes (see the glint note in water.js)
+      glintPower: 3,
+      // a whisper of sky sheen so the sea is never a dead flat colour in the
+      // shadowed troughs; the clock's key light does the rest
+      self: 0.05,
+      shore: {
+        x: CX, z: CZ, r: 11.3, a1: 2.5, p1: 0.45, a3: 0.4, p3: 0.7,
+        foamW: 1.0, depthRange: 17,
+      },
+      name: 'sea',
+    });
+    scene.add(this._water.mesh);
 
     // wet sand band
     const wet = new THREE.Mesh(
@@ -2802,22 +2860,10 @@ export class BeachRoom extends Room {
     this._relight(dt);
     const wind = 1 + this._windAmt * 0.9;
 
-    // sea surface: height + analytic normal (plane local z is world y)
-    const wpos = a.water.geometry.attributes.position;
-    const wnrm = a.water.geometry.attributes.normal;
-    const arr = wpos.array, narr = wnrm.array;
-    for (let i = 0, n = a.wx.length; i < n; i++) {
-      const x = a.wx[i], z = a.wz[i];
-      const p1 = x * W1K + t * W1S, p2 = z * W2K + t * W2S, p3 = (x + z) * W3K + t * W3S;
-      arr[i * 3 + 2] = W1A * Math.sin(p1) + W2A * Math.sin(p2) + W3A * Math.sin(p3);
-      const d3 = W3A * W3K * Math.cos(p3);
-      const dx = W1A * W1K * Math.cos(p1) + d3;
-      const dz = W2A * W2K * Math.cos(p2) + d3;
-      const inv = 1 / Math.sqrt(dx * dx + dz * dz + 1);
-      narr[i * 3] = -dx * inv; narr[i * 3 + 1] = dz * inv; narr[i * 3 + 2] = inv;
-    }
-    wpos.needsUpdate = true;
-    wnrm.needsUpdate = true;
+    // sea surface: one uniform. Swell, normals, foam bands, depth falloff and
+    // the glitter band are all shader-side now (src/world/water.js); _relight
+    // owns its colours and its sun direction.
+    this._water.update(t);
 
     // foam: outer edge rides the swell, whole line breathes in and out
     const fpos = a.foam.geometry.attributes.position;
@@ -2993,7 +3039,12 @@ export class BeachRoom extends Room {
     this._lamps = null;
     this._lampDock = null;
     this._sun = this._hemi = this._amb = null;
-    this._waterMat = this._deepMat = this._cloudMat = null;
+    // the engine disposes the scene graph, but the water owns a unique
+    // (uncached) material + geometry pair, so say so out loud; dispose() is
+    // idempotent, so the double free is free
+    this._water?.dispose();
+    this._water = null;
+    this._deepMat = this._cloudMat = null;
     this._scene = null;
     this._game = null;
     this.hotspots.length = 0;

@@ -2,8 +2,12 @@ import * as THREE from 'three';
 import { makeToon, canvasTexture } from '../core/materials.js';
 import { buildHat } from './hats.js';
 
-// Chibi capybara avatar. Face points +Z. Feet at y=0, total height ~1.72 (the
-// old model measured 1.71, so seats, name tags and sled rigs still line up).
+// Chibi capybara avatar. Face points +Z. Feet at y=0, total height ~1.75 - the
+// ear tip, measured at rest (v1 was 1.72, v0 1.71; the extra 0.03 is v2's second
+// ear lobe). Feet stay at y=-0.002 and rest half-width at 0.633, and nothing
+// downstream reads the top of the model - name tags anchor at yOff 2.35 and
+// bubbles at 2.75 in engine.js, and the sled builds its own rig - so seats,
+// tags and rigs still line up. This number is quoted elsewhere: keep it true.
 // Anim states: idle | walk | dance | sit | swim | ride (+ playWave() on top of
 // any of them). 'swim'/'ride' belong to The Drift; everything on the wire is
 // still one of idle/walk/dance/sit (see src/world/rooms/drift.js).
@@ -18,15 +22,20 @@ import { buildHat } from './hats.js';
 //     buffer. Built lazily on the first createAvatar call, never at import time
 //     (see CONTRACT.md). Anything marked geometry.userData.shared is skipped by
 //     every dispose path.
-//  2. Detail is merged, not added. Every extra bead, patch and paw is baked into
-//     one of the shared geometries, so the whole capy is 16 meshes / 16 draw
-//     calls (the old plainer model was 15) and ~3.4k triangles with ~15 remotes
-//     on screen.
+//  2. Detail is merged, not added. Every extra bead, patch, tuft and paw is
+//     baked into one of the shared geometries, so the whole capy is 16 meshes /
+//     16 draw calls and ~4.3k triangles. That budget is FIXED: v2 bought its fur
+//     tufts, its softer ears and muzzle and a separately animatable mouth with
+//     triangles, never with meshes. The one mesh v2 spends on the mouth was paid
+//     for by folding the eye catchlights into the eye geometry (note 3), so the
+//     count is exactly what it was before.
 //  3. Two-tone fur runs on ONE material: each fur geometry carries a baked
 //     'color' attribute used as a tint multiplier (1 = body colour, ~2 = cream
 //     belly/muzzle/paw tips, <1 = soft shading). Accents therefore track any
 //     body colour for free, and adding a second material (a second draw call per
-//     limb) was never needed.
+//     limb) was never needed. The eyes run the same trick in reverse: one cream
+//     material, the beads tinted DOWN to ink (EYE_INK) and the catchlights left
+//     at 1, so a blink squashes bead and glint together in one draw call.
 //  4. World fx (footstep dust, shoreline ripples) are POOLED and LAZY. Nothing
 //     is built until a capybara first kicks something up, the two objects hide
 //     themselves the moment their pool empties (an invisible object costs no
@@ -53,6 +62,8 @@ const EAR_Y = 0.325;
 const EAR_Z = -0.03;
 const EAR_TILT = 0.2;
 const BLINK_DUR = 0.15;
+const LAND_DUR = 0.19;   // the impact beat under each footfall
+const NOSE_DUR = 0.55;   // one sniff-wiggle of the snout
 const WAVE_DUR = 1.6;
 const WAVE_TAIL = 0.75;  // the arm swings past rest and springs back after it
 const GROOVE_DUR = 0.38; // one groove pop (before combo speed-up)
@@ -73,6 +84,15 @@ const RING_LIFE = 1.0;
 const FUR = [1, 1, 1];
 const CREAM = [2.45, 2.28, 1.98];
 const SOFT = [1.45, 1.38, 1.28];
+const TUFT_T = [0.86, 0.83, 0.79]; // fur tufts read as fur in shadow, not as trim
+
+// Eye tints, against a cream 0xfffaf0 base material. EYE_INK is 0x241a12 divided
+// by that cream in LINEAR space, so the bead is exactly the ink it always was;
+// the big catchlight is the base colour untouched and the small one is dimmed,
+// which is what gives the bead its depth. One material, one mesh, one blink.
+const EYE_INK = [0.0176, 0.0108, 0.0069];
+const EYE_LIT = [1, 1, 1];
+const EYE_DIM = [0.74, 0.74, 0.74];
 
 // Head/muzzle are ellipsoids; face details are placed ON their front surface so
 // a proportion tweak here moves the whole face instead of leaving beads floating.
@@ -84,6 +104,40 @@ function frontZ(e, x, y, out = 0) {
   const k = Math.max(0, 1 - dx * dx - dy * dy);
   return e.c[2] + e.r[2] * Math.sqrt(k) + out;
 }
+
+// The mouth and the snout are their own meshes so they can be animated (a grin,
+// a sniff) without dragging the rest of the face along, and each is built AROUND
+// its own pivot so a scale opens the smile instead of sliding it off the muzzle.
+const MOUTH_P = [0, -0.163, frontZ(MUZZLE, 0.043, -0.163) + 0.006];
+const SNOUT_P = [0, -0.05, 0.30];
+
+/** Per-hat fit on the head. A hat builder authors its shape around y=0 sitting
+ *  on the crown, but "the crown" is a different height for a helmet that swallows
+ *  the skull, a top hat that perches on it and a snorkel strap that rings the
+ *  brow, and one anchor for all of them buried half of them in the head. Numbers
+ *  are HEAD-LOCAL: y is the anchor height (the skull is an ellipsoid of radii
+ *  0.47 / 0.437 / 0.442 about the head origin, so 0.437 is the very top), s
+ *  scales the builder's units, z nudges it along the muzzle and tilt leans it.
+ *  Anything not listed (runtime hats from registerHat) gets HAT_DEF. */
+const HAT_DEF = { y: 0.365, s: 1.18, z: 0, tilt: 0 };
+const HAT_FIT = {
+  beanie: { y: 0.3, s: 1.19, z: 0.005, tilt: -0.04 },    // knit, pulled down to the brow
+  cap: { y: 0.255, s: 1.18, z: 0.015, tilt: -0.08 },     // the rim meets the skull's widest point
+  flower: { y: 0.35, s: 1.15, z: 0.02, tilt: 0.16 },     // stem planted in the crown
+  tophat: { y: 0.425, s: 1.06, z: -0.01, tilt: -0.03 },  // brim RESTS on the crown
+  viking: { y: 0.21, s: 1.24, z: 0, tilt: -0.02 },       // a helmet swallows the skull
+  crown: { y: 0.33, s: 1.15, z: 0, tilt: 0 },
+  propeller: { y: 0.255, s: 1.18, z: 0.005, tilt: -0.03 },
+  chef: { y: 0.295, s: 1.14, z: -0.005, tilt: -0.02 },
+  pirate: { y: 0.275, s: 1.2, z: 0.01, tilt: -0.06 },
+  // The mask RESTS ON the brow lobe (its centre lands at head-local 0.419, the
+  // brow tops out at 0.40) and so is clear of the eyes at 0.10. Note the
+  // direction: this anchor is LOWER than HAT_DEF, not higher - the mask was
+  // brought DOWN onto the brow from floating over it, and it is the bigger
+  // scale that keeps it off the eyes. Raising y here lifts it off the face.
+  snorkel: { y: 0.25, s: 1.3, z: 0.01, tilt: 0 },
+  golden_pick: { y: 0.285, s: 1.24, z: 0, tilt: 0 },     // the band rings the crown
+};
 
 const _m = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
@@ -214,7 +268,7 @@ let GEO = null;
 let BLOB_MAT = null;
 let INK_MAT = null;
 let PINK_MAT = null;
-let SHINE_MAT = null;
+let EYE_MAT = null;
 function geo() {
   if (GEO) return GEO;
   const sph = (w, h) => new THREE.SphereGeometry(1, w, h);
@@ -226,72 +280,113 @@ function geo() {
   const ARM_CAP = new THREE.CapsuleGeometry(0.105, 0.17, 2, 8);
   const LEG_CAP = new THREE.CapsuleGeometry(0.115, 0.06, 2, 8);
   const SMILE = new THREE.TorusGeometry(0.042, 0.011, 3, 8, Math.PI);
+  // One unit cone, 10 triangles, pointing +Y about its own centre: every fur
+  // tuft in the model is this shape scaled and leaned. Ten triangles is the
+  // whole reason the silhouette could get furrier without the budget moving.
+  const TUFT = new THREE.ConeGeometry(1, 1, 5);
 
   // eyes sit on the skull, but their geometry is built around y=0 so scale.y
-  // blinks each eye about its own centre instead of sliding it down the face
+  // blinks each eye about its own centre instead of sliding it down the face.
+  // Bead and both catchlights live in ONE geometry (see note 3): the tint does
+  // the colour, so the glints squash with the blink for free.
   const eyeZ = frontZ(SKULL, 0.205, EYE_Y) - 0.035;
   const eyes = [];
-  const shine = [];
-  // ink/pink/shine parts keep a neutral tint: their materials are flat colours,
-  // not the tinted fur material
   for (const side of [-1, 1]) {
-    eyes.push(piece(S12, FUR, [side * 0.205, 0, eyeZ], [0.105, 0.113, 0.092]));
-    shine.push(piece(S6, FUR, [side * 0.235, 0.042, eyeZ + 0.055], 0.036));
-    shine.push(piece(S4, FUR, [side * 0.178, -0.038, eyeZ + 0.05], 0.021));
+    eyes.push(piece(S12, EYE_INK, [side * 0.205, 0, eyeZ], [0.105, 0.113, 0.092]));
+    eyes.push(piece(S6, EYE_LIT, [side * 0.235, 0.042, eyeZ + 0.055], 0.036));
+    eyes.push(piece(S4, EYE_DIM, [side * 0.178, -0.038, eyeZ + 0.05], 0.021));
   }
 
-  const face = [
-    piece(S8, FUR, [0, -0.05, frontZ(MUZZLE, 0, -0.05) - 0.025], [0.105, 0.062, 0.078]),
+  // snout = nose + whisker dots, around SNOUT_P so a sniff pivots at the muzzle
+  const snout = [
+    piece(S8, FUR, [0, -0.05 - SNOUT_P[1], frontZ(MUZZLE, 0, -0.05) - 0.025 - SNOUT_P[2]], [0.105, 0.062, 0.078]),
   ];
+  // mouth = the two half-smile arcs, around MOUTH_P so a grin scales open
+  const mouth = [];
   for (const side of [-1, 1]) {
-    // half-smile arc per side: together they read as a soft capy grin
-    face.push(piece(SMILE, FUR, [side * 0.043, -0.163, frontZ(MUZZLE, side * 0.043, -0.163) - 0.004], 1, [0.25, 0, Math.PI]));
+    mouth.push(piece(SMILE, FUR,
+      [side * 0.043, 0, frontZ(MUZZLE, side * 0.043, MOUTH_P[1]) + 0.006 - MOUTH_P[2]],
+      1, [0.25, 0, Math.PI]));
     for (const [wx, wy] of [[0.16, -0.03], [0.19, -0.075]]) {
-      face.push(piece(S4, FUR, [side * wx, wy, frontZ(MUZZLE, side * wx, wy) - 0.002], 0.013));
+      snout.push(piece(S4, FUR,
+        [side * wx, wy - SNOUT_P[1], frontZ(MUZZLE, side * wx, wy) - 0.002 - SNOUT_P[2]], 0.013));
     }
   }
 
   GEO = {
-    // torso egg + heavy pear bottom + one big round cream tummy
+    // torso egg + heavy pear bottom + one big round cream tummy, plus the fur
+    // that breaks the egg: a chest bib under the chin, a ruff behind each
+    // shoulder, hip tufts and one scruff over the rump. Every tuft is planted
+    // just inside the surface so only its point clears the silhouette.
     body: merge([
       piece(S16, FUR, [0, 0.62, 0], [0.52, 0.55, 0.46]),
       piece(S12, FUR, [0, 0.34, -0.02], [0.46, 0.34, 0.42]),
       piece(S16, CREAM, [0, 0.5, 0.13], [0.42, 0.46, 0.35]),
+      piece(S6, CREAM, [-0.1, 0.94, 0.27], [0.13, 0.1, 0.1]),   // chest bib
+      piece(S6, CREAM, [0.1, 0.94, 0.27], [0.13, 0.1, 0.1]),
+      piece(TUFT, TUFT_T, [-0.33, 0.94, -0.22], [0.085, 0.19, 0.08], [-0.5, 0, 0.75]),
+      piece(TUFT, TUFT_T, [0.33, 0.94, -0.22], [0.085, 0.19, 0.08], [-0.5, 0, -0.75]),
+      piece(TUFT, TUFT_T, [-0.4, 0.38, -0.12], [0.08, 0.18, 0.075], [-0.4, 0, 0.95]),
+      piece(TUFT, TUFT_T, [0.4, 0.38, -0.12], [0.08, 0.18, 0.075], [-0.4, 0, -0.95]),
+      piece(TUFT, TUFT_T, [0, 0.72, -0.4], [0.09, 0.2, 0.07], [-1.1, 0, 0]),
     ]),
+    // skull + muzzle, softened: a bridge lobe fills the step from brow to snout,
+    // two small lobes fill the crease where the muzzle meets the cheeks, a
+    // cheek flare gives the face width in silhouette and a nape scruff gives the
+    // back of the head something other than a sphere. All well clear of the hat
+    // anchor, so no tuft ever pokes through a hat.
     head: merge([
       piece(S16, FUR, [0, 0, 0], SKULL.r),
       piece(S12, CREAM, MUZZLE.c, MUZZLE.r),
-      piece(S8, CREAM, [0, -0.245, 0.2], [0.185, 0.1, 0.14]),   // chin
+      piece(S8, CREAM, [0, -0.245, 0.2], [0.19, 0.105, 0.145]),  // chin
       piece(S8, CREAM, [-0.26, -0.115, 0.2], [0.15, 0.13, 0.12]), // cheek pads widen
       piece(S8, CREAM, [0.26, -0.115, 0.2], [0.15, 0.13, 0.12]),  // the muzzle
-      piece(S8, SOFT, [0, 0.28, 0.24], [0.26, 0.12, 0.16]),     // brow highlight
+      piece(S8, SOFT, [0, 0.28, 0.24], [0.26, 0.12, 0.16]),      // brow highlight
+      piece(S8, CREAM, [0, 0.0, 0.3], [0.225, 0.13, 0.155]),     // bridge of the snout
+      piece(S6, SOFT, [-0.235, -0.145, 0.33], [0.1, 0.085, 0.085]),
+      piece(S6, SOFT, [0.235, -0.145, 0.33], [0.1, 0.085, 0.085]),
+      piece(TUFT, TUFT_T, [-0.42, -0.06, -0.02], [0.07, 0.17, 0.07], [0, 0, 1.35]),
+      piece(TUFT, TUFT_T, [0.42, -0.06, -0.02], [0.07, 0.17, 0.07], [0, 0, -1.35]),
+      piece(TUFT, TUFT_T, [-0.12, 0.26, -0.33], [0.06, 0.17, 0.055], [-0.95, 0, 0.25]),
+      piece(TUFT, TUFT_T, [0.12, 0.26, -0.33], [0.06, 0.17, 0.055], [-0.95, 0, -0.25]),
+      piece(TUFT, TUFT_T, [0, 0.3, -0.35], [0.065, 0.19, 0.06], [-0.85, 0, 0]),
     ]),
-    ear: merge([piece(S8, FUR, [0, 0.03, 0], [0.135, 0.128, 0.075])]),
-    earIn: merge([piece(S6, FUR, [0, -0.01, 0.045], [0.088, 0.086, 0.05])]),
+    // two lobes instead of one: a wide base and a rounder, narrower tip, which
+    // is the shape a capybara ear actually is and reads far softer at the top
+    ear: merge([
+      piece(S8, FUR, [0, 0.015, 0], [0.137, 0.115, 0.078]),
+      piece(S6, FUR, [0, 0.105, -0.006], [0.1, 0.085, 0.062]),
+    ]),
+    earIn: merge([piece(S6, FUR, [0, -0.008, 0.045], [0.082, 0.088, 0.05])]),
     eyes: merge(eyes),
-    shine: merge(shine),
-    face: merge(face),
+    snout: merge(snout),
+    mouth: merge(mouth),
     blush: merge([-1, 1].map((side) => piece(S6, FUR,
-      [side * 0.295, -0.025, frontZ(SKULL, side * 0.295, -0.025) - 0.05], [0.105, 0.08, 0.06]))),
+      [side * 0.295, -0.025, frontZ(SKULL, side * 0.295, -0.025) - 0.05], [0.11, 0.083, 0.06]))),
     arm: merge([
       piece(ARM_CAP, FUR, [0, -0.16, 0], 1),
-      piece(S8, CREAM, [0, -0.3, 0.025], [0.115, 0.1, 0.125]), // chunky paw
+      piece(S6, SOFT, [0, 0.005, 0], [0.125, 0.1, 0.12]),       // shoulder cap
+      piece(S8, CREAM, [0, -0.3, 0.025], [0.115, 0.1, 0.125]),  // chunky paw
     ]),
     leg: merge([
       piece(LEG_CAP, FUR, [0, -0.055, 0], 1),
+      piece(S6, SOFT, [0, 0.015, -0.01], [0.132, 0.1, 0.125]),  // haunch cap
       piece(S8, CREAM, [0, -0.155, 0.045], [0.115, 0.072, 0.13]), // foot
     ]),
-    tail: merge([piece(S8, FUR, [0, 0.03, -0.05], [0.085, 0.1, 0.09])]),
+    tail: merge([
+      piece(S8, FUR, [0, 0.03, -0.05], [0.085, 0.1, 0.09]),
+      piece(TUFT, TUFT_T, [0, 0.09, -0.1], [0.05, 0.14, 0.045], [-1.0, 0, 0]),
+    ]),
     blob: new THREE.CircleGeometry(0.48, 20),
   };
   GEO.blob.userData.shared = true;
-  for (const g of [S16, S12, S8, S6, S4, ARM_CAP, LEG_CAP, SMILE]) g.dispose();
+  for (const g of [S16, S12, S8, S6, S4, ARM_CAP, LEG_CAP, SMILE, TUFT]) g.dispose();
 
   BLOB_MAT = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18, depthWrite: false });
   BLOB_MAT.userData.shared = true;
   INK_MAT = makeToon(0x241a12);
   PINK_MAT = makeToon(0xf0959f);
-  SHINE_MAT = makeToon(0xfffaf0);
+  EYE_MAT = makeToon(0xfffaf0, { vertexColors: true });
   return GEO;
 }
 
@@ -320,13 +415,23 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
   skull.castShadow = true;
   headG.add(skull);
 
-  // eyes blink by squashing; catchlights ride along as children so they squash too
-  const eyes = new THREE.Mesh(G.eyes, INK_MAT);
+  // Eyes blink by squashing and glance by sliding: one mesh holding both beads
+  // and their catchlights, so a blink, a happy squeeze and a saccade are all
+  // two numbers on one object.
+  const eyes = new THREE.Mesh(G.eyes, EYE_MAT);
   eyes.position.y = EYE_Y;
   headG.add(eyes);
-  eyes.add(new THREE.Mesh(G.shine, SHINE_MAT));
 
-  headG.add(new THREE.Mesh(G.face, INK_MAT));   // nose + grin + whisker dots
+  // the snout sniffs and the mouth grins, so they are separate objects pivoted
+  // at the muzzle and at the mouth line respectively
+  const snout = new THREE.Mesh(G.snout, INK_MAT);
+  snout.position.set(SNOUT_P[0], SNOUT_P[1], SNOUT_P[2]);
+  headG.add(snout);
+
+  const mouth = new THREE.Mesh(G.mouth, INK_MAT);
+  mouth.position.set(MOUTH_P[0], MOUTH_P[1], MOUTH_P[2]);
+  headG.add(mouth);
+
   headG.add(new THREE.Mesh(G.blush, PINK_MAT));
 
   const ears = [];
@@ -366,11 +471,13 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
   blob.position.y = 0.02;
   group.add(blob);
 
-  // hats are authored for the old smaller skull, so the anchor scales them to
-  // the new head instead of every builder being re-tuned
+  // Hats are authored for the old smaller skull, so the anchor scales them to
+  // this head instead of every builder being re-tuned - and it does it PER HAT
+  // (HAT_FIT), because one height for a helmet, a top hat and a snorkel strap
+  // is one height that buries two of them. setHat() writes it.
   const hatAnchor = new THREE.Group();
-  hatAnchor.position.set(0, 0.365, 0);
-  hatAnchor.scale.setScalar(1.18);
+  hatAnchor.position.set(0, HAT_DEF.y, HAT_DEF.z);
+  hatAnchor.scale.setScalar(HAT_DEF.s);
   headG.add(hatAnchor);
 
   const fur = [torso, skull, tail, ...limbs.arms, ...limbs.legs, ...ears];
@@ -385,6 +492,14 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
     // walk-start anticipation / walk-stop settle, and the stride phase sign we
     // watch for footfalls
     antic: 0, settle: 0, scuff: false, walkS: 0,
+    // the landing beat of the walk cycle: one impulse, decayed everywhere
+    landT: 0,
+    // the face. glad = how pleased it is (drives the squeezed eyes and the
+    // grin), eyeX/eyeY = where the eyes are pointed, sacX/sacY = where they are
+    // pointed NEXT, yawRate = the smoothed turn the eyes lead into.
+    glad: 0, grin: 0, eyeX: 0, eyeY: 0,
+    sacIn: 1 + Math.random() * 2, sacX: 0, sacY: 0,
+    yawPrev: 0, yawRate: 0, noseIn: 3 + Math.random() * 6, noseT: 0,
     // idle life: an occasional look-around, and a slow settle after a long wait
     lookIn: 5 + Math.random() * 9, lookT: 0, lookDir: 1,
     idleT: 0, doze: 0, everWalked: false,
@@ -605,6 +720,12 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
   function setHat(id) {
     state.hat = id;
     hatAnchor.clear();
+    // own-property only, same reason buildHat does it: HAT_FIT['constructor']
+    // would otherwise hand us a function and put the hat at NaN
+    const fit = Object.prototype.hasOwnProperty.call(HAT_FIT, id) ? HAT_FIT[id] : HAT_DEF;
+    hatAnchor.position.set(0, fit.y, fit.z);
+    hatAnchor.scale.setScalar(fit.s);
+    hatAnchor.rotation.x = fit.tilt;
     const h = buildHat(id);
     if (h) hatAnchor.add(h);
     state.spinner = h?.getObjectByName?.('spin') || null;
@@ -680,9 +801,13 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
         speed = 0;
         state.wading = false;
         flushFx();
+        // and no spin: an a-tp mid-walk otherwise reads the facing jump as a
+        // huge yaw rate and pins the eyes to the rail for half a second
+        state.yawPrev = group.rotation.y;
       }
     } else {
       state.seeded = true;
+      state.yawPrev = group.rotation.y; // or the first frame reads a spawn as a spin
     }
     state.px = group.position.x;
     state.pz = group.position.z;
@@ -707,6 +832,13 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
       ears[i].rotation.set(0, 0, -side * EAR_TILT);
     }
     tail.rotation.set(0, 0, 0);
+
+    // The landing impulse decays out here so the timer never survives a stop
+    // and fires stale on the next stride. NOTE it is only ever SPENT inside the
+    // walk branch below: a capy that leaves 'walk' on the frame its paw lands
+    // drops that beat rather than paying it out. The settle rock covers the
+    // same moment, so this is deliberate rather than free.
+    if (state.landT > 0) state.landT = Math.max(0, state.landT - dt);
 
     // the blob shadow fakes ground contact, so it has nothing to land on in a
     // room with no floor: it would hang in the water column under a swimmer
@@ -747,10 +879,36 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
       // Footfall = the stride phase crossing zero, which is exactly where the
       // bounce bottoms out, so the puff lands on the beat the paw does. Only
       // for a capy that is really covering ground: a walker pressed against a
-      // wall should not sand-blast it.
+      // wall should not sand-blast it. The landing beat itself fires either
+      // way - a capy jogging on the spot still puts its weight down.
       const was = state.walkS;
       state.walkS = s;
-      if (was * s < 0 && speed > 0.6) footfall(s < 0 ? -1 : 1, 1);
+      if (was * s < 0) {
+        state.landT = LAND_DUR;
+        if (speed > 0.6) footfall(s < 0 ? -1 : 1, 1);
+      }
+
+      // The landing beat. The bounce above is a sine: it rises and falls and
+      // nothing ever ARRIVES. This is the arrival - one impulse per footfall,
+      // decayed over a fifth of a second, squashing the body down and wide,
+      // dropping the chin and flicking the ears. It is what the eye reads as
+      // weight, and it is the difference between a bobbing capy and a walking
+      // one. Scaled by `gait` so the anticipation crouch does not land twice.
+      if (state.landT > 0 && !calm()) {
+        const u = state.landT / LAND_DUR;
+        const k = u * u * gait;
+        body.scale.y -= k * 0.075;
+        body.scale.x += k * 0.05;
+        body.scale.z += k * 0.05;
+        body.position.y -= k * 0.03;
+        headG.rotation.x += k * 0.11;
+        headG.position.y -= k * 0.022;
+        arms[0].rotation.x += k * 0.14;
+        arms[1].rotation.x += k * 0.14;
+        ears[0].rotation.x -= k * 0.34;
+        ears[1].rotation.x -= k * 0.34;
+        tail.rotation.x -= k * 0.22;
+      }
     } else if (state.anim === 'dance') {
       // two moves that swap every ~4s with a short crossfade: A = hip sway with
       // alternating paws, B = two-paw hop-and-spin
@@ -802,14 +960,19 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
       if (state.anim === 'swim') {
         const p = t * 7;
         const s = Math.sin(p);
-        body.rotation.x = 1.3 + Math.sin(t * 2.1) * 0.05;   // horizontal
+        // the power stroke: every pull surges the chest forward and up, and the
+        // glide between strokes settles back. Without it the paddle is a pair of
+        // arms waving under a body that never reacts to them.
+        const pull = s > 0 ? s * s : 0;
+        body.rotation.x = 1.3 + Math.sin(t * 2.1) * 0.05 - pull * 0.07;
         body.rotation.z = Math.sin(t * 1.7) * 0.07;         // lazy roll
         body.rotation.y = Math.sin(t * 3.5) * 0.055;        // fishy wag
-        body.position.y = 0.32 + Math.sin(t * 2.1) * 0.05;
-        body.scale.y = 1.06;                                // streamlined
-        body.scale.x = body.scale.z = 0.98;
-        headG.rotation.x = -1.05 + Math.sin(t * 2.1) * 0.06;
+        body.position.y = 0.32 + Math.sin(t * 2.1) * 0.05 + pull * 0.035;
+        body.scale.y = 1.06 + pull * 0.03;                  // streamlined
+        body.scale.x = body.scale.z = 0.98 - pull * 0.015;
+        headG.rotation.x = -1.05 + Math.sin(t * 2.1) * 0.06 - pull * 0.09;
         headG.rotation.y = Math.sin(t * 0.9) * 0.13;
+        headG.position.y += pull * 0.02;
         arms[0].rotation.x = -0.55 + s * 0.75;
         arms[1].rotation.x = -0.55 - s * 0.75;
         arms[0].rotation.z = -(ARM_SPLAY + 0.3);
@@ -818,9 +981,13 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
         legs[1].rotation.x = -0.35 - Math.sin(p + 1.1) * 0.6;
         legs[0].rotation.z = -0.2;
         legs[1].rotation.z = 0.2;
-        ears[0].rotation.x = 0.28;
-        ears[1].rotation.x = 0.28;
+        // ears pinned back and down against the water, twitching on the stroke
+        ears[0].rotation.x = 0.34 + pull * 0.08;
+        ears[1].rotation.x = 0.34 + pull * 0.08;
+        ears[0].rotation.z += 0.22;
+        ears[1].rotation.z -= 0.22;
         tail.rotation.x = Math.sin(t * 5.2) * 0.4;
+        tail.rotation.y = Math.sin(t * 3.5) * 0.3;          // rudder
       } else {
         // riding Big Blue: astride her back, paws planted, head sightseeing
         body.position.y = -0.12 + Math.sin(t * 1.7) * 0.03;
@@ -999,18 +1166,114 @@ export function createAvatar({ color = 0xb08a5a, hat = 'none' } = {}) {
       tail.rotation.z -= dy * 0.5;
     }
 
-    // ---- always-on life: blink, ear flick (any state) ----------------------
+    // ---- the face (any state) ----------------------------------------------
+    // Blink, lid, glance, grin and sniff all land on three meshes, so they are
+    // resolved here as numbers and written ONCE at the end of the block. Every
+    // term is a scalar lerp: no allocation, no branching per bead.
+
+    // 1. the blink, on its own natural timer
     state.blinkIn -= dt;
     if (state.blinkIn <= 0) {
       // a quarter of blinks come in pairs, which reads far more alive than a metronome
       state.blinkIn = Math.random() < 0.22 ? 0.32 : 2.6 + Math.random() * 3.8;
       state.blinkT = BLINK_DUR;
     }
+    let open = 1;
     if (state.blinkT > 0) {
       state.blinkT -= dt;
-      eyes.scale.y = 1 - 0.88 * Math.sin(Math.max(0, state.blinkT) / BLINK_DUR * Math.PI);
-    } else if (eyes.scale.y !== 1) {
-      eyes.scale.y = 1;
+      open = 1 - 0.88 * Math.sin(Math.max(0, state.blinkT) / BLINK_DUR * Math.PI);
+    }
+
+    // 2. how pleased the capy is. A wave and a groove pop each have an envelope
+    //    already; dancing is simply pleased the whole way through. A wave
+    //    squeezes LESS than a dance: the eyes have to stay readable while the
+    //    capy is looking straight at whoever it is waving to.
+    const gladWant = state.anim === 'dance' ? 1 : Math.max(
+      state.waveT >= 0 ? Math.sin(Math.min(1, state.waveT / WAVE_DUR * 1.25) * Math.PI) * 0.72 : 0,
+      state.grooveT >= 0 ? Math.sin(Math.min(1, state.grooveT / GROOVE_DUR) * Math.PI) : 0,
+    );
+    state.glad += (gladWant - state.glad) * Math.min(1, dt * 8);
+
+    // 3. the lid. A happy squeeze and a contented half-close are both just an
+    //    eye that is less open, so they bid against the blink and the lowest
+    //    bid wins. Sitting still, or dozing on the spot, is a capy at peace:
+    //    the rest lid breathes over 0.48..0.64 (1 - 1*(0.44 +/- 0.08)), never
+    //    all the way shut, so the bead is always visible under it.
+    let lid = 1 - state.glad * 0.85;
+    const rest = state.anim === 'sit' ? 1 : Math.min(1, state.doze);
+    if (rest > 0.02) lid = Math.min(lid, 1 - rest * (0.44 + Math.sin(t * 1.6) * 0.08));
+    if (state.anim === 'swim') lid = Math.min(lid, 0.84); // squinting into the water
+    if (open > lid) open = lid;
+
+    // 4. the glance. The eyes lead a turn (they get there before the head does),
+    //    look where the head is being turned during a look-around, and drift
+    //    about in tiny saccades the rest of the time.
+    let yawD = group.rotation.y - state.yawPrev;
+    state.yawPrev = group.rotation.y;
+    if (yawD > Math.PI) yawD -= Math.PI * 2; else if (yawD < -Math.PI) yawD += Math.PI * 2;
+    state.yawRate += (yawD / Math.max(dt, 1e-4) - state.yawRate) * Math.min(1, dt * 9);
+    let ex = 0;
+    let ey = 0;
+    if (state.lookT > 0) {
+      ex = state.lookDir;
+    } else if (state.anim === 'walk') {
+      // +yaw swings the nose toward local +X, so a turn pulls the eyes the same way
+      ex = Math.max(-1, Math.min(1, state.yawRate * 0.5));
+    } else {
+      state.sacIn -= dt;
+      if (state.sacIn <= 0) {
+        state.sacIn = 1.3 + Math.random() * 3.4;
+        state.sacX = (Math.random() * 2 - 1) * 0.85;
+        state.sacY = (Math.random() * 2 - 1) * 0.5;
+      }
+      ex = state.sacX;
+      ey = state.sacY;
+    }
+    if (calm()) { ex = 0; ey = 0; }
+    const sk = Math.min(1, dt * 14); // saccades are fast; that is what sells them
+    state.eyeX += (ex - state.eyeX) * sk;
+    state.eyeY += (ey - state.eyeY) * sk;
+
+    // 5. write the eyes: slide along the face, pull back a hair off-centre so
+    //    the beads stay on the skull's curve, squash for the lid, ride up a
+    //    little when the capy is pleased
+    eyes.position.set(
+      state.eyeX * 0.027,
+      EYE_Y + state.eyeY * 0.016 + state.glad * 0.013,
+      -state.eyeX * state.eyeX * 0.007,
+    );
+    eyes.scale.y = open;
+
+    // 6. the grin. One mesh, so a smile is the mouth opening out about its own
+    //    pivot: wider, deeper, and dropped a touch so it reads from the 3/4
+    //    camera. A walking capy is already having a nice time.
+    const grinWant = Math.max(state.glad,
+      state.anim === 'walk' ? 0.25 : state.anim === 'ride' ? 0.55 : 0);
+    state.grin += (grinWant - state.grin) * Math.min(1, dt * 7);
+    const gm = state.grin;
+    mouth.scale.set(1 + gm * 0.55, 1 + gm * 0.72, 1);
+    mouth.position.y = MOUTH_P[1] - gm * 0.013;
+    mouth.rotation.x = -gm * 0.12;
+
+    // 7. the nose tic: a quick sniff at the world, only while standing about
+    state.noseIn -= dt;
+    if (state.noseIn <= 0) {
+      state.noseIn = 4 + Math.random() * 7;
+      if (!calm() && (state.anim === 'idle' || state.anim === 'sit')) state.noseT = NOSE_DUR;
+    }
+    if (state.noseT > 0) {
+      state.noseT = Math.max(0, state.noseT - dt);
+      const u = state.noseT / NOSE_DUR;
+      const k = Math.sin(u * Math.PI * 5) * u * u;
+      const a = k < 0 ? -k : k;
+      snout.rotation.set(-a * 0.12, 0, k * 0.17);
+      snout.scale.set(1 + a * 0.1, 1 - a * 0.08, 1 + a * 0.04);
+      snout.position.y = SNOUT_P[1] + a * 0.009;
+      // the whiskers are in that mesh, so they come with it
+    } else if (snout.scale.y !== 1) {
+      snout.rotation.set(0, 0, 0);
+      snout.scale.set(1, 1, 1);
+      snout.position.y = SNOUT_P[1];
     }
 
     state.twitchIn -= dt;

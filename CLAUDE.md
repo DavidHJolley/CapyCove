@@ -27,6 +27,11 @@ check DESIGN.md's palette/principles or ask the orchestrator.
 One file = one owner per work wave. Never edit outside your assignment.
 
 - `src/world/rooms/<id>.js`: one room, one owner. Self-contained scene.
+- `src/world/water.js`: the shared sea (`makeWater`). Every room that shows
+  open water builds it here so the cove reads as ONE ocean.
+- `src/world/ambience.js`: the living-air layer (`attachAmbience`, called by
+  the engine after every room build). Per-room particle recipes live here;
+  respect any removal a room file records in its own comments.
 - `src/minigames/games/<id>.js`: one minigame, one owner. Self-contained.
 - `src/ui/<feature>.js`: one UI overlay per file (hud.js is the shared shell
   and is high-traffic: coordinate before touching).
@@ -231,6 +236,19 @@ means COMPLETED). Wrong-way banner per §A6, never a penalty. Feel wave:
 postfx.setScene(scene, camera, room, {arrive}) is the explicit arrival
 signal (switchRoom true, rebuildRoom false); rooms may set this.grade =
 {warmth, lift, dusk} (jungle pins dusk: 0).
+Shipped flourish slot (walk trails + idle auras, shared/constants.js TRAILS,
+art in src/player/trails.js): `buy-trail` {trail} -> the EXISTING `shop` frame
+{ok, ownedTrails, boughtTrail} (no ownedHats on that answer, so the client takes
+each list only when the frame names it). `custom` gained `trail`: the client
+sends the WHOLE look (color+hat+trail) or a hat change would strip the flourish,
+the server clamps it against ownedTrails and broadcasts it with the rest.
+Snapshots carry `trail` only when one is worn (snapshotFor), and publicProfile
+carries trail/ownedTrails. `profile-set` {showcase:[stampId]} pins up to 3 EARNED
+stamps and has no answer frame. Milestone trails at 25/45 stamps (tidewake,
+goldpaw) are granted by server/progress.js and ride the `shop` frame exactly
+like the milestone hats: price 0, `milestone: true`, hidden by the shop and
+refused by the server. Guest hello does NOT carry trail fields (the server's
+guest clamp reads coins/ownedHats/bests only).
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.
