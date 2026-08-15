@@ -11,6 +11,7 @@ import { initFriendsButton } from './ui/friends.js';
 import { showTitle } from './ui/title.js';
 import { maybeStartTour } from './ui/firstrun.js';
 import { DEFAULT_ROOM } from '../shared/constants.js';
+import { preloadLayout } from './world/overlay.js';
 
 /**
  * BOOT LOADING SCREEN (the #boot panel + its critical CSS are inlined in
@@ -93,6 +94,7 @@ game.net = net;
 // (CLAUDE.md), so this only warms the module cache: the build below reuses it.
 {
   const warm = Object.prototype.hasOwnProperty.call(ROOMS, DEFAULT_ROOM) ? ROOMS[DEFAULT_ROOM] : null;
+  preloadLayout(DEFAULT_ROOM); // published-layout fetch rides the boot; never rejects
   const at55 = () => boot.set(55, 'unrolling the plaza');
   if (warm) Promise.resolve().then(warm).then(at55, at55);
   else at55();

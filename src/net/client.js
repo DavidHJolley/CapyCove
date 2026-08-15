@@ -1,5 +1,6 @@
 import { createAvatar } from '../player/avatar.js';
 import { NET_TICK_MS } from '../../shared/constants.js';
+import { evictLayout } from '../world/overlay.js';
 
 // Poses a remote avatar is allowed into. 'sit' rides sleds/benches; anything
 // unknown (older server, rogue frame) falls back to idle so nobody gets wedged
@@ -336,6 +337,17 @@ export class NetClient {
           if (Number.isFinite(m.coins)) game.syncCoins(m.coins, m.delta ?? 0, 'furniture');
         }
         game.events.emit('furn', m);
+        break;
+      case 'layout-rev':
+        // a layout was published/reverted; drop the cache (ETag survives, so an
+        // unrelated room costs one 304) and rebuild if we're standing in it
+        evictLayout(m.room);
+        if (game.roomId === m.room) game.engine?.rebuildRoom();
+        game.events.emit(m.t, m);
+        break;
+      case 'layout-doc':
+      case 'layout-ack':
+        game.events.emit(m.t, m);
         break;
     }
   }

@@ -99,6 +99,24 @@ Milestone rewards reuse the EXISTING `shop`/`furn`/`toast` frames; the title and
 unlocked dye colours ride the welcome profile (publicProfile) and the world tag
 snapshot. Milestone cosmetics are `milestone:true` in shared/constants.js with
 price 0: the shop hides them AND the server refuses to sell them.
+Shipped wave 9 (accounts/admin spine): the `a-*` operator family (a-who,
+a-inspect, a-mute, a-kick, a-ban, a-unban, a-tp, a-announce...) is handled
+ENTIRELY inside server/admin.js `performOp` (capability-checked, audited) and
+answered with `a-ok`/`a-err`; `announce` broadcasts. Dispatch order in
+server/index.js is LOAD-BEARING: admin.handleMessage (mute/ban pre-empt) ->
+chatlog.observe (never consumes) -> reports.handleMessage -> layouts.handleMessage
+-> progress.handleMessage -> main switch.
+Shipped wave 10 (T&S): `report` (player/mural/drawing reports -> server/reports.js),
+`dd-vote` {kind:'skip'} (majority of current guessers skips a dead doodle round);
+chat/whisper/names pass server/filter.js and broadcast the CLEANED text.
+Shipped editor v2 (rlo/1 layout docs at data/layouts/<room>.json, server/layouts.js):
+`layout-get` {room} -> `layout-doc` {room,doc,rev}; `layout-save` {room,ops} (draft),
+`layout-publish`, `layout-discard`, `layout-revert` -> `layout-ack` {ok,...};
+publish broadcasts `layout-rev` {room,rev} to ALL (client evicts its cache and
+rebuilds if standing in that room). All layout-* writes require the 'editor'
+capability. Read side: `GET /api/layout/:room` with ETag; published ops applied
+at room build by src/world/overlay.js `attachOverlay` (called from engine
+switchRoom/rebuildRoom; do not call room.build without it).
 Adding a message: implement server handler (validated, rate-limited, inside
 the try/catch), client handler that re-emits via `game.events`, and add it to
 this list.
@@ -138,21 +156,14 @@ docs/CARDGAME.md section 10) is PARKED pending an explicit user go-ahead.
 Remaining after that: PUBLIC DEPLOYMENT (configs in repo: Dockerfile,
 render.yaml, fly.toml; needs the user's hosting account).
 
-### !!! DEPLOYMENT BLOCKER: temporary admin backdoor !!!
+### Admin backdoor: RESOLVED (wave 9)
 
-`src/main.js` gates the dev layout editor (Ctrl+E) behind `isAdmin()`, which
-is a `/^david/i` test on the player's DISPLAY NAME: anyone who signs up as
-"davidsomething" gets it. It must be removed or replaced with a real
-server-side `admin` flag (on the user record, surfaced through
-publicProfile()) BEFORE the game is public. The editor itself is client-side
-only (it drags local meshes and prints coordinates; it writes nothing to the
-server), so this is a UX gate, not a privilege escalation, but the name test
-must not ship. Everything to unpick: `isAdmin()` + the Ctrl+E block in
-main.js, `src/ui/editor.js`, `Room.editable/editables` in
-`src/world/room.js`, and the `reg()` wrapper + `editorExport()` in
-`src/world/rooms/lounge.js`.
+The old `/^david/i` display-name gate is gone. Ctrl+E now requires the
+server-granted `editor` capability (game.can('editor'), from the role on the
+user record via publicProfile), and Ctrl+Shift+A (mod panel) requires any
+capability. Roles are seeded by the COVE_ADMIN env var and granted with a-role.
 
-## Dev layout editor (Ctrl+E)
+## Layout editor (Ctrl+E)
 
 Rooms are built from numbers, not scene files, so the editor edits numbers and
 exports them; the room file stays the source of truth. Two modes:
@@ -185,6 +196,16 @@ lines, sprites and depth-writeless glow overlays are unpickable, and oversized
 backdrops sort last. Free edits are a VISUAL preview: nothing derived from a
 number follows, and they are session-only. The panel prints position, rotation
 and scale plus a scene path so the value can be found in the room builder.
+
+**Build (editor v2, persistent)**: the third tab edits a per-room layout
+DOCUMENT (`rlo/1` op list: move/rot/scale/hide existing props, place new props
+from a palette, spawn/cam overrides). Drafts autosave to the server
+(`layout-save`, editor capability required) and are private to editors;
+**Publish** bumps the room's rev, broadcasts `layout-rev`, and every player's
+client applies it at room build via `src/world/overlay.js` (`attachOverlay`).
+Discard drops the draft; Revert rolls back one published rev. Room files stay
+the source of truth for geometry; the layout doc is a diff on top. Server side
+lives in `server/layouts.js` (owner: editor wave), docs at data/layouts/.
 
 ## Historical roadmap notes (2026-08-06)
 

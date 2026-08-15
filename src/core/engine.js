@@ -3,6 +3,7 @@ import * as postfx from './postfx.js';
 import { disposeObject } from './materials.js';
 import { createAvatar } from '../player/avatar.js';
 import { WalkController } from '../player/controller.js';
+import { attachOverlay, preloadLayout } from '../world/overlay.js';
 
 const DOWN = new THREE.Vector3(0, -1, 0);
 const _rayOrigin = new THREE.Vector3(); // snapY runs per remote per frame; don't allocate
@@ -158,7 +159,9 @@ export class Engine {
       this._switchTimer = null;
       let RoomClass;
       try {
-        RoomClass = await pending;
+        // preloadLayout resolves null after 250ms and never rejects, so the
+        // published-layout fetch rides the fade without delaying the switch
+        [RoomClass] = await Promise.all([pending, preloadLayout(id)]);
       } catch (e) {
         console.error(`[engine] failed to load room '${id}':`, e);
         if (seq === this._switchSeq) { this._pendingRoom = null; this._irisReset(fade); }
@@ -171,6 +174,7 @@ export class Engine {
       this.room = new RoomClass();
       this.scene = new THREE.Scene();
       this.room.build(this.scene, this.game);
+      attachOverlay(this.room, this.scene, this.game, id);
       if (!this.room.groundMeshes?.length) console.warn(`[engine] room '${id}' has no groundMeshes`);
       this.scene.add(this.remoteGroup);
       postfx.setScene(this.scene, this.camera);
@@ -311,6 +315,7 @@ export class Engine {
     this.room = new RoomClass();
     this.scene = new THREE.Scene();
     this.room.build(this.scene, this.game);
+    attachOverlay(this.room, this.scene, this.game, this.room.id);
     this.scene.add(this.remoteGroup);
     postfx.setScene(this.scene, this.camera);
 
@@ -571,6 +576,8 @@ export class Engine {
    */
   _resolveStaticCam(ease) {
     if (!this.room) return;
+    // the editor pins the camera while dragging; rebuilds/resizes must not yank it
+    if (this.camLock) return;
     const sc = this.room.staticCamera;
     if (sc?.position && sc?.lookAt) {
       const position = sc.position.clone();

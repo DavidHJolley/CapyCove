@@ -13,6 +13,7 @@ import { BotManager } from './bots.js';
 import * as progress from './progress.js';
 import * as admin from './admin.js';
 import * as audit from './audit.js';
+import * as layouts from './layouts.js';
 import * as filter from './filter.js';
 import * as chatlog from './chatlog.js';
 import * as reports from './reports.js';
@@ -237,6 +238,7 @@ app.get('/api/me', (req, res) => {
 // currently have someone standing in them. Handy for spotting a den that failed
 // to get reaped when its last visitor left.
 app.get('/api/health', (_req, res) => res.json({ ok: true, online: world.players.size, rooms: world.rooms.size, audit: audit.stats() }));
+app.get('/api/layout/:room', (req, res) => layouts.httpGet(req, res));
 
 // dev-only: lets automated playtests save canvas captures to disk
 if (process.env.NODE_ENV !== 'production') {
@@ -464,6 +466,7 @@ admin.install({
 });
 chatlog.install({ audit: audit.log, recordFor });
 reports.install({ audit: audit.log, sendTo, recordFor, findEntity, chatlog });
+layouts.install({ sendTo, broadcastAll, recordFor, audit: audit.log });
 
 /**
  * Every scoring moment the island produces, handed to the progression module.
@@ -2231,6 +2234,7 @@ wss.on('connection', (ws) => {
       // be logged as something they said; observe never consumes
       if (p) chatlog.observe(p, m);
       if (p && reports.handleMessage(p, m)) return;
+      if (p && layouts.handleMessage(p, m)) return;
       if (p && progress.handleMessage(p, m)) return;
       switch (m.t) {
         case 'hello': {
@@ -2904,6 +2908,7 @@ process.on('uncaughtException', (e) => {
   try {
     audit.log({ actor: null, via: 'system', op: audit.OPS.SERVER_UNCAUGHT, args: { name: e?.name || 'Error', at: String(e?.stack || e).slice(0, 800) }, ok: false });
     audit.flush();
+    layouts.flush();
     flush();
   } catch {}
 });
