@@ -1,5 +1,7 @@
 # Capy Cove
 
+https://capycove.duckdns.org/
+
 A cozy multiplayer hangout world in the browser. Waddle around five locations
 as a chibi capybara, chat and dance with other players, earn coins in three
 minigames, and spend them on hats. Three.js client, Node + WebSocket server,
